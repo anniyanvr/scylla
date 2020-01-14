@@ -33,6 +33,7 @@ import xml.etree.ElementTree as ET
 
 # Apply custom options to these tests
 custom_test_args = {
+    'boost/cql_query_test': '-c2 -m2G --fail-on-abandoned-failed-futures',
     'boost/mutation_reader_test': '-c{} -m2G'.format(min(os.cpu_count(), 3)),
     'boost/sstable_test': '-c1 -m2G',
     'boost/sstable_datafile_test': '-c1 -m2G',
