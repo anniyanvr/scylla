@@ -1,23 +1,19 @@
 /*
- */
-
-/*
  * Modified by ScyllaDB
  * Copyright (C) 2015-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include <stdint.h>
-#include <seastar/core/shared_ptr.hh>
-#include "utils/UUID.hh"
+#include "schema/schema_fwd.hh"
 #include "utils/hash.hh"
 #include "sstables/version.hh"
-
+#include "seastarx.hh"
 
 namespace db {
 
@@ -45,18 +41,7 @@ struct replay_position {
         }
     }
 
-    bool operator<(const replay_position & r) const {
-        return id < r.id ? true : (r.id < id ? false : pos < r.pos);
-    }
-    bool operator<=(const replay_position & r) const {
-        return !(r < *this);
-    }
-    bool operator==(const replay_position & r) const {
-        return id == r.id && pos == r.pos;
-    }
-    bool operator!=(const replay_position & r) const {
-        return !(*this == r);
-    }
+    auto operator<=>(const replay_position&) const noexcept = default;
 
     unsigned shard_id() const {
         return unsigned(id >> max_ts_bits);
@@ -70,13 +55,21 @@ struct replay_position {
 
     template <typename Describer>
     auto describe_type(sstables::sstable_version_types v, Describer f) { return f(id, pos); }
+
+    bool valid() const {
+        return id != 0 && pos != 0;
+    }
+
+    static const replay_position max;
 };
 
 class commitlog;
 class cf_holder;
 
-using cf_id_type = utils::UUID;
+using cf_id_type = table_id;
 
+// One reference in a commitlog segment's per-table use count (segment::_cf_dirty). The
+// destructor drops it; after rp_set::put() or release() the reference outlives the handle.
 class rp_handle {
 public:
     rp_handle() noexcept;
@@ -84,7 +77,13 @@ public:
     rp_handle& operator=(rp_handle&&) noexcept;
     ~rp_handle();
 
-    replay_position release();
+    // A new reference on this handle's segment for table `id`, which must use this commitlog,
+    // dated no later than this handle's table's first write there. The clone sits at
+    // (segment id, 0), below every entry, so it only holds the segment. Flush requests that
+    // already covered the segment do not ask `id` to flush: the caller must.
+    [[nodiscard]] rp_handle clone(const cf_id_type& id) const;
+
+    replay_position release() noexcept;
 
     operator bool() const {
         return _h && _rp != replay_position();
@@ -105,9 +104,6 @@ private:
     replay_position _rp;
 };
 
-
-std::ostream& operator<<(std::ostream& out, const replay_position& s);
-
 }
 
 namespace std {
@@ -118,3 +114,8 @@ struct hash<db::replay_position> {
     }
 };
 }
+
+template <> struct fmt::formatter<db::replay_position> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const db::replay_position&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2014-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -20,6 +17,8 @@
 #include "cql3/cql_statement.hh"
 
 #include <seastar/core/shared_ptr.hh>
+
+#include "service/raft/raft_group0_client.hh"
 
 class mutation;
 
@@ -34,37 +33,45 @@ namespace messages = cql_transport::messages;
 /**
  * Abstract class for statements that alter the schema.
  */
-class schema_altering_statement : public raw::cf_statement, public cql_statement_no_metadata {
+class schema_altering_statement : public raw::cf_statement, public cql_statement {
 private:
     const bool _is_column_family_level;
 
-    future<::shared_ptr<messages::result_message>>
-    execute0(query_processor& qp, service::query_state& state, const query_options& options) const;
 protected:
     explicit schema_altering_statement(timeout_config_selector timeout_selector = &timeout_config::other_timeout);
 
     schema_altering_statement(cf_name name, timeout_config_selector timeout_selector = &timeout_config::other_timeout);
+    
+    virtual bool needs_guard(query_processor& qp, service::query_state& state) const override;
 
+    virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const override;
+
+    virtual uint32_t get_bound_terms() const override;
+
+    virtual void prepare_keyspace(const service::client_state& state) override;
+
+    virtual future<::shared_ptr<messages::result_message>>
+    execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
+
+    virtual audit::statement_category category() const override;
+
+    // DDL manages schema objects, it is not a user load reclassification target.
+    bool should_reclassify_control_connection() const override {
+        return false;
+    }
+
+public:
     /**
      * When a new data_dictionary::database object (keyspace, table) is created, the creator needs to be granted all applicable
      * permissions on it.
      *
      * By default, this function does nothing.
      */
-    virtual future<> grant_permissions_to_creator(const service::client_state&) const;
+    virtual future<> grant_permissions_to_creator(const service::client_state&, service::group0_batch&) const;
 
-    virtual bool depends_on_keyspace(const sstring& ks_name) const override;
-
-    virtual bool depends_on_column_family(const sstring& cf_name) const override;
-
-    virtual uint32_t get_bound_terms() const override;
-
-    virtual void prepare_keyspace(const service::client_state& state) override;
-
-    virtual future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const = 0;
-
-    virtual future<::shared_ptr<messages::result_message>>
-    execute(query_processor& qp, service::query_state& state, const query_options& options) const override;
+    using event_t = cql_transport::event::schema_change;
+    virtual future<std::tuple<::shared_ptr<event_t>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const;
+    virtual future<std::tuple<::shared_ptr<event_t>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, service::query_state& state, const query_options& options, service::group0_batch& mc) const;
 };
 
 }

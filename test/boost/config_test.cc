@@ -3,20 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
 #include <boost/test/unit_test.hpp>
 #include <stdlib.h>
 #include <iostream>
+#include <fmt/ranges.h>
 
-#include <seastar/testing/test_case.hh>
+#include "test/lib/scylla_test_case.hh"
+#include "test/lib/test_utils.hh"
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/future-util.hh>
+#include <yaml-cpp/yaml.h>
 #include "db/config.hh"
+#include "db/object_storage_endpoint_param.hh"
 #include "utils/updateable_value.hh"
-#include <algorithm>
 
 using namespace db;
 
@@ -157,10 +160,10 @@ partitioner: org.apache.cassandra.dht.Murmur3Partitioner
 # commitlog_directory: /var/lib/cassandra/commitlog
 
 # policy for data disk failures:
-# die: shut down gossip and Thrift and kill the JVM for any fs errors or
+# die: shut down gossip and kill the JVM for any fs errors or
 #      single-sstable errors, so the node can be replaced.
-# stop_paranoid: shut down gossip and Thrift even for single-sstable errors.
-# stop: shut down gossip and Thrift, leaving the node effectively dead, but
+# stop_paranoid: shut down gossip even for single-sstable errors.
+# stop: shut down gossip, leaving the node effectively dead, but
 #       can still be inspected via JMX.
 # best_effort: stop using the failed disk and respond to requests based on
 #              remaining available sstables.  This means you WILL see obsolete
@@ -169,8 +172,8 @@ partitioner: org.apache.cassandra.dht.Murmur3Partitioner
 disk_failure_policy: stop
 
 # policy for commit disk failures:
-# die: shut down gossip and Thrift and kill the JVM, so the node can be replaced.
-# stop: shut down gossip and Thrift, leaving the node effectively dead, but
+# die: shut down gossip and kill the JVM, so the node can be replaced.
+# stop: shut down gossip, leaving the node effectively dead, but
 #       can still be inspected via JMX.
 # stop_commit: shutdown the commit log, letting writes collect but
 #              continuing to service reads, as in pre-2.0.5 Cassandra
@@ -440,10 +443,7 @@ native_transport_port: 9042
 # be rejected as invalid. The default is 256MB.
 # native_transport_max_frame_size_in_mb: 256
 
-# Whether to start the thrift rpc server.
-start_rpc: true
-
-# The address or interface to bind the Thrift RPC service and native transport
+# The address or interface to bind the native transport
 # server to.
 #
 # Set rpc_address OR rpc_interface, not both. Interfaces must correspond
@@ -457,9 +457,6 @@ start_rpc: true
 rpc_address: localhost
 # rpc_interface: eth1
 
-# port for Thrift to listen for clients on
-rpc_port: 9160
-
 # RPC address to broadcast to drivers and other Cassandra nodes. This cannot
 # be set to 0.0.0.0. If left blank, this will be set to the value of
 # rpc_address. If rpc_address is set to 0.0.0.0, broadcast_rpc_address must
@@ -468,43 +465,6 @@ rpc_port: 9160
 
 # enable or disable keepalive on rpc/native connections
 rpc_keepalive: true
-
-# Cassandra provides two out-of-the-box options for the RPC Server:
-#
-# sync  -> One thread per thrift connection. For a very large number of clients, memory
-#          will be your limiting factor. On a 64 bit JVM, 180KB is the minimum stack size
-#          per thread, and that will correspond to your use of virtual memory (but physical memory
-#          may be limited depending on use of stack space).
-#
-# hsha  -> Stands for "half synchronous, half asynchronous." All thrift clients are handled
-#          asynchronously using a small number of threads that does not vary with the amount
-#          of thrift clients (and thus scales well to many clients). The rpc requests are still
-#          synchronous (one thread per active request). If hsha is selected then it is essential
-#          that rpc_max_threads is changed from the default value of unlimited.
-#
-# The default is sync because on Windows hsha is about 30% slower.  On Linux,
-# sync/hsha performance is about the same, with hsha of course using less memory.
-#
-# Alternatively,  can provide your own RPC server by providing the fully-qualified class name
-# of an o.a.c.t.TServerFactory that can create an instance of it.
-rpc_server_type: sync
-
-# Uncomment rpc_min|max_thread to set request pool size limits.
-#
-# Regardless of your choice of RPC server (see above), the number of maximum requests in the
-# RPC thread pool dictates how many concurrent requests are possible (but if you are using the sync
-# RPC server, it also dictates the number of clients that can be connected at all).
-#
-# The default is unlimited and thus provides no protection against clients overwhelming the server. You are
-# encouraged to set a maximum that makes sense for you in production, but do keep in mind that
-# rpc_max_threads represents the maximum number of client requests this server may execute concurrently.
-#
-# rpc_min_threads: 16
-# rpc_max_threads: 2048
-
-# uncomment to set socket buffer sizes on rpc connections
-# rpc_send_buff_size_in_bytes:
-# rpc_recv_buff_size_in_bytes:
 
 # Uncomment to set socket buffer size for internode communication
 # Note that when setting this, the buffer size is limited by net.core.wmem_max
@@ -517,9 +477,6 @@ rpc_server_type: sync
 # and: man tcp
 # internode_send_buff_size_in_bytes:
 # internode_recv_buff_size_in_bytes:
-
-# Frame size for thrift (maximum message length).
-thrift_framed_transport_size_in_mb: 15
 
 # Set to true to have Cassandra create a hard link to each sstable
 # flushed or streamed locally in a backups/ subdirectory of the
@@ -543,7 +500,7 @@ auto_snapshot: true
 # tombstones seen in memory so we can return them to the coordinator, which
 # will use them to make sure other replicas also know about the deleted rows.
 # With workloads that generate a lot of tombstones, this can cause performance
-# problems and even exaust the server heap.
+# problems and even exhaust the server heap.
 # (http://www.datastax.com/dev/blog/cassandra-anti-patterns-queues-and-queue-like-datasets)
 # Adjust the thresholds here if you understand the dangers and want to
 # scan more tombstones anyway.  These thresholds may also be adjusted at runtime
@@ -555,13 +512,13 @@ tombstone_failure_threshold: 100000
 # Increase if your rows are large, or if you have a very large
 # number of rows per partition.  The competing goals are these:
 #   1) a smaller granularity means more index entries are generated
-#      and looking up rows withing the partition by collation column
+#      and looking up rows within the partition by collation column
 #      is faster
 #   2) but, Cassandra will keep the collation index in memory for hot
 #      rows (as part of the key cache), so a larger granularity means
 #      you can cache more hot rows
 column_index_size_in_kb: 64
-
+column_index_auto_scale_threshold_in_kb: 1024
 
 # Log WARN on any batch size exceeding this value. 5kb per batch by default.
 # Caution should be taken on increasing the size of this threshold as it can lead to node instability.
@@ -707,7 +664,7 @@ dynamic_snitch_update_interval_in_ms: 100
 # controls how often to reset all host scores, allowing a bad host to
 # possibly recover
 dynamic_snitch_reset_interval_in_ms: 600000
-# if set greater than zero and read_repair_chance is < 1.0, this will allow
+# if set greater than zero, this will allow
 # 'pinning' of replicas to hosts in order to increase cache capacity.
 # The badness threshold will control how much worse the pinned host has to be
 # before the dynamic snitch will prefer other replicas over it.  This is
@@ -911,8 +868,8 @@ SEASTAR_TEST_CASE(test_parse_broken) {
     return make_ready_future<>();
 }
 
-using ef = experimental_features_t;
-using features = std::vector<enum_option<ef>>;
+using ef = experimental_features_t::feature;
+using features = std::vector<enum_option<experimental_features_t>>;
 
 SEASTAR_TEST_CASE(test_parse_experimental_features_cdc) {
     auto cfg_ptr = std::make_unique<config>();
@@ -921,8 +878,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_cdc) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
     BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::ALTERNATOR_STREAMS));
-    BOOST_CHECK(!cfg.check_experimental(ef::RAFT));
     return make_ready_future();
 }
 
@@ -933,8 +888,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_unused) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
     BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::ALTERNATOR_STREAMS));
-    BOOST_CHECK(!cfg.check_experimental(ef::RAFT));
     return make_ready_future();
 }
 
@@ -945,8 +898,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_udf) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UDF});
     BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::ALTERNATOR_STREAMS));
-    BOOST_CHECK(!cfg.check_experimental(ef::RAFT));
     return make_ready_future();
 }
 
@@ -954,23 +905,49 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_alternator_streams) {
     auto cfg_ptr = std::make_unique<config>();
     config& cfg = *cfg_ptr;
     cfg.read_from_yaml("experimental_features:\n    - alternator-streams\n", throw_on_error);
-    BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::ALTERNATOR_STREAMS});
-    BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
+    BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
+    BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(cfg.check_experimental(ef::ALTERNATOR_STREAMS));
-    BOOST_CHECK(!cfg.check_experimental(ef::RAFT));
     return make_ready_future();
 }
 
-SEASTAR_TEST_CASE(test_parse_experimental_features_raft) {
+SEASTAR_TEST_CASE(test_parse_experimental_features_broadcast_tables) {
+    // broadcast-tables is a retired experimental feature: its name is still
+    // recognized, but specifying it is rejected with a readable, fatal error
+    // (rather than being silently ignored, like an ordinary parse error) so
+    // operators notice they must remove it from their configuration, e.g.
+    // after upgrading past its removal.
     auto cfg_ptr = std::make_unique<config>();
     config& cfg = *cfg_ptr;
-    cfg.read_from_yaml("experimental_features:\n    - raft\n", throw_on_error);
-    BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::RAFT});
+    using value_status = utils::config_file::value_status;
+    // The retired value escapes read_from_yaml as a dedicated exception; it is
+    // not downgraded to a warning via the error handler.
+    bool handler_called = false;
+    auto handler = [&] (const sstring&, const sstring&, std::optional<value_status>) {
+        handler_called = true;
+    };
+    try {
+        cfg.read_from_yaml("experimental_features:\n    - broadcast-tables\n", handler);
+        BOOST_FAIL("expected retired_config_value_error");
+    } catch (const utils::retired_config_value_error& e) {
+        const sstring msg = e.what();
+        BOOST_REQUIRE_NE(msg.find("broadcast-tables"), msg.npos);
+        BOOST_REQUIRE_NE(msg.find("has been removed"), msg.npos);
+    }
+    BOOST_CHECK(!handler_called);
+    // The bad value aborts parsing of the whole list, so no feature is enabled.
     BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::ALTERNATOR_STREAMS));
-    BOOST_CHECK(cfg.check_experimental(ef::RAFT));
+    return make_ready_future();
+}
+
+SEASTAR_TEST_CASE(test_parse_experimental_features_keyspace_storage_options) {
+    auto cfg_ptr = std::make_unique<config>();
+    config& cfg = *cfg_ptr;
+    cfg.read_from_yaml("experimental_features:\n    - keyspace-storage-options\n", throw_on_error);
+    BOOST_CHECK_EQUAL(cfg.experimental_features(), features{ef::UNUSED});
+    BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
+    BOOST_CHECK(!cfg.check_experimental(ef::UDF));
     return make_ready_future();
 }
 
@@ -981,7 +958,6 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_multiple) {
     BOOST_CHECK_EQUAL(cfg.experimental_features(), (features{ef::UNUSED, ef::UNUSED, ef::UNUSED}));
     BOOST_CHECK(cfg.check_experimental(ef::UNUSED));
     BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::ALTERNATOR_STREAMS));
     return make_ready_future();
 }
 
@@ -995,29 +971,79 @@ SEASTAR_TEST_CASE(test_parse_experimental_features_invalid) {
                            BOOST_REQUIRE_NE(msg.find("line 2, column 7"), msg.npos);
                            BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
                            BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-                           BOOST_CHECK(!cfg.check_experimental(ef::ALTERNATOR_STREAMS));
                        });
     return make_ready_future();
 }
 
-SEASTAR_TEST_CASE(test_parse_experimental_true) {
-    auto cfg_ptr = std::make_unique<config>();
-    config& cfg = *cfg_ptr;
-    cfg.read_from_yaml("experimental: true", throw_on_error);
-    BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
-    BOOST_CHECK(cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(cfg.check_experimental(ef::ALTERNATOR_STREAMS));
-    BOOST_CHECK(!cfg.check_experimental(ef::RAFT));
-    return make_ready_future();
+SEASTAR_THREAD_TEST_CASE(test_object_storage_endpoint_region_from_environment) {
+    tests::tmp_set_env region_env("AWS_DEFAULT_REGION", "us-east-1");
+    auto ep = object_storage_endpoint_param::decode(YAML::Load("name: http://localhost:9000\n"));
+    BOOST_REQUIRE(ep.is_s3_storage());
+    BOOST_CHECK_EQUAL(ep.get_s3_storage().region, "us-east-1");
 }
 
-SEASTAR_TEST_CASE(test_parse_experimental_false) {
+SEASTAR_THREAD_TEST_CASE(test_object_storage_endpoint_region_unresolvable) {
+    tests::tmp_unset_env no_region_env("AWS_DEFAULT_REGION");
+    // Neither source is available. The error has to name both of them, so that
+    // the operator knows where to put the region.
+    try {
+        object_storage_endpoint_param::decode(YAML::Load("name: http://localhost:9000\n"));
+        BOOST_FAIL("expected the missing region to be reported");
+    } catch (const std::invalid_argument& e) {
+        const sstring msg = e.what();
+        BOOST_REQUIRE_NE(msg.find("aws_region"), msg.npos);
+        BOOST_REQUIRE_NE(msg.find("AWS_DEFAULT_REGION"), msg.npos);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_object_storage_endpoint_region_empty) {
+    // An empty region is the same broken state as an absent one - it signs
+    // requests with an empty credential scope - so neither source may resolve
+    // to it.
+    {
+        tests::tmp_unset_env no_region_env("AWS_DEFAULT_REGION");
+        BOOST_REQUIRE_THROW(object_storage_endpoint_param::decode(
+                YAML::Load("name: http://localhost:9000\naws_region: \"\"\n")),
+            std::invalid_argument);
+    }
+    {
+        tests::tmp_set_env empty_region_env("AWS_DEFAULT_REGION", "");
+        BOOST_REQUIRE_THROW(object_storage_endpoint_param::decode(
+                YAML::Load("name: http://localhost:9000\n")),
+            std::invalid_argument);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_parse_object_storage_endpoints_one_entry_broken) {
+    tests::tmp_unset_env no_region_env("AWS_DEFAULT_REGION");
     auto cfg_ptr = std::make_unique<config>();
     config& cfg = *cfg_ptr;
-    cfg.read_from_yaml("experimental: false", throw_on_error);
-    BOOST_CHECK(!cfg.check_experimental(ef::UNUSED));
-    BOOST_CHECK(!cfg.check_experimental(ef::UDF));
-    BOOST_CHECK(!cfg.check_experimental(ef::ALTERNATOR_STREAMS));
-    BOOST_CHECK(!cfg.check_experimental(ef::RAFT));
-    return make_ready_future();
+
+    // The first entry cannot resolve a region. It must cost its own endpoint
+    // only - the correctly configured GCS entry below it has to survive.
+    cfg.read_from_yaml(R"foo(object_storage_endpoints:
+    - name: http://localhost:9000
+    - name: https://storage.googleapis.com
+      type: gs
+)foo", throw_on_error);
+
+    const auto& endpoints = cfg.object_storage_endpoints();
+    BOOST_REQUIRE_EQUAL(endpoints.size(), 1);
+    BOOST_CHECK(endpoints.front().is_gs_storage());
+    BOOST_CHECK_EQUAL(endpoints.front().key(), "https://storage.googleapis.com");
+}
+
+// Checks that a config that isn't broadcast to all shards can be used on a
+// shard other than 0, even after another config was broadcast on that shard.
+SEASTAR_THREAD_TEST_CASE(test_config_not_broadcast_on_other_shard) {
+    if (smp::count < 2) {
+        return;
+    }
+    auto broadcast_cfg = std::make_unique<config>();
+    broadcast_cfg->broadcast_to_all_shards().get();
+    smp::submit_to(1, [] {
+        auto cfg = std::make_unique<config>();
+        cfg->data_file_directories.set({"/some/dir"});
+        BOOST_REQUIRE_EQUAL(cfg->data_file_directories(), std::vector<sstring>{"/some/dir"});
+    }).get();
 }

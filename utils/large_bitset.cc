@@ -3,45 +3,31 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include "utils/assert.hh"
 #include "large_bitset.hh"
-#include <algorithm>
+#include "stall_free.hh"
+
 #include <seastar/core/align.hh>
 #include <seastar/core/thread.hh>
-#include "seastarx.hh"
+
+#include <algorithm>
 
 using namespace seastar;
 
+// Bound the preemption-check granularity to one chunk of the storage.
+static constexpr size_t words_per_yield = large_bitset::storage_type::max_chunk_capacity();
+
 large_bitset::large_bitset(size_t nr_bits) : _nr_bits(nr_bits) {
-    assert(thread::running_in_thread());
+    SCYLLA_ASSERT(thread::running_in_thread());
 
-    const size_t orig_nr_ints = align_up(nr_bits, bits_per_int()) / bits_per_int();
-    auto nr_ints = orig_nr_ints;
-    while (nr_ints) {
-        nr_ints = _storage.reserve_partial(nr_ints);
-        if (need_preempt()) {
-            thread::yield();
-        }
-    }
-    nr_ints = orig_nr_ints;
-    while (nr_ints) {
-        _storage.push_back(0);
-        --nr_ints;
-        if (need_preempt()) {
-            thread::yield();
-        }
-    }
-}
-
-void
-large_bitset::clear() {
-    assert(thread::running_in_thread());
-    for (auto&& pos: _storage) {
-        pos = 0;
-        if (need_preempt()) {
-            thread::yield();
-        }
+    size_t nr_ints = align_up(nr_bits, bits_per_int()) / bits_per_int();
+    utils::reserve_gently(_storage, nr_ints).get();
+    // Fill one chunk per yield; capacity is already reserved.
+    while (_storage.size() < nr_ints) {
+        _storage.resize(std::min(nr_ints, _storage.size() + words_per_yield));
+        thread::maybe_yield();
     }
 }

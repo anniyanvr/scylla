@@ -1,20 +1,21 @@
 /*
- * Copyright (C) 2021 ScyllaDB
+ * Copyright (C) 2021-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <seastar/core/reactor.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 
 using namespace seastar;
 
-// Calls the given function as fast as the Seastar reactor allows and yields between each call.
+// Calls the given function as fast as the Seastar reactor allows and waits on each call.
 // The function is passed an incrementing integer (incremented by one for each call, starting at 0).
 // The number of ticks can be limited. We crash if the ticker reaches the limit before it's `abort()`ed.
 // Call `start()` to start the ticking.
@@ -29,13 +30,13 @@ public:
     ticker(ticker&&) = delete;
 
     ~ticker() {
-        assert(!_ticker);
+        SCYLLA_ASSERT(!_ticker);
     }
 
-    using on_tick_t = noncopyable_function<void(uint64_t)>;
+    using on_tick_t = noncopyable_function<future<>(uint64_t)>;
 
     void start(on_tick_t fun, uint64_t limit = std::numeric_limits<uint64_t>::max()) {
-        assert(!_ticker);
+        SCYLLA_ASSERT(!_ticker);
         _ticker = tick(std::move(fun), limit);
     }
 
@@ -54,12 +55,10 @@ private:
                 co_return;
             }
 
-            fun(tick);
-
-            co_await seastar::yield();
+            co_await fun(tick);
         }
 
         _logger.error("ticker: limit reached");
-        assert(false);
+        SCYLLA_ASSERT(false);
     }
 };

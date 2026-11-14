@@ -1,30 +1,26 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "schema.hh"
+#include "schema/schema.hh"
 
 #include <algorithm>
 #include <functional>
-#include <iosfwd>
 
 namespace cql3 {
 
 class column_identifier_raw;
 
 /**
- * Represents an identifer for a CQL column definition.
+ * Represents an identifier for a CQL column definition.
  * TODO : should support light-weight mode without text representation for when not interned
  */
 class column_identifier final {
@@ -54,10 +50,6 @@ public:
 
     sstring to_cql_string() const;
 
-    friend std::ostream& operator<<(std::ostream& out, const column_identifier& i) {
-        return out << i._text;
-    }
-
 #if 0
     public ColumnIdentifier clone(AbstractAllocator allocator)
     {
@@ -86,26 +78,22 @@ public:
 
     ::shared_ptr<column_identifier> prepare_column_identifier(const schema& s) const;
 
-    // for selectable::with_expression::raw:
-    bool processes_selection() const;
-
     bool operator==(const column_identifier_raw& other) const;
 
-    bool operator!=(const column_identifier_raw& other) const;
+    const sstring& text() const;
 
-    virtual sstring to_string() const;
+    sstring to_string() const;
     sstring to_cql_string() const;
 
     friend std::hash<column_identifier_raw>;
-    friend std::ostream& operator<<(std::ostream& out, const column_identifier_raw& id);
 };
 
-static inline
+inline
 const column_definition* get_column_definition(const schema& schema, const column_identifier& id) {
     return schema.get_column_definition(id.bytes_);
 }
 
-static inline
+inline
 ::shared_ptr<column_identifier> to_identifier(const column_definition& def) {
     return def.column_specification->name;
 }
@@ -129,3 +117,15 @@ struct hash<cql3::column_identifier_raw> {
 };
 
 }
+
+template <> struct fmt::formatter<cql3::column_identifier> : fmt::formatter<string_view> {
+    auto format(const cql3::column_identifier& i, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", i.text());
+    }
+};
+
+template <> struct fmt::formatter<cql3::column_identifier_raw> : fmt::formatter<string_view> {
+    auto format(const cql3::column_identifier_raw& id, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", id.text());
+    }
+};

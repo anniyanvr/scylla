@@ -3,14 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <any>
+#include <memory>
 #include <cstdlib>
-#include <seastar/core/memory.hh>
+#include <string>
 #include <seastar/util/alloc_failure_injector.hh>
 #include <malloc.h>
 
@@ -40,6 +41,7 @@ public:
     virtual size_t size(const void* obj) const = 0;
     size_t align() const { return _align; }
     uint32_t index() const { return _index; }
+    virtual std::string name() const = 0;
 };
 
 // Non-constant-size classes (ending with `char data[0]`) must provide
@@ -61,21 +63,23 @@ size_for_allocation_strategy(const T& obj) noexcept {
 }
 
 template <typename T>
+requires std::is_nothrow_move_constructible_v<T> && std::is_nothrow_destructible_v<T>
 class standard_migrator final : public migrate_fn_type {
     friend class allocation_strategy;
     standard_migrator() : migrate_fn_type(alignof(T)) {}
 
 public:
     virtual void migrate(void* src, void* dst, size_t size) const noexcept override {
-        static_assert(std::is_nothrow_move_constructible<T>::value, "T must be nothrow move-constructible.");
-        static_assert(std::is_nothrow_destructible<T>::value, "T must be nothrow destructible.");
-
         T* src_t = static_cast<T*>(src);
         new (static_cast<T*>(dst)) T(std::move(*src_t));
         src_t->~T();
     }
     virtual size_t size(const void* obj) const override {
         return size_for_allocation_strategy(*static_cast<const T*>(obj));
+    }
+
+    virtual std::string name() const override {
+        return typeid(T).name();
     }
 };
 
@@ -118,6 +122,15 @@ public:
 
     virtual ~allocation_strategy() {}
 
+    // Allocates space.
+    //
+    // Throws std::bad_alloc on allocation failure.
+    //
+    // Allocations bigger than `preferred_max_contiguous_allocation()` are unsupported
+    // and are very likely to fail.
+    //
+    // (But not *guaranteed* to fail because implementations are allowed tolerate bigger
+    // allocations for legacy reasons. New code shouldn't rely on that).
     virtual void* alloc(migrate_fn, size_t size, size_t alignment) = 0;
     //
     // Allocates space for a new ManagedObject. The caller must construct the
@@ -128,6 +141,11 @@ public:
     //
     // Doesn't invalidate references to objects allocated with this strategy.
     //
+    // Allocations bigger than `preferred_max_contiguous_allocation()` are unsupported
+    // and are very likely to fail.
+    //
+    // (But not *guaranteed* to fail because implementations are allowed to tolerate bigger
+    // allocations for legacy reasons. New code shouldn't rely on that).
     template <typename T>
     requires DynamicObject<T>
     void* alloc(size_t size) {
@@ -170,6 +188,14 @@ public:
         free(obj, size);
     }
 
+    // Returns the preferred maximum contiguous allocation size
+    // supported by this allocator.
+    //
+    // Allocations bigger than `preferred_max_contiguous_allocation()` are unsupported
+    // and are very likely to fail.
+    //
+    // (But not *guaranteed* to fail because implementations are allowed to tolerate bigger
+    // allocations for legacy reasons. New code shouldn't rely on that).
     size_t preferred_max_contiguous_allocation() const noexcept {
         return _preferred_max_contiguous_allocation;
     }
@@ -184,6 +210,24 @@ public:
 
     void invalidate_references() noexcept {
         ++_invalidate_counter;
+    }
+
+    // Asks the allocator to set aside some free memory,
+    // preventing it from being allocated until the matching
+    // unreserve() call. Can be used to preallocate some memory
+    // for a critical section where allocations can't fail.
+    //
+    // This is hack designed with the implementation details of the
+    // log-structured allocator in mind. In other allocators,
+    // it doesn't do anything useful.
+    //
+    // Don't use this unless you understand exactly what you are doing.
+    virtual uintptr_t reserve(size_t memory) {
+        return 0;
+    }
+
+    // As the argument to this function, you must pass the *return value* of the matching reserve().
+    virtual void unreserve(uintptr_t opaque) noexcept {
     }
 };
 
@@ -254,6 +298,16 @@ struct alloc_strategy_deleter {
     }
 };
 
+// RAII for allocation_strategy::reserve().
+class hold_reserve {
+    uintptr_t _opaque;
+public:
+    hold_reserve(size_t memory) : _opaque(current_allocator().reserve(memory)) {}
+    ~hold_reserve() { current_allocator().unreserve(_opaque); }
+    // Disallow copying and moving. They *could* be implemented, but I just didn't bother.
+    hold_reserve(hold_reserve&&) = delete;
+};
+
 // std::unique_ptr which can be used for owning an object allocated using allocation_strategy.
 // Must be destroyed before the pointer is invalidated. For compacting allocators, that
 // means it must not escape outside allocating_section or reclaim lock.
@@ -278,7 +332,7 @@ using alloc_strategy_unique_ptr = std::unique_ptr<T, alloc_strategy_deleter<T>>;
 // time. That seems to be the case in current uses, so a simplified scheme of
 // passing allocators will do. Allocation strategy is set in a thread-local
 // context, as shown below. From there, aware objects pick up the allocation
-// strategy. The code controling the objects must ensure that object allocated
+// strategy. The code controlling the objects must ensure that object allocated
 // in one regime is also freed in the same regime.
 //
 // with_allocator() provides a way to set the current allocation strategy used

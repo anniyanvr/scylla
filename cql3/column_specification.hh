@@ -1,19 +1,16 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "types.hh"
+#include "types/types.hh"
 
 namespace cql3 {
 
@@ -44,5 +41,7 @@ public:
 
     static bool all_in_same_table(const std::vector<lw_shared_ptr<column_specification>>& names);
 };
+
+lw_shared_ptr<column_specification> make_column_spec(std::string_view ks_name, std::string_view cf_name, sstring name, data_type type);
 
 }

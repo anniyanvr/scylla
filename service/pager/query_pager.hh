@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -17,13 +14,25 @@
 #include "cql3/result_set.hh"
 #include "cql3/selection/selection.hh"
 #include "service/query_state.hh"
+#include "exceptions/coordinator_result.hh"
+#include "service/cas_shard.hh"
 
 namespace service {
 
 class storage_proxy;
+class storage_proxy_coordinator_query_options;
 class storage_proxy_coordinator_query_result;
 
 namespace pager {
+
+using query_function = std::function<future<exceptions::coordinator_result<service::storage_proxy_coordinator_query_result>>(
+        service::storage_proxy& sp,
+        schema_ptr schema,
+        lw_shared_ptr<query::read_command> cmd,
+        dht::partition_range_vector&& partition_ranges,
+        db::consistency_level cl,
+        service::storage_proxy_coordinator_query_options optional_params,
+        std::optional<service::cas_shard> cas_shard)>;
 
 /**
  * Perform a query, paging it by page of a given size.
@@ -46,6 +55,9 @@ namespace pager {
  */
 class query_pager {
 public:
+    template<typename T = void>
+    using result = exceptions::coordinator_result<T>;
+
     struct stats {
         // Total number of rows read by this pager, based on all pages it fetched
         size_t rows_read_total = 0;
@@ -59,26 +71,32 @@ protected:
     uint64_t _per_partition_limit;
 
     std::optional<partition_key> _last_pkey;
-    std::optional<clustering_key> _last_ckey;
-    std::optional<utils::UUID> _query_uuid;
+    position_in_partition _last_pos;
+    std::optional<query_id> _query_uuid;
 
     shared_ptr<service::storage_proxy> _proxy;
-    schema_ptr _schema;
+    schema_ptr _query_schema;
     shared_ptr<const cql3::selection::selection> _selection;
     service::query_state& _state;
     const cql3::query_options& _options;
     lw_shared_ptr<query::read_command> _cmd;
     dht::partition_range_vector _ranges;
+    std::optional<service::cas_shard> _cas_shard;
     paging_state::replicas_per_token_range _last_replicas;
     std::optional<db::read_repair_decision> _query_read_repair_decision;
     uint64_t _rows_fetched_for_last_partition = 0;
     stats _stats;
+
+    query_function _query_function;
+
 public:
-    query_pager(service::storage_proxy& p, schema_ptr s, shared_ptr<const cql3::selection::selection> selection,
+    query_pager(service::storage_proxy& p, schema_ptr query_schema, shared_ptr<const cql3::selection::selection> selection,
                 service::query_state& state,
                 const cql3::query_options& options,
                 lw_shared_ptr<query::read_command> cmd,
-                dht::partition_range_vector ranges);
+                dht::partition_range_vector ranges,
+                std::optional<service::cas_shard> cas_shard,
+                query_function query_function_override = {});
     virtual ~query_pager() {}
 
     /**
@@ -88,13 +106,16 @@ public:
      * @return the page of result.
      */
     future<std::unique_ptr<cql3::result_set>> fetch_page(uint32_t page_size, gc_clock::time_point, db::timeout_clock::time_point timeout);
+    future<result<std::unique_ptr<cql3::result_set>>> fetch_page_result(uint32_t page_size, gc_clock::time_point, db::timeout_clock::time_point timeout);
 
     /**
      * For more than one page.
      */
-    virtual future<> fetch_page(cql3::selection::result_set_builder&, uint32_t page_size, gc_clock::time_point, db::timeout_clock::time_point timeout);
+    future<> fetch_page(cql3::selection::result_set_builder&, uint32_t page_size, gc_clock::time_point, db::timeout_clock::time_point timeout);
+    virtual future<result<>> fetch_page_result(cql3::selection::result_set_builder&, uint32_t page_size, gc_clock::time_point, db::timeout_clock::time_point timeout);
 
     future<cql3::result_generator> fetch_page_generator(uint32_t page_size, gc_clock::time_point now, db::timeout_clock::time_point timeout, cql3::cql_stats& stats);
+    future<result<cql3::result_generator>> fetch_page_generator_result(uint32_t page_size, gc_clock::time_point now, db::timeout_clock::time_point timeout, cql3::cql_stats& stats);
 
     /**
      * Whether or not this pager is exhausted, i.e. whether or not a call to
@@ -122,8 +143,11 @@ public:
      *
      * @return the current paging state. If the pager is exhausted, the result is a valid pointer
      * to a paging_state instance which will return 0 on calling get_remaining() on it.
+     *
+     * @param plan the plan this pager scans, recorded so a later page keeps it.
+     * No default: std::nullopt pins nothing, and must stay distinct. See #18992.
      */
-    lw_shared_ptr<const paging_state> state() const;
+    lw_shared_ptr<const paging_state> state(std::optional<query_plan> plan) const;
 
     const stats& stats() const {
         return _stats;
@@ -133,7 +157,7 @@ protected:
     template<typename Base>
     class query_result_visitor;
     
-    future<service::storage_proxy_coordinator_query_result>
+    future<result<service::storage_proxy_coordinator_query_result>>
     do_fetch_page(uint32_t page_size, gc_clock::time_point now, db::timeout_clock::time_point timeout);
 
     template<typename Visitor>

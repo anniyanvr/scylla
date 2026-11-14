@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "mutation_reader.hh"
-#include "memtable.hh"
-#include "schema.hh"
+#include "replica/memtable.hh"
 #include "replica/database_fwd.hh"
 
 namespace db {
@@ -38,6 +36,7 @@ public:
     };
 
     explicit virtual_table(schema_ptr s) : _s(std::move(s)) {}
+    virtual ~virtual_table() = default;
 
     const schema_ptr& schema() const { return _s; }
 
@@ -56,7 +55,14 @@ public:
     // Override one of these execute() overloads.
     // The handler is always allowed to produce more data than implied by the query_restrictions.
     virtual future<> execute(std::function<void(mutation)> mutation_sink) { return make_ready_future<>(); }
-    virtual future<> execute(std::function<void(mutation)> mutation_sink, const query_restrictions&) { return execute(mutation_sink); }
+
+    virtual future<> execute(std::function<void(mutation)> mutation_sink, reader_permit) {
+        return execute(mutation_sink);
+    }
+
+    virtual future<> execute(std::function<void(mutation)> mutation_sink, const query_restrictions&, reader_permit permit) {
+        return execute(mutation_sink, permit);
+    }
 
     mutation_source as_mutation_source() override;
 };
@@ -69,10 +75,11 @@ public:
         : _schema(std::move(s))
         , _permit(std::move(p))
     { }
+    virtual ~result_collector() = default;
 
     // Subsequent calls should pass fragments which form a valid mutation fragment stream (see mutation_fragment.hh).
     // Concurrent calls not allowed.
-    virtual future<> take(mutation_fragment) = 0;
+    virtual future<> take(mutation_fragment_v2) = 0;
 
 public: // helpers
     future<> emit_partition_start(dht::decorated_key dk);

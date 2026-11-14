@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <seastar/core/file.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/semaphore.hh>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -18,73 +19,193 @@
 #include "seastarx.hh"
 #include "sstables/shared_sstable.hh"            // sstables::shared_sstable
 #include "sstables/version.hh"                   // sstable versions
-#include "compaction/compaction_descriptor.hh"     // for compaction_sstable_creator_fn
+#include "data_dictionary/storage_options.hh"
 #include "sstables/open_info.hh"                 // for entry_descriptor and foreign_sstable_open_info, chunked_vector wants to know if they are move constructible
 #include "utils/chunked_vector.hh"
 #include "utils/phased_barrier.hh"
+#include "utils/disk-error-handler.hh"
+#include "sstables/generation_type.hh"
+#include "sstables/sstables_registry.hh"
+#include "sstables/object_storage_client.hh"
 
-class compaction_manager;
+namespace compaction { class compaction_manager; }
+namespace s3 { class client; }
 
 namespace sstables {
 
+enum class sstable_state;
+class storage;
+class sstables_manager;
+class opened_directory;
 bool manifest_json_filter(const std::filesystem::path&, const directory_entry& entry);
+
+class directory_semaphore {
+    unsigned _concurrency;
+    semaphore _sem;
+public:
+    directory_semaphore(unsigned concurrency)
+            : _concurrency(concurrency)
+            , _sem(concurrency)
+    {
+    }
+
+    template <std::ranges::range Container, typename Func>
+    requires std::is_invocable_r_v<future<>, Func, typename std::ranges::range_value_t<Container>&>
+    future<> parallel_for_each(Container& c, Func func) {
+        co_await max_concurrent_for_each(c, _concurrency, [&] (auto& el) -> future<>{
+            auto units = co_await get_units(1);
+            co_await func(el);
+        });
+    }
+
+    future<semaphore_units<>> get_units(size_t count) noexcept {
+        return seastar::get_units(_sem, count);
+    }
+
+    future<semaphore_units<>> get_units(size_t count, abort_source& abort) noexcept {
+        return seastar::get_units(_sem, count, abort);
+    }
+};
 
 // Handles a directory containing SSTables. It could be an auxiliary directory (like upload),
 // or the main directory.
 class sstable_directory {
 public:
-    using lack_of_toc_fatal = bool_class<class lack_of_toc_fatal_tag>;
-    using need_mutate_level = bool_class<class need_mutate_level_tag>;
-    using enable_dangerous_direct_import_of_cassandra_counters = bool_class<class enable_dangerous_direct_import_of_cassandra_counters_tag>;
-    using allow_loading_materialized_view = bool_class<class allow_loading_materialized_view_tag>;
-
-    using sstable_object_from_existing_fn =
-        noncopyable_function<sstables::shared_sstable(std::filesystem::path,
-                                                      int64_t,
-                                                      sstables::sstable_version_types,
-                                                      sstables::sstable_format_types)>;
-
     // favor chunked vectors when dealing with file lists: they can grow to hundreds of thousands
     // of elements.
-    using sstable_info_vector = utils::chunked_vector<sstables::foreign_sstable_open_info>;
-private:
-    using scan_multimap = std::unordered_multimap<int64_t, std::filesystem::path>;
-    using scan_descriptors = utils::chunked_vector<sstables::entry_descriptor>;
-    using scan_descriptors_map = std::unordered_map<int64_t, sstables::entry_descriptor>;
+    using sstable_open_info_vector = utils::chunked_vector<sstables::foreign_sstable_open_info>;
+    using sstable_entry_descriptor_vector = utils::chunked_vector<sstables::entry_descriptor>;
 
-    struct scan_state {
-        scan_multimap generations_found;
-        scan_descriptors temp_toc_found;
-        scan_descriptors_map descriptors;
+    // Flags below control how to behave when scanning new SSTables.
+    struct process_flags {
+        bool need_mutate_level = false;
+        bool throw_on_missing_toc = false;
+        bool allow_loading_materialized_view = false;
+        bool sort_sstables_according_to_owner = true;
+        bool garbage_collect = false;
+        bool allow_numerical_generations = true;
+        // Leave out an sstable whose components are gone instead of failing the
+        // whole scan. The data dir of a running node is a moving target: it can
+        // delete an sstable between the moment the scan lists it and the moment
+        // the scan loads it.
+        bool skip_vanished_sstables = false;
+        sstables::sstable_open_config sstable_open_config;
+
+        // The flags of a caller which must not modify the storage it processes,
+        // like the offline tools: nothing is rewritten or collected, and every
+        // sstable found is handed to the caller instead of being distributed
+        // among the shards owning it.
+        static process_flags read_only() {
+            return process_flags{
+                .need_mutate_level = false,
+                .sort_sstables_according_to_owner = false,
+                .garbage_collect = false,
+            };
+        }
     };
 
-    // SSTable files to be deleted: things with a Temporary TOC, missing TOC files,
-    // TemporaryStatistics, etc. Not part of the scan state, because we want to do a 2-phase
-    // delete: maybe one of the shards will have signaled an error. And in the case of an error
-    // we don't want to delete anything.
-    std::unordered_set<sstring> _files_for_removal;
+    class components_lister {
+    public:
+        /// enumerate the SSTable components found in the underlying storage
+        ///
+        /// Must complete on all shards before any shard calls process(), which
+        /// creates and removes files in the very storage being enumerated.
+        virtual future<> scan(sstable_directory& directory) = 0;
+
+        /// process all SSTable components found by the lister
+        ///
+        /// @li process all the listed valid TOC components with the given @c directory
+        /// @li removes safe-to-remove stale components
+        /// @li reports abnomalities if encounter
+        virtual future<> process(sstable_directory& directory, process_flags flags) = 0;
+        virtual future<> commit() = 0;
+        virtual future<> prepare(sstable_directory&, process_flags, storage&) = 0;
+        virtual ~components_lister() {}
+    };
+
+    class filesystem_components_lister final : public components_lister {
+        struct scan_state {
+            using scan_multimap = std::unordered_multimap<generation_type, std::filesystem::path>;
+            using scan_descriptors = utils::chunked_vector<sstables::entry_descriptor>;
+            using scan_descriptors_map = std::unordered_map<generation_type, sstables::entry_descriptor>;
+
+            scan_multimap generations_found;
+            scan_descriptors temp_toc_found;
+            scan_descriptors_map descriptors;
+
+            // SSTable files to be deleted: things with a Temporary TOC, missing TOC files,
+            // TemporaryStatistics, etc. Not part of the scan state, because we want to do a 2-phase
+            // delete: maybe one of the shards will have signaled an error. And in the case of an error
+            // we don't want to delete anything.
+            std::unordered_set<sstring> files_for_removal;
+        };
+
+        void handle(sstables::entry_descriptor desc, std::filesystem::path filename);
+
+        std::filesystem::path _directory;
+        std::unique_ptr<scan_state> _state;
+        shared_ptr<object_storage_client> _client;
+        sstring _bucket;
+
+        future<> garbage_collect(storage&);
+        future<> cleanup_column_family_temp_sst_dirs();
+        future<> handle_sstables_pending_delete();
+        future<> replay_pending_delete_log(std::filesystem::path log_file);
+
+
+    public:
+        filesystem_components_lister(std::filesystem::path dir);
+        filesystem_components_lister(std::filesystem::path dir, sstables_manager&, const data_dictionary::storage_options::object_storage&);
+
+        virtual future<> scan(sstable_directory& directory) override;
+        virtual future<> process(sstable_directory& directory, process_flags flags) override;
+        virtual future<> commit() override;
+        virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
+    };
+
+    class sstables_registry_components_lister final : public components_lister {
+        sstables_registry& _sstables_registry;
+        table_id _table_id;
+        locator::host_id _node_owner;
+
+        future<> garbage_collect(storage&);
+
+    public:
+        sstables_registry_components_lister(sstables::sstables_registry& sstables_registry, table_id tid, locator::host_id node_owner);
+
+        virtual future<> scan(sstable_directory& directory) override;
+        virtual future<> process(sstable_directory& directory, process_flags flags) override;
+        virtual future<> commit() override;
+        virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
+    };
+
+    class restore_components_lister final : public components_lister {
+        std::vector<sstring> _toc_filenames;
+        const bool _unified_layout;
+    public:
+        restore_components_lister(const data_dictionary::storage_options::value_type& options, std::vector<sstring> toc_filenames);
+        virtual future<> scan(sstable_directory& directory) override;
+        virtual future<> process(sstable_directory& directory, process_flags flags) override;
+        virtual future<> commit() override;
+        virtual future<> prepare(sstable_directory&, process_flags, storage&) override;
+    };
+
+private:
 
     // prevents an object that respects a phaser (usually a table) from disappearing in the middle of the operation.
     // Will be destroyed when this object is destroyed.
     std::optional<utils::phased_barrier::operation> _operation_barrier;
 
-    std::filesystem::path _sstable_dir;
+    sstables_manager& _manager;
+    schema_ptr _schema;
+    lw_shared_ptr<const data_dictionary::storage_options> _storage_opts;
+    sstable_state _state;
+    io_error_handler_gen _error_handler_gen;
+    std::unique_ptr<storage> _storage;
+    std::unique_ptr<components_lister> _lister;
+    std::unique_ptr<dht::sharder> _sharder_ptr;
+    const dht::sharder& _sharder;
 
-    // We may have hundreds of thousands of files to load. To protect against OOMs we will limit
-    // how many of them we process at the same time.
-    const size_t _load_parallelism;
-    semaphore& _load_semaphore;
-
-    // Flags below control how to behave when scanning new SSTables.
-    need_mutate_level _need_mutate_level;
-    lack_of_toc_fatal _throw_on_missing_toc;
-    enable_dangerous_direct_import_of_cassandra_counters _enable_dangerous_direct_import_of_cassandra_counters;
-    allow_loading_materialized_view _allow_loading_materialized_view;
-
-    // How to create an SSTable object from an existing SSTable file (respecting generation, etc)
-    sstable_object_from_existing_fn _sstable_object_from_existing_sstable;
-
-    int64_t _max_generation_seen = 0;
     sstables::sstable_version_types _max_version_seen = sstables::sstable_version_types::ka;
 
     // SSTables that are unshared and belong to this shard. They are already stored as an
@@ -97,53 +218,82 @@ private:
     //
     // The indexes of the outer vector represent the shards. Having anything in the index
     // representing this shard is illegal.
-    std::vector<sstable_info_vector> _unshared_remote_sstables;
+    std::vector<sstable_entry_descriptor_vector> _unshared_remote_sstables;
 
     // SSTables that are shared. Stored as foreign_sstable_open_info objects. Reason is those are
     // the SSTables that we found, and not necessarily the ones we will reshard. We want to balance
     // the amount of data resharded per shard, so a coordinator may redistribute this.
-    sstable_info_vector _shared_sstable_info;
-
-    future<> process_descriptor(sstables::entry_descriptor desc, const ::io_priority_class& iop, bool sort_sstables_according_to_owner = true);
-    void validate(sstables::shared_sstable sst) const;
-    void handle_component(scan_state& state, sstables::entry_descriptor desc, std::filesystem::path filename);
-    future<> remove_input_sstables_from_resharding(std::vector<sstables::shared_sstable> sstlist);
-    future<> collect_output_sstables_from_resharding(std::vector<sstables::shared_sstable> resharded_sstables);
-
-    future<> remove_input_sstables_from_reshaping(std::vector<sstables::shared_sstable> sstlist);
-    future<> collect_output_sstables_from_reshaping(std::vector<sstables::shared_sstable> reshaped_sstables);
-
-    template <typename Container, typename Func>
-    future<> parallel_for_each_restricted(Container&& C, Func&& func);
-    future<> load_foreign_sstables(sstable_info_vector info_vec);
+    sstable_open_info_vector _shared_sstable_info;
 
     std::vector<sstables::shared_sstable> _unsorted_sstables;
+private:
+    std::unique_ptr<sstable_directory::components_lister> make_components_lister();
+
+    future<> process_descriptor(sstables::entry_descriptor desc,
+            process_flags flags,
+            noncopyable_function<data_dictionary::storage_options()>&& get_storage_options);
+    future<> do_process_descriptor(sstables::entry_descriptor desc,
+            process_flags flags,
+            noncopyable_function<data_dictionary::storage_options()>&& get_storage_options);
+    void validate(sstables::shared_sstable sst, process_flags flags) const;
+    future<sstables::shared_sstable> load_sstable(sstables::entry_descriptor desc,
+            const data_dictionary::storage_options& storage_opts, sstables::sstable_open_config cfg = {}) const;
+
+    future<> load_foreign_sstables(sstable_entry_descriptor_vector info_vec);
+
+    // Compute owner of shards for a particular SSTable.
+    future<std::vector<shard_id>> get_shards_for_this_sstable(
+            const sstables::entry_descriptor& desc, const data_dictionary::storage_options& storage_opts, process_flags flags) const;
+
 public:
-    sstable_directory(std::filesystem::path sstable_dir,
-            unsigned load_parallelism,
-            semaphore& load_semaphore,
-            need_mutate_level need_mutate,
-            lack_of_toc_fatal fatal_nontoc,
-            enable_dangerous_direct_import_of_cassandra_counters eddiocc,
-            allow_loading_materialized_view,
-            sstable_object_from_existing_fn sstable_from_existing);
+    // Scans wherever the given storage options put the sstables of the table:
+    // a local directory, an object storage prefix, or the registry of a table
+    // living in object storage.
+    sstable_directory(sstables_manager& manager,
+          schema_ptr schema,
+          std::variant<std::unique_ptr<dht::sharder>, const dht::sharder*> sharder,
+          lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
+          sstable_state state,
+          io_error_handler_gen error_handler_gen);
+    sstable_directory(replica::table& table,
+            sstable_state state,
+            io_error_handler_gen error_handler_gen);
+    sstable_directory(replica::table& table,
+            sstable_state state,
+            lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
+            io_error_handler_gen error_handler_gen);
+    sstable_directory(replica::table& table,
+            lw_shared_ptr<const data_dictionary::storage_options> storage_opts,
+            std::vector<sstring> sstables,
+            io_error_handler_gen error_handler_gen);
+    sstable_directory(sstables_manager& manager,
+            schema_ptr schema,
+            const dht::sharder& sharder,
+            sstring table_dir,
+            sstable_state state,
+            io_error_handler_gen error_handler_gen);
 
     std::vector<sstables::shared_sstable>& get_unsorted_sstables() {
         return _unsorted_sstables;
     }
 
+    bool empty() const noexcept {
+        return _unshared_local_sstables.empty() && _shared_sstable_info.empty() && _unsorted_sstables.empty();
+    }
+
+    future<shared_sstable> load_foreign_sstable(foreign_sstable_open_info& info);
+
     // moves unshared SSTables that don't belong to this shard to the right shards.
     future<> move_foreign_sstables(sharded<sstable_directory>& source_directory);
-
-    // returns what is the highest generation seen in this directory.
-    int64_t highest_generation_seen() const;
 
     // returns what is the highest version seen in this directory.
     sstables::sstable_version_types highest_version_seen() const;
 
+    future<> prepare(process_flags flags);
+
     // scans a directory containing SSTables. Every generation that is believed to belong to this
     // shard is processed, the ones that are not are skipped. Potential pertinence is decided as
-    // generation % smp::count.
+    // generation % this_smp_shard_count().
     //
     // Once this method return, every SSTable that this shard processed can be in one of 3 states:
     //  - unshared, local: not a shared SSTable, and indeed belongs to this shard.
@@ -153,42 +303,22 @@ public:
     // This function doesn't change on-storage state. If files are to be removed, a separate call
     // (commit_file_removals()) has to be issued. This is to make sure that all instances of this
     // class in a sharded service have the opportunity to validate its files.
-    future<> process_sstable_dir(const ::io_priority_class& iop, bool sort_sstables_according_to_owner = true);
+    //
+    // scan_sstable_dir() must have completed on all instances of this class in a sharded
+    // service before this is called on any of them. See scan_sstable_dir() below.
+    future<> process_sstable_dir(process_flags flags);
 
-    // Sort the sstable according to owner
-    future<> sort_sstable(sstables::shared_sstable sst);
+    // Enumerates the directory, recording the SSTable components found in it.
+    //
+    // This is a separate step from process_sstable_dir() because the latter creates and
+    // removes files in this very directory (e.g. when mutating the SSTable level), while
+    // the generation-based sharding of the listing means every shard lists every file.
+    // A shard that lists another shard's in-flight SSTable would take ownership of it and
+    // schedule its components for removal.
+    future<> scan_sstable_dir();
 
     // If files were scheduled to be removed, they will be removed after this call.
     future<> commit_directory_changes();
-
-    // reshards a collection of SSTables.
-    //
-    // A reference to the compaction manager must be passed so we can register with it. Knowing
-    // which table is being processed is a requirement of the compaction manager, so this must be
-    // passed too.
-    //
-    // We will reshard max_sstables_per_job at once.
-    //
-    // A creator function must be passed that will create an SSTable object in the correct shard,
-    // and an I/O priority must be specified.
-    future<> reshard(sstable_info_vector info, compaction_manager& cm, replica::table& table,
-                     unsigned max_sstables_per_job, sstables::compaction_sstable_creator_fn creator,
-                     const ::io_priority_class& iop);
-
-    // Default filter will include all sstables
-    using sstable_filter_func_t = std::function<bool (const sstables::shared_sstable&)>;
-    static sstable_filter_func_t default_sstable_filter() {
-        return [] (const sstables::shared_sstable&) {
-            return true;
-        };
-    }
-
-    // reshapes a collection of SSTables, and returns the total amount of bytes reshaped.
-    future<uint64_t> reshape(compaction_manager& cm, replica::table& table,
-                     sstables::compaction_sstable_creator_fn creator,
-                     const ::io_priority_class& iop,
-                     sstables::reshape_mode mode,
-                     sstable_filter_func_t sstable_filter = default_sstable_filter());
 
     // Store a phased operation. Usually used to keep an object alive while the directory is being
     // processed. One example is preventing table drops concurrent to the processing of this
@@ -197,15 +327,46 @@ public:
 
     // Helper function that processes all unshared SSTables belonging to this shard, respecting the
     // concurrency limit.
+    // Note that this function is destructive, draining _shared_local_sstables.
     future<> do_for_each_sstable(std::function<future<>(sstables::shared_sstable)> func);
+
+    // Helper function that processes all unshared SSTables belonging to this shard, respecting the
+    // concurrency limit.
+    // sstables for which `func` returns a true value are kept in _shared_local_sstables, while
+    // those for which `func` returns false are erased from the list.
+    future<> filter_sstables(std::function<future<bool>(sstables::shared_sstable)> func);
 
     // Retrieves the list of shared SSTables in this object. The list will be reset once this
     // is called.
-    sstable_info_vector retrieve_shared_sstables();
+    sstable_open_info_vector retrieve_shared_sstables();
+    std::vector<sstables::shared_sstable>& get_unshared_local_sstables() { return _unshared_local_sstables; }
 
-    std::filesystem::path sstable_dir() const noexcept {
-        return _sstable_dir;
-    }
+    future<> remove_sstables(std::vector<sstables::shared_sstable> sstlist);
+    future<> remove_unshared_sstables(std::vector<sstables::shared_sstable> sstlist);
+
+    using can_be_remote = bool_class<struct can_be_remote_tag>;
+    future<> collect_output_unshared_sstables(std::vector<sstables::shared_sstable> resharded_sstables, can_be_remote);
+
+    // When we compact sstables, we have to atomically instantiate the new
+    // sstable and delete the old ones.  Otherwise, if we compact A+B into C,
+    // and if A contained some data that was tombstoned by B, and if B was
+    // deleted but A survived, then data from A will be resurrected.
+    //
+    // There are two violators of the requirement to atomically delete
+    // sstables: first sstable instantiation and deletion on disk is atomic
+    // only wrt. itself, not other sstables, and second when an sstable is
+    // shared among shard, so actual on-disk deletion of an sstable is deferred
+    // until all shards agree it can be deleted.
+    //
+    // This function only solves the second problem for now.
+
+    // Creates and commits the deletion log for atomic deletion of sstables at `base_dir`.
+    // On success, all sstables listed in the log will eventually be deleted.
+    // Returns the name of the pending_delete_log.
+    static future<sstring> create_pending_deletion_log(opened_directory& base_dir, const std::vector<shared_sstable>& ssts);
+
+    static bool compare_sstable_storage_prefix(std::string_view a, std::string_view b) noexcept;
+    sstable_state state() const noexcept { return _state; }
 };
 
 }

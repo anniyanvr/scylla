@@ -3,9 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#pragma once
+
+#include "exceptions.hh"
 #include <memory>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
@@ -14,6 +17,7 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include "seastarx.hh"
+#include "sstables/checksum_utils.hh"
 
 namespace sstables {
 
@@ -23,16 +27,21 @@ protected:
     virtual input_stream<char> open_at(uint64_t pos) = 0;
 
     void set(input_stream<char> in) {
-        assert(!_in);
+        parse_assert(!_in);
         _in = std::make_unique<input_stream<char>>(std::move(in));
     }
 
 public:
-    future <temporary_buffer<char>> read_exactly(size_t n) noexcept;
+    virtual future <temporary_buffer<char>> read_exactly(size_t n) noexcept;
 
-    future<> seek(uint64_t pos) noexcept;
+    virtual future<> seek(uint64_t pos) noexcept;
 
     bool eof() const noexcept { return _in->eof(); }
+
+    // Total size of the underlying source. Parsers use it to reject on-disk
+    // lengths that cannot possibly fit in the component before allocating
+    // for them.
+    virtual uint64_t size() const noexcept = 0;
 
     virtual future<> close() noexcept;
 
@@ -41,15 +50,36 @@ public:
 
 class file_random_access_reader : public random_access_reader {
     file _file;
-    uint64_t _file_size;
     size_t _buffer_size;
     unsigned _read_ahead;
+protected:
+    uint64_t _file_size;
 public:
     virtual input_stream<char> open_at(uint64_t pos) override;
 
     explicit file_random_access_reader(file f, uint64_t file_size, size_t buffer_size = 8192, unsigned read_ahead = 4);
 
     virtual future<> close() noexcept override;
+
+    virtual uint64_t size() const noexcept override { return _file_size; }
+};
+
+class digest_file_random_access_reader : public file_random_access_reader {
+    std::optional<uint32_t> _digest;
+    uint64_t _pos = 0;
+public:
+    digest_file_random_access_reader(file f, uint64_t file_size, size_t buffer_size = 8192, unsigned read_ahead = 4);
+
+    virtual future<temporary_buffer<char>> read_exactly(size_t n) noexcept override;
+
+    virtual future<> seek(uint64_t pos) noexcept override;
+
+    std::optional<uint32_t> digest() const noexcept {
+        if (_pos != _file_size) {
+            return std::nullopt;
+        }
+        return _digest;
+    }
 };
 
 }

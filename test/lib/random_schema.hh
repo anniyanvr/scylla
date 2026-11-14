@@ -3,22 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "schema.hh"
-#include "dht/i_partitioner.hh"
+#include "schema/schema.hh"
 #include "test/lib/data_model.hh"
 
 ///
 /// Random schema and random data generation related utilities.
 ///
 
+class cql_test_env;
+
 namespace tests {
 
 class random_schema_specification {
+public:
+    using compress_sstable = bool_class<class compress_sstable_tag>;
+private:
     sstring _keyspace_name;
 public:
     explicit random_schema_specification(sstring keyspace_name) : _keyspace_name(std::move(keyspace_name)) { }
@@ -33,6 +37,7 @@ public:
     virtual std::vector<data_type> clustering_key_columns(std::mt19937& engine) = 0;
     virtual std::vector<data_type> regular_columns(std::mt19937& engine) = 0;
     virtual std::vector<data_type> static_columns(std::mt19937& engine) = 0;
+    virtual compress_sstable& compress() = 0;
 };
 
 /// Helper class that can generate a subset of all valid combination of types.
@@ -67,7 +72,8 @@ std::unique_ptr<random_schema_specification> make_random_schema_specification(
         std::uniform_int_distribution<size_t> partition_column_count_dist = std::uniform_int_distribution<size_t>(1, 4),
         std::uniform_int_distribution<size_t> clustering_column_count_dist = std::uniform_int_distribution<size_t>(0, 4),
         std::uniform_int_distribution<size_t> regular_column_count_dist = std::uniform_int_distribution<size_t>(1, 4),
-        std::uniform_int_distribution<size_t> static_column_count_dist = std::uniform_int_distribution<size_t>(0, 4));
+        std::uniform_int_distribution<size_t> static_column_count_dist = std::uniform_int_distribution<size_t>(0, 4),
+        random_schema_specification::compress_sstable compress = random_schema_specification::compress_sstable::yes);
 
 /// Generate values for any type.
 ///
@@ -83,7 +89,7 @@ std::unique_ptr<random_schema_specification> make_random_schema_specification(
 /// TODO: counters
 class value_generator {
 public:
-    using atomic_value_generator = std::function<data_value(std::mt19937&, size_t)>;
+    using atomic_value_generator = std::function<data_value(std::mt19937&, size_t, size_t)>;
     using generator = std::function<data_model::mutation_description::value(std::mt19937&)>;
 
     static const size_t no_size_in_bytes_limit{std::numeric_limits<size_t>::max()};
@@ -100,7 +106,10 @@ public:
     size_t min_size(const abstract_type& type);
 
     atomic_value_generator get_atomic_value_generator(const abstract_type& type);
+    // Generate a value for the given type, according to the provided size constraints.
+    // Controlling the size of values only really works with string-like types and collections of these.
     data_value generate_atomic_value(std::mt19937& engine, const abstract_type& type, size_t max_size_in_bytes = no_size_in_bytes_limit);
+    data_value generate_atomic_value(std::mt19937& engine, const abstract_type& type, size_t min_size_in_bytes, size_t max_size_in_bytes);
 
     generator get_generator(const abstract_type& type);
     data_model::mutation_description::value generate_value(std::mt19937& engine, const abstract_type& type);
@@ -126,6 +135,11 @@ using timestamp_generator = std::function<api::timestamp_type(std::mt19937& engi
 ///     [api::min_timestamp, api::max_timestamp]
 /// Ignores timestamp destination.
 timestamp_generator default_timestamp_generator();
+
+/// Use this to generate mutations that cannot be compacted
+///
+/// Tombstones will not cover lower level tombstones, or data.
+timestamp_generator uncompactible_timestamp_generator(uint32_t seed, api::timestamp_type min_timestamp = api::min_timestamp);
 
 struct expiry_info {
     gc_clock::duration ttl;
@@ -164,11 +178,24 @@ public:
     /// make sure to honor this guarantee.
     random_schema(uint32_t seed, random_schema_specification& spec);
 
+    /// Create random schema object from an existing schema.
+    ///
+    /// Allows using random data generation facilities on an existing schema.
+    random_schema(schema_ptr schema) : _schema(std::move(schema)) {
+    }
+
     schema_ptr schema() const {
         return _schema;
     }
 
     sstring cql() const;
+
+    /// Create the generated schema as a table via CQL.
+    ///
+    /// Along with all its dependencies, like UDTs.
+    /// The underlying schema_ptr instance is replaced with the one from the
+    /// local table instance.
+    future<> create_with_cql(cql_test_env& env);
 
     /// Make a partition key which is n-th in some arbitrary sequence of keys.
     ///
@@ -223,7 +250,7 @@ public:
     void delete_range(
             std::mt19937& engine,
             data_model::mutation_description& md,
-            nonwrapping_range<data_model::mutation_description::key> range,
+            interval<data_model::mutation_description::key> range,
             timestamp_generator ts_gen = default_timestamp_generator(),
             expiry_generator exp_gen = no_expiry_expiry_generator());
 };
@@ -233,13 +260,26 @@ public:
 /// `clustering_row_count_dist` and `range_tombstone_count_dist` will be used to
 /// generate the respective counts for *each* partition. These params are
 /// ignored if the schema has no clustering columns.
+/// Mutations are returned in ring order. Does not contain duplicate partitions.
 /// Futurized to avoid stalls.
-future<std::vector<mutation>> generate_random_mutations(
+future<utils::chunked_vector<mutation>> generate_random_mutations(
+        uint32_t seed,
         tests::random_schema& random_schema,
         timestamp_generator ts_gen = default_timestamp_generator(),
         expiry_generator exp_gen = no_expiry_expiry_generator(),
         std::uniform_int_distribution<size_t> partition_count_dist = std::uniform_int_distribution<size_t>(8, 16),
         std::uniform_int_distribution<size_t> clustering_row_count_dist = std::uniform_int_distribution<size_t>(16, 128),
         std::uniform_int_distribution<size_t> range_tombstone_count_dist = std::uniform_int_distribution<size_t>(4, 16));
+
+future<utils::chunked_vector<mutation>> generate_random_mutations(
+        tests::random_schema& random_schema,
+        timestamp_generator ts_gen = default_timestamp_generator(),
+        expiry_generator exp_gen = no_expiry_expiry_generator(),
+        std::uniform_int_distribution<size_t> partition_count_dist = std::uniform_int_distribution<size_t>(8, 16),
+        std::uniform_int_distribution<size_t> clustering_row_count_dist = std::uniform_int_distribution<size_t>(16, 128),
+        std::uniform_int_distribution<size_t> range_tombstone_count_dist = std::uniform_int_distribution<size_t>(4, 16));
+
+/// Generate exactly partition_count partitions. See the more general overload above.
+future<utils::chunked_vector<mutation>> generate_random_mutations(tests::random_schema& random_schema, size_t partition_count);
 
 } // namespace tests

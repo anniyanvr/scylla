@@ -3,12 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <boost/range/adaptors.hpp>
-#include <experimental/source_location>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include "cql3/cql_config.hh"
@@ -21,36 +22,38 @@
 #include "types/list.hh"
 #include "types/map.hh"
 #include "types/set.hh"
+#include "types/tuple.hh"
+
+BOOST_AUTO_TEST_SUITE(restrictions_test)
 
 namespace {
 
-using std::experimental::source_location;
-using boost::adaptors::transformed;
+using std::source_location;
 
 std::unique_ptr<cql3::query_options> to_options(
         const cql3::cql_config& cfg,
-        std::optional<std::vector<sstring_view>> names,
+        std::optional<std::vector<std::string_view>> names,
         std::vector<cql3::raw_value> values) {
     static auto& d = cql3::query_options::DEFAULT;
     return std::make_unique<cql3::query_options>(
             cfg,
             d.get_consistency(), std::move(names), std::move(values), d.skip_metadata(),
-            d.get_specific_options(), d.get_cql_serialization_format());
+            d.get_specific_options());
 }
 
 /// Asserts that e.execute_prepared(id, values) contains expected rows, in any order.
 void require_rows(cql_test_env& e,
                   cql3::prepared_cache_key_type id,
-                  std::optional<std::vector<sstring_view>> names,
+                  std::optional<std::vector<std::string_view>> names,
                   const std::vector<bytes_opt>& values,
                   const std::vector<std::vector<bytes_opt>>& expected,
-                  const std::experimental::source_location& loc = source_location::current()) {
+                  const std::source_location& loc = source_location::current()) {
     // This helps compiler pick the right overload for make_value:
-    const auto rvals = values | transformed([] (const bytes_opt& v) { return cql3::raw_value::make_value(v); });
+    const auto rvals = values | std::views::transform([] (const bytes_opt& v) { return cql3::raw_value::make_value(v); });
     cql3::cql_config cfg(cql3::cql_config::default_tag{});
     auto opts = to_options(cfg, std::move(names), std::vector(rvals.begin(), rvals.end()));
     try {
-        assert_that(e.execute_prepared_with_qo(id, std::move(opts)).get0()).is_rows().with_rows_ignore_order(expected);
+        assert_that(e.execute_prepared_with_qo(id, std::move(opts)).get()).is_rows().with_rows_ignore_order(expected);
     } catch (const std::exception& e) {
         BOOST_FAIL(format("execute_prepared failed: {}\n{}:{}: originally from here",
                           e.what(), loc.file_name(), loc.line()));
@@ -107,13 +110,13 @@ SEASTAR_THREAD_TEST_CASE(regular_col_eq) {
         require_rows(e, "select r from t where q=12 and p=2 and r=99 allow filtering", {});
         cquery_nofail(e, "insert into t(p) values (100)");
         require_rows(e, "select q from t where q=12 allow filtering", {{I(12)}});
-        auto stmt = e.prepare("select q from t where q=? allow filtering").get0();
+        auto stmt = e.prepare("select q from t where q=? allow filtering").get();
         require_rows(e, stmt, {}, {I(12)}, {{I(12)}});
         require_rows(e, stmt, {}, {I(99)}, {});
-        stmt = e.prepare("select q from t where q=:q allow filtering").get0();
+        stmt = e.prepare("select q from t where q=:q allow filtering").get();
         require_rows(e, stmt, {{"q"}}, {I(12)}, {{I(12)}});
         require_rows(e, stmt, {{"q"}}, {I(99)}, {});
-        stmt = e.prepare("select p from t where q=? and r=? allow filtering").get0();
+        stmt = e.prepare("select p from t where q=? and r=? allow filtering").get();
         require_rows(e, stmt, {}, {I(12), I(22)}, {{I(2), I(12), I(22)}});
         require_rows(e, stmt, {}, {I(11), I(21)}, {{I(1), I(11), I(21)}});
         require_rows(e, stmt, {}, {I(11), I(22)}, {});
@@ -204,7 +207,7 @@ SEASTAR_THREAD_TEST_CASE(map_entry_eq) {
         const auto m3new = my_map_type->decompose(
                 make_map_value(my_map_type, map_type_impl::native_type({{1, 111}})));
         require_rows(e, "select p from t where m[1]=111 allow filtering", {{I(3), m3new}});
-        const auto stmt = e.prepare("select p from t where m[1]=:uno and m[3]=:tres allow filtering").get0();
+        const auto stmt = e.prepare("select p from t where m[1]=:uno and m[3]=:tres allow filtering").get();
         const auto m1 = my_map_type->decompose(
                 make_map_value(my_map_type, map_type_impl::native_type({{1, 11}, {2, 12}, {3, 13}})));
         require_rows(e, stmt, {{"uno", "tres"}}, {I(11), I(13)}, {{I(1), m1}});
@@ -338,17 +341,17 @@ SEASTAR_THREAD_TEST_CASE(multi_col_eq) {
         require_rows(e, "select c2 from t where (c1,c2)=('two',11) allow filtering", {});
         require_rows(e, "select c1 from t where (c1)=('one') allow filtering", {{T("one")}});
         require_rows(e, "select c1 from t where (c1)=('x') allow filtering", {});
-        auto stmt = e.prepare("select p from t where (c1,c2)=:t allow filtering").get0();
+        auto stmt = e.prepare("select p from t where (c1,c2)=:t allow filtering").get();
         require_rows(e, stmt, {{"t"}}, {make_tuple({utf8_type, float_type}, {sstring("two"), 12.f})}, {{I(2)}});
         require_rows(e, stmt, {{"t"}}, {make_tuple({utf8_type, float_type}, {sstring("x"), 12.f})}, {});
-        stmt = e.prepare("select p from t where (c1,c2)=('two',?) allow filtering").get0();
+        stmt = e.prepare("select p from t where (c1,c2)=('two',?) allow filtering").get();
         require_rows(e, stmt, {}, {F(12)}, {{I(2)}});
         require_rows(e, stmt, {}, {F(99)}, {});
-        stmt = e.prepare("select c1 from t where (c1)=? allow filtering").get0();
+        stmt = e.prepare("select c1 from t where (c1)=? allow filtering").get();
         require_rows(e, stmt, {}, {make_tuple({utf8_type}, {sstring("one")})}, {{T("one")}});
         require_rows(e, stmt, {}, {make_tuple({utf8_type}, {sstring("two")})}, {{T("two")}});
         require_rows(e, stmt, {}, {make_tuple({utf8_type}, {sstring("three")})}, {});
-        stmt = e.prepare("select c1 from t where (c1)=(:c1) allow filtering").get0();
+        stmt = e.prepare("select c1 from t where (c1)=(:c1) allow filtering").get();
         require_rows(e, stmt, {{"c1"}}, {T("one")}, {{T("one")}});
         require_rows(e, stmt, {{"c1"}}, {T("two")}, {{T("two")}});
         require_rows(e, stmt, {{"c1"}}, {T("three")}, {});
@@ -368,16 +371,16 @@ SEASTAR_THREAD_TEST_CASE(multi_col_slice) {
         require_rows(e, "select c1 from t where (c1)>=('c') allow filtering", {{T("c")}});
         require_rows(e, "select c1 from t where (c1,c2)<=('c',13) allow filtering", {{T("a")}, {T("b")}, {T("c")}});
         require_rows(e, "select c1 from t where (c1,c2)>=('b',2) and (c1,c2)<=('b',2) allow filtering", {{T("b")}});
-        auto stmt = e.prepare("select c1 from t where (c1,c2)<? allow filtering").get0();
+        auto stmt = e.prepare("select c1 from t where (c1,c2)<? allow filtering").get();
         require_rows(e, stmt, {}, {make_tuple({utf8_type, float_type}, {sstring("a"), 12.f})}, {{T("a")}});
         require_rows(e, stmt, {}, {make_tuple({utf8_type, float_type}, {sstring("a"), 11.f})}, {});
-        stmt = e.prepare("select c1 from t where (c1,c2)<('a',:c2) allow filtering").get0();
+        stmt = e.prepare("select c1 from t where (c1,c2)<('a',:c2) allow filtering").get();
         require_rows(e, stmt, {{"c2"}}, {F(12)}, {{T("a")}});
         require_rows(e, stmt, {{"c2"}}, {F(11)}, {});
-        stmt = e.prepare("select c1 from t where (c1)>=? allow filtering").get0();
+        stmt = e.prepare("select c1 from t where (c1)>=? allow filtering").get();
         require_rows(e, stmt, {}, {make_tuple({utf8_type}, {sstring("c")})}, {{T("c")}});
         require_rows(e, stmt, {}, {make_tuple({utf8_type}, {sstring("x")})}, {});
-        stmt = e.prepare("select c1 from t where (c1)>=(:c1) allow filtering").get0();
+        stmt = e.prepare("select c1 from t where (c1)>=(:c1) allow filtering").get();
         require_rows(e, stmt, {{"c1"}}, {T("c")}, {{T("c")}});
         require_rows(e, stmt, {{"c1"}}, {T("x")}, {});
     }).get();
@@ -425,20 +428,17 @@ SEASTAR_THREAD_TEST_CASE(set_contains) {
         require_rows(e, "select * from t where p contains 999 allow filtering", {});
         require_rows(e, "select p from t where p contains 3 allow filtering", {{SI({1, 3})}});
         require_rows(e, "select p from t where p contains 1 allow filtering", {{SI({1, 3})}, {SI({1})}});
-        require_rows(e, "select p from t where p contains null allow filtering",
-                         {{SI({1, 3})}, {SI({1})}, {SI({2})}});
+        require_rows(e, "select p from t where p contains null allow filtering", {});
         require_rows(e, "select p from t where p contains 1 and s contains 'a1' allow filtering",
                      {{SI({1}), ST({"a1", "b1"})}});
         require_rows(e, "select c from t where c contains 31 allow filtering", {{SI({31, 32})}});
-        require_rows(e, "select c from t where c contains null allow filtering",
-                         {{SI({11, 12})}, {SI({21, 22})}, {SI({31, 32})}});
+        require_rows(e, "select c from t where c contains null allow filtering", {});
         require_rows(e, "select c from t where c contains 11 and p contains 1 allow filtering",
                      {{SI({11, 12}), SI({1})}});
         require_rows(e, "select s from t where s contains 'a1' allow filtering", {{ST({"a1", "b1"})}});
         require_rows(e, "select s from t where s contains 'b1' allow filtering",
                      {{ST({"a1", "b1"})}, {ST({"a2", "b1"})}});
-        require_rows(e, "select s from t where s contains null allow filtering",
-                     {{ST({"a1", "b1"})}, {ST({"a2", "b1"})}, {ST({"a3", "b3"})}});
+        require_rows(e, "select s from t where s contains null allow filtering", {});
         require_rows(e, "select s from t where s contains 'b1' and s contains '' allow filtering", {});
         require_rows(e, "select s from t where s contains 'b1' and p contains 4 allow filtering", {});
         cquery_nofail(e, "insert into t (p, c, st) values ({4}, {41}, {104})");
@@ -451,11 +451,10 @@ SEASTAR_THREAD_TEST_CASE(set_contains) {
         cquery_nofail(e, "insert into t (p, c, st) values ({5}, {52}, {104, 105})");
         require_rows(e, "select p from t where st contains 105 allow filtering",
                      {{SI({4}), SI({105})}, {SI({4}), SI({105})}, {SI({5}), SI({104, 105})}});
-        require_rows(e, "select p from t where st contains null allow filtering",
-                     {{SI({4}), SI({105})}, {SI({4}), SI({105})}, {SI({5}), SI({104, 105})}});
+        require_rows(e, "select p from t where st contains null allow filtering", {});
         cquery_nofail(e, "delete from t where p={4}");
         require_rows(e, "select p from t where st contains 105 allow filtering", {{SI({5}), SI({104, 105})}});
-        const auto stmt = e.prepare("select p from t where p contains :p allow filtering").get0();
+        const auto stmt = e.prepare("select p from t where p contains :p allow filtering").get();
         require_rows(e, stmt, {{"p"}}, {I(999)}, {});
         require_rows(e, stmt, {{"p"}}, {I(1)}, {{SI({1})}, {SI({1, 3})}});
         require_rows(e, stmt, {{"p"}}, {I(2)}, {{SI({2})}});
@@ -477,20 +476,17 @@ SEASTAR_THREAD_TEST_CASE(list_contains) {
         require_rows(e, "select p from t where st contains 'xyz' allow filtering", {});
         require_rows(e, "select p from t where p contains 1 allow filtering", {{LI({1})}});
         require_rows(e, "select p from t where p contains 4 allow filtering", {{LI({4})}, {LI({4})}});
-        require_rows(e, "select p from t where p contains null allow filtering",
-                         {{LI({1})}, {LI({2})}, {LI({3})}, {LI({4})}, {LI({4})}});
+        require_rows(e, "select p from t where p contains null allow filtering", {});
         require_rows(e, "select c from t where c contains 22 allow filtering", {{LI({21,22,23})}});
         require_rows(e, "select c from t where c contains 21 allow filtering", {{LI({21,22,23})}, {LI({21,32,33})}});
-        require_rows(e, "select c from t where c contains null allow filtering",
-                         {{LI({11,12,13})}, {LI({21,22,23})}, {LI({21,32,33})}, {LI({41,42,43})}, {LI({41,42})}});
+        require_rows(e, "select c from t where c contains null allow filtering", {});
         require_rows(e, "select c from t where c contains 21 and ls contains 102 allow filtering",
                      {{LI({21,22,23}), LI({102})}});
         require_rows(e, "select ls from t where ls contains 102 allow filtering", {{LI({102})}});
-        require_rows(e, "select ls from t where ls contains null allow filtering", {{LI({102})}, {LI({103})}});
+        require_rows(e, "select ls from t where ls contains null allow filtering", {});
         require_rows(e, "select st from t where st contains 'a' allow filtering",
                          {{LT({"a"})}, {LT({"a"})}, {LT({"a", "b"})}});
-        require_rows(e, "select st from t where st contains null allow filtering",
-                         {{LT({"a"})}, {LT({"a"})}, {LT({"a", "b"})}});
+        require_rows(e, "select st from t where st contains null allow filtering", {});
         require_rows(e, "select st from t where st contains 'b' allow filtering", {{LT({"a", "b"})}});
         cquery_nofail(e, "delete from t where p=[2]");
         require_rows(e, "select c from t where c contains 21 allow filtering", {{LI({21,32,33})}});
@@ -513,7 +509,7 @@ SEASTAR_THREAD_TEST_CASE(map_contains) {
         const auto p1 = my_map_type->decompose(make_map_value(my_map_type, map_type_impl::native_type({{1, 1}})));
         const auto p2 = my_map_type->decompose(make_map_value(my_map_type, map_type_impl::native_type({{2, 2}})));
         const auto p4 = my_map_type->decompose(make_map_value(my_map_type, map_type_impl::native_type({{4, 4}})));
-        require_rows(e, "select p from t where p contains null allow filtering", {{p1}, {p2}, {p3}, {p3}, {p4}});
+        require_rows(e, "select p from t where p contains null allow filtering", {});
         const auto c4 = my_map_type->decompose(make_map_value(my_map_type, map_type_impl::native_type({{40, 40}})));
         require_rows(e, "select c from t where c contains 40 allow filtering", {{c4}});
         const auto m2 = my_map_type->decompose(
@@ -523,7 +519,7 @@ SEASTAR_THREAD_TEST_CASE(map_contains) {
                 make_map_value(my_map_type, map_type_impl::native_type({{1, 11}, {2, 12}})));
         require_rows(e, "select m from t where m contains 11 allow filtering", {{m1}});
         require_rows(e, "select m from t where m contains 12 allow filtering", {{m1}, {m2}});
-        require_rows(e, "select m from t where m contains null allow filtering", {{m1}, {m2}});
+        require_rows(e, "select m from t where m contains null allow filtering", {});
         require_rows(e, "select m from t where m contains 11 and m contains 12 allow filtering", {{m1}});
         cquery_nofail(e, "delete from t where p={2:2}");
         require_rows(e, "select m from t where m contains 12 allow filtering", {{m1}});
@@ -552,7 +548,7 @@ SEASTAR_THREAD_TEST_CASE(contains_key) {
         const auto m3 = int_map_type->decompose(make_map_value(int_map_type, map_type_impl::native_type({{11, 33}})));
         require_rows(e, "select m from t where m contains key 12 allow filtering", {{m1}});
         require_rows(e, "select m from t where m contains key 11 allow filtering", {{m1}, {m3}});
-        require_rows(e, "select m from t where m contains key null allow filtering", {{m1}, {m3}});
+        require_rows(e, "select m from t where m contains key null allow filtering", {});
         const auto text_map_type = map_type_impl::get_instance(utf8_type, int32_type, true);
         const auto c1 = text_map_type->decompose(
                 make_map_value(text_map_type, map_type_impl::native_type({{"el", 11}, {"twel", 12}})));
@@ -560,13 +556,13 @@ SEASTAR_THREAD_TEST_CASE(contains_key) {
         require_rows(e, "select c from t where c contains key 'twel' allow filtering", {{c1}});
         const auto c3 = text_map_type->decompose(
                 make_map_value(text_map_type, map_type_impl::native_type({{"th", 33}})));
-        require_rows(e, "select c from t where c contains key null allow filtering", {{c1}, {c3}});
+        require_rows(e, "select c from t where c contains key null allow filtering", {});
         const auto p3 = int_map_type->decompose(make_map_value(int_map_type, map_type_impl::native_type({{3, 33}})));
         require_rows(e, "select p from t where p contains key 3 allow filtering", {{p3}});
-        require_rows(e, "select p from t where p contains key 3 and m contains key null allow filtering", {{p3, m3}});
+        require_rows(e, "select p from t where p contains key 3 and m contains key null allow filtering", {});
         const auto p1 = int_map_type->decompose(
                 make_map_value(int_map_type, map_type_impl::native_type({{1, 11}, {2, 12}})));
-        require_rows(e, "select p from t where p contains key null allow filtering", {{p1}, {p3}});
+        require_rows(e, "select p from t where p contains key null allow filtering", {});
         cquery_nofail(e, "insert into t (p,c) values ({4:44}, {'aaaa':44})");
         require_rows(e, "select m from t where m contains key 12 allow filtering", {{m1}});
         cquery_nofail(e, "delete from t where p={1:11, 2:12}");
@@ -578,8 +574,7 @@ SEASTAR_THREAD_TEST_CASE(contains_key) {
         const auto s5 = int_text_map_type->decompose(
                 make_map_value(int_text_map_type, map_type_impl::native_type({{55, "aaaa"}})));
         require_rows(e, "select s from t where s contains key 55 allow filtering", {{s5}, {s5}});
-        require_rows(e, "select s from t where s contains key 55 and s contains key null allow filtering",
-                         {{s5}, {s5}});
+        require_rows(e, "select s from t where s contains key 55 and s contains key null allow filtering", {});
         const auto c51 = text_map_type->decompose(
                 make_map_value(text_map_type, map_type_impl::native_type({{"aaaa", 55}})));
         const auto c52 = text_map_type->decompose(
@@ -591,7 +586,7 @@ SEASTAR_THREAD_TEST_CASE(contains_key) {
         const auto s6 = int_text_map_type->decompose(
                 make_map_value(int_text_map_type, map_type_impl::native_type({{55, "bbbb"}, {66, "bbbb"}})));
         require_rows(e, "select p from t where s contains key 55 allow filtering", {{p5, s5}, {p5, s5}, {p6, s6}});
-        const auto stmt = e.prepare("select p from t where s contains key :k allow filtering").get0();
+        const auto stmt = e.prepare("select p from t where s contains key :k allow filtering").get();
         require_rows(e, stmt, {{"k"}}, {I(55)}, {{p5, s5}, {p5, s5}, {p6, s6}});
         require_rows(e, stmt, {{"k"}}, {I(999)}, {});
     }).get();
@@ -624,7 +619,7 @@ SEASTAR_THREAD_TEST_CASE(like) {
                          {{T("c2a")}, {T("c2b")}, {T("c2ba")}, {T("c2c")}});
         require_rows(e, "select * from t where ck1 like '' and ck2 like '_2a' allow filtering", {});
         require_rows(e, "select r from t where r='rb' and ck2 like 'c2_' allow filtering", {{T("rb"), T("c2b")}});
-        const auto stmt = e.prepare("select ck1 from t where ck1 like ? allow filtering").get0();
+        const auto stmt = e.prepare("select ck1 from t where ck1 like ? allow filtering").get();
         require_rows(e, stmt, {}, {T("%c")}, {{T("c1c")}});
         require_rows(e, stmt, {}, {T("%xyxyz")}, {});
     }).get();
@@ -657,7 +652,6 @@ SEASTAR_THREAD_TEST_CASE(scalar_in) {
         require_rows(e, "select r from t where r in (22,25) and s>='25' allow filtering", {{F(25), T("35")}});
         require_rows(e, "select r from t where r in (25) and s>='25' allow filtering", {{F(25), T("35")}});
         require_rows(e, "select r from t where r in (25) allow filtering", {{F(25)}});
-        require_rows(e, "select r from t where r in (null,25) allow filtering", {{F(25)}});
         cquery_nofail(e, "delete from t where p=2");
         require_rows(e, "select r from t where r in (22,25) allow filtering", {{F(25)}});
         require_rows(e, "select s from t where s in ('34','35') allow filtering", {{T("34")}, {T("34")}, {T("35")}});
@@ -666,7 +660,7 @@ SEASTAR_THREAD_TEST_CASE(scalar_in) {
         require_rows(e, "select s from t where s in ('34') allow filtering", {{T("34")}, {T("34")}});
         require_rows(e, "select s from t where s in ('34','35') and r=24 allow filtering",
                          {{T("34"), F(24)}, {T("34"), F(24)}});
-        const auto stmt = e.prepare("select r from t where r in ? allow filtering").get0();
+        const auto stmt = e.prepare("select r from t where r in ? allow filtering").get();
         require_rows(e, stmt, {}, {LF({99.f, 88.f, 77.f})}, {});
         require_rows(e, stmt, {}, {LF({21.f})}, {{F(21)}});
         require_rows(e, stmt, {}, {LF({21.f, 22.f, 23.f})}, {{F(21)}, {F(23)}});
@@ -728,8 +722,6 @@ SEASTAR_THREAD_TEST_CASE(map_in) {
                          {{c1a}, {c1b}});
         require_rows(e, "select c from t where c in ({10:11}, {10:10}, {10:10,11:11}) and r=12 allow filtering",
                          {{c1b, I(12)}});
-        require_rows(e, "select c from t where c in ({10:11}, {10:10}, {10:10,11:11}) and r in (12,null) "
-                         "allow filtering", {{c1b, I(12)}});
         require_rows(e, "select c from t where c in ({10:11}, {10:10}, {10:10,11:11}) and p in ({1:1},{2:2})",
                      {{c1a}, {c1b}});
     }).get();
@@ -750,16 +742,15 @@ SEASTAR_THREAD_TEST_CASE(multi_col_in) {
         cquery_nofail(e, "insert into t(pk,ck1,ck2,r) values (4,13,23,'a')");
         require_rows(e, "select pk from t where (ck1,ck2) in ((13,23)) allow filtering", {{I(3)}, {I(4)}});
         require_rows(e, "select pk from t where (ck1) in ((13),(33),(44)) allow filtering", {{I(3)}, {I(4)}});
-        // TODO: uncomment when #6200 is fixed.
-        // require_rows(e, "select pk from t where (ck1,ck2) in ((13,23)) and r='a' allow filtering",
-        //                  {{I(4), I(13), F(23), T("a")}});
+        require_rows(e, "select pk from t where (ck1,ck2) in ((13,23)) and r='a' allow filtering",
+                         {{I(4), I(13), F(23), T("a")}});
         cquery_nofail(e, "delete from t where pk=4");
         require_rows(e, "select pk from t where (ck1,ck2) in ((13,23)) allow filtering", {{I(3)}});
-        auto stmt = e.prepare("select ck1 from t where (ck1,ck2) in ? allow filtering").get0();
+        auto stmt = e.prepare("select ck1 from t where (ck1,ck2) in ? allow filtering").get();
         auto bound_tuples = [] (std::vector<std::tuple<int32_t, float>> tuples) {
             const auto tuple_type = tuple_type_impl::get_instance({int32_type, float_type});
             const auto list_type = list_type_impl::get_instance(tuple_type, true);
-            const auto tvals = tuples | transformed([&] (const std::tuple<int32_t, float>& t) {
+            const auto tvals = tuples | std::views::transform([&] (const std::tuple<int32_t, float>& t) {
                 return make_tuple_value(tuple_type, tuple_type_impl::native_type({std::get<0>(t), std::get<1>(t)}));
             });
             return list_type->decompose(
@@ -771,21 +762,21 @@ SEASTAR_THREAD_TEST_CASE(multi_col_in) {
         require_rows(e, stmt, {}, {bound_tuples({{13, 13}, {12, 22}})}, {{I(12)}});
         require_rows(e, stmt, {}, {bound_tuples({{12, 21}})}, {});
         require_rows(e, stmt, {}, {bound_tuples({{12, 21}, {12, 21}, {13, 21}, {14, 21}})}, {});
-        stmt = e.prepare("select ck1 from t where (ck1,ck2) in (?) allow filtering").get0();
+        stmt = e.prepare("select ck1 from t where (ck1,ck2) in (?) allow filtering").get();
         auto tpl = [] (int32_t e1, float e2) {
             return make_tuple({int32_type, float_type}, {e1, e2});
         };
         require_rows(e, stmt, {}, {tpl(11, 21)}, {{I(11)}});
         require_rows(e, stmt, {}, {tpl(12, 22)}, {{I(12)}});
         require_rows(e, stmt, {}, {tpl(12, 21)}, {});
-        stmt = e.prepare("select ck1 from t where (ck1,ck2) in (:t1,:t2) allow filtering").get0();
+        stmt = e.prepare("select ck1 from t where (ck1,ck2) in (:t1,:t2) allow filtering").get();
         require_rows(e, stmt, {{"t1", "t2"}}, {tpl(11, 21), tpl(12, 22)}, {{I(11)}, {I(12)}});
         require_rows(e, stmt, {{"t1", "t2"}}, {tpl(11, 21), tpl(11, 21)}, {{I(11)}});
         require_rows(e, stmt, {{"t1", "t2"}}, {tpl(11, 21), tpl(99, 99)}, {{I(11)}});
         require_rows(e, stmt, {{"t1", "t2"}}, {tpl(9, 9), tpl(99, 99)}, {});
         // Parsing error:
-        // stmt = e.prepare("select ck1 from t where (ck1,ck2) in ((13,23),:p1)").get0();
-        stmt = e.prepare("select ck1 from t where (ck1,ck2) in ((13,23),(?,?)) allow filtering").get0();
+        // stmt = e.prepare("select ck1 from t where (ck1,ck2) in ((13,23),:p1)").get();
+        stmt = e.prepare("select ck1 from t where (ck1,ck2) in ((13,23),(?,?)) allow filtering").get();
         require_rows(e, stmt, {}, {I(0), F(0)}, {{I(13)}});
         require_rows(e, stmt, {}, {I(11), F(21)}, {{I(11)}, {I(13)}});
     }).get();
@@ -803,10 +794,10 @@ SEASTAR_THREAD_TEST_CASE(bounds) {
         require_rows(e, "select p from t where p=1 and (c) = (11)", {{I(1)}});
         require_rows(e, "select c from t where p in (1,2,3) and c > 11 and c < 13", {{I(12)}});
         require_rows(e, "select c from t where p in (1,2,3) and c >= 11 and c < 13", {{I(11)}, {I(12)}});
-        auto stmt = e.prepare("select c from t where p in (1,2,3) and c >= 11 and c < ?").get0();
+        auto stmt = e.prepare("select c from t where p in (1,2,3) and c >= 11 and c < ?").get();
         require_rows(e, stmt, {}, {I(13)}, {{I(11)}, {I(12)}});
         require_rows(e, stmt, {}, {I(10)}, {});
-        stmt = e.prepare("select c from t where p in (1,2,3) and (c) < ?").get0();
+        stmt = e.prepare("select c from t where p in (1,2,3) and (c) < ?").get();
         require_rows(e, stmt, {}, {make_tuple({int32_type}, {13})}, {{I(11)}, {I(12)}});
         require_rows(e, stmt, {}, {make_tuple({int32_type}, {11})}, {});
     }).get();
@@ -878,7 +869,7 @@ SEASTAR_THREAD_TEST_CASE(token) {
         require_rows(e, "select p from t where token(p,q) <= token(1,11) and r<102 allow filtering",
                          {{I(1), I(101)}});
         require_rows(e, "select p from t where token(p,q) = token(2,12) and r<102 allow filtering", {});
-        const auto stmt = e.prepare("select p from t where token(p,q) = token(1,?)").get0();
+        const auto stmt = e.prepare("select p from t where token(p,q) = token(1,?)").get();
         require_rows(e, stmt, {}, {I(11)}, {{I(1)}});
         require_rows(e, stmt, {}, {I(10)}, {});
 
@@ -964,3 +955,101 @@ SEASTAR_THREAD_TEST_CASE(strict_allow_filtering_live_update) {
                 exception_predicate::message_contains("use ALLOW FILTERING"));
     }, cfg).get();
 }
+
+// Ok - only view primary key columns are restricted by IS NOT NULL
+static const char* good_is_not_null_in_views_query =
+    "CREATE MATERIALIZED VIEW t_view AS SELECT p, c, a, b FROM t "
+    "WHERE p IS NOT NULL and c IS NOT NULL and a IS NOT NULL PRIMARY KEY (a, c, p)";
+
+// Bad - b IS NOT NULL is an invalid restriction, as b isn't a part of the view's primary key
+sstring bad_is_not_null_in_views_query(int bad_view_index = 0) {
+    return fmt::format(
+        "CREATE MATERIALIZED VIEW t_badview_{} AS SELECT p, c, a, b FROM t "
+        "WHERE p IS NOT NULL and c IS NOT NULL and a IS NOT NULL AND b IS NOT NULL PRIMARY KEY (a, c, p)",
+        bad_view_index);
+}
+
+static bool contains_is_not_null_warning(const cql_transport::messages::result_message& result_msg) {
+    const std::vector<sstring>& warnings = result_msg.warnings();
+
+    auto found_warning = std::find_if(warnings.begin(), warnings.end(), [&](const sstring& warning) -> bool {
+        return warning.find("IS NOT NULL") != std::string::npos;
+    });
+
+    return found_warning != warnings.end();
+}
+
+// Test that setting strict_is_not_null_in_views=true doesn't allow invalid IS NOT NULL in views.
+SEASTAR_THREAD_TEST_CASE(strict_is_not_null_in_views_true) {
+    auto cfg = make_shared<db::config>();
+    cfg->strict_is_not_null_in_views(db::tri_mode_restriction_t::mode::TRUE);
+    do_with_cql_env_thread([&](cql_test_env& e) {
+            cquery_nofail(e, "CREATE TABLE t (p int, c int, a int, b int, PRIMARY KEY (p, c))");
+            cquery_nofail(e, good_is_not_null_in_views_query);
+
+            BOOST_REQUIRE_EXCEPTION(e.execute_cql(bad_is_not_null_in_views_query()).get(),
+                                    exceptions::invalid_request_exception,
+                                    exception_predicate::message_contains("IS NOT NULL"));
+    }, cfg).get();
+}
+
+// Test that setting strict_is_not_null_in_views=warn allows invalid IS NOT NULL in views, but throws a warning.
+SEASTAR_THREAD_TEST_CASE(strict_is_not_null_in_views_warn) {
+    auto cfg = make_shared<db::config>();
+    cfg->strict_is_not_null_in_views(db::tri_mode_restriction_t::mode::WARN);
+    do_with_cql_env_thread([&](cql_test_env& e) {
+            cquery_nofail(e, "CREATE TABLE t (p int, c int, a int, b int, PRIMARY KEY (p, c))");
+            cquery_nofail(e, good_is_not_null_in_views_query);
+
+            shared_ptr<cql_transport::messages::result_message> bad_res =
+                e.execute_cql(bad_is_not_null_in_views_query()).get();
+            BOOST_REQUIRE(contains_is_not_null_warning(*bad_res));
+    }, cfg).get();
+}
+
+// Test that setting strict_is_not_null_in_views=false allows invalid IS NOT NULL in views without any warnings.
+SEASTAR_THREAD_TEST_CASE(strict_is_not_null_in_views_false) {
+    auto cfg = make_shared<db::config>();
+    cfg->strict_is_not_null_in_views(db::tri_mode_restriction_t::mode::FALSE);
+    do_with_cql_env_thread([&](cql_test_env& e) {
+            cquery_nofail(e, "CREATE TABLE t (p int, c int, a int, b int, PRIMARY KEY (p, c))");
+            cquery_nofail(e, good_is_not_null_in_views_query);
+
+            shared_ptr<cql_transport::messages::result_message> bad_res =
+                e.execute_cql(bad_is_not_null_in_views_query()).get();
+            BOOST_REQUIRE(!contains_is_not_null_warning(*bad_res));
+    }, cfg).get();
+}
+
+// Test that the strict_is_not_null_in_views flag handles live updates properly.
+SEASTAR_THREAD_TEST_CASE(strict_is_not_null_in_views_live_update) {
+    auto cfg = make_shared<db::config>();
+    cfg->strict_is_not_null_in_views(db::tri_mode_restriction_t::mode::FALSE);
+    do_with_cql_env_thread([&](cql_test_env& e) {
+            cquery_nofail(e, "CREATE TABLE t (p int, c int, a int, b int, PRIMARY KEY (p, c))");
+            cquery_nofail(e, good_is_not_null_in_views_query);
+
+            shared_ptr<cql_transport::messages::result_message> bad_res_with_false =
+                e.execute_cql(bad_is_not_null_in_views_query(0)).get();
+            BOOST_REQUIRE(!contains_is_not_null_warning(*bad_res_with_false));
+
+            cfg->strict_is_not_null_in_views(db::tri_mode_restriction_t::mode::WARN);
+
+            shared_ptr<cql_transport::messages::result_message> bad_res_with_warn =
+                e.execute_cql(bad_is_not_null_in_views_query(1)).get();
+            BOOST_REQUIRE(contains_is_not_null_warning(*bad_res_with_warn));
+
+            cfg->strict_is_not_null_in_views(db::tri_mode_restriction_t::mode::TRUE);
+            BOOST_REQUIRE_EXCEPTION(e.execute_cql(bad_is_not_null_in_views_query(2)).get(),
+                                    exceptions::invalid_request_exception,
+                                    exception_predicate::message_contains("IS NOT NULL"));
+    }, cfg).get();
+}
+
+// Test that the default value for the strict_is_not_null_in_views flag is `warn`.
+SEASTAR_THREAD_TEST_CASE(strict_is_not_null_in_views_default_value) {
+    auto cfg = make_shared<db::config>();
+    BOOST_REQUIRE(cfg->strict_is_not_null_in_views() == db::tri_mode_restriction_t::mode::WARN);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

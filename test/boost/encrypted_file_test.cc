@@ -1,0 +1,966 @@
+/*
+ * Copyright (C) 2016-present ScyllaDB
+ */
+
+
+
+#include <boost/test/unit_test.hpp>
+#include <stdint.h>
+#include <limits>
+#include <random>
+
+#include <seastar/core/align.hh>
+#include <seastar/core/future-util.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
+
+#include <seastar/testing/test_case.hh>
+
+#include "ent/encryption/encryption.hh"
+#include "ent/encryption/symmetric_key.hh"
+#include "ent/encryption/encrypted_file_impl.hh"
+#include "test/lib/log.hh"
+#include "test/lib/tmpdir.hh"
+#include "test/lib/random_utils.hh"
+#include "test/lib/exception_utils.hh"
+#include "test/lib/limiting_data_source.hh"
+#include "utils/io-wrappers.hh"
+
+#include <seastar/util/memory-data-source.hh>
+
+using namespace encryption;
+
+static tmpdir dir;
+
+static std::tuple<std::string, ::shared_ptr<symmetric_key>> make_filename(const std::string& name, ::shared_ptr<symmetric_key> k = nullptr) {
+    auto dst = std::string(dir.path() / std::string(name));
+    if (k == nullptr) {
+        key_info info{"AES/CBC", 256};
+        k = ::make_shared<symmetric_key>(info);
+    }
+    return std::make_tuple(dst, k);
+}
+
+static future<std::tuple<file, ::shared_ptr<symmetric_key>>> make_file(const std::string& name, open_flags mode, ::shared_ptr<symmetric_key> k_in = nullptr) {
+    auto [dst, k] = make_filename(name, std::move(k_in));
+    file f = co_await open_file_dma(dst, mode);
+    co_return std::tuple(file(make_encrypted_file(f, k)), k);
+}
+
+template<typename T = char>
+static void fill_random(temporary_buffer<T>& buf) {
+    auto data = tests::random::get_sstring(buf.size());
+    std::copy(data.begin(), data.end(), buf.get_write());
+}
+
+template<typename T = char>
+static temporary_buffer<T> generate_random(size_t n) {
+    temporary_buffer<T> tmp(n);
+    fill_random(tmp);
+    return tmp;
+}
+
+template<typename T = char>
+static temporary_buffer<T> generate_random(size_t n, size_t align) {
+    auto tmp = temporary_buffer<T>::aligned(align, align_up(n, align));
+    fill_random(tmp);
+    return tmp;
+}
+
+static future<> test_random_data_disk(size_t n) {
+    auto name = "test_rand_" + std::to_string(n);
+    auto t = co_await make_file(name, open_flags::rw|open_flags::create);
+    auto f = std::get<0>(t);
+    std::exception_ptr ex = nullptr;
+
+    try {
+        auto k = std::get<1>(t);
+        auto a = f.memory_dma_alignment();
+        auto buf = generate_random(n, a);
+        auto w = co_await f.dma_write(0, buf.get(), buf.size());
+
+        co_await f.flush();
+        if (n != buf.size()) {
+            co_await f.truncate(n);
+        }
+
+        BOOST_REQUIRE_EQUAL(w, buf.size());
+
+        auto k2 = ::make_shared<symmetric_key>(k->info(), k->key());
+        auto f2 = std::get<0>(co_await make_file(name, open_flags::ro, k2));
+
+        auto tmp = temporary_buffer<uint8_t>::aligned(a, buf.size());
+        auto n2 = co_await f2.dma_read(0, tmp.get_write(), tmp.size());
+
+        BOOST_REQUIRE_EQUAL(n2, n);
+        BOOST_REQUIRE_EQUAL_COLLECTIONS(tmp.get(), tmp.get() + n2, buf.get(), buf.get() + n2);
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await f.close();
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
+static void test_random_data(size_t n) {
+    auto buf = generate_random(n, 8);
+
+
+    // first, verify padded.
+    {
+        key_info info{"AES/CBC/PKCSPadding", 256};
+        auto k = ::make_shared<symmetric_key>(info);
+
+        bytes b(bytes::initialized_later(), k->iv_len());
+        k->generate_iv(b.data(), k->iv_len());
+
+        temporary_buffer<uint8_t> tmp(n + k->block_size());
+        k->encrypt(buf.get(), buf.size(), tmp.get_write(), tmp.size(), b.data());
+
+        auto bytes = k->key();
+        auto k2 = ::make_shared<symmetric_key>(info, bytes);
+
+        temporary_buffer<uint8_t> tmp2(n + k->block_size());
+        k2->decrypt(tmp.get(), tmp.size(), tmp2.get_write(), tmp2.size(), b.data());
+
+        BOOST_REQUIRE_EQUAL_COLLECTIONS(tmp2.get(), tmp2.get() + n, buf.get(), buf.get() + n);
+    }
+
+    // unpadded
+    {
+        key_info info{"AES/CBC", 256};
+        auto k = ::make_shared<symmetric_key>(info);
+
+        bytes b(bytes::initialized_later(), k->iv_len());
+        k->generate_iv(b.data(), k->iv_len());
+
+        temporary_buffer<uint8_t> tmp(n);
+        k->encrypt_unpadded(buf.get(), buf.size(), tmp.get_write(), b.data());
+
+        auto bytes = k->key();
+        auto k2 = ::make_shared<symmetric_key>(info, bytes);
+
+        temporary_buffer<uint8_t> tmp2(buf.size());
+        k2->decrypt_unpadded(tmp.get(), tmp.size(), tmp2.get_write(), b.data());
+
+        BOOST_REQUIRE_EQUAL_COLLECTIONS(tmp2.get(), tmp2.get() + n, buf.get(), buf.get() + n);
+    }
+}
+
+
+BOOST_AUTO_TEST_CASE(test_encrypting_data_128) {
+    test_random_data(128);
+}
+
+BOOST_AUTO_TEST_CASE(test_encrypting_data_4k) {
+    test_random_data(4*1024);
+}
+
+
+SEASTAR_TEST_CASE(test_encrypted_file_data_4k) {
+    return test_random_data_disk(4*1024);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_file_data_16k) {
+    return test_random_data_disk(16*1024);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_file_data_unaligned) {
+    return test_random_data_disk(16*1024 - 3);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_file_data_unaligned2) {
+    return test_random_data_disk(16*1024 - 4092);
+}
+
+SEASTAR_TEST_CASE(test_short) {
+    auto name = "test_short";
+    file f = co_await open_file_dma(sstring(dir.path() / name), open_flags::rw|open_flags::create);
+    co_await f.truncate(1);
+    co_await f.close();
+
+    auto t = co_await make_file(name, open_flags::ro);
+    f = std::get<0>(t);
+    std::exception_ptr ex = nullptr;
+
+    try {
+        temporary_buffer<char> buf(f.memory_dma_alignment());
+
+        BOOST_REQUIRE_EXCEPTION(
+            co_await f.dma_read(0, buf.get_write(), buf.size()),
+            std::domain_error,
+            exception_predicate::message_contains("file size 1, expected 0 or at least 16")
+        );
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await f.close();
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
+SEASTAR_TEST_CASE(test_read_across_size_boundary) {
+    auto name = "test_read_across_size_boundary";
+
+    auto [dst, k] = co_await make_file(name, open_flags::rw|open_flags::create);
+    auto size = dst.disk_write_dma_alignment() - 1;
+    co_await dst.truncate(size);
+    co_await dst.close();
+
+    auto [f, _] = co_await make_file(name, open_flags::ro, k);
+    auto a = f.disk_write_dma_alignment();
+    auto m = f.memory_dma_alignment();
+
+    auto buf = temporary_buffer<char>::aligned(m, a);
+    auto n = co_await f.dma_read(0, buf.get_write(), buf.size());
+
+    auto buf2 = temporary_buffer<char>::aligned(m, a);
+    auto n2 = co_await f.dma_read(a, buf2.get_write(), buf2.size());
+
+    auto buf3 = temporary_buffer<char>::aligned(m, a);
+    std::vector<iovec> iov({{buf3.get_write(), buf3.size()}});
+    auto n3 = co_await f.dma_read(a, std::move(iov));
+
+    auto buf4 = co_await f.dma_read_bulk<char>(a, size_t(a));
+
+    co_await f.close();
+
+    BOOST_REQUIRE_EQUAL(size, n);
+    buf.trim(n);
+    for (auto c : buf) {
+        BOOST_REQUIRE_EQUAL(c, 0);
+    }
+
+    BOOST_REQUIRE_EQUAL(0, n2);
+    BOOST_REQUIRE_EQUAL(0, n3);
+    BOOST_REQUIRE_EQUAL(0, buf4.size());
+}
+
+static future<> test_read_across_size_boundary_unaligned_helper(int64_t size_off, int64_t read_off) {
+    auto name = "test_read_across_size_boundary_unaligned";
+    auto [dst, k] = co_await make_file(name, open_flags::rw|open_flags::create);
+    auto size = dst.disk_write_dma_alignment() + size_off;
+    co_await dst.truncate(size);
+    co_await dst.close();
+
+    auto [f, k2] = co_await make_file(name, open_flags::ro, k);
+    auto buf = co_await f.dma_read_bulk<char>(f.disk_write_dma_alignment() + read_off, size_t(f.disk_write_dma_alignment()));
+
+    co_await f.close();
+
+    BOOST_REQUIRE_EQUAL(0, buf.size());
+}
+
+SEASTAR_TEST_CASE(test_read_across_size_boundary_unaligned) {
+    co_await test_read_across_size_boundary_unaligned_helper(-1, 1);
+}
+
+SEASTAR_TEST_CASE(test_read_across_size_boundary_unaligned2) {
+    co_await test_read_across_size_boundary_unaligned_helper(-2, -1);
+}
+
+SEASTAR_TEST_CASE(test_truncating_empty) {
+    auto name = "test_truncating_empty";
+    auto t = co_await make_file(name, open_flags::rw|open_flags::create);
+    auto f = std::get<0>(t);
+    auto k = std::get<1>(t);
+    auto s = 64 * f.memory_dma_alignment();
+
+    co_await f.truncate(s);
+
+    temporary_buffer<char> buf(s);
+    auto n = co_await f.dma_read(0, buf.get_write(), buf.size());
+
+    co_await f.close();
+
+    BOOST_REQUIRE_EQUAL(s, n);
+
+    for (auto c : buf) {
+        BOOST_REQUIRE_EQUAL(c, 0);
+    }
+}
+
+SEASTAR_TEST_CASE(test_truncating_extend) {
+    auto name = "test_truncating_extend";
+    auto t = co_await make_file(name, open_flags::rw|open_flags::create);
+    auto f = std::get<0>(t);
+    auto k = std::get<1>(t);
+    auto a = f.memory_dma_alignment();
+    auto s = 32 * a;
+    auto buf = generate_random(s, a);
+    auto w = co_await f.dma_write(0, buf.get(), buf.size());
+
+    co_await f.flush();
+    BOOST_REQUIRE_EQUAL(s, w);
+
+    for (size_t i = 1; i < 64; ++i) {
+        // truncate smaller, unaligned
+        auto l = w - i;
+        auto r = w + 8 * a;
+        co_await f.truncate(l);
+        BOOST_REQUIRE_EQUAL(l, (co_await f.stat()).st_size);
+
+        {
+            auto tmp = temporary_buffer<uint8_t>::aligned(a, align_up(l, a));
+            auto n = co_await f.dma_read(0, tmp.get_write(), tmp.size());
+
+            BOOST_REQUIRE_EQUAL(l, n);
+            BOOST_REQUIRE_EQUAL_COLLECTIONS(tmp.get(), tmp.get() + l, buf.get(), buf.get() + l);
+
+            auto k = align_down(l, a);
+
+            while (k > 0) {
+                n = co_await f.dma_read(0, tmp.get_write(), k);
+
+                BOOST_REQUIRE_EQUAL(k, n);
+                BOOST_REQUIRE_EQUAL_COLLECTIONS(tmp.get(), tmp.get() + k, buf.get(), buf.get() + k);
+
+                n = co_await f.dma_read(k, tmp.get_write(), tmp.size());
+                BOOST_REQUIRE_EQUAL(l - k, n);
+                BOOST_REQUIRE_EQUAL_COLLECTIONS(tmp.get(), tmp.get() + n, buf.get() + k, buf.get() + k + n);
+
+                k -= a;
+            }
+        }
+
+        co_await f.truncate(r);
+        BOOST_REQUIRE_EQUAL(r, (co_await f.stat()).st_size);
+
+        auto tmp = temporary_buffer<uint8_t>::aligned(a, align_up(r, a));
+        auto n = co_await f.dma_read(0, tmp.get_write(), tmp.size());
+
+        BOOST_REQUIRE_EQUAL(r, n);
+        BOOST_REQUIRE_EQUAL_COLLECTIONS(tmp.get(), tmp.get() + l, buf.get(), buf.get() + l);
+
+        while (l < r) {
+            BOOST_REQUIRE_EQUAL(tmp[l], 0);
+            ++l;
+        }
+    }
+
+    co_await f.close();
+}
+
+// SCYLLADB-4602 repro: a short read that is NOT at end of file.
+//
+// encrypted_file_impl::transform() treats any length that is not a multiple of
+// block_size as proof that this is the file's last block, and returns
+// `std::max(_file_length, pos) - pos` -- the distance to end of data -- rather
+// than the number of bytes it actually decrypted. That inference is sound only
+// if the file underneath comes back short solely at end of data, which a local
+// disk guarantees and an arbitrary file_impl does not.
+//
+// This wraps a plain on-disk file in a file_impl that truncates exactly one
+// read, mid-file.
+class truncating_file_impl : public file_impl {
+    file _f;
+    uint64_t _at;
+    size_t _deliver;
+public:
+    // Truncate a read starting at `at` to `deliver` bytes, once.
+    truncating_file_impl(file f, uint64_t at, size_t deliver)
+        : _f(std::move(f)), _at(at), _deliver(deliver)
+    {
+        _memory_dma_alignment = _f.memory_dma_alignment();
+        _disk_read_dma_alignment = _f.disk_read_dma_alignment();
+        _disk_write_dma_alignment = _f.disk_write_dma_alignment();
+    }
+    future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, io_intent* intent) override {
+        auto n = co_await _f.dma_read(pos, reinterpret_cast<uint8_t*>(buffer), len, intent);
+        if (pos == _at && _deliver < n) {
+            testlog.info("truncating read at {} from {} to {} bytes", pos, n, _deliver);
+            n = std::exchange(_deliver, std::numeric_limits<size_t>::max());
+        }
+        co_return n;
+    }
+    future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, io_intent* intent) override {
+        auto n = co_await _f.dma_read(pos, std::move(iov), intent);
+        if (pos == _at && _deliver < n) {
+            testlog.info("truncating iovec read at {} from {} to {} bytes", pos, n, _deliver);
+            n = std::exchange(_deliver, std::numeric_limits<size_t>::max());
+        }
+        co_return n;
+    }
+    future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t pos, size_t range_size, io_intent* intent) override {
+        temporary_buffer<uint8_t> buf(range_size);
+        auto n = co_await read_dma(pos, buf.get_write(), range_size, intent);
+        buf.trim(n);
+        co_return buf;
+    }
+    future<uint64_t> size() override { return _f.size(); }
+    future<struct stat> stat() override { return _f.stat(); }
+    future<> close() override { return _f.close(); }
+    future<> flush() override { return make_ready_future<>(); }
+    future<> truncate(uint64_t) override { throw std::logic_error("ro"); }
+    future<> allocate(uint64_t, uint64_t) override { return make_ready_future<>(); }
+    future<> discard(uint64_t, uint64_t) override { return make_ready_future<>(); }
+    future<size_t> write_dma(uint64_t, const void*, size_t, io_intent*) override { throw std::logic_error("ro"); }
+    future<size_t> write_dma(uint64_t, std::vector<iovec>, io_intent*) override { throw std::logic_error("ro"); }
+    subscription<directory_entry> list_directory(std::function<future<>(directory_entry)>) override { throw std::logic_error("ro"); }
+};
+
+SEASTAR_TEST_CASE(test_short_read_mid_file_is_not_eof) {
+    key_info kinfo{"AES/CBC", 256};
+    auto k = ::make_shared<symmetric_key>(kinfo);
+    constexpr auto& filename = "short_read_mid_file";
+
+    // Four full 4k blocks of known plaintext, so every offset is mid-file.
+    constexpr size_t plaintext_size = 4 * 4096;
+    auto written = generate_random<char>(plaintext_size, 4096);
+    {
+        auto [f, _] = co_await make_file(filename, open_flags::create | open_flags::wo, k);
+        co_await f.dma_write(0, written.get(), written.size());
+        co_await f.close();
+    }
+
+    auto [dst, _] = make_filename(filename, k);
+    auto raw = co_await open_file_dma(dst, open_flags::ro);
+    auto physical = co_await raw.size();
+    BOOST_REQUIRE_EQUAL(physical, plaintext_size); // 4k-aligned: no padding block
+
+    // Deliver only 1000 of the 8192 bytes asked for, at offset 0. 1000 is not a
+    // multiple of 4096, so transform() takes it for the final block.
+    constexpr uint64_t read_pos = 0;
+    constexpr size_t read_len = 2 * 4096;
+    constexpr size_t delivered = 1000;
+
+    file f(make_encrypted_file(file(seastar::make_shared<truncating_file_impl>(raw, read_pos, delivered)), k));
+
+    auto rbuf = temporary_buffer<char>::aligned(f.memory_dma_alignment(), read_len);
+    std::fill(rbuf.get_write(), rbuf.get_write() + rbuf.size(), '\xa5'); // poison
+    auto n = co_await f.dma_read<char>(read_pos, rbuf.get_write(), read_len);
+
+    testlog.info("underlying delivered {} bytes; encrypted_file reported {}", delivered, n);
+
+    // The layer must never claim more bytes than were actually decrypted.
+    BOOST_CHECK_MESSAGE(n <= delivered, seastar::format(
+            "reported {} bytes from a read that delivered only {} -- {} bytes of the "
+            "caller's buffer were never written by this read", n, delivered, n - delivered));
+
+    // And whatever it does claim must be the real plaintext, not poison.
+    auto good = std::min(n, plaintext_size);
+    for (size_t i = 0; i < good; ++i) {
+        if (rbuf.get()[i] != written.get()[i]) {
+            BOOST_ERROR(seastar::format(
+                    "byte {} of {} reported bytes differs from the plaintext "
+                    "(got {:#x}, expected {:#x}) -- corrupt data reported as a successful read",
+                    i, n, uint8_t(rbuf.get()[i]), uint8_t(written.get()[i])));
+            break;
+        }
+    }
+    co_await f.close();
+}
+
+// The iovec counterpart of the case above. read_dma(pos, iov) ignored the byte
+// count it was handed and transformed every iovec at its full length, so a read
+// that stopped after the first iovec still reported both as decoded, having
+// decrypted the caller's own buffer contents into the second one.
+SEASTAR_TEST_CASE(test_short_read_mid_file_iovec_is_not_eof) {
+    key_info kinfo{"AES/CBC", 256};
+    auto k = ::make_shared<symmetric_key>(kinfo);
+    constexpr auto& filename = "short_read_mid_file_iovec";
+
+    constexpr size_t plaintext_size = 4 * 4096;
+    auto written = generate_random<char>(plaintext_size, 4096);
+    {
+        auto [f, _] = co_await make_file(filename, open_flags::create | open_flags::wo, k);
+        co_await f.dma_write(0, written.get(), written.size());
+        co_await f.close();
+    }
+
+    auto [dst, _] = make_filename(filename, k);
+    auto raw = co_await open_file_dma(dst, open_flags::ro);
+
+    // Deliver only the first of the two 4096 byte iovecs. Both lengths stay
+    // block-aligned, so nothing here depends on the truncated-block path.
+    constexpr uint64_t read_pos = 0;
+    constexpr size_t delivered = 4096;
+
+    file f(make_encrypted_file(file(seastar::make_shared<truncating_file_impl>(raw, read_pos, delivered)), k));
+
+    auto rbuf = temporary_buffer<char>::aligned(f.memory_dma_alignment(), 2 * 4096);
+    std::fill(rbuf.get_write(), rbuf.get_write() + rbuf.size(), '\xa5'); // poison
+    std::vector<iovec> iov;
+    iov.push_back({rbuf.get_write(), 4096});
+    iov.push_back({rbuf.get_write() + 4096, 4096});
+    auto n = co_await f.dma_read(read_pos, std::move(iov));
+
+    testlog.info("underlying delivered {} bytes; encrypted_file reported {}", delivered, n);
+
+    BOOST_CHECK_MESSAGE(n <= delivered, seastar::format(
+            "reported {} bytes from an iovec read that delivered only {} -- {} bytes of the "
+            "caller's buffer were never written by this read", n, delivered, n - delivered));
+
+    auto good = std::min(n, plaintext_size);
+    for (size_t i = 0; i < good; ++i) {
+        if (rbuf.get()[i] != written.get()[i]) {
+            BOOST_ERROR(seastar::format(
+                    "byte {} of {} reported bytes differs from the plaintext "
+                    "(got {:#x}, expected {:#x}) -- corrupt data reported as a successful read",
+                    i, n, uint8_t(rbuf.get()[i]), uint8_t(written.get()[i])));
+            break;
+        }
+    }
+    co_await f.close();
+}
+
+// An iovec that is not a whole number of blocks leaves off mid-block, and
+// transform() requires a block-aligned position of every call. Nothing on this
+// path asserts the iovec lengths the way write_dma() does, so the loop has to
+// stop by itself rather than hand transform() a position it rejects.
+SEASTAR_TEST_CASE(test_iovec_not_a_block_multiple_stops_at_the_partial_block) {
+    key_info kinfo{"AES/CBC", 256};
+    auto k = ::make_shared<symmetric_key>(kinfo);
+    constexpr auto& filename = "iovec_not_block_multiple";
+
+    constexpr size_t plaintext_size = 4 * 4096;
+    auto written = generate_random<char>(plaintext_size, 4096);
+    {
+        auto [f, _] = co_await make_file(filename, open_flags::create | open_flags::wo, k);
+        co_await f.dma_write(0, written.get(), written.size());
+        co_await f.close();
+    }
+
+    auto [dst, _] = make_filename(filename, k);
+    auto raw = co_await open_file_dma(dst, open_flags::ro);
+    file f(make_encrypted_file(std::move(raw), k));
+
+    // 512 is a multiple of the key block size but not of block_size, so the
+    // first iovec ends inside block 0.
+    constexpr size_t partial = 512;
+    auto buf = temporary_buffer<char>::aligned(f.memory_dma_alignment(), 2 * 4096);
+    std::fill(buf.get_write(), buf.get_write() + buf.size(), '\xa5'); // poison
+    std::vector<iovec> iov{{buf.get_write(), partial}, {buf.get_write() + partial, 4096}};
+
+    auto n = co_await f.dma_read(0, std::move(iov));
+    testlog.info("iovec read of {}+4096 reported {} bytes", partial, n);
+
+    // Only the first iovec was a decodable run of blocks. Reporting more would
+    // mean the second iovec was decrypted at a position transform() rejects.
+    BOOST_REQUIRE_EQUAL(n, partial);
+    BOOST_REQUIRE_EQUAL(std::string_view(buf.get(), partial),
+                        std::string_view(written.get(), partial));
+
+    co_await f.close();
+}
+
+// A file whose data length is not a multiple of block_size -- which is most of
+// them -- read through more than one iovec. Nothing here is contrived: no
+// injection, no wrapping file_impl, no truncation, just a read that reaches the
+// end of the data. transform() returns the distance to the end of the data for
+// the partial block, so without stopping there the next iovec is transformed at
+// a position that is not block-aligned, and iv_for()'s assert aborts the node.
+SEASTAR_TEST_CASE(test_iovec_read_reaching_end_of_data) {
+    key_info kinfo{"AES/CBC/PKCSPadding", 128};
+    auto k = ::make_shared<symmetric_key>(kinfo);
+    constexpr auto& filename = "iovec_read_to_end_of_data";
+
+    size_t bs = 0, data_len = 0;
+    {
+        auto [file, _] = co_await make_file(filename, open_flags::create | open_flags::wo, k);
+        auto ostream = co_await make_file_output_stream(file);
+        bs = file.disk_write_dma_alignment();
+        data_len = bs - 1;
+        auto wbuf = seastar::temporary_buffer<char>::aligned(file.memory_dma_alignment(), data_len);
+        std::fill(wbuf.get_write(), wbuf.get_write() + wbuf.size(), 'x');
+        co_await ostream.write(wbuf.get(), wbuf.size());
+        co_await ostream.close();
+    }
+
+    auto [f, _] = co_await make_file(filename, open_flags::ro, k);
+    BOOST_REQUIRE_EQUAL(co_await f.size(), data_len);
+
+    auto buf = seastar::temporary_buffer<char>::aligned(f.memory_dma_alignment(), 2 * bs);
+    std::vector<iovec> iov{{static_cast<void*>(buf.get_write()), bs},
+                           {static_cast<void*>(buf.get_write() + bs), bs}};
+
+    // Only the data is there to report; the second iovec has no block of its own.
+    BOOST_REQUIRE_EQUAL(co_await f.dma_read(0, std::move(iov)), data_len);
+    BOOST_REQUIRE_EQUAL(std::string_view(buf.get(), data_len), std::string(data_len, 'x'));
+
+    co_await f.close();
+}
+
+// Reproducer for https://github.com/scylladb/scylladb/issues/22236
+SEASTAR_TEST_CASE(test_read_from_padding) {
+    key_info kinfo {"AES/CBC/PKCSPadding", 128};
+    shared_ptr<symmetric_key> k = make_shared<symmetric_key>(kinfo);
+    testlog.info("Created symmetric key: info={} key={} ", k->info(), k->key());
+
+    size_t block_size;
+    size_t buf_size;
+
+    constexpr auto& filename = "encrypted_file";
+    const auto& filepath = dir.path() / filename;
+
+    testlog.info("Creating encrypted file {}", filepath.string());
+    {
+        auto [file, _] = co_await make_file(filename, open_flags::create | open_flags::wo, k);
+        auto ostream = co_await make_file_output_stream(file);
+
+        block_size = file.disk_write_dma_alignment();
+        buf_size = block_size - 1;
+
+        auto wbuf = seastar::temporary_buffer<char>::aligned(file.memory_dma_alignment(), buf_size);
+        co_await ostream.write(wbuf.get(), wbuf.size());
+        testlog.info("Wrote {} bytes to encrypted file {}", wbuf.size(), filepath.string());
+
+        co_await ostream.close();
+        testlog.info("Length of {}: {} bytes", filename, co_await file.size());
+    }
+
+    testlog.info("Testing DMA reads from padding area of file {}", filepath.string());
+    {
+        auto [file, _] = co_await make_file(filename, open_flags::ro, k);
+
+        // Triggering the bug requires reading from the padding area:
+        // `buf_size < read_pos < file.size()`
+        //
+        // For `dma_read()`, we have the additional requirement that `read_pos` must be aligned.
+        // For `dma_read_bulk()`, it doesn't have to.
+        uint64_t read_pos = block_size;
+        size_t read_len = block_size;
+        auto rbuf = seastar::temporary_buffer<char>::aligned(file.memory_dma_alignment(), read_len);
+        std::vector<iovec> iov {{static_cast<void*>(rbuf.get_write()), rbuf.size()}};
+
+        auto res = co_await file.dma_read_bulk<char>(read_pos, read_len);
+        BOOST_CHECK_MESSAGE(res.size() == 0, seastar::format(
+                "Bulk DMA read on pos {}, len {}: returned {} bytes instead of zero", read_pos, read_len, res.size()));
+
+        auto res_len = co_await file.dma_read(read_pos, iov);
+        BOOST_CHECK_MESSAGE(res_len == 0, seastar::format(
+                "IOV DMA read on pos {}, len {}: returned {} bytes instead of zero", read_pos, read_len, res_len));
+
+        res_len = co_await file.dma_read<char>(read_pos, rbuf.get_write(), read_len);
+        BOOST_CHECK_MESSAGE(res_len == 0, seastar::format(
+                "DMA read on pos {}, len {}: returned {} bytes instead of zero", read_pos, read_len, res_len));
+
+        co_await file.close();
+    }
+}
+
+namespace seastar {
+std::ostream& operator<<(std::ostream& os, const temporary_buffer<char>& buf) {
+    return os << "temporary_buffer[size=" << buf.size() << ", data=" << std::string_view(buf.get(), buf.size()) << "]";
+}
+}
+
+static future<> test_random_data_sink(std::vector<size_t> sizes) {
+    auto name = "test_rand_sink";
+    std::vector<temporary_buffer<char>> bufs, srcs;
+
+    auto [dst, k] = make_filename(name);
+    uint64_t total = 0;
+    std::exception_ptr ex = nullptr;
+
+    data_sink sink(make_encrypted_sink(create_memory_sink(bufs), k));
+
+    try {
+        for (size_t s : sizes) {
+            auto buf = generate_random<char>(s);
+            co_await sink.put(buf.clone()); // deep copy. encrypted sink uses "owned" data
+            total += buf.size();
+            srcs.emplace_back(std::move(buf));
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await sink.close();
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+
+    {
+        auto os = co_await make_file_output_stream(co_await open_file_dma(dst, open_flags::wo|open_flags::create));
+        for (auto& buf : bufs) {
+            co_await os.write(buf.get(), buf.size());
+        }
+        co_await os.flush();
+        co_await os.close();
+    }
+
+    file f = make_encrypted_file(co_await open_file_dma(dst, open_flags::ro), k);
+
+    try {
+        auto file_size = co_await f.size();
+
+        BOOST_REQUIRE_EQUAL(file_size, total);
+
+        auto in = make_file_input_stream(std::move(f));
+
+        for (auto& src : srcs) {
+            auto tmp = co_await in.read_exactly(src.size());
+            BOOST_REQUIRE_EQUAL(tmp, src);
+        }
+        co_await in.close();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    if (f) {
+        co_await f.close();
+    }
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
+SEASTAR_TEST_CASE(test_encrypted_sink_data_small) {
+    return test_random_data_sink({ 13 });
+}
+
+SEASTAR_TEST_CASE(test_encrypted_sink_data_smallish) {
+    return test_random_data_sink({ 4*1024, 4*1024, 1467 });
+}
+
+SEASTAR_TEST_CASE(test_encrypted_sink_data_medium) {
+    return test_random_data_sink({ 4*1024, 4*1024, 2*1024, 1457, 234, 999 });
+}
+
+SEASTAR_TEST_CASE(test_encrypted_sink_data_large) {
+    return test_random_data_sink({ 4096, 4096, 4096, 4096, 8192, 1232, 32, 4096, 134 });
+}
+
+static future<> test_random_data_source(std::vector<size_t> sizes) {
+    testlog.info("test_random_data_source with sizes: {} ({})", sizes, std::accumulate(sizes.begin(), sizes.end(), size_t(0), std::plus{}));
+
+    auto name = "test_rand_source";
+    std::vector<temporary_buffer<char>> bufs, srcs;
+
+    auto [dst, k] = make_filename(name);
+    using namespace std::chrono_literals;
+    std::exception_ptr ex = nullptr;
+
+    data_sink sink(make_encrypted_sink(create_memory_sink(bufs), k));
+
+    try {
+        for (size_t s : sizes) {
+            auto buf = generate_random<char>(s);
+            co_await sink.put(buf.clone()); // deep copy. encrypted sink uses "owned" data
+            srcs.emplace_back(std::move(buf));
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await sink.close();
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+
+    {
+        auto os = co_await make_file_output_stream(co_await open_file_dma(dst, open_flags::truncate|open_flags::wo | open_flags::create));
+        for (auto& buf : bufs) {
+            co_await os.write(buf.get(), buf.size());
+        }
+        co_await os.flush();
+        co_await os.close();
+    }
+
+    auto f = co_await open_file_dma(dst, open_flags::ro);
+    testlog.info("file source {}", (co_await f.stat()).st_size);
+
+    auto source = make_file_data_source(std::move(f), file_input_stream_options{});
+
+    class random_chunk_source 
+        : public data_source_impl
+    {
+        data_source _source;
+        temporary_buffer<char> _buf;
+    public:
+        random_chunk_source(data_source s)
+            : _source(std::move(s))
+        {}
+        future<temporary_buffer<char>> get() override {
+            if (!_buf.empty()) {
+                co_return std::exchange(_buf, temporary_buffer<char>{});
+            }
+            _buf = co_await _source.get();
+            if (_buf.empty()) {
+                co_return temporary_buffer<char>{};
+            }
+            auto n = tests::random::get_int(size_t(1), _buf.size());
+            auto res = _buf.share(0, n);
+            _buf.trim_front(n);
+            co_return res;
+        }
+        future<temporary_buffer<char>> skip(uint64_t n) override {
+            if (!_buf.empty()) {
+                auto m = std::min(n, _buf.size());
+                _buf.trim_front(m);
+                n -= m;
+            }
+            if (n) {
+                co_await _source.skip(n);
+            }
+            co_return temporary_buffer<char>{};
+        }
+    };
+    try {
+        auto encrypted_source = data_source(make_encrypted_source(data_source(std::make_unique<random_chunk_source>(std::move(source))), k));
+        temporary_buffer<char> unified_buff(std::accumulate(srcs.begin(), srcs.end(), 0, [](size_t acc, const auto& buf) { return acc + buf.size(); }));
+        size_t pos = 0;
+        for (const auto& src : srcs) {
+            memcpy(unified_buff.get_write() + pos, src.get(), src.size());
+            pos += src.size();
+        }
+
+        pos = 0;
+        while (auto read_buff = co_await encrypted_source.get()) {
+            auto rem = unified_buff.size() - pos;
+            BOOST_REQUIRE_LE(read_buff.size(), rem);
+            size_t size_to_compare = std::min(rem, read_buff.size());
+            auto v1 = std::string_view(read_buff.get(), size_to_compare);
+            auto v2 = std::string_view(unified_buff.get() + pos, size_to_compare);
+            BOOST_REQUIRE_EQUAL(v1, v2);
+            pos += size_to_compare;
+            auto skip = unified_buff.size() - pos > 4113 ? 4097 : (unified_buff.size() - pos)/2;
+            co_await encrypted_source.skip(skip);
+            pos += skip;
+        }
+        co_await encrypted_source.close();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+}
+
+SEASTAR_TEST_CASE(test_encrypted_data_source_simple) {
+    std::vector<size_t> sizes({3200, 13086, 12065, 200, 11959, 12159, 12852});
+    co_await test_random_data_source(sizes);
+}
+
+// Reproduces the production deadlock where encrypted SSTable component downloads
+// got stuck during restore. The encrypted_data_source::get() caches a block in
+// _next, then on the next call bypasses input_stream::read()'s _eof check and
+// calls input_stream::read_exactly() — which does NOT check _eof when _buf is
+// empty. This causes a second get() on the underlying source after EOS.
+//
+// In production the underlying source was chunked_download_source whose get()
+// hung forever. Here we simulate it with a strict source that fails the test.
+//
+// The fix belongs in seastar's input_stream::read_exactly(): check _eof before
+// calling _fd.get(), consistent with read(), read_up_to(), and consume().
+static future<> test_encrypted_source_copy(size_t plaintext_size) {
+    testlog.info("test_encrypted_source_copy: plaintext_size={}", plaintext_size);
+
+    key_info info{"AES/CBC", 256};
+    auto k = ::make_shared<symmetric_key>(info);
+
+    // Step 1: Encrypt the plaintext into memory buffers
+    auto plaintext = generate_random<char>(plaintext_size);
+    std::vector<temporary_buffer<char>> encrypted_bufs;
+    {
+        data_sink sink(make_encrypted_sink(create_memory_sink(encrypted_bufs), k));
+        co_await sink.put(plaintext.clone());
+        co_await sink.close();
+    }
+
+    // Flatten encrypted buffers into a single contiguous buffer
+    size_t encrypted_total = 0;
+    for (const auto& b : encrypted_bufs) {
+        encrypted_total += b.size();
+    }
+    temporary_buffer<char> encrypted(encrypted_total);
+    size_t pos = 0;
+    for (const auto& b : encrypted_bufs) {
+        std::copy(b.begin(), b.end(), encrypted.get_write() + pos);
+        pos += b.size();
+    }
+
+    // Step 2: Create a data source from the encrypted data that fails on
+    // post-EOS get() — simulating a source like chunked_download_source
+    // that would hang forever in this situation.
+    class strict_memory_source final : public limiting_data_source_impl {
+        bool _eof = false;
+    public:
+        strict_memory_source(temporary_buffer<char> data, size_t chunk_size)
+            : limiting_data_source_impl(
+                data_source(std::make_unique<util::temporary_buffer_data_source>(std::move(data))),
+                chunk_size) {}
+
+        future<temporary_buffer<char>> get() override {
+            BOOST_REQUIRE_MESSAGE(!_eof,
+                "get() called on source after it already returned EOS — "
+                "this is the production deadlock: read_exactly() does not "
+                "check _eof before calling _fd.get()");
+            auto buf = co_await limiting_data_source_impl::get();
+            _eof = buf.empty();
+            co_return buf;
+        }
+    };
+
+    // Step 3: Wrap in encrypted_data_source and drain via consume() —
+    // the exact code path used by seastar::copy() which is what
+    // sstables_loader_helpers::download_sstable() calls.
+    // Try multiple chunk sizes to hit different alignment scenarios.
+    for (size_t chunk_size : {1ul, 7ul, 4096ul, 8192ul, encrypted_total, encrypted_total + 1}) {
+        if (chunk_size == 0) continue;
+        auto src = data_source(make_encrypted_source(
+            data_source(std::make_unique<strict_memory_source>(encrypted.clone(), chunk_size)), k));
+        auto in = input_stream<char>(std::move(src));
+
+        // consume() is what seastar::copy() uses internally. It calls
+        // encrypted_data_source::get() via _fd.get() until EOF.
+        size_t total_decrypted = 0;
+        co_await in.consume([&total_decrypted](temporary_buffer<char> buf) {
+            total_decrypted += buf.size();
+            return make_ready_future<consumption_result<char>>(continue_consuming{});
+        });
+        co_await in.close();
+
+        BOOST_REQUIRE_EQUAL(total_decrypted, plaintext_size);
+    }
+}
+
+SEASTAR_TEST_CASE(test_encrypted_source_copy_8k) {
+    co_await test_encrypted_source_copy(8192);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_source_copy_4k) {
+    co_await test_encrypted_source_copy(4096);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_source_copy_small) {
+    co_await test_encrypted_source_copy(100);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_source_copy_12k) {
+    co_await test_encrypted_source_copy(12288);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_source_copy_unaligned) {
+    co_await test_encrypted_source_copy(8193);
+}
+
+SEASTAR_TEST_CASE(test_encrypted_source_copy_1byte) {
+    co_await test_encrypted_source_copy(1);
+}
+
+
+SEASTAR_TEST_CASE(test_encrypted_data_source_fuzzy) {
+    std::mt19937_64 rand_gen(std::random_device{}());
+    for (auto i = 0; i < 1000; ++i) {
+        std::uniform_int_distribution<uint16_t> rand_dist(1, 15);
+        std::vector<size_t> sizes(rand_dist(rand_gen));
+        for (auto& s : sizes) {
+            std::uniform_int_distribution<uint16_t> buff_sizes(1, 147*100);
+            s = buff_sizes(rand_gen);
+        }
+        co_await test_random_data_source(sizes);
+    }
+
+    co_return;
+}

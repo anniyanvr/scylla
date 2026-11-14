@@ -2,13 +2,15 @@
  * Copyright (C) 2018-present ScyllaDB
  */
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 #include "compaction_backlog_manager.hh"
+#include "size_tiered_compaction_strategy.hh"
 #include <cmath>
-#include <ctgmath>
+
+namespace compaction {
 
 // Backlog for one SSTable under STCS:
 //
@@ -63,32 +65,44 @@
 // certain point in time, whose size is the amount of bytes currently written. So all we need
 // to do is keep track of them too, and add the current estimate to the static part of (4).
 class size_tiered_backlog_tracker final : public compaction_backlog_tracker::impl {
+    struct sstables_backlog_contribution {
+        double value = 0.0f;
+        std::unordered_set<sstables::shared_sstable> sstables;
+    };
+
+    size_tiered_compaction_strategy_options _stcs_options;
     int64_t _total_bytes = 0;
-    double _sstables_backlog_contribution = 0.0f;
+    mutable sstables_backlog_contribution _contrib;
+    // Set by replace_sstables(), cleared by backlog() once _contrib is recomputed.
+    mutable bool _backlog_dirty = false;
+    std::unordered_set<sstables::shared_sstable> _all;
 
     struct inflight_component {
-        int64_t total_bytes = 0;
+        uint64_t total_bytes = 0;
         double contribution = 0;
     };
 
-    inflight_component partial_backlog(const compaction_backlog_tracker::ongoing_writes& ongoing_writes) const;
-
     inflight_component compacted_backlog(const compaction_backlog_tracker::ongoing_compactions& ongoing_compactions) const;
 
-    double log4(double x) const {
+    static double log4(double x) {
         double inv_log_4 = 1.0f / std::log(4);
         return log(x) * inv_log_4;
     }
-public:
-    virtual double backlog(const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override;
 
-    virtual void add_sstable(sstables::shared_sstable sst) override;
+    static sstables_backlog_contribution calculate_sstables_backlog_contribution(const std::vector<sstables::shared_sstable>& all, const size_tiered_compaction_strategy_options& stcs_options);
+public:
+    size_tiered_backlog_tracker(size_tiered_compaction_strategy_options stcs_options) : _stcs_options(stcs_options) {}
+
+    virtual double backlog(const compaction_backlog_source& src, const compaction_backlog_tracker::ongoing_writes& ow, const compaction_backlog_tracker::ongoing_compactions& oc) const override;
 
     // Removing could be the result of a failure of an in progress write, successful finish of a
     // compaction, or some one-off operation, like drop
-    virtual void remove_sstable(sstables::shared_sstable sst) override;
+    // Provides strong exception safety guarantees.
+    virtual void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts) override;
 
     int64_t total_bytes() const {
         return _total_bytes;
     }
 };
+
+}

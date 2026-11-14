@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2021 ScyllaDB
+# Copyright (C) 2021-present ScyllaDB
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
 #
@@ -14,52 +14,37 @@
 # maximally-complete unified index.
 #
 
-# Usage: merge-compdb.py build/{debug,release,dev,sanitize} [input...]
+# Usage: merge-compdb.py [input...]
 #
-# Glue inputs, which must be compdb ("compile_command.json") files,
-# together, filtering out anything that is not indexable or not built
-# under the given prefix, and write the result to stdout.
+# Each input must be a compdb (i.e., a `compile_commands.json`) file.
+# Inputs are specified as file names, optionally with an output prefix,
+# using the format: <path-to-compdb>[:<output-prefix>]
 #
-# An input is either a file name or "-" for stdin.
+# The script combines the inputs by:
+#   - Filtering out entries that are not source files (e.g., non-C/C++ files)
+#   - Excluding entries not built under the specified output prefix (if provided)
+#   - Writing the filtered and merged result to stdout
 #
-# configure.py calls this with "-" for the ninja-generated scylla
-# compdb and mode-specific seastar & abseil compdbs.
-#
+# `configure.py` calls this script with:
+#   - The ninja-generated Scylla compdb, with an output prefix for the current build mode
+#   - Mode-specific Seastar and Abseil compdbs, without output prefixes
 
 import json
-import logging
-import re
 import sys
+import os.path
 
-prefix = sys.argv[1]
-inputs = sys.argv[2:]
+inputs = sys.argv[1:]
+indexable_exts = {'.c', '.C', '.cc', '.cxx'}
 
-def read_input(fname):
-    try:
-        if fname == '-':
-            f = sys.stdin
-        else:
-            f = open(fname)
-
+def read_json(fname: str):
+    with open(fname) as f:
         return json.load(f)
-    except Exception as e:
-        logging.error('failed to parse %s: %s', fname, e)
-        return [];
-    finally:
-        if fname != '-':
-            f.close()
 
-def is_indexable(e):
-    return any(e['file'].endswith('.' + suffix) for suffix in ['c', 'C', 'cc', 'cxx'])
 
-# We can only definitely say whether an entry is built under the right
-# prefix when it has an "output" field, so those without are assumed
-# to be OK.  This works for our usage, where only the "-" input (which
-# results from "ninja -t compdb") has 'output' entries _and_ needs to
-# be filtered in the first place.
-def is_relevant(e):
-    return ('output' not in e) or (e['output'].startswith(prefix))
-
-json.dump([e for fname in inputs
-           for e in read_input(fname) if is_indexable(e) and is_relevant(e)],
-          sys.stdout, indent=True)
+output_entries = [e
+           for f, _, prefix in (i.partition(':') for i in inputs)
+           for e in read_json(f)
+           if os.path.splitext(e['file'])[1] in indexable_exts
+           and (not prefix or e['output'].startswith(prefix))
+           ]
+json.dump(output_entries, sys.stdout, indent=True)

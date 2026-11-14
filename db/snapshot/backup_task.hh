@@ -1,0 +1,129 @@
+/*
+ * Copyright (C) 2024-present ScyllaDB
+ *
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#pragma once
+
+#include <filesystem>
+#include <exception>
+#include <vector>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <seastar/core/gate.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/shard_id.hh>
+#include <seastar/core/sharded.hh>
+
+#include "utils/upload_progress.hh"
+#include "utils/small_vector.hh"
+#include "tasks/task_manager.hh"
+#include "sstables/component_type.hh"
+#include "sstables/generation_type.hh"
+#include "sstables/sstables_manager_subscription.hh"
+
+namespace replica {
+    class database;
+}
+
+namespace sstables {
+class sstables_manager;
+class storage_manager;
+class object_storage_client;
+}
+
+namespace db {
+class snapshot_ctl;
+
+namespace snapshot {
+
+inline constexpr auto backup_task_type = "backup";
+
+class backup_state {
+    snapshot_ctl& _snap_ctl;
+    sharded<sstables::storage_manager>& _sstm;
+    sstring _endpoint;
+    sstring _bucket;
+    sstring _prefix;
+    sstring _keyspace;
+    std::filesystem::path _snapshot_dir;
+    bool _remove_on_uploaded;
+    tasks::task_manager::task::progress _total_progress;
+
+    std::exception_ptr _ex;
+    std::vector<sstring> _files;
+    using comps_vector = utils::small_vector<std::string, sstables::num_component_types>;
+    using comps_map = std::unordered_map<sstables::generation_type, comps_vector>;
+    comps_map _sstable_comps;   // Keeps all sstable components to back up, extract entries once queued for upload
+    std::unordered_set<sstables::generation_type> _sstables_in_snapshot; // Keeps all sstable generations in snapshot
+    std::vector<sstables::generation_type> _deleted_sstables;
+    shard_id _backup_shard;
+
+    class worker : sstables::sstables_manager_event_handler {
+        sstables::sstables_manager& _manager;
+        backup_state& _state;
+        shared_ptr<sstables::object_storage_client> _client;
+        abort_source _as;
+        std::exception_ptr _ex;
+
+    public:
+        worker(const replica::database& db, backup_state& state);
+        ~worker();
+
+        // Called by sharded<worker>::stop() before the worker is destroyed.
+        // Unsubscribes from the sstables_manager and waits for in-flight
+        // sstable deletion notifications, which hop to the backup shard using
+        // smp::submit_to and would otherwise outlive the worker.
+        future<> stop() noexcept {
+            return sstables::sstables_manager_event_handler::stop();
+        }
+
+        future<> start_uploading();
+
+        void abort();
+
+        sstables::sstables_manager& manager() const noexcept {
+            return _manager;
+        }
+
+    private:
+        virtual future<> deleted_sstable(sstables::generation_type gen) const override;
+        struct upload_permit {
+            gate::holder gh;
+            semaphore_units<> units;
+        };
+        future<> backup_file(sstring name, upload_permit permit);
+        future<> upload_component(sstring name);
+    };
+    sharded<worker> _sharded_worker;
+    std::vector<utils::upload_progress> _progress_per_shard{this_smp_shard_count()};
+
+    future<> do_backup(abort_source& as);
+    future<> process_snapshot_dir();
+    // Returns a disengaged optional when done
+    std::optional<std::string> dequeue();
+    void dequeue_sstable();
+    void on_sstable_deletion(sstables::generation_type gen);
+
+public:
+    backup_state(snapshot_ctl& ctl,
+                 sharded<sstables::storage_manager>& sstm,
+                 sstring endpoint,
+                 sstring bucket,
+                 sstring prefix,
+                 sstring ks,
+                 std::filesystem::path snapshot_dir,
+                 bool move_files);
+
+    // Must be called on the shard the state was created on.
+    future<> run(abort_source& as);
+    future<tasks::task_manager::task::progress> get_progress() const;
+};
+
+} // snapshot namespace
+} // db namespace

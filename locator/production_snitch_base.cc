@@ -1,21 +1,15 @@
 /*
- *
- */
-
-/*
  * Modified by ScyllaDB
  * Copyright (C) 2018-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #include "locator/production_snitch_base.hh"
-#include "reconnectable_snitch_helper.hh"
 #include "db/system_keyspace.hh"
 #include "gms/gossiper.hh"
 #include "message/messaging_service.hh"
-#include "utils/fb_utilities.hh"
 #include "db/config.hh"
 
 #include <boost/algorithm/string/trim.hpp>
@@ -25,91 +19,40 @@
 
 namespace locator {
 
-production_snitch_base::production_snitch_base(const sstring& prop_file_name)
-        : allowed_property_keys({ dc_property_key,
+production_snitch_base::production_snitch_base(snitch_config cfg)
+        : snitch_base(cfg)
+        , allowed_property_keys({ dc_property_key,
                           rack_property_key,
                           prefer_local_property_key,
                           dc_suffix_property_key }) {
-    if (!prop_file_name.empty()) {
-        _prop_file_name = prop_file_name;
+    if (!cfg.properties_file_name.empty()) {
+        _prop_file_name = cfg.properties_file_name;
     } else {
         _prop_file_name = db::config::get_conf_sub(snitch_properties_filename).string();
     }
 }
 
 
-sstring production_snitch_base::get_rack(inet_address endpoint) {
-    if (endpoint == utils::fb_utilities::get_broadcast_address()) {
-        return _my_rack;
-    }
-
-    return get_endpoint_info(endpoint,
-                             gms::application_state::RACK,
-                             default_rack);
+sstring production_snitch_base::get_rack() const {
+    return _my_rack;
 }
 
-sstring production_snitch_base::get_datacenter(inet_address endpoint) {
-    if (endpoint == utils::fb_utilities::get_broadcast_address()) {
-        return _my_dc;
-    }
-
-    return get_endpoint_info(endpoint,
-                             gms::application_state::DC,
-                             default_dc);
+sstring production_snitch_base::get_datacenter() const {
+    return _my_dc;
 }
 
-void production_snitch_base::set_my_distributed(distributed<snitch_ptr>* d) {
-    _my_distributed = d;
+void production_snitch_base::set_backreference(snitch_ptr& d) {
+    _backreference = &d;
 }
 
-void production_snitch_base::reset_io_state() {
-    //
-    // Reset the promise to allow repeating
-    // start()+stop()/pause_io()+resume_io() call sequences.
-    //
-    _io_is_stopped = promise<>();
-}
-
-sstring production_snitch_base::get_endpoint_info(inet_address endpoint, gms::application_state key,
-                                                  const sstring& default_val) {
-    auto val = snitch_base::get_endpoint_info(endpoint, key);
-    if (val) {
-        return *val;
-    }
-    // ...if not found - look in the SystemTable...
-    if (!_saved_endpoints) {
-        _saved_endpoints = db::system_keyspace::load_dc_rack_info();
-    }
-
-    auto it = _saved_endpoints->find(endpoint);
-
-    if (it != _saved_endpoints->end()) {
-        if (key == gms::application_state::RACK) {
-            return it->second.rack;
-        } else { // gms::application_state::DC
-            return it->second.dc;
-        }
-    }
-
-    auto resolved = gms::get_local_gossiper().get_local_messaging().get_public_endpoint_for(endpoint);
-    if (resolved != endpoint) {
-        return get_endpoint_info(resolved, key, default_val);
-    }
-
-    // ...if still not found - return a default value
-    return default_val;
-}
-
-void production_snitch_base::set_my_dc(const sstring& new_dc) {
+void production_snitch_base::set_my_dc_and_rack(const sstring& new_dc, const sstring& new_rack) {
     if (!new_dc.empty()) {
         _my_dc = new_dc;
     } else {
         _my_dc = default_dc;
         logger().warn("{} snitch attempted to set DC to an empty string, falling back to {}.", get_name(), default_dc);
     }
-}
 
-void production_snitch_base::set_my_rack(const sstring& new_rack) {
     if (!new_rack.empty()) {
         _my_rack = new_rack;
     } else {
@@ -123,28 +66,17 @@ void production_snitch_base::set_prefer_local(bool prefer_local) {
 }
 
 future<> production_snitch_base::load_property_file() {
-    return open_file_dma(_prop_file_name, open_flags::ro)
-    .then([this] (file f) {
-        return do_with(std::move(f), [this] (file& f) {
-            return f.size().then([this, &f] (size_t s) {
-                _prop_file_size = s;
-
-                return f.dma_read_exactly<char>(0, s);
-            });
-        }).then([this] (temporary_buffer<char> tb) {
-            _prop_file_contents = std::string(tb.get(), _prop_file_size);
-            parse_property_file();
-
-            return make_ready_future<>();
-        });
-    });
+    auto f = co_await open_file_dma(_prop_file_name, open_flags::ro);
+    auto s = co_await f.size();
+    auto tb = co_await f.dma_read_exactly<char>(0, s);
+    parse_property_file(std::string(tb.get(), s));
 }
 
-void production_snitch_base::parse_property_file() {
+void production_snitch_base::parse_property_file(std::string contents) {
     using namespace boost::algorithm;
 
     std::string line;
-    std::istringstream istrm(_prop_file_contents);
+    std::istringstream istrm(contents);
     std::vector<std::string> split_line;
     _prop_values.clear();
 
@@ -180,96 +112,20 @@ void production_snitch_base::parse_property_file() {
 
 [[noreturn]]
 void production_snitch_base::throw_double_declaration(const sstring& key) const {
-    logger().error("double \"{}\" declaration in {}", key, _prop_file_name);
+    logger().warn("double \"{}\" declaration in {}", key, _prop_file_name);
     throw bad_property_file_error();
 }
 
 [[noreturn]]
 void production_snitch_base::throw_bad_format(const sstring& line) const {
-    logger().error("Bad format in properties file {}: {}", _prop_file_name, line);
+    logger().warn("Bad format in properties file {}: {}", _prop_file_name, line);
     throw bad_property_file_error();
 }
 
 [[noreturn]]
 void production_snitch_base::throw_incomplete_file() const {
-    logger().error("Property file {} is incomplete. Some obligatory fields are missing.", _prop_file_name);
+    logger().warn("Property file {} is incomplete. Some obligatory fields are missing.", _prop_file_name);
     throw bad_property_file_error();
-}
-
-logging::logger& reconnectable_snitch_helper::logger() {
-    static logging::logger _logger("reconnectable_snitch_helper");
-    return _logger;
-}
-
-
-future<> reconnectable_snitch_helper::reconnect(gms::inet_address public_address, const gms::versioned_value& local_address_value) {
-    return reconnect(public_address, gms::inet_address(local_address_value.value));
-}
-
-future<> reconnectable_snitch_helper::reconnect(gms::inet_address public_address, gms::inet_address local_address) {
-    netw::messaging_service& ms = gms::get_local_gossiper().get_local_messaging();
-    auto& sn_ptr = locator::i_endpoint_snitch::get_local_snitch_ptr();
-
-    if (sn_ptr->get_datacenter(public_address) == _local_dc &&
-        ms.get_preferred_ip(public_address) != local_address) {
-        //
-        // First, store the local address in the system_table...
-        //
-        co_await db::system_keyspace::update_preferred_ip(public_address, local_address);
-
-        //
-        // ...then update messaging_service cache and reset the currently
-        // open connections to this endpoint on all shards...
-        //
-        co_await ms.container().invoke_on_all([public_address, local_address] (auto& local_ms) {
-            local_ms.cache_preferred_ip(public_address, local_address);
-            local_ms.remove_rpc_client(netw::msg_addr(public_address));
-        });
-
-        logger().debug("Initiated reconnect to an Internal IP {} for the {}", local_address, public_address);
-    }
-}
-
-reconnectable_snitch_helper::reconnectable_snitch_helper(sstring local_dc)
-        : _local_dc(local_dc) {}
-
-future<> reconnectable_snitch_helper::before_change(gms::inet_address endpoint, gms::endpoint_state cs, gms::application_state new_state_key, const gms::versioned_value& new_value) {
-    // do nothing.
-    return make_ready_future();
-}
-
-future<> reconnectable_snitch_helper::on_join(gms::inet_address endpoint, gms::endpoint_state ep_state) {
-    auto* internal_ip_state = ep_state.get_application_state_ptr(gms::application_state::INTERNAL_IP);
-    if (internal_ip_state) {
-        return reconnect(endpoint, *internal_ip_state);
-    }
-    return make_ready_future();
-}
-
-future<> reconnectable_snitch_helper::on_change(gms::inet_address endpoint, gms::application_state state, const gms::versioned_value& value) {
-    if (state == gms::application_state::INTERNAL_IP) {
-        return reconnect(endpoint, value);
-    }
-    return make_ready_future();
-}
-
-future<> reconnectable_snitch_helper::on_alive(gms::inet_address endpoint, gms::endpoint_state ep_state) {
-    return on_join(std::move(endpoint), std::move(ep_state));
-}
-
-future<> reconnectable_snitch_helper::on_dead(gms::inet_address endpoint, gms::endpoint_state ep_state) {
-    // do nothing.
-    return make_ready_future();
-}
-
-future<> reconnectable_snitch_helper::on_remove(gms::inet_address endpoint) {
-    // do nothing.
-    return make_ready_future();
-}
-
-future<> reconnectable_snitch_helper::on_restart(gms::inet_address endpoint, gms::endpoint_state state) {
-    // do nothing.
-    return make_ready_future();
 }
 
 } // namespace locator

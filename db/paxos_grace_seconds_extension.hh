@@ -2,14 +2,18 @@
  * Copyright 2020-present ScyllaDB
  */
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include <cstdint>
+
+#include <seastar/core/on_internal_error.hh>
+
 #include "serializer.hh"
-#include "schema.hh"
-#include "log.hh"
+#include "schema/schema.hh"
+#include "utils/log.hh"
 
 extern logging::logger dblog;
 
@@ -34,6 +38,10 @@ class paxos_grace_seconds_extension : public schema_extension {
 public:
     static constexpr auto NAME = "paxos_grace_seconds";
 
+    // cdc_extension was written before schema_extension was deprecated, so support it
+    // without warnings
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     paxos_grace_seconds_extension() = default;
     
     explicit paxos_grace_seconds_extension(int32_t seconds)
@@ -50,13 +58,18 @@ public:
     explicit paxos_grace_seconds_extension(const sstring& s)
         : _paxos_gc_sec(std::stoi(s))
     {}
+#pragma clang diagnostic pop
 
     bytes serialize() const override {
         return ser::serialize_to_buffer<bytes>(_paxos_gc_sec);
     }
 
+    std::string options_to_string() const override {
+        return std::to_string(_paxos_gc_sec);
+    }
+
     static int32_t deserialize(const bytes_view& buffer) {
-        return ser::deserialize_from_buffer(buffer, boost::type<int32_t>());
+        return ser::deserialize_from_buffer(buffer, std::type_identity<int32_t>());
     }
 
     int32_t get_paxos_grace_seconds() const {

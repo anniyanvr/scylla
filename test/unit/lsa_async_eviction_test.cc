@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
@@ -14,9 +14,7 @@
 
 #include "utils/managed_bytes.hh"
 #include "utils/logalloc.hh"
-#include "utils/managed_ref.hh"
-#include "test/perf/perf.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 void print_stats() {
     std::cout << "free " << memory::stats().free_memory()
@@ -45,7 +43,7 @@ int main(int argc, char** argv) {
             logalloc::region r;
 
             with_allocator(r.allocator(), [&] {
-                auto clear_refs = defer([&refs] { refs.clear(); });
+                auto clear_refs = defer([&refs] noexcept { refs.clear(); });
 
                 r.make_evictable([&] {
                     return with_allocator(r.allocator(), [&] {

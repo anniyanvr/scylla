@@ -51,7 +51,7 @@ namely:
 
 A complete description of expected semantics and guarantees
 is maintained in the comments for these classes and in sample
-implementations. Let's list here key aspects the implementor should
+implementations. Let's list here key aspects the implementer should
 bear in mind:
 - RPC should implement a model of asynchronous, unreliable network,
   in which messages can be lost, reordered, retransmitted more than
@@ -63,11 +63,11 @@ bear in mind:
   part containing Raft log, thousands and hundreds of thousands of entries,
   and a small register-like memory are to contain Raft
   term, vote and the most recent snapshot descriptor.
-- Raft library calls `state_machine::apply_entry()` for entries
+- Raft library calls `state_machine::apply()` for entries
   reliably committed to the replication log on the majority of
-  servers. While `apply_entry()` is called in the order
+  servers. While `apply()` is called in the order
   the entries were serialized in the distributed log, there is
-  no guarantee that `apply_entry()` is called exactly once.
+  no guarantee that `apply()` is called exactly once.
   E.g. when a server restarts from the persistent state,
   it may re-apply some already applied log entries.
 
@@ -88,7 +88,7 @@ In a nutshell:
 - call server::start() to start the server
 - repeat the above for every node in the cluster
 - use `server::add_entry()` to submit new entries
-  `state_machine::apply_entries()` is called after the added
+  `state_machine::apply()` is called after the added
   entry is committed by the cluster.
 
 ### Subsequent usages
@@ -145,6 +145,11 @@ this:
   groups, hence failure detection RPC could run once on network peer level,
   not sepately for each Raft instance. The library expects an accurate
   `failure_detector` instance from a complying implementation.
+- Since Raft leader no longer sends RPC every  0.1 second there can be a
+  situation when a follower may not know who the leader is for a long time
+  (if the leader is idle). Add an extension that allows a follower to actively
+  search for a leader by sending specially crafted append reply RPC to all voters.
+  A leader will reply with an empty append message to such a message.
 
 ### Pre-voting and protection against disruptive leaders
 
@@ -256,7 +261,7 @@ to truncate Raft log length afterwards, or when the snapshot
 transfer from the leader is initiated via `rpc::send_snapshot()`.
 
 In the latter case the leader's state machine is expected
-to contact the follower's state machine and send its snaphsot to
+to contact the follower's state machine and send its snapshot to
 it.
 
 When Raft wants to initialize a state machine with a snapshot

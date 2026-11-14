@@ -1,25 +1,35 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "cql3/statements/cf_prop_defs.hh"
+#include "cql3/statements/property_definitions.hh"
+#include "cql3/statements/request_validations.hh"
+#include "cql3/statements/strong_consistency/statement_helpers.hh"
+#include "compaction/compaction_strategy_impl.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "db/extensions.hh"
+#include "db/tags/extension.hh"
 #include "cdc/log.hh"
 #include "cdc/cdc_extension.hh"
 #include "gms/feature.hh"
 #include "gms/feature_service.hh"
 #include "tombstone_gc_extension.hh"
 #include "tombstone_gc.hh"
+#include "db/per_partition_rate_limit_extension.hh"
+#include "db/per_partition_rate_limit_options.hh"
+#include "db/tablet_options.hh"
+#include "utils/bloom_calculations.hh"
+#include "utils/overloaded_functor.hh"
+#include "db/config.hh"
+#include "db/cluster_config_registry.hh"
+#include "cql3/statements/cluster_config_props.hh"
 
 #include <boost/algorithm/string/predicate.hpp>
 
@@ -27,9 +37,13 @@ namespace cql3 {
 
 namespace statements {
 
+namespace {
+
+constexpr auto table_scope = db::cluster_config_registry::scope::table;
+
+}
+
 const sstring cf_prop_defs::KW_COMMENT = "comment";
-const sstring cf_prop_defs::KW_READREPAIRCHANCE = "read_repair_chance";
-const sstring cf_prop_defs::KW_DCLOCALREADREPAIRCHANCE = "dclocal_read_repair_chance";
 const sstring cf_prop_defs::KW_GCGRACESECONDS = "gc_grace_seconds";
 const sstring cf_prop_defs::KW_PAXOSGRACESECONDS = "paxos_grace_seconds";
 const sstring cf_prop_defs::KW_MINCOMPACTIONTHRESHOLD = "min_threshold";
@@ -41,6 +55,7 @@ const sstring cf_prop_defs::KW_MAX_INDEX_INTERVAL = "max_index_interval";
 const sstring cf_prop_defs::KW_SPECULATIVE_RETRY = "speculative_retry";
 const sstring cf_prop_defs::KW_BF_FP_CHANCE = "bloom_filter_fp_chance";
 const sstring cf_prop_defs::KW_MEMTABLE_FLUSH_PERIOD = "memtable_flush_period_in_ms";
+const sstring cf_prop_defs::KW_SYNCHRONOUS_UPDATES = "synchronous_updates";
 
 const sstring cf_prop_defs::KW_COMPACTION = "compaction";
 const sstring cf_prop_defs::KW_COMPRESSION = "compression";
@@ -52,44 +67,72 @@ const sstring cf_prop_defs::COMPACTION_STRATEGY_CLASS_KEY = "class";
 
 const sstring cf_prop_defs::COMPACTION_ENABLED_KEY = "enabled";
 
+const sstring cf_prop_defs::KW_TABLETS = "tablets";
+
+const sstring cf_prop_defs::KW_STORAGE_ENGINE = "storage_engine";
+const sstring cf_prop_defs::KW_LARGE_DATA_GUARDRAILS_ENABLED = "large_data_guardrails_enabled";
+
 schema::extensions_map cf_prop_defs::make_schema_extensions(const db::extensions& exts) const {
     schema::extensions_map er;
     for (auto& p : exts.schema_extensions()) {
         auto i = _properties.find(p.first);
         if (i != _properties.end()) {
-            std::visit([&](auto& v) {
+            std::visit(overloaded_functor{
+            [&](const sstring& v) {
                 auto ep = p.second(v);
                 if (ep) {
                     er.emplace(p.first, std::move(ep));
                 }
-            }, i->second);
+            },
+            [&](const property_definitions::extended_map_type& xmap) {
+                auto ep = p.second(property_definitions::to_simple_map(std::move(xmap)));
+                if (ep) {
+                    er.emplace(p.first, std::move(ep));
+                }
+            }}, i->second);
         }
     }
     return er;
 }
 
-void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name, const schema::extensions_map& schema_extensions) const {
-    // Skip validation if the comapction strategy class is already set as it means we've alreayd
-    // prepared (and redoing it would set strategyClass back to null, which we don't want)
-    if (_compaction_strategy_class) {
-        return;
+data_dictionary::keyspace cf_prop_defs::find_keyspace(const data_dictionary::database db, std::string_view ks_name) {
+    try {
+        return db.find_keyspace(ks_name);
+    } catch (const data_dictionary::no_such_keyspace& e) {
+        throw request_validations::invalid_request("{}", e.what());
     }
+}
+
+void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name, const schema::extensions_map& schema_extensions) const {
+    const auto& ks = find_keyspace(db, ks_name);
+
+    cluster_config_props::ensure_registry_supported(table_scope, *this, db.features());
 
     static std::set<sstring> keywords({
-        KW_COMMENT, KW_READREPAIRCHANCE, KW_DCLOCALREADREPAIRCHANCE,
+        KW_COMMENT,
         KW_GCGRACESECONDS, KW_CACHING, KW_DEFAULT_TIME_TO_LIVE,
         KW_MIN_INDEX_INTERVAL, KW_MAX_INDEX_INTERVAL, KW_SPECULATIVE_RETRY,
         KW_BF_FP_CHANCE, KW_MEMTABLE_FLUSH_PERIOD, KW_COMPACTION,
-        KW_COMPRESSION, KW_CRC_CHECK_CHANCE, KW_ID, KW_PAXOSGRACESECONDS
+        KW_COMPRESSION, KW_CRC_CHECK_CHANCE,  KW_ID, KW_PAXOSGRACESECONDS,
+        KW_SYNCHRONOUS_UPDATES, KW_TABLETS,
+        KW_STORAGE_ENGINE,
+        KW_LARGE_DATA_GUARDRAILS_ENABLED,
     });
     static std::set<sstring> obsolete_keywords({
         sstring("index_interval"),
         sstring("replicate_on_write"),
         sstring("populate_io_cache_on_flush"),
+        sstring("read_repair_chance"),
+        sstring("dclocal_read_repair_chance"),
     });
 
     const auto& exts = db.extensions();
-    property_definitions::validate(keywords, exts.schema_extension_keywords(), obsolete_keywords);
+    auto allowed_keywords = keywords;
+    auto config_keywords = cluster_config_props::supported_config_keywords(table_scope, db.features());
+    allowed_keywords.insert(config_keywords.begin(), config_keywords.end());
+    property_definitions::validate(allowed_keywords, exts.schema_extension_keywords(), obsolete_keywords);
+
+    cluster_config_props::validate_config_values(table_scope, *this, db.features());
 
     try {
         get_id();
@@ -98,17 +141,17 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
     }
 
     auto compaction_type_options = get_compaction_type_options();
-    if (!compaction_type_options.empty()) {
+    if (!_compaction_strategy_class && !compaction_type_options.empty()) {
         auto strategy = compaction_type_options.find(COMPACTION_STRATEGY_CLASS_KEY);
         if (strategy == compaction_type_options.end()) {
             throw exceptions::configuration_exception(sstring("Missing sub-option '") + COMPACTION_STRATEGY_CLASS_KEY + "' for the '" + KW_COMPACTION + "' option.");
         }
-        _compaction_strategy_class = sstables::compaction_strategy::type(strategy->second);
+        auto compaction_strategy_class = compaction::compaction_strategy::type(strategy->second);
+        // Validate before recording the class: the recorded class is the marker
+        // that skips this block when a prepared statement is executed again.
+        compaction::compaction_strategy_impl::validate_options_for_strategy_type(compaction_type_options, compaction_strategy_class);
+        _compaction_strategy_class = compaction_strategy_class;
         remove_from_map_if_exists(KW_COMPACTION, COMPACTION_STRATEGY_CLASS_KEY);
-
-#if 0
-       CFMetaData.validateCompactionOptions(compactionStrategyClass, compactionOptions);
-#endif
     }
 
     auto compression_options = get_compression_options();
@@ -118,20 +161,19 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
             throw exceptions::configuration_exception(sstring("Missing sub-option '") + compression_parameters::SSTABLE_COMPRESSION + "' for the '" + KW_COMPRESSION + "' option.");
         }
         compression_parameters cp(*compression_options);
-        cp.validate();
+        cp.validate(compression_parameters::dicts_feature_enabled(bool(db.features().sstable_compression_dicts)));
     }
 
-    if (auto caching_options = get_caching_options(); caching_options && !caching_options->enabled() && !db.features().cluster_supports_per_table_caching()) {
-        throw exceptions::configuration_exception(KW_CACHING + " can't contain \"'enabled':false\" unless whole cluster supports it");
+    auto per_partition_rate_limit_options = get_per_partition_rate_limit_options(schema_extensions);
+    if (per_partition_rate_limit_options && !db.features().typed_errors_in_read_rpc) {
+        throw exceptions::configuration_exception("Per-partition rate limit is not supported yet by the whole cluster");
     }
-
-    auto cdc_options = get_cdc_options(schema_extensions);
-    if (cdc_options && cdc_options->enabled() && !db.features().cluster_supports_cdc()) {
-        throw exceptions::configuration_exception("CDC not supported by the cluster");
+    if (per_partition_rate_limit_options && strong_consistency::is_strongly_consistent(db, ks_name)) {
+        throw exceptions::configuration_exception("Per-partition rate limit is not supported in strongly consistent keyspaces");
     }
 
     auto tombstone_gc_options = get_tombstone_gc_options(schema_extensions);
-    validate_tombstone_gc_options(tombstone_gc_options, db.real_database(), ks_name);
+    validate_tombstone_gc_options(tombstone_gc_options, db, ks_name);
 
     validate_minimum_int(KW_DEFAULT_TIME_TO_LIVE, 0, DEFAULT_DEFAULT_TIME_TO_LIVE);
     validate_minimum_int(KW_PAXOSGRACESECONDS, 0, DEFAULT_GC_GRACE_SECONDS);
@@ -145,7 +187,51 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
         throw exceptions::configuration_exception(KW_MAX_INDEX_INTERVAL + " must be greater than " + KW_MIN_INDEX_INTERVAL);
     }
 
+    if (get_simple(KW_BF_FP_CHANCE)) {
+        double bloom_filter_fp_chance = get_double(KW_BF_FP_CHANCE, 0/*not used*/);
+        double min_bloom_filter_fp_chance = utils::bloom_calculations::min_supported_bloom_filter_fp_chance();
+        if (bloom_filter_fp_chance <= min_bloom_filter_fp_chance || bloom_filter_fp_chance > 1.0) {
+            throw exceptions::configuration_exception(format(
+                "{} must be larger than {} and less than or equal to 1.0 (got {})",
+                KW_BF_FP_CHANCE, min_bloom_filter_fp_chance, bloom_filter_fp_chance));
+        }
+    }
+
+    auto memtable_flush_period = get_int(KW_MEMTABLE_FLUSH_PERIOD, DEFAULT_MEMTABLE_FLUSH_PERIOD);
+    if (memtable_flush_period != 0 && memtable_flush_period < DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE) {
+        throw exceptions::configuration_exception(format(
+            "{} must be 0 or greater than {}",
+            KW_MEMTABLE_FLUSH_PERIOD, DEFAULT_MEMTABLE_FLUSH_PERIOD_MIN_VALUE));
+    }
+
     speculative_retry::from_sstring(get_string(KW_SPECULATIVE_RETRY, speculative_retry(speculative_retry::type::NONE, 0).to_sstring()));
+
+    if (auto tablet_options_map = get_tablet_options()) {
+        if (!ks.uses_tablets()) {
+            throw exceptions::configuration_exception("tablet options cannot be used when tablets are disabled for the keyspace");
+        }
+        if (!db.features().tablet_options) {
+            throw exceptions::configuration_exception("tablet options cannot be used until all nodes in the cluster enable this feature");
+        }
+        db::tablet_options::validate(*tablet_options_map, db.features());
+    }
+
+    if (has_property(KW_STORAGE_ENGINE)) {
+        auto storage_engine = get_string(KW_STORAGE_ENGINE, "");
+        if (storage_engine == "logstor") {
+            if (!db.features().logstor) {
+                throw exceptions::configuration_exception(format("The experimental feature 'logstor' must be enabled in order to use the 'logstor' storage engine."));
+            }
+        } else {
+            throw exceptions::configuration_exception(format("Illegal value for '{}'", KW_STORAGE_ENGINE));
+        }
+    }
+
+    if (has_property(KW_LARGE_DATA_GUARDRAILS_ENABLED) && get_boolean(KW_LARGE_DATA_GUARDRAILS_ENABLED, false)) {
+        if (!db.features().large_data_guardrails) {
+            throw exceptions::configuration_exception("large_data_guardrails_enabled cannot be used until all nodes in the cluster enable this feature");
+        }
+    }
 }
 
 std::map<sstring, sstring> cf_prop_defs::get_compaction_type_options() const {
@@ -174,14 +260,18 @@ int32_t cf_prop_defs::get_gc_grace_seconds() const
     return get_int(KW_GCGRACESECONDS, DEFAULT_GC_GRACE_SECONDS);
 }
 
+bool cf_prop_defs::get_synchronous_updates_flag() const {
+    return get_boolean(KW_SYNCHRONOUS_UPDATES, false);
+}
+
 int32_t cf_prop_defs::get_paxos_grace_seconds() const {
     return get_int(KW_PAXOSGRACESECONDS, DEFAULT_GC_GRACE_SECONDS);
 }
 
-std::optional<utils::UUID> cf_prop_defs::get_id() const {
+std::optional<table_id> cf_prop_defs::get_id() const {
     auto id = get_simple(KW_ID);
     if (id) {
-        return utils::UUID(*id);
+        return std::make_optional<table_id>(utils::UUID(*id));
     }
 
     return std::nullopt;
@@ -193,8 +283,8 @@ std::optional<caching_options> cf_prop_defs::get_caching_options() const {
         return {};
     }
     return std::visit(make_visitor(
-        [] (const property_definitions::map_type& map) {
-            return map.empty() ? std::nullopt : std::optional<caching_options>(caching_options::from_map(map));
+        [] (const property_definitions::extended_map_type& map) {
+            return map.empty() ? std::nullopt : std::optional<caching_options>(caching_options::from_map(to_simple_map(map)));
         },
         [] (const sstring& str) {
             return std::optional<caching_options>(caching_options::from_sstring(str));
@@ -203,36 +293,50 @@ std::optional<caching_options> cf_prop_defs::get_caching_options() const {
 }
 
 const cdc::options* cf_prop_defs::get_cdc_options(const schema::extensions_map& schema_exts) const {
-    auto it = schema_exts.find(cdc::cdc_extension::NAME);
-    if (it == schema_exts.end()) {
-        return nullptr;
-    }
-
-    auto cdc_ext = dynamic_pointer_cast<cdc::cdc_extension>(it->second);
-    return &cdc_ext->get_options();
+    auto ext = get_schema_extension<cdc::cdc_extension>(schema_exts, cdc::cdc_extension::NAME);
+    return ext ? &ext->get_options() : nullptr;
 }
 
 const tombstone_gc_options* cf_prop_defs::get_tombstone_gc_options(const schema::extensions_map& schema_exts) const {
-    auto it = schema_exts.find(tombstone_gc_extension::NAME);
-    if (it == schema_exts.end()) {
-        return nullptr;
-    }
-
-    auto ext = dynamic_pointer_cast<tombstone_gc_extension>(it->second);
-    return &ext->get_options();
+    auto ext = get_schema_extension<tombstone_gc_extension>(schema_exts, tombstone_gc_extension::NAME);
+    return ext ? &ext->get_options() : nullptr;
 }
 
-void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions) const {
+const db::per_partition_rate_limit_options* cf_prop_defs::get_per_partition_rate_limit_options(const schema::extensions_map& schema_exts) const {
+    auto ext = get_schema_extension<db::per_partition_rate_limit_extension>(schema_exts, db::per_partition_rate_limit_extension::NAME);
+    return ext ? &ext->get_options() : nullptr;
+}
+
+std::optional<db::tablet_options::map_type> cf_prop_defs::get_tablet_options() const {
+    if (auto tablet_options = get_map(KW_TABLETS)) {
+        return tablet_options.value();
+    }
+    return std::nullopt;
+}
+
+bool cf_prop_defs::has_table_config_properties(const gms::feature_service& feat) const {
+    return std::ranges::any_of(_properties, [&feat] (const auto& entry) {
+        return cluster_config_props::is_config_property(table_scope, entry.first, feat);
+    });
+}
+
+bool cf_prop_defs::has_non_table_config_properties(const gms::feature_service& feat) const {
+    return std::ranges::any_of(_properties, [&feat] (const auto& entry) {
+        return !cluster_config_props::is_config_property(table_scope, entry.first, feat);
+    });
+}
+
+std::map<sstring, std::optional<sstring>> cf_prop_defs::get_config_updates(const gms::feature_service& feat) const {
+    std::map<sstring, std::optional<sstring>> updates;
+    for (auto& [name, value] : cluster_config_props::config_updates(table_scope, *this, feat)) {
+        updates.emplace(std::move(name), std::move(value));
+    }
+    return updates;
+}
+
+void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_map schema_extensions, const data_dictionary::database& db, sstring ks_name, bool supports_repair) const {
     if (has_property(KW_COMMENT)) {
         builder.set_comment(get_string(KW_COMMENT, ""));
-    }
-
-    if (has_property(KW_READREPAIRCHANCE)) {
-        builder.set_read_repair_chance(get_double(KW_READREPAIRCHANCE, builder.get_read_repair_chance()));
-    }
-
-    if (has_property(KW_DCLOCALREADREPAIRCHANCE)) {
-        builder.set_dc_local_read_repair_chance(get_double(KW_DCLOCALREADREPAIRCHANCE, builder.get_dc_local_read_repair_chance()));
     }
 
     if (has_property(KW_GCGRACESECONDS)) {
@@ -314,8 +418,35 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
             schema_extensions.emplace(key, ext);
         }
     }
-
+    // Set default tombstone_gc mode.
+    if (!schema_extensions.contains(tombstone_gc_extension::NAME)) {
+        auto ext = seastar::make_shared<tombstone_gc_extension>(get_default_tombstone_gc_mode(db, ks_name, supports_repair));
+        schema_extensions.emplace(tombstone_gc_extension::NAME, std::move(ext));
+    }
     builder.set_extensions(std::move(schema_extensions));
+
+    if (has_property(KW_SYNCHRONOUS_UPDATES)) {
+        bool is_synchronous = get_synchronous_updates_flag();
+        std::map<sstring, sstring> tags_map = {
+            {db::SYNCHRONOUS_VIEW_UPDATES_TAG_KEY, is_synchronous ? "true" : "false"}
+        };
+
+        builder.add_extension(db::tags_extension::NAME, ::make_shared<db::tags_extension>(tags_map));
+    }
+
+    if (auto tablet_options_opt = get_map(KW_TABLETS)) {
+        builder.set_tablet_options(std::move(*tablet_options_opt));
+    }
+
+    if (has_property(KW_STORAGE_ENGINE)) {
+        auto storage_engine = get_string(KW_STORAGE_ENGINE, "");
+        if (storage_engine == "logstor") {
+            builder.set_logstor();
+        }
+    }
+    if (has_property(KW_LARGE_DATA_GUARDRAILS_ENABLED)) {
+        builder.set_large_data_guardrails_enabled(get_boolean(KW_LARGE_DATA_GUARDRAILS_ENABLED, false));
+    }
 }
 
 void cf_prop_defs::validate_minimum_int(const sstring& field, int32_t minimum_value, int32_t default_value) const
@@ -327,7 +458,22 @@ void cf_prop_defs::validate_minimum_int(const sstring& field, int32_t minimum_va
     }
 }
 
-std::optional<sstables::compaction_strategy_type> cf_prop_defs::get_compaction_strategy_class() const {
+std::optional<sstring> check_deprecated_compaction_strategy(std::optional<compaction::compaction_strategy_type> strategy, bool allow) {
+    if (strategy != compaction::compaction_strategy_type::size_tiered) {
+        return std::nullopt;
+    }
+    auto deprecated = format("{} is deprecated and is now an alias of {}",
+            compaction::compaction_strategy::name(compaction::compaction_strategy_type::size_tiered),
+            compaction::compaction_strategy::name(compaction::compaction_strategy_type::incremental));
+    if (!allow) {
+        throw exceptions::configuration_exception(format("{}, which should be used instead. To keep accepting the "
+                "deprecated name, set the allow_deprecated_size_tiered_compaction_strategy configuration option.",
+                deprecated));
+    }
+    return format("{}, which it will be compacted with. Please ask for the latter explicitly instead.", deprecated);
+}
+
+std::optional<compaction::compaction_strategy_type> cf_prop_defs::get_compaction_strategy_class() const {
     // Unfortunately, in our implementation, the compaction strategy begins
     // stored in the compaction strategy options, and then the validate()
     // functions moves it into _compaction_strategy_class... If we want a
@@ -339,7 +485,7 @@ std::optional<sstables::compaction_strategy_type> cf_prop_defs::get_compaction_s
     auto compaction_type_options = get_compaction_type_options();
     auto strategy = compaction_type_options.find(COMPACTION_STRATEGY_CLASS_KEY);
     if (strategy != compaction_type_options.end()) {
-        return sstables::compaction_strategy::type(strategy->second);
+        return compaction::compaction_strategy::type(strategy->second);
     }
     return std::nullopt;
 }

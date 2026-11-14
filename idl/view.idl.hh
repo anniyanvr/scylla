@@ -3,14 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+
+#include "idl/uuid.idl.hh"
 
 namespace db {
 namespace view {
 class update_backlog {
-    size_t current;
-    size_t max;
+    size_t get_current_bytes();
+    size_t get_max_bytes();
 };
+
 }
 }
+
+verb [[cancellable]] work_on_view_building_tasks(raft::term_t term, shard_id shard, std::vector<utils::UUID> tasks_ids) -> std::vector<utils::UUID>

@@ -1,36 +1,35 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include <type_traits>
 #include "service/migration_listener.hh"
 #include "gms/endpoint_state.hh"
-#include <seastar/core/distributed.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/timed_out_error.hh>
 #include "gms/inet_address.hh"
 #include "gms/feature.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
-#include "message/msg_addr.hh"
-#include "utils/UUID.hh"
+#include "schema/schema_fwd.hh"
+#include "utils/pluggable.hh"
 #include "utils/serialized_action.hh"
-#include "service/raft/raft_group_registry.hh"
+#include "service/raft/group0_fwd.hh"
+#include "service/raft/raft_timeout.hh"
+#include "inet_address_vectors.hh"
+#include <seastar/core/sharded.hh>
+#include "db/timeout_clock.hh"
 
 #include <vector>
 
 class canonical_mutation;
-class frozen_mutation;
 namespace cql3 {
 namespace functions { class user_function; class user_aggregate; }
 }
@@ -39,45 +38,21 @@ namespace netw { class messaging_service; }
 namespace gms {
 
 class gossiper;
-enum class application_state;
-class versioned_value;
 
+}
+
+namespace db {
+class system_keyspace;
+}
+
+namespace replica {
+class database;
 }
 
 namespace service {
 
 class storage_proxy;
-
-template<typename M>
-concept MergeableMutation = std::is_same<M, canonical_mutation>::value || std::is_same<M, frozen_mutation>::value;
-
-// Obtaining this object means that all previously finished operations on group 0 are visible on this node.
-// It is also required in order to perform group 0 changes (through `announce`).
-// See `group0_guard::impl` for more detailed explanations.
-class group0_guard {
-    friend class migration_manager;
-    struct impl;
-    std::unique_ptr<impl> _impl;
-
-    group0_guard(std::unique_ptr<impl>);
-
-public:
-    ~group0_guard();
-    group0_guard(group0_guard&&) noexcept;
-
-    utils::UUID observed_group0_state_id() const;
-    utils::UUID new_group0_state_id() const;
-
-    // Use this timestamp when creating group 0 mutations.
-    api::timestamp_type write_timestamp() const;
-};
-
-class group0_concurrent_modification : public std::runtime_error {
-public:
-    group0_concurrent_modification()
-        : std::runtime_error("Failed to apply group 0 change due to concurrent modification")
-    {}
-};
+class storage_service;
 
 class migration_manager : public seastar::async_sharded_service<migration_manager>,
                             public gms::i_endpoint_state_change_subscriber,
@@ -85,97 +60,44 @@ class migration_manager : public seastar::async_sharded_service<migration_manage
 private:
     migration_notifier& _notifier;
 
-    std::unordered_map<netw::msg_addr, serialized_action, netw::msg_addr::hash> _schema_pulls;
-    std::vector<gms::feature::listener_registration> _feature_listeners;
-    seastar::gate _background_tasks;
-    static const std::chrono::milliseconds migration_delay;
+    seastar::named_gate _background_tasks;
     gms::feature_service& _feat;
     netw::messaging_service& _messaging;
     service::storage_proxy& _storage_proxy;
+    utils::pluggable<storage_service> _ss;
     gms::gossiper& _gossiper;
     seastar::abort_source _as;
-    service::raft_group_registry& _raft_gr;
+    service::raft_group0_client& _group0_client;
+    sharded<db::system_keyspace>& _sys_ks;
+    serialized_action _group0_barrier;
     serialized_action _schema_push;
-    utils::UUID _schema_version_to_publish;
+    table_schema_version _schema_version_to_publish;
 
-    friend class group0_state_machine;
-    // See `group0_guard::impl` for explanation of the purpose of these locks.
-    semaphore _group0_read_apply_mutex;
-    semaphore _group0_operation_mutex;
-
-    gc_clock::duration _group0_history_gc_duration;
-
+    friend class group0_state_machine; // needed for access to _messaging
     size_t _concurrent_ddl_retries;
 public:
-    migration_manager(migration_notifier&, gms::feature_service&, netw::messaging_service& ms, service::storage_proxy&, gms::gossiper& gossiper, service::raft_group_registry& raft_gr);
+    migration_manager(migration_notifier&, gms::feature_service&, netw::messaging_service& ms, service::storage_proxy&, gms::gossiper& gossiper, service::raft_group0_client& group0_client, sharded<db::system_keyspace>& sysks);
+    void plug_storage_service(service::storage_service& ss);
+    future<> unplug_storage_service();
 
     migration_notifier& get_notifier() { return _notifier; }
     const migration_notifier& get_notifier() const { return _notifier; }
-
-    future<> submit_migration_task(const gms::inet_address& endpoint, bool can_ignore_down_node = true);
+    service::storage_proxy& get_storage_proxy() { return _storage_proxy; }
+    const service::storage_proxy& get_storage_proxy() const { return _storage_proxy; }
+    const service::raft_group0_client& get_group0_client() const { return _group0_client; }
+    abort_source& get_abort_source() noexcept { return _as; }
+    const abort_source& get_abort_source() const noexcept { return _as; }
+    serialized_action& get_group0_barrier() noexcept { return _group0_barrier; }
+    const serialized_action& get_group0_barrier() const noexcept { return _group0_barrier; }
 
     // Makes sure that this node knows about all schema changes known by "nodes" that were made prior to this call.
-    future<> sync_schema(const replica::database& db, const std::vector<gms::inet_address>& nodes);
-
-    // Fetches schema from remote node and applies it locally.
-    // Differs from submit_migration_task() in that all errors are propagated.
-    // Coalesces requests.
-    future<> merge_schema_from(netw::msg_addr);
-    future<> do_merge_schema_from(netw::msg_addr);
+    future<> sync_schema(const replica::database& db, const std::vector<locator::host_id>& nodes);
 
     // Merge mutations received from src.
     // Keep mutations alive around whole async operation.
-    future<> merge_schema_from(netw::msg_addr src, const std::vector<canonical_mutation>& mutations);
-    // Deprecated. The canonical mutation should be used instead.
-    future<> merge_schema_from(netw::msg_addr src, const std::vector<frozen_mutation>& mutations);
-
-    template<typename M>
-    requires MergeableMutation<M>
-    future<> merge_schema_in_background(netw::msg_addr src, const std::vector<M>& mutations) {
-        return with_gate(_background_tasks, [this, src, &mutations] {
-            return merge_schema_from(src, mutations);
-        });
-    }
-
-    bool should_pull_schema_from(const gms::inet_address& endpoint);
-    bool has_compatible_schema_tables_version(const gms::inet_address& endpoint);
-
-    std::vector<mutation> prepare_keyspace_update_announcement(lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type);
-
-    std::vector<mutation> prepare_new_keyspace_announcement(lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type);
-
-
-    // The timestamp parameter can be used to ensure that all nodes update their internal tables' schemas
-    // with identical timestamps, which can prevent an undeeded schema exchange
-    future<std::vector<mutation>> prepare_column_family_update_announcement(schema_ptr cfm, bool from_thrift, std::vector<view_ptr> view_updates, api::timestamp_type ts);
-
-    future<std::vector<mutation>> prepare_new_column_family_announcement(schema_ptr cfm, api::timestamp_type timestamp);
-
-    future<std::vector<mutation>> prepare_new_type_announcement(user_type new_type, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_new_function_announcement(shared_ptr<cql3::functions::user_function> func, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_new_aggregate_announcement(shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_function_drop_announcement(shared_ptr<cql3::functions::user_function> func, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_aggregate_drop_announcement(shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_update_type_announcement(user_type updated_type, api::timestamp_type);
-
-    std::vector<mutation> prepare_keyspace_drop_announcement(const sstring& ks_name, api::timestamp_type);
-
-    class drop_views_tag;
-    using drop_views = bool_class<drop_views_tag>;
-    future<std::vector<mutation>> prepare_column_family_drop_announcement(const sstring& ks_name, const sstring& cf_name, api::timestamp_type, drop_views drop_views = drop_views::no);
-
-    future<std::vector<mutation>> prepare_type_drop_announcement(user_type dropped_type, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_new_view_announcement(view_ptr view, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_view_update_announcement(view_ptr view, api::timestamp_type);
-
-    future<std::vector<mutation>> prepare_view_drop_announcement(const sstring& ks_name, const sstring& cf_name, api::timestamp_type);
+    future<> merge_schema_from(locator::host_id src, const utils::chunked_vector<canonical_mutation>& mutations);
+    // Incremented each time the function above is called. Needed by tests.
+    size_t canonical_mutation_merge_count = 0;
 
     // The function needs to be called if the user wants to read most up-to-date group 0 state (including schema state)
     // (the function ensures that all previously finished group0 operations are visible on this node) or to write it.
@@ -185,16 +107,38 @@ public:
     //
     // Call ONLY on shard 0.
     // Requires a quorum of nodes to be available in order to finish.
-    future<group0_guard> start_group0_operation();
+    // Parameters:
+    //   timeout -- Optional. If set, this timeout is used for the group0.read_barrier operation.
+    //              If the timeout is reached and there is no Raft quorum, an exception is thrown.
+    //              The exception will include information about the current set of alive and
+    //              unavailable voters.
+    //              If not set, the default timeout is used (from the Scylla config parameter
+    //              `group0_raft_op_timeout_in_ms`, which defaults to one minute).
+    //   as      -- Optional. Aborts the operation, like the drain of the migration manager.
+    future<group0_guard> start_group0_operation(std::optional<raft_timeout> timeout = std::nullopt, abort_source* as = nullptr);
 
-    // used to check if raft is enabled on the cluster
-    bool is_raft_enabled() { return _raft_gr.is_enabled(); }
+    // Ensure all non-system tables have committed_by_group0 = true in
+    // system_schema.scylla_tables. Tables created before the
+    // GROUP0_SCHEMA_VERSIONING feature was enabled will have this column
+    // as null, causing their version to be deleted by maybe_delete_schema_version()
+    // and forcing hash-based version computation. This fixup stamps them
+    // so we can eventually remove the legacy hashing code.
+    future<> ensure_committed_by_group0();
 
     // Apply a group 0 change.
     // The future resolves after the change is applied locally.
-    future<> announce(std::vector<mutation> schema, group0_guard, std::string_view description = "");
+    // Parameters:
+    //   timeout -- Optional. If set, this timeout is used for the group0.add_entry operation.
+    //              If the timeout is reached and there is no Raft quorum, an exception is thrown.
+    //              The exception will include information about the current set of alive and
+    //              unavailable voters, which 
+    //              If not set, the default timeout is used (from the Scylla config parameter
+    //              `group0_raft_op_timeout_in_ms`, which defaults to one minute).
+    //   as      -- Optional. Aborts the operation, like the drain of the migration manager.
+    template<typename mutation_type = schema_change>
+    future<> announce(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout = std::nullopt, abort_source* as = nullptr);
 
-    void passive_announce(utils::UUID version);
+    void passive_announce(table_schema_version version);
 
     future<> drain();
     future<> stop();
@@ -203,62 +147,115 @@ public:
      * Known peers in the cluster have the same schema version as us.
      */
     bool have_schema_agreement();
-
-    void init_messaging_service();
+    // Thrown by wait_for_schema_agreement() when the deadline is reached.
+    struct schema_agreement_timeout : public seastar::timed_out_error {
+        const char* what() const noexcept override {
+            return "Unable to reach schema agreement";
+        }
+    };
+    /**
+     * Waits until all known live peers have the same schema version as this
+     * node. Returns normally once agreement is reached, or throws
+     * schema_agreement_timeout if the deadline is reached before agreement.
+     * If as != nullptr, can also throw abort_requested_exception if the abort
+     * source fires.
+     */
+    future<> wait_for_schema_agreement(const replica::database& db, db::timeout_clock::time_point deadline, seastar::abort_source* as);
 
     // Maximum number of retries one should attempt when trying to perform
     // a DDL statement and getting `group0_concurrent_modification` exception.
     size_t get_concurrent_ddl_retries() const { return _concurrent_ddl_retries; }
 private:
+    void init_messaging_service();
     future<> uninit_messaging_service();
-
-    future<std::vector<mutation>> include_keyspace(const keyspace_metadata& keyspace, std::vector<mutation> mutations);
-    future<std::vector<mutation>> do_prepare_new_type_announcement(user_type new_type, api::timestamp_type);
-
-    future<> push_schema_mutation(const gms::inet_address& endpoint, const std::vector<mutation>& schema);
 
     future<> passive_announce();
 
-    void schedule_schema_pull(const gms::inet_address& endpoint, const gms::endpoint_state& state);
-
-    future<> maybe_schedule_schema_pull(const utils::UUID& their_version, const gms::inet_address& endpoint);
-
-    future<> announce_with_raft(std::vector<mutation> schema, group0_guard, std::string_view description);
-    future<> announce_without_raft(std::vector<mutation> schema);
+    template<typename mutation_type = schema_change>
+    future<> announce_with_raft(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout, abort_source* as);
 
 public:
-    future<> maybe_sync(const schema_ptr& s, netw::msg_addr endpoint);
-
     // Returns schema of given version, either from cache or from remote node identified by 'from'.
     // The returned schema may not be synchronized. See schema::is_synced().
     // Intended to be used in the read path.
-    future<schema_ptr> get_schema_for_read(table_schema_version, netw::msg_addr from, netw::messaging_service& ms);
+    future<schema_ptr> get_schema_for_read(table_schema_version, locator::host_id from, unsigned shard, netw::messaging_service& ms, abort_source& as);
 
     // Returns schema of given version, either from cache or from remote node identified by 'from'.
     // Ensures that this node is synchronized with the returned schema. See schema::is_synced().
     // Intended to be used in the write path, which relies on synchronized schema.
-    future<schema_ptr> get_schema_for_write(table_schema_version, netw::msg_addr from, netw::messaging_service& ms);
+    future<schema_ptr> get_schema_for_write(table_schema_version, locator::host_id from, unsigned shard, netw::messaging_service& ms, abort_source& as);
+
+    // Fetches the column mappings (system.scylla_table_schema_history entries) for table
+    // `cf_id` that are missing on this node from the other replicas.
+    future<> fetch_column_mappings(table_id cf_id,
+        host_id_vector_replica_set replicas,
+        bool ignore_down_replicas,
+        abort_source& as);
 
 private:
-    virtual future<> on_join(gms::inet_address endpoint, gms::endpoint_state ep_state) override;
-    virtual future<> on_change(gms::inet_address endpoint, gms::application_state state, const gms::versioned_value& value) override;
-    virtual future<> on_alive(gms::inet_address endpoint, gms::endpoint_state state) override;
-    virtual future<> on_dead(gms::inet_address endpoint, gms::endpoint_state state) override { return make_ready_future(); }
-    virtual future<> on_remove(gms::inet_address endpoint) override { return make_ready_future(); }
-    virtual future<> on_restart(gms::inet_address endpoint, gms::endpoint_state state) override { return make_ready_future(); }
-    virtual future<> before_change(gms::inet_address endpoint, gms::endpoint_state current_state, gms::application_state new_statekey, const gms::versioned_value& newvalue) override { return make_ready_future(); }
+    virtual future<> on_join(gms::inet_address endpoint,locator::host_id id,  gms::endpoint_state_ptr ep_state, gms::permit_id) override;
+    virtual future<> on_change(gms::inet_address endpoint, locator::host_id id, const gms::application_state_map& states, gms::permit_id) override;
+    virtual future<> on_alive(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr state, gms::permit_id) override;
 
 public:
     // For tests only.
-    void set_group0_history_gc_duration(gc_clock::duration);
-
-    // For tests only.
     void set_concurrent_ddl_retries(size_t);
-
-    // For tests only.
-    semaphore& group0_operation_mutex();
 };
 
-future<column_mapping> get_column_mapping(utils::UUID table_id, table_schema_version v);
+extern template
+future<> migration_manager::announce_with_raft<schema_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout, abort_source* as);
+extern template
+future<> migration_manager::announce_with_raft<topology_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout, abort_source* as);
+
+extern template
+future<> migration_manager::announce<schema_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout = std::nullopt, abort_source* as = nullptr);
+extern template
+future<> migration_manager::announce<topology_change>(utils::chunked_vector<mutation> schema, group0_guard, std::string_view description, std::optional<raft_timeout> timeout = std::nullopt, abort_source* as = nullptr);
+
+utils::chunked_vector<mutation> prepare_keyspace_update_announcement(replica::database& db, lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type ts);
+
+utils::chunked_vector<mutation> prepare_new_keyspace_announcement(replica::database& db, lw_shared_ptr<keyspace_metadata> ksm, api::timestamp_type timestamp);
+
+// The timestamp parameter can be used to ensure that all nodes update their internal tables' schemas
+// with identical timestamps, which can prevent an undeeded schema exchange
+future<utils::chunked_vector<mutation>> prepare_column_family_update_announcement(storage_proxy& sp,
+        schema_ptr cfm, std::vector<view_ptr> view_updates, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_new_column_family_announcement(storage_proxy& sp, schema_ptr cfm, api::timestamp_type timestamp);
+// The ksm parameter can describe a keyspace that hasn't been created yet.
+// This function allows announcing a new keyspace together with its tables at once.
+future<> prepare_new_column_family_announcement(utils::chunked_vector<mutation>& mutations,
+        storage_proxy& sp, const keyspace_metadata& ksm, schema_ptr cfm, api::timestamp_type timestamp);
+// Announce multiple tables in one operation
+future<> prepare_new_column_families_announcement(utils::chunked_vector<mutation>& mutations,
+        storage_proxy& sp, const keyspace_metadata& ksm, std::vector<schema_ptr> cfms, api::timestamp_type timestamp);
+
+future<utils::chunked_vector<mutation>> prepare_new_type_announcement(storage_proxy& sp, user_type new_type, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_new_function_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_function> func, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_new_aggregate_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_function_drop_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_function> func, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_aggregate_drop_announcement(storage_proxy& sp, shared_ptr<cql3::functions::user_aggregate> aggregate, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_update_type_announcement(storage_proxy& sp, user_type updated_type, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_keyspace_drop_announcement(storage_proxy& sp, const sstring& ks_name, api::timestamp_type ts);
+
+class drop_views_tag;
+using drop_views = bool_class<drop_views_tag>;
+future<utils::chunked_vector<mutation>> prepare_column_family_drop_announcement(storage_proxy& sp,
+        const sstring& ks_name, const sstring& cf_name, api::timestamp_type ts, drop_views drop_views = drop_views::no,
+        bool in_notification = false);
+
+future<utils::chunked_vector<mutation>> prepare_type_drop_announcement(storage_proxy& sp, user_type dropped_type, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_new_view_announcement(storage_proxy& sp, view_ptr view, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_view_update_announcement(storage_proxy& sp, view_ptr view, api::timestamp_type ts);
+
+future<utils::chunked_vector<mutation>> prepare_view_drop_announcement(storage_proxy& sp, const sstring& ks_name, const sstring& cf_name, api::timestamp_type ts);
 
 }

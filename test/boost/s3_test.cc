@@ -1,0 +1,1629 @@
+/*
+ * Copyright (C) 2022-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+
+#include <algorithm>
+#include <unordered_set>
+#include <regex>
+#include <boost/test/unit_test.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/classification.hpp>
+#include <seastar/core/thread.hh>
+#include <seastar/core/reactor.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/http/exception.hh>
+#include <seastar/util/closeable.hh>
+#include <seastar/util/short_streams.hh>
+#include <seastar/core/units.hh>
+#include <seastar/core/metrics_api.hh>
+#include "test/lib/scylla_test_case.hh"
+#include "test/lib/log.hh"
+#include "test/lib/random_utils.hh"
+#include "test/lib/test_utils.hh"
+#include "test/lib/tmpdir.hh"
+#include "utils/assert.hh"
+#include "utils/error_injection.hh"
+#include "utils/s3/aws_error.hh"
+#include "utils/s3/client.hh"
+#include "utils/s3/creds.hh"
+#include "utils/s3/aws_throttling_controller.hh"
+#include "utils/s3/default_aws_retry_strategy.hh"
+#include "utils/s3/noop_throttling_controller.hh"
+#include "utils/s3/utils/manip_s3.hh"
+#include "utils/exceptions.hh"
+#include "utils/hashers.hh"
+#include "utils/s3/credentials_providers/aws_credentials_provider_chain.hh"
+#include "utils/s3/credentials_providers/instance_profile_credentials_provider.hh"
+#include "utils/s3/credentials_providers/sts_assume_role_credentials_provider.hh"
+#include "sstables/checksum_utils.hh"
+#include "gc_clock.hh"
+
+using namespace std::string_view_literals;
+using namespace std::chrono_literals;
+
+// Retry strategy for tests: same retryability logic as the default AWS strategy,
+// but with a delay schedule tuned for a local mock server rather than a remote
+// AWS endpoint.
+//
+// Two very different things make a request fail here. The common one is the s3
+// proxy (test/pylib/s3_proxy.py) injecting a retryable error into a request the
+// server would have served immediately; retrying that after a millisecond keeps
+// the tests fast, and the proxy gives up injecting after at most
+// `--max-retries` errors on the same path. The uncommon one is the mock server
+// itself going unresponsive for tens of seconds under the load of the whole
+// test suite running against it concurrently (SCYLLADB-4576), which no number
+// of millisecond retries can ride out.
+//
+// So the retry budget is expressed as wall-clock time rather than as a retry
+// count: the first `fast_retry_count` retries happen a millisecond apart, to
+// deal with the injected errors at no cost, and after that the delay grows
+// exponentially up to `maximum_retry_delay` until `total_retry_budget` of
+// delays has been spent. Only a failing request ever waits, so the schedule
+// costs a passing test nothing.
+class test_retry_strategy : public seastar::http::retry_strategy {
+    static constexpr unsigned fast_retry_count = 10;
+    static constexpr std::chrono::milliseconds fast_retry_delay = 1ms;
+    static constexpr std::chrono::milliseconds maximum_retry_delay = 1s;
+
+    std::chrono::milliseconds _total_retry_budget;
+
+    // The delay to wait before the retry that follows `attempted_retries`
+    // already attempted ones.
+    static std::chrono::milliseconds delay_before_retry(unsigned attempted_retries) {
+        if (attempted_retries < fast_retry_count) {
+            return fast_retry_delay;
+        }
+        // Cap the shift well below the width of the representation, so that the
+        // clamp below, and not overflow, is what bounds the result.
+        auto doublings = std::min(attempted_retries - fast_retry_count + 1, 20u);
+        return std::min(fast_retry_delay * (1u << doublings), maximum_retry_delay);
+    }
+
+    // How much of the budget the delays before the retries attempted so far
+    // have consumed. The schedule depends on nothing but the retry count, so
+    // this can be summed up rather than measured, which keeps the strategy
+    // stateless and therefore shareable between the concurrent requests of one
+    // client.
+    static std::chrono::milliseconds delay_spent_so_far(unsigned attempted_retries) {
+        auto spent = 0ms;
+        for (unsigned retry = 0; retry < attempted_retries; ++retry) {
+            spent += delay_before_retry(retry);
+        }
+        return spent;
+    }
+
+public:
+    explicit test_retry_strategy(std::chrono::milliseconds total_retry_budget = 60s)
+        : _total_retry_budget(total_retry_budget) {}
+
+    future<bool> should_retry(std::exception_ptr error, unsigned attempted_retries) const override {
+        auto err = aws::aws_error::from_exception_ptr(error);
+        if (err.is_retryable() != utils::http::retryable::yes) {
+            co_return false;
+        }
+        if (delay_spent_so_far(attempted_retries) >= _total_retry_budget) {
+            co_return false;
+        }
+        if (attempted_retries > 0) {
+            co_await seastar::sleep(delay_before_retry(attempted_retries));
+        }
+        co_return true;
+    }
+};
+
+static std::unique_ptr<seastar::http::retry_strategy> make_test_retry_strategy() {
+    return std::make_unique<test_retry_strategy>();
+}
+
+// For the tests that deliberately point a client at an address nothing listens
+// on and want the failure handed back to them. A refused connection is
+// retryable, so with the budget above such a test would spend all of it waiting
+// for a server that does not exist.
+static std::unique_ptr<seastar::http::retry_strategy> make_unretrying_test_retry_strategy() {
+    return std::make_unique<test_retry_strategy>(0ms);
+}
+
+// The test can be run on real AWS-S3 bucket. For that, create a bucket with
+// permissive enough policy and then run the test with env set respectively
+// E.g. like this
+//
+//   export S3_SERVER_ADDRESS_FOR_TEST=s3.us-east-2.amazonaws.com
+//   export S3_SERVER_PORT_FOR_TEST=443
+//   export S3_BUCKET_FOR_TEST=xemul
+//   export AWS_ACCESS_KEY_ID=${aws_access_key_id}
+//   export AWS_SECRET_ACCESS_KEY=${aws_secret_access_key}
+//   export AWS_SESSION_TOKEN=${aws_session_token}
+//   export AWS_DEFAULT_REGION="us-east-2"
+
+static shared_ptr<s3::client> make_proxy_client() {
+    s3::endpoint_config cfg = {
+        .port = std::stoul(tests::getenv_safe("PROXY_S3_SERVER_PORT")),
+        .use_https = false,
+        .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
+    };
+    return s3::client::make(tests::getenv_safe("PROXY_S3_SERVER_HOST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)), make_test_retry_strategy(),
+                            std::make_unique<s3::noop_throttling_controller>());
+}
+
+// Like make_proxy_client, but leaves both the throttling controller and the
+// retry strategy unset, so the client builds its production defaults: the
+// real AWS controller and the default AWS retry strategy wired to that
+// controller. Used by the
+// throttling metrics integration test, which relies on the proxy injecting
+// throttling errors to make the controller react. Injecting either would test a
+// configuration that never ships — and in particular a retry strategy that is
+// not default_aws_retry_strategy never reports throttling to the controller at
+// all, so nothing would be measured.
+static shared_ptr<s3::client> make_proxy_client_with_aws_throttling() {
+    s3::endpoint_config cfg = {
+        .port = std::stoul(tests::getenv_safe("PROXY_S3_SERVER_PORT")),
+        .use_https = false,
+        .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
+    };
+    return s3::client::make(tests::getenv_safe("PROXY_S3_SERVER_HOST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)));
+}
+
+static shared_ptr<s3::client> make_s3_client() {
+    s3::endpoint_config cfg = {
+        .port = std::stoul(tests::getenv_safe("S3_SERVER_PORT_FOR_TEST")),
+        .use_https = ::getenv("AWS_DEFAULT_REGION") != nullptr,
+        .region = ::getenv("AWS_DEFAULT_REGION") ? : "local",
+    };
+    return s3::client::make(tests::getenv_safe("S3_SERVER_ADDRESS_FOR_TEST"), make_lw_shared<s3::endpoint_config>(std::move(cfg)), make_test_retry_strategy());
+}
+
+using client_maker_function = std::function<shared_ptr<s3::client>()>;
+
+// Per-test S3 fixture: creates an S3 client and a unique bucket on
+// construction, closes the client and deletes the bucket (with all
+// objects) on destruction.
+// Must be used inside a seastar::thread context.
+//
+// Bucket name is derived from the Boost test name + pid,
+// making it unique across concurrent test processes and multiple
+// fixtures within a single test.
+class s3_test_fixture {
+    shared_ptr<s3::client> _client;
+    sstring _bucket;
+
+    // S3 bucket names must be 3-63 chars, alphanumeric and hyphens only, no consecutive hyphens, no leading/trailing hyphen.
+    static sstring get_sanitized_bucket_name() {
+        static constexpr std::string_view prefix = "s3-"sv;
+        static constexpr size_t prefix_len = prefix.length();
+        const std::string suffix = format("-{}", ::getpid());
+        static const std::regex re("[^A-Za-z0-9]+");
+
+        const std::string normalized_test_name =
+            std::regex_replace(boost::unit_test::framework::current_test_unit().p_name.get(), re, "-").substr(0, 63 - prefix_len - suffix.length());
+        // e.g. "s3-test-chunked-download-data-source-with-delays-proxy-335888"
+        return format("{}{}{}", prefix, normalized_test_name, suffix);
+    }
+
+public:
+    explicit s3_test_fixture(const client_maker_function& maker)
+        : _client(maker())
+        , _bucket(get_sanitized_bucket_name())
+    {
+        testlog.info("Creating test bucket {}", _bucket);
+        _client->create_bucket(_bucket).get();
+    }
+
+    ~s3_test_fixture() {
+        try {
+            testlog.info("Cleaning up test bucket {}", _bucket);
+            _client->delete_bucket_with_objects(_bucket).get();
+            testlog.info("Deleted test bucket {}", _bucket);
+            _client->close().get();
+        } catch (...) {
+            testlog.error("Failed to clean up fixture for bucket {}: {}", _bucket, std::current_exception());
+        }
+    }
+
+    s3_test_fixture(const s3_test_fixture&) = delete;
+    s3_test_fixture& operator=(const s3_test_fixture&) = delete;
+
+    const sstring& bucket() const { return _bucket; }
+    shared_ptr<s3::client> client() const { return _client; }
+
+    // Format an object path: /<bucket>/<object_name>
+    sstring object_path(std::string_view object_name) const {
+        return fmt::format("/{}/{}", _bucket, object_name);
+    }
+};
+
+static future<uint32_t> create_file(const std::string& path, size_t file_size) {
+    uint32_t ret_val = crc32_utils::init_checksum();
+    file f = co_await open_file_dma(path, open_flags::truncate | open_flags::create | open_flags::wo);
+    auto output = co_await make_file_output_stream(std::move(f));
+
+    for (size_t bytes_written = 0; bytes_written < file_size;) {
+        auto rnd = tests::random::get_bytes(std::min(file_size - bytes_written, 128_KiB));
+        const auto buff_pointer = reinterpret_cast<const char*>(rnd.data());
+        co_await output.write(buff_pointer, rnd.size());
+        ret_val = crc32_utils::checksum(ret_val, buff_pointer, rnd.size());
+        bytes_written += rnd.size();
+    }
+    co_await output.close();
+    co_return ret_val;
+}
+
+/*
+ * Tests below expect an S3 server to be running on localhost
+ * with s3_test_fixture creating per-test buckets for isolation
+ */
+
+void client_put_get_object(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testobject");
+
+    testlog.info("Put object {}\n", name);
+    temporary_buffer<char> data = sstring("1234567890").release();
+    cln->put_object(name, std::move(data)).get();
+
+    testlog.info("Get object size\n");
+    size_t sz = cln->get_object_size(name).get();
+    BOOST_REQUIRE_EQUAL(sz, 10);
+
+    testlog.info("Get object stats\n");
+    s3::stats st = cln->get_object_stats(name).get();
+    BOOST_REQUIRE_EQUAL(st.size, 10);
+    // forgive timezone difference as the S3 server is GMT by default
+    BOOST_REQUIRE(std::difftime(st.last_modified, gc_clock::to_time_t(gc_clock::now())) < 24*3600);
+
+    testlog.info("Get object content\n");
+    temporary_buffer<char> res = cln->get_object_contiguous(name).get();
+    BOOST_REQUIRE_EQUAL(to_sstring(std::move(res)), sstring("1234567890"));
+
+    testlog.info("Get object part\n");
+    res = cln->get_object_contiguous(name, s3::range{ 1, 3 }).get();
+    BOOST_REQUIRE_EQUAL(to_sstring(std::move(res)), sstring("234"));
+
+    testlog.info("Delete object\n");
+    cln->delete_object(name).get();
+
+    testlog.info("Verify it's gone\n");
+    BOOST_REQUIRE_EXCEPTION(cln->get_object_size(name).get(), storage_io_error, [] (const storage_io_error& ex) {
+        return ex.code().value() == ENOENT;
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_object_s3) {
+    client_put_get_object(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_object_proxy) {
+    client_put_get_object(make_proxy_client);
+}
+
+void client_get_object_info_etag(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testetagobject");
+
+    static constexpr auto content = "1234567890"sv;
+    // The fixture's bucket is unencrypted, so for an object uploaded in a single
+    // PUT S3 derives the ETag from the hex-encoded MD5 of its content (that does
+    // not hold in general, see s3::object_info::etag). The header carries it as a
+    // quoted entity-tag, and both the quotes and the value have to survive the
+    // trip through put_object_and_get_etag() and get_object_info().
+    const auto expected_etag = format("\"{}\"", to_hex(md5_hasher::calculate(content)));
+
+    testlog.info("Put object {}\n", name);
+    const auto put_etag = cln->put_object_and_get_etag(name, temporary_buffer<char>(content.data(), content.size())).get();
+    BOOST_REQUIRE_EQUAL(put_etag, expected_etag);
+
+    testlog.info("Get object info\n");
+    s3::object_info info = cln->get_object_info(name).get();
+    BOOST_REQUIRE_EQUAL(info.etag, expected_etag);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_get_object_info_etag_s3) {
+    client_get_object_info_etag(make_s3_client);
+}
+
+void do_test_client_multipart_upload(const client_maker_function& client_maker, bool with_copy_upload) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path(fmt::format("test{}object", with_copy_upload ? "jumbo" : "large"));
+
+    testlog.info("Upload object (with copy = {})\n", with_copy_upload);
+    auto out = output_stream<char>(
+        // Make it 3 parts per piece, so that 128Mb buffer below
+        // would be split into several 15Mb pieces
+        with_copy_upload ? cln->make_upload_jumbo_sink(name, s3::object_metadata{}, 3) : cln->make_upload_sink(name)
+    );
+    auto close = seastar::deferred_close(out);
+
+    static constexpr unsigned chunk_size = 1000;
+    auto rnd = tests::random::get_bytes(chunk_size);
+    uint64_t object_size = 0;
+    for (unsigned ch = 0; ch < 128 * 1024; ch++) {
+        out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+        object_size += rnd.size();
+    }
+
+    testlog.info("Flush multipart upload\n");
+    out.flush().get();
+
+    testlog.info("Closing\n");
+    close.close_now();
+
+    testlog.info("Checking file size\n");
+    size_t sz = cln->get_object_size(name).get();
+    BOOST_REQUIRE_EQUAL(sz, object_size);
+
+    testlog.info("Checking correctness\n");
+    for (int samples = 0; samples < 7; samples++) {
+        uint64_t len = tests::random::get_int(1u, chunk_size);
+        uint64_t off = tests::random::get_int(object_size - len);
+
+        auto s_buf = cln->get_object_contiguous(name, s3::range{ off, len }).get();
+        unsigned align = off % chunk_size;
+        testlog.info("Got [{}:{}) chunk\n", off, len);
+        testlog.info("Checking {} vs {} len {}\n", align, 0, std::min<uint64_t>(chunk_size - align, len));
+        BOOST_REQUIRE_EQUAL(memcmp(rnd.begin() + align, s_buf.get(), std::min<uint64_t>(chunk_size - align, len)), 0);
+        if (len > chunk_size - align) {
+            testlog.info("Checking {} vs {} len {}\n", 0, chunk_size - align, len - (chunk_size - align));
+            BOOST_REQUIRE_EQUAL(memcmp(rnd.begin(), s_buf.get() + (chunk_size - align), len - (chunk_size - align)), 0);
+        }
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_s3) {
+    do_test_client_multipart_upload(make_s3_client, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_proxy) {
+    do_test_client_multipart_upload(make_proxy_client, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_copy_upload_s3) {
+    do_test_client_multipart_upload(make_s3_client, true);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_copy_upload_proxy) {
+    do_test_client_multipart_upload(make_proxy_client, true);
+}
+
+// A recognizable exception to abort the uploads below with. Asserting on it
+// rather than on seastar's default abort_requested_exception keeps the checks
+// from being satisfied by an unrelated failure -- in particular not by the
+// "Failed to parse ETag list. Aborting multipart upload." error, which is what
+// the sink reports today when a part upload is cancelled.
+class upload_cancelled_marker : public std::exception {
+public:
+    const char* what() const noexcept override { return "upload_cancelled_marker"; }
+};
+
+// Cancelling an upload has to stop it and reach the caller as the cancellation
+// itself.
+//
+// Part uploads are issued in the background and their failures are only logged,
+// so an aborted part leaves its ETag unset and finalize_upload() then reports
+// the resulting hole in the ETag list instead of the abort. The jumbo sink adds
+// another layer of the same: the child sink's entire flush path runs in the
+// background and its exception is consumed after the piece is closed and its
+// temporary object deleted.
+void do_test_client_multipart_upload_abort(const client_maker_function& client_maker, bool with_copy_upload) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path(fmt::format("testaborted{}object", with_copy_upload ? "jumbo" : "large"));
+
+    seastar::abort_source as;
+    auto out = output_stream<char>(
+        // One part per piece, so that every completed part makes the jumbo sink
+        // hand a piece over to the parent upload -- and thus start it.
+        with_copy_upload ? cln->make_upload_jumbo_sink(name, s3::object_metadata{}, 1, &as)
+                         : cln->make_upload_sink(name, s3::object_metadata{}, &as)
+    );
+
+    // A part's worth of data plus 1Mb, which is more than the 128Kb the
+    // output_stream may still be holding back, so that by the time this returns
+    // the sink has certainly handed a full part over to the upload and started
+    // collecting the next one.
+    static constexpr size_t chunk_size = 1_MiB;
+    auto rnd = tests::random::get_bytes(chunk_size);
+    auto write_part = [&] {
+        for (size_t written = 0; written <= s3::minimum_part_size; written += chunk_size) {
+            out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+        }
+    };
+
+    auto reports_the_abort = [](const std::exception& ex) {
+        testlog.info("Aborted upload reported: {}", ex.what());
+        // Either the abort exception itself, or the storage_io_error that
+        // map_s3_client_exception() turns a failed request into, which names it.
+        return std::string_view(ex.what()).find("upload_cancelled_marker") != std::string_view::npos;
+    };
+
+    // The first part starts the multipart upload while the abort source is still
+    // clean, so nothing below can simply be the sink's own upload-initiating
+    // request coming back aborted.
+    write_part();
+
+    testlog.info("Abort the upload (with copy = {})\n", with_copy_upload);
+    as.request_abort_ex(upload_cancelled_marker{});
+
+    if (with_copy_upload) {
+        // The part above filled a piece, so the jumbo sink has handed that piece
+        // over to the parent upload and opened a fresh piece sink, which has not
+        // initiated a multipart upload of its own yet. Writing another part is
+        // what makes it initiate one, and that request is the one the abort
+        // source now handed down to the piece sinks has to cancel -- so this
+        // write has to fail rather than upload more data. Without the abort
+        // source reaching the piece sink the piece uploads happily and only the
+        // finalization below ever notices that the upload was cancelled.
+        testlog.info("Write into the aborted upload\n");
+        BOOST_REQUIRE_EXCEPTION(write_part(), std::exception, reports_the_abort);
+    } else {
+        // The plain sink issues its part uploads in the background, so a write
+        // cannot report their cancellation -- only the flush below can.
+        write_part();
+    }
+
+    testlog.info("Flush the aborted upload\n");
+    BOOST_REQUIRE_EXCEPTION(out.flush().get(), std::exception, reports_the_abort);
+
+    // The failed flush has already aborted the multipart upload, so closing is
+    // cleanup only and must not fail.
+    testlog.info("Closing\n");
+    out.close().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_abort_minio) {
+    do_test_client_multipart_upload_abort(make_s3_client, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_upload_abort_proxy) {
+    do_test_client_multipart_upload_abort(make_proxy_client, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_copy_upload_abort_minio) {
+    do_test_client_multipart_upload_abort(make_s3_client, true);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_multipart_copy_upload_abort_proxy) {
+    do_test_client_multipart_upload_abort(make_proxy_client, true);
+}
+
+// A zero-byte component is not hypothetical. BTI's Rows.db is empty for an
+// sstable holding only small partitions, and sstables/mx/writer.cc papers over
+// that by appending four bytes of padding before closing the writer. The tests
+// below pin down what each upload path does when nothing at all is written.
+
+void do_test_client_put_empty_object(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testemptyobject");
+
+    testlog.info("PUT an empty object\n");
+    cln->put_object(name, temporary_buffer<char>()).get();
+
+    BOOST_REQUIRE(cln->object_exists(name).get());
+    BOOST_REQUIRE_EQUAL(cln->get_object_size(name).get(), 0);
+}
+
+void do_test_client_upload_empty_object(const client_maker_function& client_maker, bool with_copy_upload) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path(fmt::format("testempty{}object", with_copy_upload ? "jumbo" : "large"));
+
+    testlog.info("Upload an empty object (with copy = {})\n", with_copy_upload);
+    auto out = output_stream<char>(
+        with_copy_upload ? cln->make_upload_jumbo_sink(name, s3::object_metadata{}, 3) : cln->make_upload_sink(name)
+    );
+    auto close = seastar::deferred_close(out);
+
+    // Nothing is written to the stream.
+    testlog.info("Flush upload\n");
+    out.flush().get();
+
+    testlog.info("Closing\n");
+    close.close_now();
+
+    BOOST_REQUIRE(cln->object_exists(name).get());
+    BOOST_REQUIRE_EQUAL(cln->get_object_size(name).get(), 0);
+}
+
+// Reading a zero-length object needs the same care as writing one: no byte range
+// is satisfiable on an empty object, so a ranged GET is answered with 416.
+void do_test_download_empty_object(const client_maker_function& client_maker, bool is_chunked) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testemptydownloadobject");
+
+    cln->put_object(name, temporary_buffer<char>()).get();
+
+    testlog.info("Download an empty object (chunked = {})\n", is_chunked);
+    auto in = is_chunked ? input_stream<char>(cln->make_chunked_download_source(name, s3::full_range))
+                         : input_stream<char>(cln->make_download_source(name, s3::full_range));
+    auto close = seastar::deferred_close(in);
+
+    BOOST_REQUIRE(in.read().get().empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_empty_object_s3) {
+    do_test_client_put_empty_object(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_download_empty_object_s3) {
+    do_test_download_empty_object(make_s3_client, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_empty_object_s3) {
+    do_test_download_empty_object(make_s3_client, true);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_empty_object_s3) {
+    do_test_client_upload_empty_object(make_s3_client, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_copy_upload_empty_object_s3) {
+    do_test_client_upload_empty_object(make_s3_client, true);
+}
+
+// Uploads object_size bytes through a jumbo sink and requires the entity tag the
+// sink reports to be non-empty and equal to the one get_object_info() returns.
+void do_test_client_upload_jumbo_sink_etag(const client_maker_function& client_maker, size_t object_size) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path(fmt::format("testjumboetag{}object", object_size));
+
+    testlog.info("Upload object of {} bytes\n", object_size);
+    auto [sink, etag_f] = cln->make_upload_jumbo_sink_and_get_etag(name, s3::object_metadata{}, 3);
+    auto out = output_stream<char>(std::move(sink));
+    auto close = seastar::deferred_close(out);
+
+    const auto content = sstring(object_size, 'x');
+    out.write(content.data(), content.size()).get();
+    out.flush().get();
+    close.close_now();
+
+    const auto etag = etag_f.get();
+    testlog.info("Reported etag {}\n", etag);
+    BOOST_REQUIRE(!etag.empty());
+    BOOST_REQUIRE_EQUAL(etag, cln->get_object_info(name).get().etag);
+}
+
+// 1000 bytes make the sink complete a multipart upload.
+SEASTAR_THREAD_TEST_CASE(test_client_upload_jumbo_sink_etag_s3) {
+    do_test_client_upload_jumbo_sink_etag(make_s3_client, 1000);
+}
+
+// 0 bytes make the sink create the object with a single PUT.
+SEASTAR_THREAD_TEST_CASE(test_client_upload_jumbo_sink_etag_empty_object_s3) {
+    do_test_client_upload_jumbo_sink_etag(make_s3_client, 0);
+}
+
+// Uploads object_size bytes through a plain sink and requires the entity tag the
+// sink reports to be non-empty and equal to the one get_object_info() returns.
+void do_test_client_upload_sink_etag(const client_maker_function& client_maker, size_t object_size) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path(fmt::format("testetag{}object", object_size));
+
+    testlog.info("Upload object of {} bytes\n", object_size);
+    auto [sink, etag_f] = cln->make_upload_sink_and_get_etag(name);
+    auto out = output_stream<char>(std::move(sink));
+    auto close = seastar::deferred_close(out);
+
+    const auto chunk = sstring(1000, 'x');
+    for (size_t written = 0; written < object_size; written += chunk.size()) {
+        out.write(chunk.data(), std::min(chunk.size(), object_size - written)).get();
+    }
+    out.flush().get();
+    close.close_now();
+
+    const auto etag = etag_f.get();
+    testlog.info("Reported etag {}\n", etag);
+    BOOST_REQUIRE(!etag.empty());
+    BOOST_REQUIRE_EQUAL(etag, cln->get_object_info(name).get().etag);
+}
+
+// 1000 bytes fit in a single part, so the sink creates the object with a plain PUT.
+SEASTAR_THREAD_TEST_CASE(test_client_upload_sink_etag_s3) {
+    do_test_client_upload_sink_etag(make_s3_client, 1000);
+}
+
+// 0 bytes also go out as a plain PUT, of an empty object.
+SEASTAR_THREAD_TEST_CASE(test_client_upload_sink_etag_empty_object_s3) {
+    do_test_client_upload_sink_etag(make_s3_client, 0);
+}
+
+// More than one part's worth of data makes the sink complete a multipart upload.
+SEASTAR_THREAD_TEST_CASE(test_client_upload_sink_etag_multipart_s3) {
+    do_test_client_upload_sink_etag(make_s3_client, s3::minimum_part_size + 1000);
+}
+
+// A sink closed without ever being flushed produces no object, so there is no tag
+// for it to report. Closing it must resolve the etag future there and then -- the
+// sink is still alive at that point and nothing is going to produce the object any
+// more, so a caller that awaits the tag before dropping the sink would otherwise
+// wait forever. The same happens when the sink is closed because a put() into it
+// failed: output_stream::close() then closes it without calling its flush().
+void do_test_client_upload_sink_etag_without_flush(const client_maker_function& client_maker, bool is_jumbo) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path(fmt::format("test{}etagunflushedobject", is_jumbo ? "jumbo" : ""));
+
+    testlog.info("Close the sink of {} without flushing it\n", name);
+    auto [sink, etag_f] = is_jumbo ? cln->make_upload_jumbo_sink_and_get_etag(name, s3::object_metadata{}, 3)
+                                   : cln->make_upload_sink_and_get_etag(name);
+    sink.close().get();
+
+    BOOST_REQUIRE(etag_f.available());
+    BOOST_REQUIRE_THROW(etag_f.get(), seastar::broken_promise);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_sink_etag_without_flush_s3) {
+    do_test_client_upload_sink_etag_without_flush(make_s3_client, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_jumbo_sink_etag_without_flush_s3) {
+    do_test_client_upload_sink_etag_without_flush(make_s3_client, true);
+}
+
+using with_remainder_t = bool_class<class with_remainder_tag>;
+
+void test_client_upload_file(const client_maker_function& client_maker, size_t total_size) {
+    tmpdir tmp;
+    const auto file_path = tmp.path() / "test";
+
+    auto expected_checksum = create_file(file_path, total_size).get();
+
+    s3_test_fixture guard(client_maker);
+    auto client = guard.client();
+    const auto object_name = guard.object_path("upload-test");
+
+    // 2. upload the file to s3
+    client->upload_file(file_path, object_name).get();
+    // 3. retrieve the object from s3 and retrieve the object from S3 and
+    //    compare it with the pattern
+    uint32_t actual_checksum = crc32_utils::init_checksum();
+    auto readable_file = client->make_readable_file(object_name);
+    auto input = make_file_input_stream(readable_file);
+    size_t actual_size = 0;
+    for (;;) {
+        auto buf = input.read().get();
+        if (buf.empty()) {
+            // empty() signifies the end of stream
+            break;
+        }
+        actual_size += buf.size();
+        bytes_view bv{reinterpret_cast<const int8_t*>(buf.get()), buf.size()};
+        //fmt::print("{}", fmt_hex(bv));
+        uint32_t chunk_checksum = crc32_utils::checksum(buf.get(), buf.size());
+        actual_checksum = checksum_combine_or_feed<crc32_utils>(
+            actual_checksum, chunk_checksum, buf.get(), buf.size());
+    }
+    BOOST_CHECK_EQUAL(total_size, actual_size);
+    BOOST_CHECK_EQUAL(expected_checksum, actual_checksum);
+
+    readable_file.close().get();
+    input.close().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_file_multi_part_without_remainder_s3) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = 4 * part_size;
+    test_client_upload_file(make_s3_client, total_size);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_file_multi_part_without_remainder_proxy) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = 4 * part_size;
+    test_client_upload_file(make_proxy_client, total_size);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_file_multi_part_with_remainder_s3) {
+    const size_t part_size = 5_MiB;
+    const size_t remainder_size = part_size / 2;
+    const size_t total_size = 4 * part_size + remainder_size;
+    test_client_upload_file(make_s3_client, total_size);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_file_multi_part_with_remainder_proxy) {
+    const size_t part_size = 5_MiB;
+    const size_t remainder_size = part_size / 2;
+    const size_t total_size = 4 * part_size + remainder_size;
+    test_client_upload_file(make_proxy_client, total_size);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_file_single_part_s3) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = part_size / 2;
+    test_client_upload_file(make_s3_client, total_size);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_upload_file_single_part_proxy) {
+    const size_t part_size = 5_MiB;
+    const size_t total_size = part_size / 2;
+    test_client_upload_file(make_proxy_client, total_size);
+}
+
+void client_readable_file(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testroobject");
+
+    testlog.info("Put object {}\n", name);
+    temporary_buffer<char> data = sstring("1234567890ABCDEF").release();
+    cln->put_object(name, std::move(data)).get();
+
+    auto f = cln->make_readable_file(name);
+    auto close_readable_file = deferred_close(f);
+
+    testlog.info("Check file size\n");
+    size_t sz = f.size().get();
+    BOOST_REQUIRE_EQUAL(sz, 16);
+
+    testlog.info("Check buffer read\n");
+    char buffer[16];
+    sz = f.dma_read(4, buffer, 7).get();
+    BOOST_REQUIRE_EQUAL(sz, 7);
+    BOOST_REQUIRE_EQUAL(sstring(buffer, 7), sstring("567890A"));
+
+    testlog.info("Check iovec read\n");
+    std::vector<iovec> iovs;
+    iovs.push_back({buffer, 3});
+    iovs.push_back({buffer + 3, 2});
+    iovs.push_back({buffer + 5, 4});
+    sz = f.dma_read(3, std::move(iovs)).get();
+    BOOST_REQUIRE_EQUAL(sz, 9);
+    BOOST_REQUIRE_EQUAL(sstring(buffer, 3), sstring("456"));
+    BOOST_REQUIRE_EQUAL(sstring(buffer + 3, 2), sstring("78"));
+    BOOST_REQUIRE_EQUAL(sstring(buffer + 5, 4), sstring("90AB"));
+
+    testlog.info("Check bulk read\n");
+    auto buf = f.dma_read_bulk<char>(5, 8).get();
+    BOOST_REQUIRE_EQUAL(to_sstring(std::move(buf)), sstring("67890ABC"));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_s3) {
+    client_readable_file(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_proxy) {
+    client_readable_file(make_proxy_client);
+}
+
+void client_readable_file_stream(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("teststreamobject");
+
+    testlog.info("Put object {}\n", name);
+    sstring sample("1F2E3D4C5B6A70899807A6B5C4D3E2F1");
+    temporary_buffer<char> data(sample.c_str(), sample.size());
+    cln->put_object(name, std::move(data)).get();
+
+    auto f = cln->make_readable_file(name);
+    auto close_readable_file = deferred_close(f);
+    auto in = make_file_input_stream(f);
+    auto close_stream = deferred_close(in);
+
+    testlog.info("Check input stream read\n");
+    auto res = seastar::util::read_entire_stream_contiguous(in).get();
+    BOOST_REQUIRE_EQUAL(res, sample);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_stream_s3) {
+    client_readable_file_stream(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_readable_file_stream_proxy) {
+    client_readable_file_stream(make_proxy_client);
+}
+
+void client_put_get_tagging(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto client = guard.client();
+    const auto name = guard.object_path("testobject");
+
+    auto data = sstring("1234567890ABCDEF").release();
+    client->put_object(name, std::move(data)).get();
+
+    {
+        auto tagset = client->get_object_tagging(name).get();
+        BOOST_CHECK(tagset.empty());
+    }
+    {
+        s3::tag_set expected_tagset{{"1", "one"}, {"2", "two"}};
+        client->put_object_tagging(name, expected_tagset).get();
+        auto actual_tagset = client->get_object_tagging(name).get();
+        std::ranges::sort(actual_tagset);
+        std::ranges::sort(expected_tagset);
+        BOOST_CHECK(actual_tagset == expected_tagset);
+    }
+    {
+        client->delete_object_tagging(name).get();
+        auto tagset = client->get_object_tagging(name).get();
+        BOOST_CHECK(tagset.empty());
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_tagging_s3) {
+    client_put_get_tagging(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_put_get_tagging_proxy) {
+    client_put_get_tagging(make_proxy_client);
+}
+
+static std::unordered_set<sstring> populate_bucket(shared_ptr<s3::client> client, sstring bucket, sstring prefix, int nr_objects) {
+    std::unordered_set<sstring> names;
+
+    for (int i = 0; i < nr_objects; i++) {
+        temporary_buffer<char> data = sstring("1234567890").release();
+        auto name = format("obj.{}", i);
+        client->put_object(format("/{}/{}{}", bucket, prefix, name), std::move(data)).get();
+        names.insert(name);
+    }
+
+    return names;
+}
+
+void client_list_objects(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto client = guard.client();
+    const sstring& bucket = guard.bucket();
+    const sstring prefix("testprefix/");
+
+    // Put extra object to check list-by-prefix filters it out
+    temporary_buffer<char> data = sstring("1234567890").release();
+    client->put_object(format("/{}/extra-{}", bucket, ::getpid()), std::move(data)).get();
+    auto names = populate_bucket(client, bucket, prefix, 12);
+
+    s3::client::bucket_lister lister(client, bucket, prefix, 5);
+    auto close_lister = deferred_close(lister);
+
+    while (auto de = lister.get().get()) {
+        testlog.info("-> [{}]", de->name);
+        auto it = names.find(de->name);
+        BOOST_REQUIRE(it != names.end());
+        names.erase(it);
+    }
+    BOOST_REQUIRE(names.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_s3) {
+    client_list_objects(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_proxy) {
+    client_list_objects(make_proxy_client);
+}
+
+void client_list_objects_incomplete(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto client = guard.client();
+    const sstring& bucket = guard.bucket();
+    const sstring prefix("testprefix/");
+
+    populate_bucket(client, bucket, prefix, 8);
+
+    s3::client::bucket_lister lister(client, bucket, prefix, 9, 2);
+    auto close_lister = deferred_close(lister);
+
+    // Peek one entry to start lister work
+    auto de = lister.get().get();
+    close_lister.close_now();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_incomplete_s3) {
+    client_list_objects_incomplete(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_list_objects_incomplete_proxy) {
+    client_list_objects_incomplete(make_proxy_client);
+}
+
+// Not using s3_test_fixture here — the test intentionally targets a
+// non-existent bucket, so there is no bucket to create or clean up.
+void client_broken_bucket(const client_maker_function& client_maker) {
+    const sstring name("/no-bucket/testobject");
+    auto client = client_maker();
+
+    auto close_client = deferred_close(*client);
+    auto data = sstring("1234567890ABCDEF").release();
+    BOOST_REQUIRE_EXCEPTION(client->put_object(name, std::move(data)).get(), storage_io_error, [](const storage_io_error& e) {
+        return e.code().value() == ENOENT && std::string(e.what()).contains("Reason: The specified bucket does not exist.");
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_broken_bucket_s3) {
+    client_broken_bucket(make_s3_client);
+}
+
+void client_missing_prefix(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto client = guard.client();
+    const auto name = guard.object_path("testobject");
+
+    BOOST_REQUIRE_EXCEPTION(client->get_object_size(name).get(), storage_io_error, [](const storage_io_error& e) {
+        return e.code().value() == ENOENT && std::string(e.what()).contains("Reason:  HTTP code: 404 Not Found");
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_missing_prefix_s3) {
+    client_missing_prefix(make_s3_client);
+}
+
+void client_access_missing_object(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto client = guard.client();
+    const auto name = guard.object_path("testobject");
+
+    BOOST_REQUIRE_EXCEPTION(client->get_object_tagging(name).get(), storage_io_error, [](const storage_io_error& e) {
+        return e.code().value() == ENOENT && std::string(e.what()).contains("Reason: The specified key does not exist.");
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_access_missing_object_s3) {
+    client_access_missing_object(make_s3_client);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_object_reupload) {
+    // Pay attention, we are reuploading the same file during the test
+    s3_test_fixture guard(make_s3_client);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testobject");
+    constexpr std::string_view content{"1234567890"};
+    for (auto i : {1, 2}) {
+        testlog.info("Put object {}, iteration {}", name, i);
+        temporary_buffer<char> data = sstring(content).release();
+        cln->put_object(name, std::move(data)).get();
+
+        size_t sz = cln->get_object_size(name).get();
+        BOOST_REQUIRE_EQUAL(sz, content.length());
+
+        s3::stats st = cln->get_object_stats(name).get();
+        BOOST_REQUIRE_EQUAL(st.size, content.length());
+    }
+
+    for (auto jumbo : {true, false}) {
+        for (auto i : {1, 2}) {
+            testlog.info("Upload object {}, iteration {} (with copy = {})", name, i, jumbo);
+            auto out = output_stream<char>(
+                // Make it 3 parts per piece, so that 128Mb buffer below
+                // would be split into several 15Mb pieces
+                jumbo ? cln->make_upload_jumbo_sink(name, s3::object_metadata{}, 3) : cln->make_upload_sink(name));
+
+            constexpr unsigned chunk_size = 1000;
+            constexpr unsigned writes = 128 * 1024;
+            auto rnd = tests::random::get_bytes(chunk_size);
+            uint64_t object_size = 0;
+            for (unsigned ch = 0; ch < writes; ch++) {
+                out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+                object_size += rnd.size();
+            }
+
+            out.flush().get();
+            out.close().get();
+
+            size_t sz = cln->get_object_size(name).get();
+            BOOST_REQUIRE_EQUAL(sz, object_size);
+
+            s3::stats st = cln->get_object_stats(name).get();
+            BOOST_REQUIRE_EQUAL(st.size, object_size);
+        }
+    }
+}
+
+void test_download_data_source(const client_maker_function& client_maker, bool is_chunked, unsigned chunks) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testdatasourceobject");
+
+    static constexpr unsigned chunk_size = 1000;
+    testlog.info("Preparation: Upload object");
+    auto rnd = tests::random::get_bytes(chunk_size);
+    {
+        auto out = output_stream<char>(cln->make_upload_sink(name));
+        auto close = seastar::deferred_close(out);
+
+        for (unsigned ch = 0; ch < chunks; ch++) {
+            out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+        }
+        out.flush().get();
+    }
+
+    testlog.info("Download object");
+    auto in = is_chunked ? input_stream<char>(cln->make_chunked_download_source(name, s3::full_range)) : input_stream<char>(cln->make_download_source(name, s3::full_range));
+    auto close = seastar::deferred_close(in);
+    for (unsigned ch = 0; ch < chunks; ch++) {
+        auto buf = in.read_exactly(chunk_size).get();
+        BOOST_REQUIRE_EQUAL(memcmp(buf.begin(), rnd.begin(), 1000), 0);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_download_data_source_s3) {
+    test_download_data_source(make_s3_client, false, 128 * 1024);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_download_data_source_proxy) {
+    test_download_data_source(make_proxy_client, false, 3 * 1024);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_s3) {
+    test_download_data_source(make_s3_client, true, 128 * 1024);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_proxy) {
+    test_download_data_source(make_proxy_client, true, 3 * 1024);
+}
+
+void test_chunked_download_data_source(const client_maker_function& client_maker, size_t object_size) {
+    tmpdir tmp;
+    const auto file_path = tmp.path() / "test_object";
+    create_file(file_path, object_size).get();
+
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto object_name = guard.object_path("test_object");
+    cln->upload_file(file_path, object_name).get();
+
+    testlog.info("Download object");
+    auto in = input_stream<char>(cln->make_chunked_download_source(object_name, s3::full_range));
+    auto close = seastar::deferred_close(in);
+
+    file rf = open_file_dma(file_path.native(), open_flags::ro).get();
+    auto file_input = make_file_input_stream(std::move(rf));
+    auto close_file = seastar::deferred_close(file_input);
+
+    // The fiber gives up after default_max_retries failed requests in a row, so the
+    // whole read has to stay under that -- the proxy flavour spends part of the budget
+    // on its own injected errors. Buffers arrive socket-sized, so the loop spins about
+    // object_size / 128 KiB times; spacing the injections over that spreads them across
+    // the download rather than bunching them at the start.
+    constexpr size_t injected_failures = 3;
+    static_assert(injected_failures < aws::default_aws_retry_strategy::default_max_retries);
+    const size_t trigger_interval = std::max(1ul, object_size / 128_KiB / (injected_failures + 1));
+
+    size_t total_size = 0;
+    size_t trigger_counter = 0;
+    size_t injected = 0;
+    while (true) {
+        // We want the background fiber to fill the buffer queue and start waiting to drain it
+        seastar::sleep(100us).get();
+        auto buf = in.read().get();
+        total_size += buf.size();
+        if (buf.empty()) {
+            break;
+        }
+        ++trigger_counter;
+        // Arming a one-shot that is still pending is absorbed rather than queued, so
+        // only count an arm the injector actually took, and re-try on the next buffer
+        // until the previous failure has been consumed.
+        if (injected < injected_failures && trigger_counter >= (injected + 1) * trigger_interval &&
+            !utils::get_local_injector().is_enabled("break_s3_inflight_req")) {
+            utils::get_local_injector().enable("break_s3_inflight_req", true);
+            ++injected;
+        }
+
+        auto file_buf = file_input.read_exactly(buf.size()).get();
+        BOOST_REQUIRE_EQUAL(memcmp(buf.begin(), file_buf.begin(), buf.size()), 0);
+    }
+
+    BOOST_REQUIRE_EQUAL(total_size, object_size);
+    BOOST_REQUIRE_EQUAL(injected, injected_failures);
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+    utils::get_local_injector().enable("kill_s3_inflight_req");
+    auto in_throw = input_stream<char>(cln->make_chunked_download_source(object_name, s3::full_range));
+    auto close_throw = seastar::deferred_close(in_throw);
+
+    auto reader = [&in_throw] {
+        while (true) {
+            auto buf = in_throw.read().get();
+            if (buf.empty()) {
+                break;
+            }
+        }
+    };
+    BOOST_REQUIRE_EXCEPTION(
+        reader(), aws::aws_exception, [](const aws::aws_exception& e) {
+            return e.error().get_error_type() == aws::aws_error_type::RESOURCE_NOT_FOUND;
+        });
+#else
+    testlog.info("Skipping error injection test, as it requires SCYLLA_ENABLE_ERROR_INJECTION to be enabled");
+#endif
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_with_delays_s3) {
+    test_chunked_download_data_source(make_s3_client, 20_MiB);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_chunked_download_data_source_with_delays_proxy) {
+    test_chunked_download_data_source(make_proxy_client, 20_MiB);
+}
+
+void test_object_copy(const client_maker_function& client_maker, size_t chunk_size, size_t chunks) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testobject");
+    const auto name_copy = guard.object_path("testobject-copy");
+
+    auto out = output_stream<char>(cln->make_upload_sink(name));
+    auto rnd = tests::random::get_bytes(chunk_size);
+
+    for (unsigned ch = 0; ch < chunks; ch++) {
+        out.write(reinterpret_cast<char*>(rnd.begin()), rnd.size()).get();
+    }
+
+    out.flush().get();
+    out.close().get();
+    cln->copy_object(name, name_copy, s3::object_metadata{}, 5_MiB).get();
+
+    auto sz = cln->get_object_size(name_copy).get();
+    BOOST_REQUIRE_EQUAL(sz, chunk_size * chunks);
+
+    for (size_t off = 0; off < sz; off += chunk_size) {
+        auto len = std::min(chunk_size, sz - off);
+        auto range = s3::range{off, len};
+        auto orig_buf = cln->get_object_contiguous(name, range).get();
+        auto copy_buf = cln->get_object_contiguous(name_copy, range).get();
+        testlog.info("Got [{}:{}) chunk", off, len);
+        BOOST_REQUIRE_EQUAL(memcmp(copy_buf.get(), orig_buf.get(), len), 0);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_small_object_copy) {
+    test_object_copy(make_s3_client, 1000, 2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_object_copy) {
+    test_object_copy(make_s3_client, 1_MiB, 6);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_small_object_copy_proxy) {
+    test_object_copy(make_proxy_client, 1000, 2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_object_copy_proxy) {
+    test_object_copy(make_proxy_client, 1_MiB, 6);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_creds) {
+    /*
+     * Note: This test does not cover the functionality of the `aws::environment_aws_credentials_provider` class because proper testing requires altering
+     * environment variables. Therefore, running such a test in parallel is not feasible. However, all S3-based tests will use
+     * `aws::environment_aws_credentials_provider` to obtain credentials. As a result, if this functionality fails, all S3-related tests will fail immediately.
+     */
+
+    auto host = tests::getenv_safe("MOCK_S3_SERVER_HOST");
+    auto port = std::stoul(tests::getenv_safe("MOCK_S3_SERVER_PORT"));
+    tmpdir tmp;
+
+    auto sts_provider = std::make_unique<aws::sts_assume_role_credentials_provider>(host, port, false, make_test_retry_strategy);
+    auto creds = sts_provider->get_aws_credentials().get();
+    BOOST_REQUIRE_EQUAL(creds.access_key_id, "STS_EXAMPLE_ACCESS_KEY_ID");
+    BOOST_REQUIRE_EQUAL(creds.secret_access_key, "STS_EXAMPLE_SECRET_ACCESS_KEY");
+    BOOST_REQUIRE_EQUAL(creds.session_token.contains("STS_SESSIONTOKEN"), true);
+
+    auto md_provider = std::make_unique<aws::instance_profile_credentials_provider>(host, port, make_test_retry_strategy);
+    creds = md_provider->get_aws_credentials().get();
+    BOOST_REQUIRE_EQUAL(creds.access_key_id, "INSTANCE_FROFILE_EXAMPLE_ACCESS_KEY_ID");
+    BOOST_REQUIRE_EQUAL(creds.secret_access_key, "INSTANCE_FROFILE_EXAMPLE_SECRET_ACCESS_KEY");
+    BOOST_REQUIRE_EQUAL(creds.session_token.contains("INSTANCE_FROFILE_SESSIONTOKEN"), true);
+
+    aws::aws_credentials_provider_chain provider_chain;
+    provider_chain.add_credentials_provider(std::make_unique<aws::sts_assume_role_credentials_provider>(host, port, false, make_test_retry_strategy))
+        .add_credentials_provider(std::make_unique<aws::instance_profile_credentials_provider>(host, port, make_test_retry_strategy));
+    creds = provider_chain.get_aws_credentials().get();
+    BOOST_REQUIRE_EQUAL(creds.access_key_id, "STS_EXAMPLE_ACCESS_KEY_ID");
+    BOOST_REQUIRE_EQUAL(creds.secret_access_key, "STS_EXAMPLE_SECRET_ACCESS_KEY");
+    BOOST_REQUIRE_EQUAL(creds.session_token.contains("STS_SESSIONTOKEN"), true);
+    seastar::sleep(1050ms).get();
+    auto creds1 = provider_chain.get_aws_credentials().get();
+    BOOST_REQUIRE(creds1.expires_at - creds.expires_at >= 1s);
+
+    provider_chain = {};
+    provider_chain.add_credentials_provider(std::make_unique<aws::sts_assume_role_credentials_provider>("0.0.0.0", 0, false, make_unretrying_test_retry_strategy))
+        .add_credentials_provider(std::make_unique<aws::instance_profile_credentials_provider>(host, port, make_test_retry_strategy));
+    creds = provider_chain.get_aws_credentials().get();
+    BOOST_REQUIRE_EQUAL(creds.access_key_id, "INSTANCE_FROFILE_EXAMPLE_ACCESS_KEY_ID");
+    BOOST_REQUIRE_EQUAL(creds.secret_access_key, "INSTANCE_FROFILE_EXAMPLE_SECRET_ACCESS_KEY");
+    BOOST_REQUIRE_EQUAL(creds.session_token.contains("INSTANCE_FROFILE_SESSIONTOKEN"), true);
+    seastar::sleep(1050ms).get();
+    creds1 = provider_chain.get_aws_credentials().get();
+    BOOST_REQUIRE(creds1.expires_at - creds.expires_at >= 1s);
+
+    provider_chain = {};
+    provider_chain.add_credentials_provider(std::make_unique<aws::sts_assume_role_credentials_provider>("0.0.0.0", 0, false, make_unretrying_test_retry_strategy))
+        .add_credentials_provider(std::make_unique<aws::instance_profile_credentials_provider>("0.0.0.0", 0, make_unretrying_test_retry_strategy));
+    creds = provider_chain.get_aws_credentials().get();
+    BOOST_REQUIRE_EQUAL(creds.access_key_id, "");
+    BOOST_REQUIRE_EQUAL(creds.secret_access_key, "");
+    BOOST_REQUIRE_EQUAL(creds.session_token, "");
+}
+
+BOOST_AUTO_TEST_CASE(s3_fqn_manipulation) {
+    std::string bucket_name, object_name;
+    // Empty input
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("", bucket_name, object_name), false);
+    BOOST_REQUIRE(bucket_name.empty());
+    BOOST_REQUIRE(object_name.empty());
+    // Incorrect scheme
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("http://bucket/object", bucket_name, object_name), false);
+    BOOST_REQUIRE(bucket_name.empty());
+    BOOST_REQUIRE(object_name.empty());
+    // No scheme
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("/bucket/object", bucket_name, object_name), false);
+    BOOST_REQUIRE_EQUAL(bucket_name.empty(), true);
+    BOOST_REQUIRE_EQUAL(object_name.empty(), true);
+    // Scheme without slashes
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3:", bucket_name, object_name), false);
+    BOOST_REQUIRE_EQUAL(bucket_name.empty(), true);
+    BOOST_REQUIRE_EQUAL(object_name.empty(), true);
+    // Scheme with single slash
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3:/", bucket_name, object_name), true);
+    BOOST_REQUIRE_EQUAL(bucket_name.empty(), true);
+    BOOST_REQUIRE_EQUAL(object_name, "/");
+    // Without bucket
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3://", bucket_name, object_name), true);
+    BOOST_REQUIRE_EQUAL(bucket_name.empty(), true);
+    BOOST_REQUIRE_EQUAL(object_name, "/");
+    // Bucket only, no prefix/object
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3://bucket/", bucket_name, object_name), true);
+    BOOST_REQUIRE_EQUAL(bucket_name, "bucket");
+    BOOST_REQUIRE_EQUAL(object_name, "/");
+    // Same as above, but without trailing slash
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3://bucket", bucket_name, object_name), true);
+    BOOST_REQUIRE_EQUAL(bucket_name, "bucket");
+    BOOST_REQUIRE_EQUAL(object_name, "/");
+    // Bucket and prefix without object
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3://bucket/object", bucket_name, object_name), true);
+    BOOST_REQUIRE_EQUAL(bucket_name, "bucket");
+    BOOST_REQUIRE_EQUAL(object_name, "object");
+    // Bucket and object with object
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3://bucket/prefix1/prefix2/foo.bar", bucket_name, object_name), true);
+    BOOST_REQUIRE_EQUAL(bucket_name, "bucket");
+    BOOST_REQUIRE_EQUAL(object_name, "prefix1/prefix2/foo.bar");
+    // Bucket and object with object and extra slashes
+    BOOST_REQUIRE_EQUAL(s3::s3fqn_to_parts("s3://bucket///prefix1/prefix2//foo.bar", bucket_name, object_name), true);
+    BOOST_REQUIRE_EQUAL(bucket_name, "bucket");
+    BOOST_REQUIRE_EQUAL(object_name, "prefix1/prefix2/foo.bar");
+}
+
+// Regression test for a SEGV in s3::parse_multipart_copy_upload_etag.
+// When an UploadPartCopy request returns a well-formed XML body that is not a
+// <CopyPartResult> (typically an S3 <Error> document), the parser used to
+// dereference the nullptr returned by first_node("CopyPartResult"), crashing
+// the node. It must instead throw so the caller can handle the error.
+// Reproduces: https://scylladb.atlassian.net/browse/SCYLLADB-2965
+// Observed in Argus runs a0272423-d456-4a57-83d9-37bd0a558602 and
+// c8c78e05-4e70-4934-b964-29aed04d58e3.
+BOOST_AUTO_TEST_CASE(parse_multipart_copy_upload_etag_test) {
+    // Happy path: a real <CopyPartResult> with an <ETag>.
+    {
+        sstring body = R"(<?xml version="1.0" encoding="UTF-8"?><CopyPartResult><ETag>"abc123"</ETag></CopyPartResult>)";
+        BOOST_REQUIRE_EQUAL(s3::parse_multipart_copy_upload_etag(body), "\"abc123\"");
+    }
+
+    // Well-formed XML but an <Error> document (missing <CopyPartResult>):
+    // must throw, not crash.
+    {
+        sstring body = R"(<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>We encountered an internal error.</Message></Error>)";
+        BOOST_REQUIRE_THROW(s3::parse_multipart_copy_upload_etag(body), std::runtime_error);
+    }
+
+    // <CopyPartResult> present but no <ETag> child: must throw, not crash.
+    {
+        sstring body = R"(<?xml version="1.0" encoding="UTF-8"?><CopyPartResult></CopyPartResult>)";
+        BOOST_REQUIRE_THROW(s3::parse_multipart_copy_upload_etag(body), std::runtime_error);
+    }
+
+    // Non-XML body: parse error path, returns empty (caller treats as failure).
+    {
+        sstring body = "this is not xml";
+        BOOST_REQUIRE_EQUAL(s3::parse_multipart_copy_upload_etag(body), "");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(part_size_calculation_test) {
+    BOOST_REQUIRE_EXCEPTION(s3::calc_part_size(490_GiB, s3::minimum_part_size), std::runtime_error, [](const std::runtime_error& e) {
+        return std::string(e.what()).starts_with(format("too many parts: 100352 > {}", s3::maximum_parts_in_piece));
+    });
+    BOOST_REQUIRE_EXCEPTION(s3::calc_part_size(490_GiB, 4_MiB), std::runtime_error, [](const std::runtime_error& e) {
+        return std::string(e.what()).starts_with(format("part_size too small: 4194304 is smaller than minimum part size: {}", s3::minimum_part_size));
+    });
+    BOOST_REQUIRE_EXCEPTION(s3::calc_part_size(s3::maximum_object_size + 1, 0), std::runtime_error, [](const std::runtime_error& e) {
+        return std::string(e.what()).starts_with(
+            format("object size too large: {} is larger than maximum S3 object size: {}", s3::maximum_object_size + 1, s3::maximum_object_size));
+    });
+    BOOST_REQUIRE_EXCEPTION(s3::calc_part_size(1_TiB, s3::maximum_part_size + 1), std::runtime_error, [](const std::runtime_error& e) {
+        return std::string(e.what()).starts_with(
+            format("part_size too large: {} is larger than maximum part size: {}", s3::maximum_part_size + 1, s3::maximum_part_size));
+    });
+    size_t total_size = s3::minimum_part_size * (s3::maximum_parts_in_piece + 1); // 10001 parts at 5 MiB
+    BOOST_REQUIRE_EXCEPTION(s3::calc_part_size(total_size, s3::minimum_part_size), std::runtime_error, [](auto& e) {
+        return std::string(e.what()).starts_with(format("too many parts: 10001 > {}", s3::maximum_parts_in_piece));
+    });
+    {
+        auto [parts, size] = s3::calc_part_size(490_GiB, 100_MiB);
+        BOOST_REQUIRE_EQUAL(size, 100_MiB);
+        BOOST_REQUIRE(parts == 5018);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(50_MiB, 0);
+        BOOST_REQUIRE_EQUAL(size, 50_MiB);
+        BOOST_REQUIRE_EQUAL(parts, 1);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(49_MiB, 0);
+        BOOST_REQUIRE_EQUAL(size, 50_MiB);
+        BOOST_REQUIRE_EQUAL(parts, 1);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(490_GiB, 0);
+        BOOST_REQUIRE_EQUAL(size, 51_MiB);
+        BOOST_REQUIRE(parts == 9839);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(50_MiB * s3::maximum_parts_in_piece, 0);
+        BOOST_REQUIRE_EQUAL(size, 50_MiB);
+        BOOST_REQUIRE_EQUAL(parts, s3::maximum_parts_in_piece);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(50_MiB * s3::maximum_parts_in_piece + 1, 0);
+        BOOST_REQUIRE(size > 50_MiB);
+        BOOST_REQUIRE(parts <= s3::maximum_parts_in_piece);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(5_TiB, 0);
+        BOOST_REQUIRE_EQUAL(parts, 9987);
+        BOOST_REQUIRE_EQUAL(size, 525_MiB);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(s3::minimum_part_size * s3::maximum_parts_in_piece, s3::minimum_part_size);
+        BOOST_REQUIRE_EQUAL(size, s3::minimum_part_size);
+        BOOST_REQUIRE_EQUAL(parts, s3::maximum_parts_in_piece);
+    }
+    {
+        size_t total = 500_GiB + 123; // odd size to force non-MiB alignment
+        auto [parts, size] = s3::calc_part_size(total, 0);
+
+        BOOST_REQUIRE(size % 1_MiB == 0); // aligned
+        BOOST_REQUIRE(parts <= s3::maximum_parts_in_piece);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(6_MiB, 0);
+        BOOST_REQUIRE_EQUAL(size, 50_MiB);
+        BOOST_REQUIRE_EQUAL(parts, 1);
+    }
+    {
+        auto [parts, size] = s3::calc_part_size(100_MiB, 200_MiB);
+        BOOST_REQUIRE_EQUAL(parts, 1);
+        BOOST_REQUIRE_EQUAL(size, 200_MiB);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// throttling_controller unit tests.
+//
+// The controller has one piece of behaviour: once the endpoint is refusing a
+// sustained share of requests it freezes sending for a few seconds.
+// ---------------------------------------------------------------------------
+
+SEASTAR_THREAD_TEST_CASE(test_throttling_controller_freeze_stops_admission_on_sustained_refusal) {
+    s3::aws_throttling_controller tc;
+    auto first = tc.acquire(nullptr);
+    BOOST_REQUIRE(first.available()); // nothing holds a request back before any refusal
+    first.get();
+
+    // One refusal is not evidence about the shard, and must not brake it.
+    tc.on_throttled();
+    BOOST_REQUIRE_EQUAL(tc.freezes(), 0u);
+
+    // Nor is a sample the endpoint answered nearly all of. Together with the refusal
+    // above this closes one full sample, at a share far below the threshold.
+    constexpr unsigned outcomes_per_sample = 50;
+    for (unsigned i = 1; i < outcomes_per_sample; ++i) {
+        tc.on_not_throttled();
+    }
+    BOOST_REQUIRE_EQUAL(tc.freezes(), 0u);
+
+    // A sample the endpoint refused outright must brake it, on the outcome that closes
+    // the sample rather than after any wall-clock interval.
+    const auto froze_at = seastar::lowres_clock::now();
+    for (unsigned i = 0; i < outcomes_per_sample; ++i) {
+        tc.on_throttled();
+    }
+    BOOST_REQUIRE_EQUAL(tc.freezes(), 1u);
+
+    // Outcomes arriving now answer requests sent before the freeze, so they must not
+    // feed the estimate: enough of them to close several samples must not re-arm it.
+    for (unsigned i = 0; i < 4 * outcomes_per_sample; ++i) {
+        tc.on_throttled();
+    }
+    BOOST_REQUIRE_EQUAL(tc.freezes(), 1u);
+
+    // The freeze must hold admission, and must not be ready synchronously.
+    seastar::abort_source as;
+    auto frozen = tc.acquire(&as);
+    BOOST_REQUIRE(!frozen.available());
+
+    // It must lift on its own, well inside this deadline.
+    const auto deadline = seastar::lowres_clock::now() + 10s;
+    while (!frozen.available() && seastar::lowres_clock::now() < deadline) {
+        seastar::sleep(100ms).get();
+    }
+
+    // Report only once acquire() is done with the controller. Failing while it is
+    // still sleeping would destroy the controller it holds a reference to.
+    const bool resumed = frozen.available();
+    if (!resumed) {
+        as.request_abort();
+    }
+    frozen.handle_exception([](std::exception_ptr) {}).get();
+
+    BOOST_REQUIRE_MESSAGE(resumed, "acquire() never resumed after the throttling freeze");
+
+    // A freeze that lifted immediately would satisfy everything above, so pin the
+    // length: admission has to have been held for the freeze, not just deferred.
+    const auto held = seastar::lowres_clock::now() - froze_at;
+    BOOST_REQUIRE_GE(std::chrono::duration_cast<std::chrono::milliseconds>(held).count(), 3500);
+}
+
+// Read a single S3 metric value out of the seastar metrics registry, matching on
+// the "operation" label only. The other label the client attaches is "endpoint",
+// which depends on the test host, so we iterate the family rather than hardcode it.
+//
+// Returns std::nullopt if the family has no matching series, which is what a
+// client that never registered these metrics looks like.
+static std::optional<double> read_s3_metric(const sstring& metric_name, const sstring& operation) {
+    const auto& value_map = seastar::metrics::impl::get_value_map();
+    auto fam_it = value_map.find(metric_name);
+    if (fam_it == value_map.end()) {
+        return std::nullopt;
+    }
+    for (const auto& [holder, reg] : fam_it->second) {
+        if (!reg || !reg->is_enabled()) {
+            continue;
+        }
+        const auto& labels = reg->get_id().labels();
+        auto op_it = labels.find("operation");
+        if (op_it != labels.end() && op_it->second.value() == operation) {
+            return (*reg)().d();
+        }
+    }
+    return std::nullopt;
+}
+
+// The client registers the connection counters per scheduling group; the tests below
+// want the total, so the series are summed rather than matched on a label.
+static std::optional<double> sum_s3_metric(const sstring& metric_name) {
+    const auto& value_map = seastar::metrics::impl::get_value_map();
+    auto fam_it = value_map.find(metric_name);
+    if (fam_it == value_map.end()) {
+        return std::nullopt;
+    }
+    std::optional<double> total;
+    for (const auto& [holder, reg] : fam_it->second) {
+        if (reg && reg->is_enabled()) {
+            total = total.value_or(0.0) + (*reg)().d();
+        }
+    }
+    return total;
+}
+
+// An exception leaving the reply handler makes seastar's http client drop the
+// connection, so reporting a missing object must not raise one.
+void do_test_client_object_absent(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testabsentobject");
+
+    BOOST_REQUIRE(!cln->object_exists(name).get());
+
+    // After the first probe, so the connection it may have had to dial is not counted.
+    auto connections = sum_s3_metric("s3_total_new_connections");
+    BOOST_REQUIRE_MESSAGE(connections.has_value(), "s3_total_new_connections metric not registered");
+    for (int i = 0; i < 3; i++) {
+        BOOST_REQUIRE(!cln->object_exists(name).get());
+    }
+    BOOST_REQUIRE_EQUAL(sum_s3_metric("s3_total_new_connections").value(), *connections);
+
+    cln->put_object(name, temporary_buffer<char>()).get();
+    BOOST_REQUIRE(cln->object_exists(name).get());
+    BOOST_REQUIRE_EQUAL(sum_s3_metric("s3_total_new_connections").value(), *connections);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_object_absent_s3) {
+    do_test_client_object_absent(make_s3_client);
+}
+
+// Deleting is idempotent: callers only want the object gone afterwards. As above, that
+// must not cost a connection.
+void do_test_client_delete_absent_object(const client_maker_function& client_maker) {
+    s3_test_fixture guard(client_maker);
+    auto cln = guard.client();
+    const auto name = guard.object_path("testdeleteabsentobject");
+
+    cln->delete_object(name).get();
+    BOOST_REQUIRE(!cln->object_exists(name).get());
+
+    auto connections = sum_s3_metric("s3_total_new_connections");
+    BOOST_REQUIRE_MESSAGE(connections.has_value(), "s3_total_new_connections metric not registered");
+    for (int i = 0; i < 3; i++) {
+        cln->delete_object(name).get();
+    }
+
+    // Makes the above a tolerated outcome rather than a delete that does nothing.
+    cln->put_object(name, temporary_buffer<char>()).get();
+    BOOST_REQUIRE(cln->object_exists(name).get());
+    cln->delete_object(name).get();
+    BOOST_REQUIRE(!cln->object_exists(name).get());
+
+    // S3 and the gateway answer a DELETE for a key that was never there with 204, so a
+    // missing bucket is the only way to get the 404 this tolerates.
+    cln->delete_object(format("/{}-no-such-bucket/{}", guard.bucket(), "object")).get();
+
+    BOOST_REQUIRE_EQUAL(sum_s3_metric("s3_total_new_connections").value(), *connections);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_delete_absent_object_s3) {
+    do_test_client_delete_absent_object(make_s3_client);
+}
+
+// Integration test: drive a real upload through the fuzzing S3 proxy with the
+// actual AWS throttling controller wired in, and verify the
+// throttling machinery is exercised end-to-end by watching its metrics.
+//
+// The proxy injects retryable errors (including 503 SlowDown), which makes the
+// controller engage: it records throttles and freezes sending. The
+// no-op controller used by other proxy tests would leave these metrics
+// untouched, so a change here proves the real controller is on the request
+// path and reacting to S3 pushback.
+SEASTAR_THREAD_TEST_CASE(test_throttling_controller_metrics_change_on_upload_proxy) {
+    tmpdir tmp;
+    const auto file_path = tmp.path() / "test";
+    const size_t total_size = 4 * 5_MiB;
+    create_file(file_path, total_size).get();
+
+    s3_test_fixture guard(make_proxy_client_with_aws_throttling);
+    auto client = guard.client();
+
+    // The proxy injects retryable errors probabilistically (random seed), so a
+    // single upload does not deterministically hit a throttling-class error. We
+    // upload repeatedly until the controller records at least one throttle, up
+    // to a generous bound. In practice this converges within the first few
+    // iterations; the bound only guards against an infinite loop if the proxy
+    // ever stops injecting errors.
+    std::optional<double> throttles;
+    constexpr int max_uploads = 50;
+    for (int i = 0; i < max_uploads; ++i) {
+        const auto object_name = guard.object_path(format("throttling-metrics-test-{}", i));
+        client->upload_file(file_path, object_name).get();
+        throttles = read_s3_metric("s3_throttles", "request");
+        if (throttles.has_value() && *throttles > 0.0) {
+            break;
+        }
+        client->delete_object(object_name).get();
+    }
+
+    // The proxy injects throttling errors, so the controller must have seen at
+    // least one and reacted. throttles > 0 is the primary signal that the real
+    // controller was engaged on the write path rather than the no-op stub.
+    BOOST_REQUIRE_MESSAGE(throttles.has_value(), "s3_throttles{operation=request} metric not registered - controller was not exercised");
+    BOOST_REQUIRE_GT(*throttles, 0.0);
+
+    // Whether the brake actually engages depends on the share of requests the proxy
+    // refuses crossing the threshold, and the proxy injects at random, so the freeze
+    // count is not asserted here. throttles above already separates the real
+    // controller from the no-op stub, which reports zero for all three.
+    auto freezes = read_s3_metric("s3_send_freezes", "request");
+    BOOST_REQUIRE_MESSAGE(freezes.has_value(), "s3_send_freezes{operation=request} metric not registered");
+    auto refused = read_s3_metric("s3_refused_request_ratio", "request");
+    BOOST_REQUIRE_MESSAGE(refused.has_value(), "s3_refused_request_ratio{operation=request} metric not registered");
+    BOOST_REQUIRE_GE(*refused, 0.0);
+    BOOST_REQUIRE_LE(*refused, 1.0);
+}

@@ -3,10 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <seastar/core/with_scheduling_group.hh>
 #include <seastar/net/dns.hh>
+
 #include "controller.hh"
 #include "server.hh"
 #include "executor.hh"
@@ -14,6 +16,9 @@
 #include "db/config.hh"
 #include "cdc/generation_service.hh"
 #include "service/memory_limiter.hh"
+#include "auth/service.hh"
+#include "service/qos/service_level_controller.hh"
+#include "vector_search/vector_store_client.hh"
 
 using namespace seastar;
 
@@ -24,17 +29,31 @@ static logging::logger logger("alternator_controller");
 controller::controller(
         sharded<gms::gossiper>& gossiper,
         sharded<service::storage_proxy>& proxy,
+        sharded<sstables::dictionary_service>& dicts,
         sharded<service::migration_manager>& mm,
         sharded<db::system_distributed_keyspace>& sys_dist_ks,
+        sharded<db::system_keyspace>& sys_ks,
         sharded<cdc::generation_service>& cdc_gen_svc,
         sharded<service::memory_limiter>& memory_limiter,
-        const db::config& config)
-    : _gossiper(gossiper)
+        sharded<auth::service>& auth_service,
+        sharded<qos::service_level_controller>& sl_controller,
+        sharded<vector_search::vector_store_client>& vsc,
+        sharded<updateable_timeout_config>& timeout_config,
+        const db::config& config,
+        seastar::scheduling_group sg)
+    : protocol_server(sg)
+    , _gossiper(gossiper)
     , _proxy(proxy)
+    , _dicts(dicts)
     , _mm(mm)
     , _sys_dist_ks(sys_dist_ks)
+    , _sys_ks(sys_ks)
     , _cdc_gen_svc(cdc_gen_svc)
     , _memory_limiter(memory_limiter)
+    , _auth_service(auth_service)
+    , _sl_controller(sl_controller)
+    , _vsc(vsc)
+    , _timeout_config(timeout_config)
     , _config(config)
 {
 }
@@ -56,7 +75,9 @@ std::vector<socket_address> controller::listen_addresses() const {
 }
 
 future<> controller::start_server() {
-    return seastar::async([this] {
+    seastar::thread_attributes attr;
+    attr.sched_group = _sched_group;
+    return seastar::async(std::move(attr), [this] {
         _listen_addresses.clear();
 
         auto preferred = _config.listen_interface_prefer_ipv6() ? std::make_optional(net::inet_address::family::INET6) : std::nullopt;
@@ -67,27 +88,47 @@ future<> controller::start_server() {
         // shards - if necessary for LWT.
         smp_service_group_config c;
         c.max_nonlocal_requests = 5000;
-        _ssg = create_smp_service_group(c).get0();
+        _ssg = create_smp_service_group(c).get();
 
         rmw_operation::set_default_write_isolation(_config.alternator_write_isolation());
-        executor::set_default_timeout(std::chrono::milliseconds(_config.alternator_timeout_in_ms()));
 
-        net::inet_address addr = utils::resolve(_config.alternator_address, family).get0();
+        net::inet_address addr = utils::resolve(_config.alternator_address, family).get();
 
         auto get_cdc_metadata = [] (cdc::generation_service& svc) { return std::ref(svc.get_cdc_metadata()); };
-
-        _executor.start(std::ref(_gossiper), std::ref(_proxy), std::ref(_mm), std::ref(_sys_dist_ks), sharded_parameter(get_cdc_metadata, std::ref(_cdc_gen_svc)), _ssg.value()).get();
-        _server.start(std::ref(_executor), std::ref(_proxy), std::ref(_gossiper)).get();
+        auto get_timeout_in_ms = [] (const db::config& cfg) -> utils::updateable_value<uint32_t> {
+            return cfg.alternator_timeout_in_ms;
+        };
+        _executor.start(std::ref(_gossiper), std::ref(_proxy), std::ref(_dicts), std::ref(_mm), std::ref(_sys_dist_ks), std::ref(_sys_ks),
+                        sharded_parameter(get_cdc_metadata, std::ref(_cdc_gen_svc)), std::ref(_vsc), _ssg.value(),
+                        sharded_parameter(get_timeout_in_ms, std::ref(_config))).get();
+        _server.start(std::ref(_executor), std::ref(_proxy), std::ref(_gossiper), std::ref(_auth_service), std::ref(_sl_controller), std::ref(_timeout_config)).get();
+        // Note: from this point on, if start_server() throws for any reason,
+        // it must first call stop_server() to stop the executor and server
+        // services we just started - or Scylla will cause an assertion
+        // failure when the controller object is destroyed in the exception
+        // unwinding.
         std::optional<uint16_t> alternator_port;
         if (_config.alternator_port()) {
             alternator_port = _config.alternator_port();
             _listen_addresses.push_back({addr, *alternator_port});
         }
+        std::optional<uint16_t> alternator_port_proxy_protocol;
+        if (_config.alternator_port_proxy_protocol()) {
+            alternator_port_proxy_protocol = _config.alternator_port_proxy_protocol();
+            _listen_addresses.push_back({addr, *alternator_port_proxy_protocol});
+        }
         std::optional<uint16_t> alternator_https_port;
+        std::optional<uint16_t> alternator_https_port_proxy_protocol;
         std::optional<tls::credentials_builder> creds;
-        if (_config.alternator_https_port()) {
-            alternator_https_port = _config.alternator_https_port();
-            _listen_addresses.push_back({addr, *alternator_https_port});
+        if (_config.alternator_https_port() || _config.alternator_https_port_proxy_protocol()) {
+            if (_config.alternator_https_port()) {
+                alternator_https_port = _config.alternator_https_port();
+                _listen_addresses.push_back({addr, *alternator_https_port});
+            }
+            if (_config.alternator_https_port_proxy_protocol()) {
+                alternator_https_port_proxy_protocol = _config.alternator_https_port_proxy_protocol();
+                _listen_addresses.push_back({addr, *alternator_https_port_proxy_protocol});
+            }
             creds.emplace();
             auto opts = _config.alternator_encryption_options();
             if (opts.empty()) {
@@ -97,28 +138,48 @@ future<> controller::start_server() {
                 // to allow this, for backward compatibility.
                 opts = _config.server_encryption_options();
                 if (!opts.empty()) {
-                logger.warn("Setting server_encryption_options to configure "
-                        "Alternator's HTTPS encryption is deprecated. Please "
-                        "switch to setting alternator_encryption_options instead.");
+                    logger.warn("Setting server_encryption_options to configure "
+                            "Alternator's HTTPS encryption is deprecated. Please "
+                            "switch to setting alternator_encryption_options instead.");
+                    // server_encryption_options is for internode encryption.
+                    // Its require_client_auth and truststore settings must not
+                    // bleed into Alternator's client-facing HTTPS endpoint.
+                    opts.erase("require_client_auth");
+                    opts.erase("truststore");
                 }
             }
-            opts.erase("require_client_auth");
-            opts.erase("truststore");
-            utils::configure_tls_creds_builder(creds.value(), std::move(opts)).get();
+            try {
+                utils::configure_tls_creds_builder(creds.value(), std::move(opts)).get();
+            } catch(...) {
+                logger.error("Failed to set up Alternator TLS credentials: {:t}", std::current_exception());
+                stop_server().get();
+                std::throw_with_nested(std::runtime_error("Failed to set up Alternator TLS credentials"));
+            }
         }
-        bool alternator_enforce_authorization = _config.alternator_enforce_authorization();
         _server.invoke_on_all(
-                [this, addr, alternator_port, alternator_https_port, creds = std::move(creds), alternator_enforce_authorization] (server& server) mutable {
-            return server.init(addr, alternator_port, alternator_https_port, creds, alternator_enforce_authorization,
+                [this, addr, alternator_port, alternator_https_port, alternator_port_proxy_protocol, alternator_https_port_proxy_protocol, creds = std::move(creds)] (server& server) mutable {
+            return server.init(addr, alternator_port, alternator_https_port, alternator_port_proxy_protocol, alternator_https_port_proxy_protocol, creds,
+                    _config.alternator_enforce_authorization,
+                    _config.alternator_warn_authorization,
+                    _config.alternator_max_users_query_size_in_trace_output,
                     &_memory_limiter.local().get_semaphore(),
                     _config.max_concurrent_requests_per_shard);
-        }).handle_exception([this, addr, alternator_port, alternator_https_port] (std::exception_ptr ep) {
-            logger.error("Failed to set up Alternator HTTP server on {} port {}, TLS port {}: {}",
-                    addr, alternator_port ? std::to_string(*alternator_port) : "OFF", alternator_https_port ? std::to_string(*alternator_https_port) : "OFF", ep);
+        }).handle_exception([this, addr, alternator_port, alternator_https_port, alternator_port_proxy_protocol, alternator_https_port_proxy_protocol] (std::exception_ptr ep) {
+            logger.error("Failed to set up Alternator HTTP server on {} port {}, TLS port {}, proxy-protocol port {}, TLS proxy-protocol port {}: {}",
+                    addr,
+                    alternator_port ? std::to_string(*alternator_port) : "OFF",
+                    alternator_https_port ? std::to_string(*alternator_https_port) : "OFF",
+                    alternator_port_proxy_protocol ? std::to_string(*alternator_port_proxy_protocol) : "OFF",
+                    alternator_https_port_proxy_protocol ? std::to_string(*alternator_https_port_proxy_protocol) : "OFF",
+                    ep);
             return stop_server().then([ep = std::move(ep)] { return make_exception_future<>(ep); });
-        }).then([addr, alternator_port, alternator_https_port] {
-            logger.info("Alternator server listening on {}, HTTP port {}, HTTPS port {}",
-                    addr, alternator_port ? std::to_string(*alternator_port) : "OFF", alternator_https_port ? std::to_string(*alternator_https_port) : "OFF");
+        }).then([addr, alternator_port, alternator_https_port, alternator_port_proxy_protocol, alternator_https_port_proxy_protocol] {
+            logger.info("Alternator server listening on {}, HTTP port {}, HTTPS port {}, proxy-protocol port {}, TLS proxy-protocol port {}",
+                    addr,
+                    alternator_port ? std::to_string(*alternator_port) : "OFF",
+                    alternator_https_port ? std::to_string(*alternator_https_port) : "OFF",
+                    alternator_port_proxy_protocol ? std::to_string(*alternator_port_proxy_protocol) : "OFF",
+                    alternator_https_port_proxy_protocol ? std::to_string(*alternator_https_port_proxy_protocol) : "OFF");
         }).get();
     });
 }
@@ -128,6 +189,9 @@ future<> controller::stop_server() {
         if (!_ssg) {
             return;
         }
+        // A DDL request can wait for group0 for up to group0_raft_op_timeout_in_ms, and
+        // _server.stop() waits for the running requests. So end these waits first.
+        _executor.invoke_on_all(&executor::request_stop).get();
         _server.stop().get();
         _executor.stop().get();
         _listen_addresses.clear();
@@ -136,7 +200,13 @@ future<> controller::stop_server() {
 }
 
 future<> controller::request_stop_server() {
-    return stop_server();
+    return with_scheduling_group(_sched_group, [this] {
+        return stop_server();
+    });
+}
+
+future<utils::chunked_vector<foreign_ptr<std::unique_ptr<client_data>>>> controller::get_client_data() {
+    return _server.local().get_client_data();
 }
 
 }

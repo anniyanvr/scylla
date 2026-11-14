@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <seastar/core/sstring.hh>
@@ -12,23 +12,33 @@
 #include <seastar/core/aligned_buffer.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/smp.hh>
+#include <seastar/util/short_streams.hh>
 #include <seastar/util/closeable.hh>
 
+#include "sstables/checksum_utils.hh"
+#include "sstables/generation_type.hh"
 #include "sstables/sstables.hh"
-#include "compaction/compaction_manager.hh"
 #include "sstables/key.hh"
+#include "sstables/open_info.hh"
+#include "sstables/version.hh"
+#include "test/lib/exception_utils.hh"
+#include "test/lib/log.hh"
+#include "test/lib/random_schema.hh"
 #include "test/lib/sstable_utils.hh"
-#include <seastar/testing/test_case.hh>
-#include "schema.hh"
-#include "compress.hh"
+#include "test/lib/random_utils.hh"
+#include "test/lib/reader_concurrency_semaphore.hh"
+#include "test/lib/scylla_test_case.hh"
+#include "test/lib/test_utils.hh"
+#include "schema/schema.hh"
+#include "sstables/compressor.hh"
 #include "replica/database.hh"
-#include <memory>
 #include "test/boost/sstable_test.hh"
 #include "test/lib/tmpdir.hh"
 #include "partition_slice_builder.hh"
-#include "test/lib/test_services.hh"
-#include "cell_locking.hh"
 #include "sstables/sstable_mutation_reader.hh"
+#include "sstables/binary_search.hh"
+#include "sstables/exceptions.hh"
 
 #include <boost/range/combine.hpp>
 
@@ -38,81 +48,71 @@ bytes as_bytes(const sstring& s) {
     return { reinterpret_cast<const int8_t*>(s.data()), s.size() };
 }
 
-future<> test_using_working_sst(schema_ptr s, sstring dir, int64_t gen) {
-    return test_env::do_with([s = std::move(s), dir = std::move(dir), gen] (test_env& env) {
-        return env.working_sst(std::move(s), std::move(dir), gen);
+future<> test_using_working_sst(schema_ptr s, sstring dir) {
+    return test_env::do_with_async([s = std::move(s), dir = std::move(dir)] (test_env& env) {
+        (void)env.reusable_sst(std::move(s), std::move(dir)).get();
     });
 }
 
 SEASTAR_TEST_CASE(uncompressed_data) {
-    return test_using_working_sst(uncompressed_schema(), uncompressed_dir(), 1);
+    return test_using_working_sst(uncompressed_schema(), uncompressed_dir());
 }
 
 static auto make_schema_for_compressed_sstable() {
-    return make_shared_schema({}, "ks", "cf", {{"pk", utf8_type}}, {}, {}, {}, utf8_type);
+    return schema_builder(this_smp_shard_count(), "ks", "cf").with_column("pk", utf8_type, column_kind::partition_key).build();
 }
 
 SEASTAR_TEST_CASE(compressed_data) {
     auto s = make_schema_for_compressed_sstable();
-    return test_using_working_sst(std::move(s), "test/resource/sstables/compressed", 1);
+    return test_using_working_sst(std::move(s), "test/resource/sstables/compressed");
 }
 
 SEASTAR_TEST_CASE(composite_index) {
-    return test_using_working_sst(composite_schema(), "test/resource/sstables/composite", 1);
+    return test_using_working_sst(composite_schema(), "test/resource/sstables/composite");
 }
 
-template<typename Func>
-inline auto
-test_using_reusable_sst(schema_ptr s, sstring dir, unsigned long gen, Func&& func) {
-    return test_env::do_with([s = std::move(s), dir = std::move(dir), gen, func = std::move(func)] (test_env& env) {
-        return env.reusable_sst(std::move(s), std::move(dir), gen).then([&env, func = std::move(func)] (sstable_ptr sst) mutable {
-            return func(env, std::move(sst));
-        });
+template<std::invocable<test_env&, sstable_ptr> Func>
+inline future<std::invoke_result_t<Func, test_env&, sstable_ptr>>
+test_using_reusable_sst(schema_ptr s, sstring dir, sstables::generation_type::int_t gen, Func&& func) {
+    using ret_type = std::invoke_result_t<Func, test_env&, sstable_ptr>;
+    return test_env::do_with_async_returning<ret_type>([s = std::move(s), dir = std::move(dir), gen, func = std::move(func)] (test_env& env) {
+        auto sst = env.reusable_sst(std::move(s), std::move(dir), generation_from_value(gen)).get();
+        return func(env, std::move(sst));
     });
 }
 
 future<std::vector<partition_key>> index_read(schema_ptr schema, sstring path) {
     return test_using_reusable_sst(std::move(schema), std::move(path), 1, [] (test_env& env, sstable_ptr ptr) {
-        return sstables::test(ptr).read_indexes(env.make_reader_permit()).then([] (auto&& indexes) {
-            return boost::copy_range<std::vector<partition_key>>(
-                    indexes | boost::adaptors::transformed([] (const sstables::test::index_entry& e) { return e.key; }));
-        });
+        auto indexes = sstables::test(ptr).read_indexes(env.make_reader_permit()).get();
+        return indexes | std::views::transform([] (const sstables::test::index_entry& e) { return e.key; }) | std::ranges::to<std::vector<partition_key>>();
     });
 }
 
 SEASTAR_TEST_CASE(simple_index_read) {
-    return index_read(uncompressed_schema(), uncompressed_dir()).then([] (auto vec) {
-        BOOST_REQUIRE(vec.size() == 4);
-    });
+    auto vec = co_await index_read(uncompressed_schema(), uncompressed_dir());
+    BOOST_REQUIRE(vec.size() == 4);
 }
 
 SEASTAR_TEST_CASE(composite_index_read) {
-    return index_read(composite_schema(), "test/resource/sstables/composite").then([] (auto vec) {
-        BOOST_REQUIRE(vec.size() == 20);
-    });
+    auto vec = co_await index_read(composite_schema(), "test/resource/sstables/composite");
+    BOOST_REQUIRE(vec.size() == 20);
 }
 
 template<uint64_t Position, uint64_t EntryPosition, uint64_t EntryKeySize>
-future<> summary_query(schema_ptr schema, sstring path, int generation) {
+future<> summary_query(schema_ptr schema, sstring path, sstables::generation_type::int_t generation) {
     return test_using_reusable_sst(std::move(schema), path, generation, [] (test_env& env, sstable_ptr ptr) {
-        return sstables::test(ptr).read_summary_entry(Position).then([ptr] (auto entry) {
-            BOOST_REQUIRE(entry.position == EntryPosition);
-            BOOST_REQUIRE(entry.key.size() == EntryKeySize);
-            return make_ready_future<>();
-        });
+        auto entry = sstables::test(ptr).read_summary_entry(Position).get();
+        BOOST_REQUIRE(entry.position == EntryPosition);
+        BOOST_REQUIRE(entry.key.size() == EntryKeySize);
     });
 }
 
 template<uint64_t Position, uint64_t EntryPosition, uint64_t EntryKeySize>
-future<> summary_query_fail(schema_ptr schema, sstring path, int generation) {
-    return summary_query<Position, EntryPosition, EntryKeySize>(std::move(schema), path, generation).then_wrapped([] (auto fut) {
-        try {
-            fut.get();
-        } catch (std::out_of_range& ok) {
-            return make_ready_future<>();
-        }
-        return make_ready_future<>();
-    });
+future<> summary_query_fail(schema_ptr schema, sstring path, sstables::generation_type::int_t generation) {
+    try {
+        co_await summary_query<Position, EntryPosition, EntryKeySize>(std::move(schema), std::move(path), generation);
+    } catch (const std::out_of_range&) {
+    }
 }
 
 SEASTAR_TEST_CASE(small_summary_query_ok) {
@@ -160,79 +160,40 @@ SEASTAR_TEST_CASE(missing_summary_interval_1_query_ok) {
 
 SEASTAR_TEST_CASE(missing_summary_first_last_sane) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 2, [] (test_env& env, shared_sstable ptr) {
-        auto& summary = sstables::test(ptr).get_summary();
+        const auto& summary = ptr->get_summary();
         BOOST_REQUIRE(summary.header.size == 1);
         BOOST_REQUIRE(summary.positions.size() == 1);
         BOOST_REQUIRE(summary.entries.size() == 1);
         BOOST_REQUIRE(bytes_view(summary.first_key) == as_bytes("vinna"));
         BOOST_REQUIRE(bytes_view(summary.last_key) == as_bytes("finna"));
-        return make_ready_future<>();
     });
 }
 
-static future<sstable_ptr> do_write_sst(test_env& env, schema_ptr schema, sstring load_dir, sstring write_dir, unsigned long generation) {
-    return env.reusable_sst(std::move(schema), load_dir, generation).then([write_dir, generation] (sstable_ptr sst) {
-        sstables::test(sst).change_generation_number(generation + 1);
-        sstables::test(sst).change_dir(write_dir);
-        auto fut = sstables::test(sst).store();
-        return std::move(fut).then([sst = std::move(sst)] {
-            return make_ready_future<sstable_ptr>(std::move(sst));
-        });
-    });
+static future<std::pair<sstable_ptr, sstable_ptr>> do_write_sst(test_env& env, schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
+    auto sst = co_await env.reusable_sst(std::move(schema), load_dir, generation);
+    sstable_generation_generator gen;
+    auto sst2 = co_await sstables::test(sst).store(write_dir, gen());
+    co_return std::make_pair(sst, sst2);
 }
 
-static future<> write_sst_info(schema_ptr schema, sstring load_dir, sstring write_dir, unsigned long generation) {
-    return test_env::do_with([schema = std::move(schema), load_dir = std::move(load_dir), write_dir = std::move(write_dir), generation] (test_env& env) {
-        return do_write_sst(env, std::move(schema), load_dir, write_dir, generation).then([] (auto ptr) { return make_ready_future<>(); });
+static future<std::pair<sstables::generation_type, sstables::generation_type>> write_sst_info(schema_ptr schema, sstring load_dir, sstring write_dir, sstables::generation_type generation) {
+    std::pair<sstables::generation_type, sstables::generation_type> ret;
+    co_await test_env::do_with_async([schema = std::move(schema), load_dir = std::move(load_dir), write_dir = std::move(write_dir),
+                                    generation = std::move(generation), &ret] (test_env& env) {
+        auto [sst1, sst2] = do_write_sst(env, std::move(schema), std::move(load_dir), std::move(write_dir), std::move(generation)).get();
+        ret = std::make_pair(sst1->generation(), sst2->generation());
     });
-}
-
-using bufptr_t = std::unique_ptr<char [], free_deleter>;
-static future<std::pair<bufptr_t, size_t>> read_file(sstring file_path)
-{
-    return open_file_dma(file_path, open_flags::ro).then([] (file f) {
-        return f.size().then([f] (auto size) mutable {
-            auto aligned_size = align_up(size, 512UL);
-            auto buf = allocate_aligned_buffer<char>(aligned_size, 512UL);
-            auto rbuf = buf.get();
-            ::memset(rbuf, 0, aligned_size);
-            return f.dma_read(0, rbuf, aligned_size).then([size, buf = std::move(buf), f] (auto ret) mutable {
-                BOOST_REQUIRE(ret == size);
-                std::pair<bufptr_t, size_t> p(std::move(buf), std::move(size));
-                return make_ready_future<std::pair<bufptr_t, size_t>>(std::move(p));
-            }).finally([f] () mutable { return f.close().finally([f] {}); });
-        });
-    });
-}
-
-struct sstdesc {
-    sstring dir;
-    int64_t gen;
-};
-
-static future<> compare_files(sstdesc file1, sstdesc file2, component_type component) {
-    auto file_path = sstable::filename(file1.dir, "ks", "cf", la, file1.gen, big, component);
-    return read_file(file_path).then([component, file2] (auto ret) {
-        auto file_path = sstable::filename(file2.dir, "ks", "cf", la, file2.gen, big, component);
-        return read_file(file_path).then([ret = std::move(ret)] (auto ret2) {
-            // assert that both files have the same size.
-            BOOST_REQUIRE(ret.second == ret2.second);
-            // assert that both files have the same content.
-            BOOST_REQUIRE(::memcmp(ret.first.get(), ret2.first.get(), ret.second) == 0);
-            // free buf from both files.
-        });
-    });
-
+    co_return ret;
 }
 
 static future<> check_component_integrity(component_type component) {
-    auto tmp = make_lw_shared<tmpdir>();
-    auto s = make_schema_for_compressed_sstable();
-    return write_sst_info(s, "test/resource/sstables/compressed", tmp->path().string(), 1).then([component, tmp] {
-        return compare_files(sstdesc{"test/resource/sstables/compressed", 1 },
-                             sstdesc{tmp->path().string(), 2 },
-                             component);
-    }).then([tmp] {});
+    tmpdir tmp;
+    auto load_gen = sstables::generation_type(1);
+    auto [gen1, gen2] = co_await write_sst_info(make_schema_for_compressed_sstable(), "test/resource/sstables/compressed", tmp.path().string(), load_gen);
+    auto file_path_a = sstable::filename("test/resource/sstables/compressed", "ks", "cf", la, load_gen, big, component);
+    auto file_path_b = sstable::filename(tmp.path().string(), "ks", "cf", la, gen2, big, component);
+    auto eq = co_await tests::compare_files(file_path_a, file_path_b);
+    BOOST_REQUIRE(eq);
 }
 
 SEASTAR_TEST_CASE(check_compressed_info_func) {
@@ -240,29 +201,26 @@ SEASTAR_TEST_CASE(check_compressed_info_func) {
 }
 
 future<>
-write_and_validate_sst(schema_ptr s, sstring dir, noncopyable_function<future<> (shared_sstable sst1, shared_sstable sst2)> func) {
-    return test_env::do_with(tmpdir(), [s = std::move(s), dir = std::move(dir), func = std::move(func)] (test_env& env, tmpdir& tmp) mutable {
-        return do_write_sst(env, s, dir, tmp.path().string(), 1).then([&env, &tmp, s = std::move(s), func = std::move(func)] (auto sst1) {
-            auto sst2 = env.make_sstable(s, tmp.path().string(), 2, sst1->get_version());
-            return func(std::move(sst1), std::move(sst2));
-        });
+write_and_validate_sst(schema_ptr s, sstring dir, sstables::generation_type load_gen, noncopyable_function<void (shared_sstable sst1, shared_sstable sst2)> func) {
+    return test_env::do_with_async([s = std::move(s), dir = std::move(dir), load_gen, func = std::move(func)] (test_env& env) mutable {
+        auto [sst1, sst2] = do_write_sst(env, s, dir, env.tempdir().path().native(), load_gen).get();
+        func(std::move(sst1), std::move(sst2));
     });
 }
 
 SEASTAR_TEST_CASE(check_summary_func) {
     auto s = make_schema_for_compressed_sstable();
-    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        return sstables::test(sst2).read_summary().then([sst1, sst2] {
-            summary& sst1_s = sstables::test(sst1).get_summary();
-            summary& sst2_s = sstables::test(sst2).get_summary();
+    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", sstables::generation_type(1), [] (shared_sstable sst1, shared_sstable sst2) {
+        sstables::test(sst2).read_summary().get();
 
-            BOOST_REQUIRE(::memcmp(&sst1_s.header, &sst2_s.header, sizeof(summary::header)) == 0);
-            BOOST_REQUIRE(sst1_s.positions == sst2_s.positions);
-            BOOST_REQUIRE(sst1_s.entries == sst2_s.entries);
-            BOOST_REQUIRE(sst1_s.first_key.value == sst2_s.first_key.value);
-            BOOST_REQUIRE(sst1_s.last_key.value == sst2_s.last_key.value);
-            return make_ready_future<>();
-        });
+        const summary& sst1_s = sst1->get_summary();
+        const summary& sst2_s = sst2->get_summary();
+
+        BOOST_REQUIRE(::memcmp(&sst1_s.header, &sst2_s.header, sizeof(summary::header)) == 0);
+        BOOST_REQUIRE(sst1_s.positions == sst2_s.positions);
+        BOOST_REQUIRE(sst1_s.entries == sst2_s.entries);
+        BOOST_REQUIRE(sst1_s.first_key.value == sst2_s.first_key.value);
+        BOOST_REQUIRE(sst1_s.last_key.value == sst2_s.last_key.value);
     });
 }
 
@@ -272,54 +230,44 @@ SEASTAR_TEST_CASE(check_filter_func) {
 
 SEASTAR_TEST_CASE(check_statistics_func) {
     auto s = make_schema_for_compressed_sstable();
-    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        return sstables::test(sst2).read_statistics().then([sst1, sst2] {
-            statistics& sst1_s = sstables::test(sst1).get_statistics();
-            statistics& sst2_s = sstables::test(sst2).get_statistics();
+    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", sstables::generation_type(1), [] (shared_sstable sst1, shared_sstable sst2) {
+        sstables::test(sst2).read_statistics().get();
+        const auto& sst1_s = sst1->get_statistics();
+        const auto& sst2_s = sst2->get_statistics();
 
-            BOOST_REQUIRE(sst1_s.offsets.elements.size() == sst2_s.offsets.elements.size());
-            BOOST_REQUIRE(sst1_s.contents.size() == sst2_s.contents.size());
+        BOOST_REQUIRE(sst1_s.offsets.elements.size() == sst2_s.offsets.elements.size());
+        BOOST_REQUIRE(sst1_s.contents.size() == sst2_s.contents.size());
 
-            for (auto&& e : boost::combine(sst1_s.offsets.elements, sst2_s.offsets.elements)) {
-                BOOST_REQUIRE(boost::get<0>(e).second ==  boost::get<1>(e).second);
-            }
-            // TODO: compare the field contents from both sstables.
-            return make_ready_future<>();
-        });
+        for (auto&& e : boost::combine(sst1_s.offsets.elements, sst2_s.offsets.elements)) {
+            BOOST_REQUIRE(boost::get<0>(e).second ==  boost::get<1>(e).second);
+        }
+        // TODO: compare the field contents from both sstables.
     });
 }
 
 SEASTAR_TEST_CASE(check_toc_func) {
     auto s = make_schema_for_compressed_sstable();
-    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", [] (shared_sstable sst1, shared_sstable sst2) {
-        return sstables::test(sst2).read_toc().then([sst1, sst2] {
-            auto& sst1_c = sstables::test(sst1).get_components();
-            auto& sst2_c = sstables::test(sst2).get_components();
+    return write_and_validate_sst(std::move(s), "test/resource/sstables/compressed", sstables::generation_type(1), [] (shared_sstable sst1, shared_sstable sst2) {
+        sstables::test(sst2).read_toc().get();
+        auto& sst1_c = sstables::test(sst1).get_components();
+        auto& sst2_c = sstables::test(sst2).get_components();
 
-            BOOST_REQUIRE(sst1_c == sst2_c);
-            return make_ready_future<>();
-        });
+        BOOST_REQUIRE(sst1_c == sst2_c);
     });
 }
 
 SEASTAR_TEST_CASE(uncompressed_random_access_read) {
-    return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [this] (auto& env, auto sstp) {
-        // note: it's important to pass on a shared copy of sstp to prevent its
-        // destruction until the continuation finishes reading!
-        return sstables::test(sstp).data_read(env.make_reader_permit(), 97, 6).then([sstp] (temporary_buffer<char> buf) {
-            BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
-            return make_ready_future<>();
-        });
+    return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [] (auto& env, auto sstp) {
+        temporary_buffer<char> buf = sstp->data_read(97, 6, env.make_reader_permit()).get();
+        BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
     });
 }
 
 SEASTAR_TEST_CASE(compressed_random_access_read) {
     auto s = make_schema_for_compressed_sstable();
-    return test_using_reusable_sst(std::move(s), "test/resource/sstables/compressed", 1, [this] (auto& env, auto sstp) {
-        return sstables::test(sstp).data_read(env.make_reader_permit(), 97, 6).then([sstp] (temporary_buffer<char> buf) {
-            BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
-            return make_ready_future<>();
-        });
+    return test_using_reusable_sst(std::move(s), "test/resource/sstables/compressed", 1, [] (auto& env, auto sstp) {
+        temporary_buffer<char> buf = sstp->data_read(97, 6, env.make_reader_permit()).get();
+        BOOST_REQUIRE(sstring(buf.get(), buf.size()) == "gustaf");
     });
 }
 
@@ -341,8 +289,7 @@ SEASTAR_TEST_CASE(find_key_map) {
         kk.push_back(make_map_value(map_type, map));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -363,8 +310,7 @@ SEASTAR_TEST_CASE(find_key_set) {
         kk.push_back(make_set_value(set_type, set));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -385,8 +331,7 @@ SEASTAR_TEST_CASE(find_key_list) {
         kk.push_back(make_list_value(list_type, list));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -404,8 +349,7 @@ SEASTAR_TEST_CASE(find_key_composite) {
         kk.push_back(data_value(b2));
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == 0);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == 0);
     });
 }
 
@@ -416,21 +360,19 @@ SEASTAR_TEST_CASE(all_in_place) {
         int idx = 0;
         for (auto& e: summary.entries) {
             auto key = sstables::key::from_bytes(bytes(e.key));
-            BOOST_REQUIRE(sstables::test(sstp).binary_search(sstp->get_schema()->get_partitioner(), summary.entries, key) == idx++);
+            BOOST_REQUIRE(sstables::binary_search(sstp->get_schema()->get_partitioner(), summary.entries, key) == idx++);
         }
-        return make_ready_future<>();
     });
 }
 
 SEASTAR_TEST_CASE(full_index_search) {
     return test_using_reusable_sst(uncompressed_schema(), uncompressed_dir(), 1, [] (auto& env, auto sstp) {
-        return sstables::test(sstp).read_indexes(env.make_reader_permit()).then([sstp] (auto&& index_list) {
-            int idx = 0;
-            for (auto& e : index_list) {
-                auto key = key::from_partition_key(*sstp->get_schema(), e.key);
-                BOOST_REQUIRE(sstables::test(sstp).binary_search(sstp->get_schema()->get_partitioner(), index_list, key) == idx++);
-            }
-        });
+        auto index_list = sstables::test(sstp).read_indexes(env.make_reader_permit()).get();
+        int idx = 0;
+        for (auto& e : index_list) {
+            auto key = key::from_partition_key(*sstp->get_schema(), e.key);
+            BOOST_REQUIRE(sstables::binary_search(sstp->get_schema()->get_partitioner(), index_list, key) == idx++);
+        }
     });
 }
 
@@ -448,77 +390,110 @@ SEASTAR_TEST_CASE(not_find_key_composite_bucket0) {
 
         auto key = sstables::key::from_deeply_exploded(*s, kk);
         // (result + 1) * -1 -1 = 0
-        BOOST_REQUIRE(sstables::test(sstp).binary_search(s->get_partitioner(), summary.entries, key) == -2);
-        return make_ready_future<>();
+        BOOST_REQUIRE(sstables::binary_search(s->get_partitioner(), summary.entries, key) == -2);
     });
 }
 
 // See CASSANDRA-7593. This sstable writes 0 in the range_start. We need to handle that case as well
 SEASTAR_TEST_CASE(wrong_range) {
     return test_using_reusable_sst(uncompressed_schema(), "test/resource/sstables/wrongrange", 114, [] (auto& env, auto sstp) {
-        return do_with(dht::partition_range::make_singular(make_dkey(uncompressed_schema(), "todata")), [&env, sstp] (auto& range) {
-            auto s = columns_schema();
-            return with_closeable(sstp->make_reader(s, env.make_reader_permit(), range, s->full_slice()), [sstp, s] (auto& rd) {
-              return read_mutation_from_flat_mutation_reader(rd).then([sstp, s] (auto mutation) {
-                return make_ready_future<>();
-              });
-            });
-        });
+        auto range = dht::partition_range::make_singular(make_dkey(uncompressed_schema(), "todata"));
+        auto s = columns_schema();
+        auto rd = sstp->make_reader(s, env.make_reader_permit(), range, s->full_slice());
+        auto close_rd = deferred_close(rd);
+        (void)read_mutation_from_mutation_reader(rd).get();
     });
 }
 
-static future<>
-test_sstable_exists(sstring dir, unsigned long generation, bool exists) {
-    auto file_path = sstable::filename(dir, "ks", "cf", la, generation, big, component_type::Data);
-    return open_file_dma(file_path, open_flags::ro).then_wrapped([exists] (future<file> f) {
-        if (exists) {
-            BOOST_CHECK_NO_THROW(f.get0());
-        } else {
-            BOOST_REQUIRE_THROW(f.get0(), std::system_error);
-        }
-        return make_ready_future<>();
-    });
-}
+future<sstable_ptr> mutate_sstable_level(test_env& env, sstable_ptr sstp, const std::string& dir_path, uint32_t new_level, sstables::update_sstable_id update_id = sstables::update_sstable_id::no) {
+    auto modifier = [new_level] (sstables::sstable& sst) {
+        sst.mutate_sstable_level(new_level);
+    };
+    auto creator = [&env, &dir_path] (shared_sstable sstp) {
+        return env.make_sstable(sstp->get_schema(), dir_path, sstp->get_version());
+    };
 
-// We need to be careful not to allow failures in this test to contaminate subsequent runs.
-// We will therefore run it in an empty directory, and first link a known SSTable from another
-// directory to it.
-SEASTAR_TEST_CASE(set_generation) {
-    return test_setup::do_with_cloned_tmp_directory(uncompressed_dir(), [] (test_env& env, sstring uncompressed_dir, sstring generation_dir) {
-        return env.reusable_sst(uncompressed_schema(), uncompressed_dir, 1).then([generation_dir] (auto sstp) {
-            return sstp->create_links(generation_dir).then([sstp] {});
-        }).then([&env, generation_dir] {
-            return env.reusable_sst(uncompressed_schema(), generation_dir, 1).then([] (auto sstp) {
-                return sstp->set_generation(2).then([sstp] {});
-            });
-        }).then([generation_dir] {
-            return test_sstable_exists(generation_dir, 1, false);
-        }).then([uncompressed_dir, generation_dir] {
-            return compare_files(sstdesc{uncompressed_dir, 1 },
-                                 sstdesc{generation_dir, 2 },
-                                 component_type::Data);
-        });
-    });
+    auto new_sst = co_await sstp->link_with_rewritten_component(std::move(creator), component_type::Statistics, modifier, update_id);
+    co_await sstp->unlink();
+    sstp = new_sst;
+
+    sstp = co_await env.reusable_sst(uncompressed_schema(), dir_path, sstp->generation());
+    co_return sstp;
 }
 
 SEASTAR_TEST_CASE(statistics_rewrite) {
-    return test_setup::do_with_cloned_tmp_directory(uncompressed_dir(), [] (test_env& env, sstring uncompressed_dir, sstring generation_dir) {
-        return env.reusable_sst(uncompressed_schema(), uncompressed_dir, 1).then([generation_dir] (auto sstp) {
-            return sstp->create_links(generation_dir).then([sstp] {});
-        }).then([generation_dir] {
-            return test_sstable_exists(generation_dir, 1, true);
-        }).then([&env, generation_dir] {
-            return env.reusable_sst(uncompressed_schema(), generation_dir, 1).then([] (auto sstp) {
-                // mutate_sstable_level results in statistics rewrite
-                return sstp->mutate_sstable_level(10).then([sstp] {});
-            });
-        }).then([&env, generation_dir] {
-            return env.reusable_sst(uncompressed_schema(), generation_dir, 1).then([] (auto sstp) {
-                BOOST_REQUIRE(sstp->get_sstable_level() == 10);
-                return make_ready_future<>();
-            });
-        });
+    return test_env::do_with_async([] (test_env& env) {
+        auto random_spec = tests::make_random_schema_specification(
+            "ks",
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(2, 4),
+            std::uniform_int_distribution<size_t>(2, 8),
+            std::uniform_int_distribution<size_t>(2, 8));
+        auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
+        auto schema = random_schema.schema();
+
+        const auto muts = tests::generate_random_mutations(random_schema, 2).get();
+        auto sstp = make_sstable_containing(env.make_sstable(schema, sstable::version_types::me), muts).get();
+
+        auto toc_path = fmt::to_string(sstp->toc_filename());
+        auto dir_path = std::filesystem::path(toc_path).parent_path().string();
+
+        BOOST_REQUIRE(sstp->get_sstable_level() != 10);
+
+        sstp = mutate_sstable_level(env, sstp, dir_path, 10).get();
+        sstp = env.reusable_sst(schema, dir_path, sstp->generation()).get();
+        BOOST_REQUIRE(sstp->get_sstable_level() == 10);
     });
+}
+
+static future<uint64_t> calculate_actual_on_disk_size(shared_sstable sst) {
+    return map_reduce(
+        sst->all_components(),
+        [sst] (const auto& p) {
+            return file_size(sst->get_filename(p.first).format());
+        },
+        uint64_t{0},
+        std::plus{}
+    );
+}
+
+static future<shared_sstable> mutate_sstable(test_env& env, shared_sstable sst, std::function<void(sstables::sstable&)> modifier, sstables::component_type type = sstables::component_type::Statistics, sstables::update_sstable_id update_id = sstables::update_sstable_id::no) {
+    auto toc_path = fmt::to_string(sst->toc_filename());
+    auto dir_path = std::filesystem::path(toc_path).parent_path().string();
+
+    auto creator = [&env, &dir_path] (shared_sstable sst) {
+        return env.make_sstable(sst->get_schema(), dir_path, sst->get_version());
+    };
+
+    auto new_sst = co_await sst->link_with_rewritten_component(std::move(creator), type, std::move(modifier), update_id);
+    co_await sst->unlink();
+    co_return new_sst;
+}
+
+static void do_test_link_with_rewritten_component_size(test_env& env) {
+    auto random_spec = tests::make_random_schema_specification(
+        "ks",
+        std::uniform_int_distribution<size_t>(1, 4),
+        std::uniform_int_distribution<size_t>(2, 4),
+        std::uniform_int_distribution<size_t>(2, 8),
+        std::uniform_int_distribution<size_t>(2, 8));
+    auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
+    auto schema = random_schema.schema();
+
+    const auto muts = tests::generate_random_mutations(random_schema, 10).get();
+    auto sst = make_sstable_containing(env.make_sstable(schema, sstable::version_types::me), muts).get();
+
+    auto before_size = calculate_actual_on_disk_size(sst).get();
+    BOOST_REQUIRE_EQUAL(before_size, sst->bytes_on_disk());
+
+    auto new_sst = mutate_sstable(env, std::move(sst), std::identity{}).get();
+
+    auto after_size = calculate_actual_on_disk_size(new_sst).get();
+    BOOST_REQUIRE_EQUAL(after_size, new_sst->bytes_on_disk());
+}
+
+SEASTAR_TEST_CASE(test_link_with_rewritten_component_bytes_on_disk) {
+    return test_env::do_with_async(do_test_link_with_rewritten_component_size);
 }
 
 // Tests for reading a large partition for which the index contains a
@@ -529,22 +504,11 @@ SEASTAR_TEST_CASE(statistics_rewrite) {
 
 static schema_ptr large_partition_schema() {
     static thread_local auto s = [] {
-        schema_builder builder(make_shared_schema(
-                generate_legacy_id("try1", "data"), "try1", "data",
-        // partition key
-        {{"t1", utf8_type}},
-        // clustering key
-        {{"t2", utf8_type}},
-        // regular columns
-        {{"t3", utf8_type}},
-        // static columns
-        {},
-        // regular column name type
-        utf8_type,
-        // comment
-        ""
-       ));
-       return builder.build(schema_builder::compact_storage::no);
+        schema_builder builder(this_smp_shard_count(), "try1", "data", generate_legacy_id("try1", "data"));
+        builder.with_column("t1", utf8_type, column_kind::partition_key);
+        builder.with_column("t2", utf8_type, column_kind::clustering_key);
+        builder.with_column("t3", utf8_type);
+        return builder.build(schema_builder::compact_storage::no);
     }();
     return s;
 }
@@ -561,14 +525,15 @@ static future<shared_sstable> load_large_partition_sst(test_env& env, const ssta
 // search for anything.
 SEASTAR_TEST_CASE(promoted_index_read) {
   return for_each_sstable_version([] (const sstables::sstable::version_types version) {
-    return test_env::do_with([version] (test_env& env) {
-      return load_large_partition_sst(env, version).then([&env] (auto sstp) {
-        schema_ptr s = large_partition_schema();
-        return sstables::test(sstp).read_indexes(env.make_reader_permit()).then([sstp] (std::vector<sstables::test::index_entry> vec) {
-            BOOST_REQUIRE(vec.size() == 1);
-            BOOST_REQUIRE(vec[0].promoted_index_size > 0);
-        });
-      });
+    if (!has_summary_and_index(version)) {
+        // This test is so basic that updating it to support `ms` sstables is not worth the effort.
+        return make_ready_future<>();
+    }
+    return test_env::do_with_async([version] (test_env& env) {
+        auto sstp = load_large_partition_sst(env, version).get();
+        std::vector<sstables::test::index_entry> vec = sstables::test(sstp).read_indexes(env.make_reader_permit()).get();
+        BOOST_REQUIRE(vec.size() == 1);
+        BOOST_REQUIRE(vec[0].promoted_index_size > 0);
     });
   });
 }
@@ -597,17 +562,17 @@ static future<int> count_rows(test_env& env, sstable_ptr sstp, schema_ptr s, sst
         auto pr = dht::partition_range::make_singular(make_dkey(s, key.c_str()));
         auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, ps);
         auto close_rd = deferred_close(rd);
-        auto mfopt = rd().get0();
+        auto mfopt = rd().get();
         if (!mfopt) {
             return 0;
         }
         int nrows = 0;
-        mfopt = rd().get0();
+        mfopt = rd().get();
         while (mfopt) {
             if (mfopt->is_clustering_row()) {
                 nrows++;
             }
-            mfopt = rd().get0();
+            mfopt = rd().get();
         }
         return nrows;
     });
@@ -619,17 +584,17 @@ static future<int> count_rows(test_env& env, sstable_ptr sstp, schema_ptr s, sst
         auto pr = dht::partition_range::make_singular(make_dkey(s, key.c_str()));
         auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
         auto close_rd = deferred_close(rd);
-        auto mfopt = rd().get0();
+        auto mfopt = rd().get();
         if (!mfopt) {
             return 0;
         }
         int nrows = 0;
-        mfopt = rd().get0();
+        mfopt = rd().get();
         while (mfopt) {
             if (mfopt->is_clustering_row()) {
                 nrows++;
             }
-            mfopt = rd().get0();
+            mfopt = rd().get();
         }
         return nrows;
     });
@@ -643,17 +608,17 @@ static future<int> count_rows(test_env& env, sstable_ptr sstp, schema_ptr s, sst
         auto reader = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, ps);
         auto close_reader = deferred_close(reader);
         int nrows = 0;
-        auto mfopt = reader().get0();
+        auto mfopt = reader().get();
         while (mfopt) {
-            mfopt = reader().get0();
+            mfopt = reader().get();
             BOOST_REQUIRE(mfopt);
             while (!mfopt->is_end_of_partition()) {
                 if (mfopt->is_clustering_row()) {
                     nrows++;
                 }
-                mfopt = reader().get0();
+                mfopt = reader().get();
             }
-            mfopt = reader().get0();
+            mfopt = reader().get();
         }
         return nrows;
     });
@@ -752,9 +717,11 @@ SEASTAR_TEST_CASE(sub_partitions_read) {
 
 SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
     return seastar::async([] {
+        tests::reader_concurrency_semaphore_wrapper semaphore;
+
         tmpdir tmp;
         auto file_path = (tmp.path() / "test").string();
-        file f = open_file_dma(file_path, open_flags::create | open_flags::wo).get0();
+        file f = open_file_dma(file_path, open_flags::create | open_flags::wo).get();
 
         file_input_stream_options opts;
         opts.read_ahead = 0;
@@ -766,8 +733,8 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
 
         sstables::compression c;
         // this initializes "c"
-        auto os = make_file_output_stream(f, file_output_stream_options()).get0();
-        auto out = make_compressed_file_m_format_output_stream(std::move(os), &c, cp);
+        auto os = make_file_output_stream(f, file_output_stream_options()).get();
+        auto out = make_compressed_file_m_format_output_stream(std::move(os), &c, cp, make_lz4_sstable_compressor_for_tests());
 
         // Make sure that amount of written data is a multiple of chunk_len so that we hit #2143.
         temporary_buffer<char> buf1(c.uncompressed_chunk_length());
@@ -782,53 +749,514 @@ SEASTAR_TEST_CASE(test_skipping_in_compressed_stream) {
         uncompressed_size += buf2.size();
         out.close().get();
 
-        auto compressed_size = seastar::file_size(file_path).get0();
+        auto compressed_size = seastar::file_size(file_path).get();
         c.update(compressed_size);
 
         auto make_is = [&] {
-            f = open_file_dma(file_path, open_flags::ro).get0();
-            return make_compressed_file_m_format_input_stream(f, &c, 0, uncompressed_size, opts);
+            f = open_file_dma(file_path, open_flags::ro).get();
+            auto stream_creator = [f](uint64_t pos, uint64_t len, file_input_stream_options options)->future<input_stream<char>> {
+                co_return input_stream<char>(make_file_data_source(std::move(f), pos, len, std::move(options)));
+            };
+            return make_compressed_file_m_format_input_stream(stream_creator, &c, 0, uncompressed_size, opts, semaphore.make_permit(), std::nullopt);
         };
 
         auto expect = [] (input_stream<char>& in, const temporary_buffer<char>& buf) {
-            auto b = in.read_exactly(buf.size()).get0();
+            auto b = in.read_exactly(buf.size()).get();
             BOOST_REQUIRE(b == buf);
         };
 
         auto expect_eof = [] (input_stream<char>& in) {
-            auto b = in.read().get0();
+            auto b = in.read().get();
             BOOST_REQUIRE(b.empty());
         };
 
+      {
         auto in = make_is();
         expect(in, buf1);
         expect(in, buf2);
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         in.skip(0).get();
         expect(in, buf1);
         expect(in, buf2);
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         expect(in, buf1);
         in.skip(0).get();
         expect(in, buf2);
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         expect(in, buf1);
         in.skip(opts.buffer_size).get();
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         in.skip(opts.buffer_size * 2).get();
         expect_eof(in);
+      }
 
-        in = make_is();
+      {
+        auto in = make_is();
         in.skip(opts.buffer_size).get();
         in.skip(opts.buffer_size).get();
         expect_eof(in);
+      }
     });
+}
+
+// Test that sstables::key_view::tri_compare(const schema& s, partition_key_view other)
+// should correctly compare empty keys. The fact we did this incorrectly was
+// noticed while fixing #9375, and a separate issue on it is #10178.
+BOOST_AUTO_TEST_CASE(test_empty_key_view_comparison) {
+    auto s_ptr = schema_builder(1, "", "")
+            .with_column("p", bytes_type, column_kind::partition_key)
+            .build();
+    const schema& s = *s_ptr;
+
+    sstables::key empty_sstable_key = sstables::key::from_deeply_exploded(s, {data_value(bytes(""))});
+    sstables::key_view empty_sstable_key_view = empty_sstable_key;
+    partition_key empty_partition_key = partition_key::from_deeply_exploded(s, {data_value(bytes(""))});
+    partition_key_view empty_partition_key_view = empty_partition_key;
+
+    // Two empty keys should be equal (this check failed in #10178)
+    BOOST_CHECK_EQUAL(std::strong_ordering::equal,
+        empty_sstable_key_view.tri_compare(s, empty_partition_key_view));
+
+    // For completeness, compare also an empty key to a non-empty key, and
+    // two equal non-empty keys. An empty key is supposed to be less-than
+    // a non-empty key.
+    sstables::key hello_sstable_key = sstables::key::from_deeply_exploded(s, {data_value(bytes("hello"))});
+    sstables::key_view hello_sstable_key_view = hello_sstable_key;
+    partition_key hello_partition_key = partition_key::from_deeply_exploded(s, {data_value(bytes("hello"))});
+    partition_key_view hello_partition_key_view = hello_partition_key;
+    BOOST_CHECK_EQUAL(std::strong_ordering::less,
+        empty_sstable_key_view.tri_compare(s, hello_partition_key_view));
+    BOOST_CHECK_EQUAL(std::strong_ordering::greater,
+        hello_sstable_key_view.tri_compare(s, empty_partition_key_view));
+    BOOST_CHECK_EQUAL(std::strong_ordering::equal,
+        hello_sstable_key_view.tri_compare(s, hello_partition_key_view));
+
+    // The underlying cause of #10178 was that legacy_form() returned
+    // a legacy_compound_view<> which, despite being empty, did not
+    // have begin()==end(). So let's reproduce that directly:
+    auto lf = empty_partition_key_view.legacy_form(s);
+    BOOST_CHECK_EQUAL(0, lf.size());
+    BOOST_CHECK(lf.begin() == lf.end());
+}
+
+static sstables::entry_descriptor make_entry_descriptor(sstables::generation_type gen, sstables::sstable_version_types version, sstables::sstable_format_types format, sstables::component_type component) {
+    optimized_optional<sstables::sstable_id> sid;
+    if (gen.is_uuid_based()) {
+        sid = sstables::sstable_id(gen.as_uuid());
+    }
+    return entry_descriptor{
+        gen,
+        sid,
+        version,
+        format,
+        component
+    };
+}
+
+// Test that sstables::parse_path is able to parse the paths of sstables
+BOOST_AUTO_TEST_CASE(test_parse_path_good) {
+    struct sstable_case {
+        std::string_view path;
+        std::string_view ks;
+        std::string_view cf;
+        sstables::entry_descriptor desc;
+    };
+    const sstable_case sstables[] = {
+        {
+            "/scylla/system/truncated-38c19fd0fb863310a4b70d0cc66628aa/mc-2-big-Data.db",
+            "system",
+            "truncated",
+            make_entry_descriptor(
+                generation_type{2},
+                sstable_version_types::mc,
+                sstable_format_types::big,
+                component_type::Data
+            )
+        },
+        {
+            "/scylla/system/scylla_local-2972ec7ffb2038ddaac1d876f2e3fcbd/mc-3-big-Summary.db",
+            "system",
+            "scylla_local",
+            make_entry_descriptor(
+                generation_type{3},
+                sstable_version_types::mc,
+                sstable_format_types::big,
+                component_type::Summary
+            )
+        },
+        {
+            "/scylla/system_distributed/cdc_generation_timestamps-fdf455c4cfec3e009719d7a45436c89d/me-3g9p_0938_0ecz429c6f019i7yuf-big-Index.db",
+            "system_distributed",
+            "cdc_generation_timestamps",
+            make_entry_descriptor(
+                generation_type::from_string("3g9p_0938_0ecz429c6f019i7yuf"),
+                sstable_version_types::me,
+                sstable_format_types::big,
+                component_type::Index
+            )
+         },
+         {
+            "/system_schema/columns-24101c25a2ae3af787c1b40ee1aca33f/md-3g9r_04ux_4be4w2d7t8bg6u7nok-big-Statistics.db",
+            "system_schema",
+            "columns",
+            make_entry_descriptor(
+                generation_type::from_string("3g9r_04ux_4be4w2d7t8bg6u7nok"),
+                sstable_version_types::md,
+                sstable_format_types::big,
+                component_type::Statistics
+            )
+        },
+        {
+            "/system_schema/columns-24101c25a2ae3af787c1b40ee1aca33f/md-3g9r_04ux_4be4w2d7t8bg6u7nok-big-ReallyBigData.db",
+            "system_schema",
+            "columns",
+            make_entry_descriptor(
+                generation_type::from_string("3g9r_04ux_4be4w2d7t8bg6u7nok"),
+                sstable_version_types::md,
+                sstable_format_types::big,
+                component_type::Unknown
+            )
+        }
+    };
+    for (auto& [path, expected_ks, expected_cf, expected_desc] : sstables) {
+        auto [desc, ks, cf] = parse_path(path).value();
+        BOOST_CHECK_EQUAL(ks, expected_ks);
+        BOOST_CHECK_EQUAL(cf, expected_cf);
+        BOOST_CHECK_EQUAL(expected_desc.generation, desc.generation);
+        BOOST_CHECK_EQUAL(expected_desc.version, desc.version);
+        BOOST_CHECK_EQUAL(expected_desc.format, desc.format);
+        BOOST_CHECK_EQUAL(expected_desc.component, desc.component);
+    }
+}
+
+// Test that sstables::parse_path throws at seeing malformed sstable names
+BOOST_AUTO_TEST_CASE(test_parse_path_bad) {
+    const std::string_view paths[] = {
+        "",
+        "/",
+        "=",
+        "hmm",
+        "//-/-",
+        "mc-2-big-Data.db",
+        "truncated~38c19fd0fb863310a4b70d0cc66628aa/",
+        "truncated-38c19fd0fb863310a4b70d0cc66628aa/mc-2-big-Data.db",
+        "truncated~38c19fd0fb863310a4b70d0cc66628aa/mc-2-big-Data.db",
+        "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/404.db",
+        "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/mc/foo/bar.db",
+        "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/mc/-------",
+        "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/mc-2-big-Data.db",
+        "/scylla/system/truncated-38c19fd0fb863310a4b70d0cc66628aa/zz-2-big-Data.db",
+        "/scylla/system/truncated-38c19fd0fb863310a4b70d0cc66628aa/mc-x-big-Data.db",
+        "/scylla/system/truncated-38c19fd0fb863310a4b70d0cc66628aa/mc-i~am~not~an~id-big-Data.db",
+        "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/mc-2--Data.db",
+        "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/mc-2-grand-Data.db",
+    };
+    for (auto path : paths) {
+        BOOST_CHECK(!parse_path(path).has_value());
+    }
+}
+
+using compress_sstable = tests::random_schema_specification::compress_sstable;
+static future<> test_component_digest_persistence(component_type component, sstable::version_types version, compress_sstable compress = compress_sstable::no, bool rewrite_statistics = false) {
+    return test_env::do_with_async([component, version, compress, rewrite_statistics] (test_env& env) mutable {
+        auto random_spec = tests::make_random_schema_specification(
+            "ks",
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(2, 4),
+            std::uniform_int_distribution<size_t>(2, 8),
+            std::uniform_int_distribution<size_t>(2, 8),
+            compress);
+        auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
+        auto schema = random_schema.schema();
+
+        const auto muts = tests::generate_random_mutations(random_schema, 2).get();
+        auto sst_original = make_sstable_containing(env.make_sstable(schema, version), muts).get();
+
+        auto& components = sstables::test(sst_original).get_components();
+        bool has_component = components.find(component) != components.end();
+        BOOST_REQUIRE(has_component);
+
+        auto toc_path = fmt::to_string(sst_original->toc_filename());
+        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name()).value();
+        auto dir_path = std::filesystem::path(toc_path).parent_path().string();
+
+        std::optional<uint32_t> original_digest;
+        if (rewrite_statistics) {
+            auto original_sstable_id = sst_original->sstable_identifier();
+            original_digest = sst_original->get_component_digest(component);
+            BOOST_REQUIRE(original_digest.has_value());
+
+            sst_original = mutate_sstable_level(env, sst_original, dir_path, 10, sstables::update_sstable_id::yes).get();
+            entry_desc.generation = sst_original->generation();
+
+            auto new_digest = sst_original->get_component_digest(component);
+            BOOST_REQUIRE(new_digest.has_value());
+            BOOST_REQUIRE(original_digest.value() != new_digest.value());
+
+            BOOST_REQUIRE_NE(original_sstable_id, sst_original->sstable_identifier());
+        }
+
+        sst_original = nullptr;
+
+        auto sst_reopened = env.make_sstable(schema, dir_path, entry_desc.generation, entry_desc.version, entry_desc.format);
+        sst_reopened->load(schema->get_sharder()).get();
+
+        auto loaded_digest = sst_reopened->get_component_digest(component);
+        BOOST_REQUIRE(loaded_digest.has_value());
+
+        auto f = open_file_dma(sstables::test(sst_reopened).filename(component).native(), open_flags::ro).get();
+        auto stream = make_file_input_stream(f);
+        auto close_stream = deferred_close(stream);
+        auto component_data = util::read_entire_stream_contiguous(stream).get();
+        auto calculated_digest = crc32_utils::checksum(component_data.begin(), component_data.size());
+        BOOST_REQUIRE_EQUAL(calculated_digest, loaded_digest.value());
+
+        // calculate scylla component digest, by reading file_size - sizeof(uint32_t)
+        auto f2 = open_file_dma(sstables::test(sst_reopened).filename(sstables::component_type::Scylla).native(), open_flags::ro).get();
+        auto stream2 = make_file_input_stream(f2);
+        auto close_stream2 = deferred_close(stream2);
+        auto scylla_data = util::read_entire_stream_contiguous(stream2).get();
+        auto calc_scylla_digest = crc32_utils::checksum(scylla_data.begin(), scylla_data.size() - sizeof(uint32_t));
+        BOOST_REQUIRE_EQUAL(calc_scylla_digest, sst_reopened->get_component_digest(sstables::component_type::Scylla).value());
+    });
+}
+
+// Digest.crc32 must hold exactly one unsigned decimal number. Anything else
+// must surface as a malformed_sstable_exception naming the component file,
+// instead of an opaque parse error.
+SEASTAR_TEST_CASE(test_read_malformed_digest) {
+    return test_env::do_with_async([] (test_env& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
+
+        auto random_spec = tests::make_random_schema_specification(
+            "ks",
+            std::uniform_int_distribution<size_t>(1, 2),
+            std::uniform_int_distribution<size_t>(1, 2),
+            std::uniform_int_distribution<size_t>(1, 2),
+            std::uniform_int_distribution<size_t>(1, 2));
+        auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
+        const auto muts = tests::generate_random_mutations(random_schema, 1).get();
+        // Skip validation so nothing reads (and caches) the digest before the test does.
+        auto sst = make_sstable_containing(env.make_sstable(random_schema.schema(), sstable::version_types::me), muts, validate::no).get();
+
+        auto& storage = sstables::test(sst).get_storage();
+        auto write_digest = [&] (std::string_view content) {
+            auto os = output_stream<char>(storage.make_component_sink(*sst, component_type::Digest, open_flags::wo | open_flags::truncate, {}).get());
+            auto close_os = deferred_close(os);
+            os.write(content.data(), content.size()).get();
+            os.flush().get();
+        };
+        const auto digest_filename = sst->get_filename(component_type::Digest).format();
+
+        auto require_malformed = [&] (std::string_view content, std::vector<std::string_view> expected_fragments) {
+            write_digest(content);
+            expected_fragments.push_back(digest_filename);
+            BOOST_REQUIRE_EXCEPTION(sst->read_digest().get(), malformed_sstable_exception, [&] (const malformed_sstable_exception& e) {
+                const std::string_view what = e.what();
+                for (auto fragment : expected_fragments) {
+                    if (what.find(fragment) == std::string_view::npos) {
+                        testlog.error("expected fragment \"{}\" missing from exception message: {}", fragment, what);
+                        return false;
+                    }
+                }
+                return true;
+            });
+        };
+
+        require_malformed("", {"Failed to parse Digest (0 bytes)"});
+        require_malformed("abc", {"Failed to parse Digest (3 bytes)"});
+        require_malformed("-1", {"Failed to parse Digest (2 bytes)"});
+        require_malformed("+1", {"Failed to parse Digest (2 bytes)"});
+        require_malformed(" 1", {"Failed to parse Digest (2 bytes)"});
+        require_malformed("12\n", {"Failed to parse Digest (3 bytes)", "1 trailing byte(s) after the number"});
+        require_malformed("12 34", {"Failed to parse Digest (5 bytes)", "3 trailing byte(s) after the number"});
+        require_malformed("4294967296", {"Failed to parse Digest (10 bytes)"});
+        require_malformed("99999999999999999999", {"Failed to parse Digest (20 bytes)"});
+        // A digit string padded with zero bytes, as left behind by a lost truncate.
+        require_malformed(std::string_view("12\0\0\0", 5), {"Failed to parse Digest (5 bytes)", "3 trailing byte(s) after the number"});
+
+        // Valid content, boundary values. read_digest() caches on success, so
+        // drop the cached value before reading the second one. Don't reload the
+        // sstable for this: loading populates the cache from the Data digest
+        // stored in Scylla.db, bypassing the Digest file entirely.
+        write_digest("0");
+        BOOST_REQUIRE_EQUAL(sst->read_digest().get().value(), 0u);
+        write_digest("4294967295");
+        sstables::test(sst).set_digest(std::nullopt);
+        BOOST_REQUIRE_EQUAL(sst->read_digest().get().value(), std::numeric_limits<uint32_t>::max());
+    });
+}
+
+// CRC.db starts with the chunk size, which the checksummed readers turn into
+// shifts and masks. Anything but a non-zero power of two must be rejected as a
+// malformed sstable naming the component file.
+SEASTAR_TEST_CASE(test_read_malformed_crc_chunk_size) {
+    return test_env::do_with_async([] (test_env& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
+
+        auto random_spec = tests::make_random_schema_specification(
+            "ks",
+            std::uniform_int_distribution<size_t>(1, 2),
+            std::uniform_int_distribution<size_t>(1, 2),
+            std::uniform_int_distribution<size_t>(1, 2),
+            std::uniform_int_distribution<size_t>(1, 2),
+            compress_sstable::no);
+        auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
+        const auto muts = tests::generate_random_mutations(random_schema, 1).get();
+        auto sst = make_sstable_containing(env.make_sstable(random_schema.schema(), sstable::version_types::me), muts, validate::no).get();
+        BOOST_REQUIRE(sstables::test(sst).get_components().contains(component_type::CRC));
+
+        auto& storage = sstables::test(sst).get_storage();
+        auto write_crc = [&] (uint32_t chunk_size, std::vector<uint32_t> checksums) {
+            auto os = output_stream<char>(storage.make_component_sink(*sst, component_type::CRC, open_flags::wo | open_flags::truncate, {}).get());
+            auto close_os = deferred_close(os);
+            auto write_be = [&] (uint32_t v) {
+                v = net::hton(v);
+                os.write(reinterpret_cast<const char*>(&v), sizeof(v)).get();
+            };
+            write_be(chunk_size);
+            for (auto c : checksums) {
+                write_be(c);
+            }
+            os.flush().get();
+        };
+        const auto crc_filename = sst->get_filename(component_type::CRC).format();
+
+        auto require_malformed = [&] (uint32_t chunk_size) {
+            write_crc(chunk_size, {1, 2, 3});
+            BOOST_REQUIRE_EXCEPTION(sst->read_checksum().get(), malformed_sstable_exception, [&] (const malformed_sstable_exception& e) {
+                const std::string_view what = e.what();
+                const auto expected = fmt::format("CRC chunk size {} is not a power of two", chunk_size);
+                if (what.find(expected) == std::string_view::npos || what.find(crc_filename) == std::string_view::npos) {
+                    testlog.error("unexpected exception message: {}", what);
+                    return false;
+                }
+                return true;
+            });
+        };
+        require_malformed(0);
+        require_malformed(3);
+        require_malformed(65535);
+
+        // Valid content is accepted and parsed back as written.
+        write_crc(65536, {1, 2, 3});
+        auto checksum = sst->read_checksum().get();
+        BOOST_REQUIRE(checksum);
+        BOOST_REQUIRE_EQUAL(checksum->chunk_size, 65536u);
+        BOOST_REQUIRE_EQUAL(checksum->checksums.size(), 3u);
+    });
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_index) {
+    return test_component_digest_persistence(component_type::Index, sstable::version_types::me);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_partitions) {
+    return test_component_digest_persistence(component_type::Partitions, sstable::version_types::ms);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_rows) {
+    return test_component_digest_persistence(component_type::Rows, sstable::version_types::ms);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_summary) {
+    return test_component_digest_persistence(component_type::Summary, sstable::version_types::me);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_filter) {
+    return test_component_digest_persistence(component_type::Filter, sstable::version_types::me);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_compression) {
+    return test_component_digest_persistence(component_type::CompressionInfo, sstable::version_types::me, compress_sstable::yes);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_toc) {
+    return test_component_digest_persistence(component_type::TOC, sstable::version_types::me);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_statistics) {
+    return test_component_digest_persistence(component_type::Statistics, sstable::version_types::me);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_statistics_rewrite) {
+    return test_component_digest_persistence(component_type::Statistics, sstable::version_types::me, compress_sstable::no, true);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_data) {
+    return test_component_digest_persistence(component_type::Data, sstable::version_types::me);
+}
+
+SEASTAR_TEST_CASE(test_digest_persistence_data_compressed) {
+    return test_component_digest_persistence(component_type::Data, sstable::version_types::me, compress_sstable::yes);
+}
+
+static future<> test_component_digest_validation(component_type component, sstable::version_types version, sstring expected_message, compress_sstable compress = compress_sstable::no) {
+    return test_env::do_with_async([component, version, expected_message = std::move(expected_message), compress] (test_env& env) mutable {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
+        auto random_spec = tests::make_random_schema_specification(
+            "ks",
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(2, 4),
+            std::uniform_int_distribution<size_t>(2, 8),
+            std::uniform_int_distribution<size_t>(2, 8),
+            compress);
+        auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
+        auto schema = random_schema.schema();
+
+        const auto muts = tests::generate_random_mutations(random_schema, 2).get();
+        auto sst = make_sstable_containing(env.make_sstable(schema, version), muts).get();
+
+        auto digest = sst->get_component_digest(component);
+        BOOST_REQUIRE(digest.has_value());
+
+        auto toc_path = fmt::to_string(sst->toc_filename());
+        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name()).value();
+        auto dir_path = std::filesystem::path(toc_path).parent_path().string();
+
+        slightly_corrupt_sstable(sst, component);
+
+        BOOST_REQUIRE(sstables::validate_checksums_and_digests(sst, env.make_reader_permit()).get().status == validate_checksums_status::invalid);
+
+        // Loading the sstable should detect the digest mismatch
+        auto sst_corrupted = env.make_sstable(schema, dir_path, entry_desc.generation, entry_desc.version, entry_desc.format);
+        BOOST_REQUIRE_EXCEPTION(sst_corrupted->load(schema->get_sharder()).get(), malformed_sstable_exception,
+            exception_predicate::message_contains(expected_message));
+    });
+}
+
+SEASTAR_TEST_CASE(test_digest_validation_statistics) {
+    return test_component_digest_validation(component_type::Statistics, sstable::version_types::me, "Statistics digest mismatch");
+}
+
+SEASTAR_TEST_CASE(test_digest_validation_filter) {
+    return test_component_digest_validation(component_type::Filter, sstable::version_types::me, "Filter digest mismatch");
+}
+
+SEASTAR_TEST_CASE(test_digest_validation_compression) {
+    return test_component_digest_validation(component_type::CompressionInfo, sstable::version_types::me, "CompressionInfo digest mismatch", compress_sstable::yes);
+}
+
+SEASTAR_TEST_CASE(test_digest_validation_toc) {
+    return test_component_digest_validation(component_type::TOC, sstable::version_types::me, "TOC digest mismatch");
+}
+
+SEASTAR_TEST_CASE(test_digest_validation_scylla) {
+    return test_component_digest_validation(component_type::Scylla, sstable::version_types::me, "Scylla digest mismatch");
 }

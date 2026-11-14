@@ -3,27 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "mutation_writer/shard_based_splitting_writer.hh"
 
-#include <cinttypes>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/min_element.hpp>
 #include <seastar/core/shared_mutex.hh>
-
-#include "mutation_reader.hh"
+#include "dht/i_partitioner.hh"
+#include "mutation_writer/feed_writers.hh"
 
 namespace mutation_writer {
 
 class shard_based_splitting_mutation_writer {
-    using shard_writer = bucket_writer_v2;
+    using shard_writer = bucket_writer;
 
 private:
     schema_ptr _schema;
     reader_permit _permit;
-    reader_consumer_v2 _consumer;
+    mutation_reader_consumer _consumer;
     unsigned _current_shard;
     std::vector<std::optional<shard_writer>> _shards;
 
@@ -32,15 +29,15 @@ private:
         return writer.consume(std::move(mf));
     }
 public:
-    shard_based_splitting_mutation_writer(schema_ptr schema, reader_permit permit, reader_consumer_v2 consumer)
+    shard_based_splitting_mutation_writer(schema_ptr schema, reader_permit permit, mutation_reader_consumer consumer)
         : _schema(std::move(schema))
         , _permit(std::move(permit))
         , _consumer(std::move(consumer))
-        , _shards(smp::count)
+        , _shards(this_smp_shard_count())
     {}
 
     future<> consume(partition_start&& ps) {
-        _current_shard = dht::shard_of(*_schema, ps.key().token());
+        _current_shard = dht::static_shard_of(*_schema, ps.key().token()); // FIXME: Use table sharder
         if (!_shards[_current_shard]) {
             _shards[_current_shard] = shard_writer(_schema, _permit, _consumer);
         }
@@ -63,12 +60,13 @@ public:
         return write_to_shard(mutation_fragment_v2(*_schema, _permit, std::move(pe)));
     }
 
-    void consume_end_of_stream() {
-        for (auto& shard : _shards) {
+    future<> consume_end_of_stream() {
+        return parallel_for_each(_shards, [] (auto& shard) {
             if (shard) {
-                shard->consume_end_of_stream();
+                return shard->consume_end_of_stream();
             }
-        }
+            return make_ready_future<>();
+        });
     }
     void abort(std::exception_ptr ep) {
         for (auto&& shard : _shards) {
@@ -84,7 +82,7 @@ public:
     }
 };
 
-future<> segregate_by_shard(flat_mutation_reader_v2 producer, reader_consumer_v2 consumer) {
+future<> segregate_by_shard(mutation_reader producer, mutation_reader_consumer consumer) {
     auto schema = producer.schema();
     auto permit = producer.permit();
     return feed_writer(

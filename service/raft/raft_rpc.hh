@@ -3,48 +3,64 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #pragma once
 
 #include <seastar/core/gate.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/util/std-compat.hh>
 #include "raft/raft.hh"
 #include "message/messaging_service_fwd.hh"
-#include "utils/UUID.hh"
-#include "service/raft/raft_address_map.hh"
-#include "service/raft/raft_state_machine.hh"
 
 namespace service {
 
-inline gms::inet_address
-raft_addr_to_inet_addr(const raft::server_address& addr) {
-    return ser::deserialize_from_buffer(addr.info, boost::type<gms::inet_address>{});
-}
-
-inline bytes
-inet_addr_to_raft_addr(gms::inet_address addr) {
-    return ser::serialize_to_buffer<bytes>(addr);
-}
+class raft_state_machine;
 
 // Scylla-specific implementation of raft RPC module.
 //
 // Uses `netw::messaging_service` as an underlying implementation for
 // actually sending RPC messages.
 class raft_rpc : public raft::rpc {
+public:
+    // Instances sharing one object, passed to the constructor, accumulate
+    // into the same counters.
+    struct stats {
+        // Requests that had to wait for in-flight requests to free memory.
+        uint64_t append_entries_memory_waits = 0;
+        // The ones waiting right now.
+        int64_t append_entries_memory_waiters = 0;
+        // Bytes of the requests being sent, as charged against the limit.
+        int64_t append_entries_in_flight_bytes = 0;
+    };
+
+protected:
     raft_state_machine& _sm;
     raft::group_id _group_id;
-    raft::server_id _server_id;
+    raft::server_id _my_id;                     // Raft server id of this node.
     netw::messaging_service& _messaging;
-    raft_address_map<>& _address_map;
-    seastar::gate _shutdown_gate;
+    shared_ptr<raft::failure_detector> _failure_detector;
+    seastar::named_gate _shutdown_gate;
 
-    raft_ticker_type::time_point timeout() {
-        return raft_ticker_type::clock::now() + raft_tick_interval * (raft::ELECTION_TIMEOUT.count() / 2);
-    }
+    // Limits the total memory usage of raft::append_request messages that are currently being sent
+    seastar::semaphore _append_entries_semaphore;
+
+    lw_shared_ptr<stats> _stats;
+
+    explicit raft_rpc(raft_state_machine& sm, netw::messaging_service& ms,
+             shared_ptr<raft::failure_detector> failure_detector, raft::group_id gid, raft::server_id my_id,
+             lw_shared_ptr<stats> stats);
+
+private:
+    enum class one_way_kind { request, reply };
+
+    template <one_way_kind rpc_kind, typename Verb, typename Msg> void
+    one_way_rpc(std::source_location loc, raft::server_id id, Verb&& verb, Msg&& msg);
+
+    template <typename Verb, typename... Args> auto
+    two_way_rpc(std::source_location loc, raft::server_id id, Verb&& verb, Args&&... args);
 
 public:
-    explicit raft_rpc(raft_state_machine& sm, netw::messaging_service& ms, raft_address_map<>& address_map, raft::group_id gid, raft::server_id srv_id);
-
     future<raft::snapshot_reply> send_snapshot(raft::server_id server_id, const raft::install_snapshot& snap, seastar::abort_source& as) override;
     future<> send_append_entries(raft::server_id id, const raft::append_request& append_request) override;
     void send_append_entries_reply(raft::server_id id, const raft::append_reply& reply) override;
@@ -56,11 +72,9 @@ public:
     future<raft::read_barrier_reply> execute_read_barrier_on_leader(raft::server_id id) override;
     future<raft::add_entry_reply> send_add_entry(raft::server_id id, const raft::command& cmd) override;
     future<raft::add_entry_reply> send_modify_config(raft::server_id id,
-        const std::vector<raft::server_address>& add,
+        const std::vector<raft::config_member>& add,
         const std::vector<raft::server_id>& del) override;
 
-    void add_server(raft::server_id id, raft::server_info info) override;
-    void remove_server(raft::server_id id) override;
     future<> abort() override;
 
     // Dispatchers to the `rpc_server` upon receiving an rpc message
@@ -76,7 +90,7 @@ public:
     future<raft::snapshot_reply> apply_snapshot(raft::server_id from, raft::install_snapshot snp);
     future<raft::add_entry_reply> execute_add_entry(raft::server_id from, raft::command cmd);
     future<raft::add_entry_reply> execute_modify_config(raft::server_id from,
-        std::vector<raft::server_address> add,
+        std::vector<raft::config_member> add,
         std::vector<raft::server_id> del);
 };
 

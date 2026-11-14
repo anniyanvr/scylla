@@ -3,8 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+
+#include "tracing/tracing.hh"
+
+#include "idl/uuid.idl.hh"
 
 namespace tracing {
 enum class trace_type : uint8_t {
@@ -25,6 +29,7 @@ class trace_info {
     uint32_t slow_query_threshold_us [[version 1.4]];
     uint32_t slow_query_ttl_sec [[version 1.4]];
     tracing::span_id parent_id [[version 1.8]]; /// RPC sender's tracing session span ID
+    uint64_t start_ts_us [[version 5.0]]; /// Microtimestamp of parent session's begin() call (or 0 if not applicable)
 };
 }
 

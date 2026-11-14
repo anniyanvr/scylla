@@ -19,18 +19,18 @@ $ git submodule update --init --recursive
 ### Dependencies
 
 Scylla is fairly fussy about its build environment, requiring a very recent
-version of the C++20 compiler and numerous tools and libraries to build.
+version of the C++23 compiler and numerous tools and libraries to build.
 
 Run `./install-dependencies.sh` (as root) to use your Linux distributions's
 package manager to install the appropriate packages on your build machine.
 However, this will only work on very recent distributions. For example,
 currently Fedora users must upgrade to Fedora 32 otherwise the C++ compiler
-will be too old, and not support the new C++20 standard that Scylla uses.
+will be too old, and not support the new C++23 standard that Scylla uses.
 
 Alternatively, to avoid having to upgrade your build machine or install
 various packages on it, we provide another option - the **frozen toolchain**.
 This is a script, `./tools/toolchain/dbuild`, that can execute build or run
-commands inside a Docker image that contains exactly the right build tools and
+commands inside a container that contains exactly the right build tools and
 libraries. The `dbuild` technique is useful for beginners, but is also the way
 in which ScyllaDB produces official releases, so it is highly recommended.
 
@@ -41,6 +41,12 @@ and running Scylla becomes as easy as:
 $ ./tools/toolchain/dbuild ./configure.py
 $ ./tools/toolchain/dbuild ninja build/release/scylla
 $ ./tools/toolchain/dbuild ./build/release/scylla --developer-mode 1
+```
+
+Note: do not mix environments - either perform all your work with dbuild, or natively on the host.
+Note2: you can get to an interactive shell within dbuild by running it without any parameters:
+```bash
+$ ./tools/toolchain/dbuild
 ```
 
 ### Build system
@@ -85,7 +91,7 @@ You can also specify a single mode. For example
 $ ninja-build release
 ```
 
-Will build everytihng in release mode. The valid modes are
+Will build everything in release mode. The valid modes are
 
 * Debug: Enables [AddressSanitizer](https://github.com/google/sanitizers/wiki/AddressSanitizer)
   and other sanity checks. It has no optimizations, which allows for debugging with tools like
@@ -114,6 +120,13 @@ Run all tests through the test execution wrapper with
 
 ```bash
 $ ./test.py --mode={debug,release}
+```
+
+or, if you are using `dbuild`, you need to build the code and the tests and then you can run them at will:
+
+```bash
+$ ./tools/toolchain/dbuild ninja {debug,release,dev}-build
+$ ./tools/toolchain/dbuild ./test.py --mode {debug,release,dev}
 ```
 
 The `--name` argument can be specified to run a particular test.
@@ -195,11 +208,11 @@ $ # Edit configuration options as appropriate
 $ SCYLLA_HOME=$HOME/scylla build/release/scylla
 ```
 
-The `scylla.yaml` file in the repository by default writes all database data to `/var/lib/scylla`, which likely requires root access. Change the `data_file_directories` and `commitlog_directory` fields as appropriate.
+The `scylla.yaml` file in the repository by default writes all database data to `/var/lib/scylla`, which likely requires root access. Change the `data_file_directories`, `commitlog_directory` and `schema_commitlog_directory` fields as appropriate.
 
 Scylla has a number of requirements for the file-system and operating system to operate ideally and at peak performance. However, during development, these requirements can be relaxed with the `--developer-mode` flag.
 
-Additionally, when running on under-powered platforms like portable laptops, the `--overprovisined` flag is useful.
+Additionally, when running on under-powered platforms like portable laptops, the `--overprovisioned` flag is useful.
 
 On a development machine, one might run Scylla as
 
@@ -207,28 +220,9 @@ On a development machine, one might run Scylla as
 $ SCYLLA_HOME=$HOME/scylla build/release/scylla --overprovisioned --developer-mode=yes
 ```
 
-To interact with scylla it is recommended to build our versions of
-cqlsh and nodetool. They are available at
-https://github.com/scylladb/scylla-tools-java and can be built with
-
-```bash
-$ sudo ./install-dependencies.sh
-$ ant jar
-```
-
-cqlsh should work out of the box, but nodetool depends on a running
-scylla-jmx (https://github.com/scylladb/scylla-jmx). It can be build
-with
-
-```bash
-$ mvn package
-```
-
-and must be started with
-
-```bash
-$ ./scripts/scylla-jmx
-```
+To interact with scylla it is recommended to build our version of
+cqlsh. It is available at
+https://github.com/scylladb/scylla-cqlsh and is available as a submodule.
 
 ### Branches and tags
 
@@ -267,21 +261,45 @@ Once the patch set is ready to be reviewed, push the branch to the public remote
 
 ### Development environment and source code navigation
 
-Scylla includes a [CMake](https://cmake.org/) file, `CMakeLists.txt`, for use only with development environments (not for building) so that they can properly analyze the source code.
+Scylla includes a [CMake](https://cmake.org/) file, `CMakeLists.txt` that can be used with development environments so
+that they can properly analyze the source code. However, building with CMake is not yet officially supported.
 
-[CLion](https://www.jetbrains.com/clion/) is a commercial IDE offers reasonably good source code navigation and advice for code hygiene, though its C++ parser sometimes makes errors and flags false issues.
+Good IDEs that have support for CMake build toolchain are [CLion](https://www.jetbrains.com/clion/),
+[KDevelop](https://www.kdevelop.org/) and [QtCreator](https://wiki.qt.io/Qt_Creator).
 
-Other good options that directly parse CMake files are [KDevelop](https://www.kdevelop.org/) and [QtCreator](https://wiki.qt.io/Qt_Creator).
+[Eclipse](https://eclipse.org/cdt/) is another open-source option. It doesn't natively work with CMake projects and its
+C++ parser has many issues.
 
-To use the `CMakeLists.txt` file with these programs, define the `FOR_IDE` CMake variable or shell environmental variable.
+#### CLion
 
-[Eclipse](https://eclipse.org/cdt/) is another open-source option. It doesn't natively work with CMake projects, and its C++ parser has many similar issues as CLion.
+[CLion](https://www.jetbrains.com/clion/) is a commercial IDE offers reasonably good source code navigation and advice
+for code hygiene, though its C++ parser sometimes makes errors and flags false issues. In order to enable proper code
+analysis in CLion, the following steps are needed:
+
+1. Get the ScyllaDB source code by following the [Getting the source code](#getting-the-source-code).
+2. Follow the steps in [Dependencies](#dependencies) in order to install the required tools natively into your system.
+   **Don't** follow the *frozen toolchain* part described there, since CMake checks for the build dependencies installed
+   in the system, not in the container image provided by the toolchain.
+3. In CLion, select `File`→`Open` and select the main ScyllaDB directory in order to open the CMake project there. The
+   project should open and fail to process the `CMakeLists.txt`. That's expected.
+4. In CLion, open `File`→`Settings`.
+5. Find and click on `Toolchains` (type *toolchains* into search box).
+6. Select the toolchain you will use, for instance the `Default` one.
+7. Type in the following system-installed tools to be used:
+    - `CMake`: *cmake*
+    - `Build Tool`: *ninja*
+    - `C Compiler`: *clang*
+    - `C++ Compiler`: *clang*
+8. On the `CMake` panel/tab, click on `Reload CMake Project`
+
+After that, CLion should successfully initialize the CMake project (marked by `[Finished]` in the console) and the
+source code editor should provide code analysis support normally from now on.
 
 ### Distributed compilation: `distcc` and `ccache`
 
 Scylla's compilations times can be long. Two tools help somewhat:
 
-- [ccache](https://ccache.samba.org/) caches compiled object files on disk and re-uses them when possible
+- [ccache](https://ccache.samba.org/) caches compiled object files on disk and reuses them when possible
 - [distcc](https://github.com/distcc/distcc) distributes compilation jobs to remote machines
 
 A reasonably-powered laptop acts as the coordinator for compilation. A second, more powerful, machine acts as a passive compilation server.
@@ -343,7 +361,7 @@ avoid that the gold linker can be told to create an index with
 
 More info at https://gcc.gnu.org/wiki/DebugFission.
 
-Both options can be enable by passing `--split-dwarf` to configure.py.
+Both options can be enabled by passing `--split-dwarf` to configure.py.
 
 Note that distcc is *not* compatible with it, but icecream
 (https://github.com/icecc/icecream) is.
@@ -352,7 +370,7 @@ Note that distcc is *not* compatible with it, but icecream
 
 Sometimes Scylla development is closely tied with a feature being developed in Seastar. It can be useful to compile Scylla with a particular check-out of Seastar.
 
-One way to do this it to create a local remote for the Seastar submodule in the Scylla repository:
+One way to do this is to create a local remote for the Seastar submodule in the Scylla repository:
 
 ```bash
 $ cd $HOME/src/scylla
@@ -383,6 +401,40 @@ Open the link printed at the end. Be horrified. Go and write more tests.
 
 For more details see `./scripts/coverage.py --help`.
 
+### Resolving stack backtraces
+
+Scylla may print stack backtraces to the log for several reasons.
+For example:
+- When aborting (e.g. due to assertion failure, internal error, or segfault)
+- When detecting seastar reactor stalls (where a seastar task runs for a long time without yielding the cpu to other tasks on that shard)
+
+The backtraces contain code pointers so they are not very helpful without resolving into code locations.
+To resolve the backtraces, one needs the scylla relocatable package that contains the scylla binary (with debug information),
+as well as the dynamic libraries it is linked against.
+
+Builds from our automated build system are uploaded to the cloud
+and can be searched on http://backtrace.scylladb.com/
+
+Make sure you have the scylla server exact `build-id` to locate
+its respective relocatable package, required for decoding backtraces it prints.
+
+The build-id is printed to the system log when scylla starts.
+It can also be found by executing `scylla --build-id`, or
+by using the `file` utility, for example:
+```
+$ scylla --build-id
+4cba12e6eb290a406bfa4930918db23941fd4be3
+
+$ file scylla
+scylla: ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////lib64/ld-linux-x86-64.so.2, for GNU/Linux 3.2.0, BuildID[sha1]=4cba12e6eb290a406bfa4930918db23941fd4be3, with debug_info, not stripped, too many notes (256)
+```
+
+To find the build-id of a coredump, use the `eu-unstrip` utility as follows:
+```
+$ eu-unstrip -n --core <coredump> | awk '/scylla$/ { s=$2; sub(/@.*$/, "", s); print s; exit(0); }'
+4cba12e6eb290a406bfa4930918db23941fd4be3
+```
+
 ### Core dump debugging
 
-See [debugging.md](debugging.md).
+See [debugging.md](docs/dev/debugging.md).

@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include "gc_clock.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "utils/extremum_tracking.hh"
 
 // Stores statistics on all the updates done to a memtable
@@ -45,32 +45,33 @@ private:
     min_tracker<gc_clock::time_point> min_local_deletion_time;
     min_tracker<gc_clock::duration> min_ttl;
 
+protected:
+    void update_timestamp(api::timestamp_type ts) noexcept {
+        min_timestamp.update(ts);
+    }
+
+    void update_local_deletion_time(gc_clock::time_point local_deletion_time) noexcept {
+        min_local_deletion_time.update(local_deletion_time);
+    }
+
+    void update_ttl(gc_clock::duration ttl) noexcept {
+        min_ttl.update(ttl);
+    }
+
 public:
-    encoding_stats_collector()
+    encoding_stats_collector() noexcept
         : min_timestamp(api::max_timestamp)
         , min_local_deletion_time(gc_clock::time_point::max())
         , min_ttl(gc_clock::duration::max())
     {}
 
-    void update_timestamp(api::timestamp_type ts) {
-        min_timestamp.update(ts);
-    }
-
-    void update_local_deletion_time(gc_clock::time_point local_deletion_time) {
-        min_local_deletion_time.update(local_deletion_time);
-    }
-
-    void update_ttl(gc_clock::duration ttl) {
-        min_ttl.update(ttl);
-    }
-
-    void update(const encoding_stats& other) {
+    void update(const encoding_stats& other) noexcept {
         update_timestamp(other.min_timestamp);
         update_local_deletion_time(other.min_local_deletion_time);
         update_ttl(other.min_ttl);
     }
 
-    encoding_stats get() const {
+    encoding_stats get() const noexcept {
         return { min_timestamp.get(), min_local_deletion_time.get(), min_ttl.get() };
     }
 };

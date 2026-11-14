@@ -4,57 +4,112 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include <seastar/core/print.hh>
+#include <concepts>
+#include <exception>
+#include <optional>
+#include <string_view>
+#include <seastar/core/format.hh>
 
+#include "sstables/component_type.hh"
+#include "sstables/generation_type.hh"
 #include "seastarx.hh"
 
 namespace sstables {
-class malformed_sstable_exception : public std::exception {
+class malformed_sstable_exception final : public std::exception {
     sstring _msg;
+    // Whether the sstable is malformed because a component of it is not there
+    // at all, as opposed to being there but unreadable. A running ScyllaDB
+    // deletes the components of an sstable it drops, so anything reading an
+    // sstable it doesn't own can see this for an sstable which was deleted
+    // under it, and carry on with the rest. It is a property of the exception
+    // rather than a type of its own, so that what a node logs for a missing
+    // component is what it always was.
+    bool _components_are_missing = false;
+    // If set, carries the identity of the sstable which caused this exception to be thrown.
+    generation_type _generation;
 public:
-    malformed_sstable_exception(sstring msg, sstring filename)
+    malformed_sstable_exception(sstring msg, component_name filename)
         : malformed_sstable_exception{format("{} in sstable {}", msg, filename)}
     {}
     malformed_sstable_exception(sstring s) : _msg(s) {}
+    static malformed_sstable_exception missing_component(component_name filename) {
+        auto e = malformed_sstable_exception(format("{}: file not found", filename));
+        e._components_are_missing = true;
+        return e;
+    }
+    bool components_are_missing() const noexcept {
+        return _components_are_missing;
+    }
+    generation_type generation() const noexcept {
+        return _generation;
+    }
     const char *what() const noexcept {
         return _msg.c_str();
     }
-};
-
-struct bufsize_mismatch_exception : malformed_sstable_exception {
-    bufsize_mismatch_exception(size_t size, size_t expected) :
-        malformed_sstable_exception(format("Buffer improperly sized to hold requested data. Got: {:d}. Expected: {:d}", size, expected))
-    {}
-};
-
-class compaction_job_exception : public std::exception {
-    sstring _msg;
-public:
-    compaction_job_exception(sstring msg) noexcept : _msg(std::move(msg)) {}
-    const char *what() const noexcept {
-        return _msg.c_str();
+    // Returns a copy of this exception attributed to the sstable with the given generation, with
+    // "<context> due to <message>" as its message if context is set, and the same message otherwise.
+    [[nodiscard]] malformed_sstable_exception attributed(generation_type generation, std::optional<std::string_view> context) const {
+        auto copy = *this;
+        copy._generation = generation;
+        if (context) {
+            copy._msg = format("{} due to {}", *context, what());
+        }
+        return copy;
     }
 };
 
-// Indicates that compaction was stopped via an external event,
-// E.g. shutdown or api call.
-class compaction_stopped_exception : public compaction_job_exception {
-public:
-    compaction_stopped_exception(sstring ks, sstring cf, sstring reason)
-        : compaction_job_exception(format("Compaction for {}/{} was stopped due to: {}", ks, cf, reason)) {}
-};
+[[noreturn]] void on_parse_error(sstring message, std::optional<component_name> filename);
+[[noreturn, gnu::noinline]] void on_bti_parse_error(uint64_t pos);
 
-// Indicates that compaction hit an unrecoverable error
-// and should be aborted.
-class compaction_aborted_exception : public compaction_job_exception {
+// Use this instead of SCYLLA_ASSERT() or assert() in code that is used while parsing SSTables.
+// SSTables can be corrupted either by ScyllaDB itself or by a freak accident like cosmic background
+// radiation hitting the disk the wrong way. Either way a corrupt SSTable should not bring down the
+// whole server. This method will call on_internal_error() if the condition is false.
+// The exception will include a complete backtrace, so no need to add call-site identifiers to the message.
+inline void parse_assert(bool condition, std::optional<component_name> filename = {}, const char* message = nullptr) {
+    if (!condition) [[unlikely]] {
+        on_parse_error(message ? message : sstring(), filename);
+    }
+}
+
+// If ex holds a malformed_sstable_exception, returns a copy of it attributed to the given
+// generation, see malformed_sstable_exception::attributed(). Other exceptions are returned unchanged.
+std::exception_ptr maybe_attribute_malformed_sstable_exception(std::exception_ptr ex, generation_type generation, std::optional<std::string_view> context = std::nullopt);
+
+// Controls whether malformed sstable errors abort the process (generating a coredump) or throw an
+// exception. Aborting is useful when the malformed sstable error is caused by memory corruption
+// rather than actual sstable corruption, as it allows post-mortem analysis of the coredump.
+// Controlled by the --abort-on-malformed-sstable-error command-line option.
+// Returns the previous value of the flag.
+bool set_abort_on_malformed_sstable_error(bool value) noexcept;
+bool abort_on_malformed_sstable_error() noexcept;
+
+// Use these helpers instead of directly throwing malformed_sstable_exception. They check the
+// abort_on_malformed_sstable_error flag and either abort the process (with logging) or throw
+// the exception.
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg);
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg, component_name filename);
+[[noreturn]] void throw_missing_sstable_component_exception(component_name filename);
+
+// Whether the error of a failed sstable load is a component which is not there,
+// as opposed to one which is there but cannot be read.
+bool components_are_missing(std::exception_ptr ex);
+[[noreturn]] void throw_bufsize_mismatch_exception(size_t size, size_t expected);
+
+// Disables aborting on malformed sstable errors for a scope.
+//
+// Intended for tests which intentionally corrupt sstables and expect
+// malformed_sstable_exception to be thrown rather than the process aborting.
+class scoped_no_abort_on_malformed_sstable_error {
+    bool _prev;
 public:
-    compaction_aborted_exception(sstring ks, sstring cf, sstring reason)
-        : compaction_job_exception(format("Compaction for {}/{} was aborted due to: {}", ks, cf, reason)) {}
+    scoped_no_abort_on_malformed_sstable_error() noexcept;
+    ~scoped_no_abort_on_malformed_sstable_error();
 };
 
 }

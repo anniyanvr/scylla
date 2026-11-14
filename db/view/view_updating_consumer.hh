@@ -3,23 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "dht/i_partitioner.hh"
-#include "schema_fwd.hh"
-#include "mutation_fragment.hh"
+#include "schema/schema_fwd.hh"
+#include "mutation/mutation_fragment.hh"
 #include "sstables/shared_sstable.hh"
 #include "reader_permit.hh"
 #include "db/view/row_locking.hh"
 #include <seastar/core/abort_source.hh>
-#include "mutation.hh"
+#include <seastar/core/circular_buffer.hh>
+#include "mutation/mutation.hh"
+#include "mutation/mutation_rebuilder.hh"
 
 class evictable_reader_handle;
 
 namespace db::view {
+
+class view_update_generator;
 
 /*
  * A consumer that pushes materialized view updates for each consumed mutation.
@@ -30,8 +33,17 @@ public:
     // We prefer flushing on partition boundaries, so at the end of a partition,
     // we flush on reaching the soft limit. Otherwise we continue accumulating
     // data. We flush mid-partition if we reach the hard limit.
-    static const size_t buffer_size_soft_limit;
-    static const size_t buffer_size_hard_limit;
+    static constexpr size_t buffer_size_soft_limit_default = 1 * 1024 * 1024;
+    static constexpr size_t buffer_size_hard_limit_default = 2 * 1024 * 1024;
+private:
+    size_t _buffer_size_soft_limit = buffer_size_soft_limit_default;
+    size_t _buffer_size_hard_limit = buffer_size_hard_limit_default;
+public:
+    // Meant only for usage in tests.
+    void set_buffer_size_limit_for_testing_purposes(size_t sz) {
+        _buffer_size_soft_limit = sz;
+        _buffer_size_hard_limit = sz;
+    }
 
 private:
     schema_ptr _schema;
@@ -39,12 +51,14 @@ private:
     const seastar::abort_source* _as;
     evictable_reader_handle& _staging_reader_handle;
     circular_buffer<mutation> _buffer;
-    mutation* _m{nullptr};
+    std::optional<mutation_rebuilder_v2> _mut_builder;
     size_t _buffer_size{0};
     noncopyable_function<future<row_locker::lock_holder>(mutation)> _view_update_pusher;
 
 private:
     void do_flush_buffer();
+    void flush_builder();
+    void end_builder();
     void maybe_flush_buffer_mid_partition();
 
 public:
@@ -58,7 +72,7 @@ public:
             , _view_update_pusher(std::move(view_update_pusher))
     { }
 
-    view_updating_consumer(schema_ptr schema, reader_permit permit, replica::table& table, std::vector<sstables::shared_sstable> excluded_sstables, const seastar::abort_source& as,
+    view_updating_consumer(view_update_generator& gen, schema_ptr schema, reader_permit permit, replica::table& table, std::vector<sstables::shared_sstable> excluded_sstables, const seastar::abort_source& as,
             evictable_reader_handle& staging_reader_handle);
 
     view_updating_consumer(view_updating_consumer&&) = default;
@@ -66,12 +80,16 @@ public:
     view_updating_consumer& operator=(view_updating_consumer&&) = delete;
 
     void consume_new_partition(const dht::decorated_key& dk) {
-        _buffer.emplace_back(_schema, dk, mutation_partition(_schema));
-        _m = &_buffer.back();
+        _mut_builder.emplace(_schema);
+        // Further accounting is inaccurate as we base it on the consumed
+        // mutation-fragments, not on their final form in the mutation.
+        // This is good enough, as long as the difference is small and mostly
+        // constant (per fragment).
+        _buffer_size += _mut_builder->consume_new_partition(dk).memory_usage(*_schema);
     }
 
     void consume(tombstone t) {
-        _m->partition().apply(std::move(t));
+        _mut_builder->consume(t);
     }
 
     stop_iteration consume(static_row&& sr) {
@@ -79,7 +97,7 @@ public:
             return stop_iteration::yes;
         }
         _buffer_size += sr.memory_usage(*_schema);
-        _m->partition().apply(*_schema, mutation_fragment(*_schema, _permit, std::move(sr)));
+        _mut_builder->consume(std::move(sr));
         maybe_flush_buffer_mid_partition();
         return stop_iteration::no;
     }
@@ -89,17 +107,17 @@ public:
             return stop_iteration::yes;
         }
         _buffer_size += cr.memory_usage(*_schema);
-        _m->partition().apply(*_schema, mutation_fragment(*_schema, _permit, std::move(cr)));
+        _mut_builder->consume(std::move(cr));
         maybe_flush_buffer_mid_partition();
         return stop_iteration::no;
     }
 
-    stop_iteration consume(range_tombstone&& rt) {
+    stop_iteration consume(range_tombstone_change&& rtc) {
         if (_as->abort_requested()) {
             return stop_iteration::yes;
         }
-        _buffer_size += rt.memory_usage(*_schema);
-        _m->partition().apply(*_schema, mutation_fragment(*_schema, _permit, std::move(rt)));
+        _buffer_size += rtc.memory_usage(*_schema);
+        _mut_builder->consume(std::move(rtc));
         maybe_flush_buffer_mid_partition();
         return stop_iteration::no;
     }
@@ -109,7 +127,8 @@ public:
         if (_as->abort_requested()) {
             return stop_iteration::yes;
         }
-        if (_buffer_size >= buffer_size_soft_limit) {
+        end_builder();
+        if (_buffer_size >= _buffer_size_soft_limit) {
             do_flush_buffer();
         }
         return stop_iteration::no;

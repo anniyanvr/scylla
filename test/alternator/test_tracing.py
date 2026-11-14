@@ -1,9 +1,9 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 ##############################################################################
-# Tests for Scylla's "tracing" feature (see docs/tracing.md) for Alternator
+# Tests for Scylla's "tracing" feature (see docs/dev/tracing.md) for Alternator
 # queries. Reproduces issue #6891, where although tracing was implemented in
 # Alternator, it only worked correctly for some operations but not others.
 # In the tests here we attempt to ensure that the tracing feature continues
@@ -14,87 +14,77 @@
 # through out-of-band HTTP requests.
 ##############################################################################
 
+import json
+import time
+import re
+
 import pytest
 import requests
-import re
-import time
-import json
-from botocore.exceptions import ClientError
-from util import random_string, full_scan, full_query, create_test_table
+
+from test.alternator.util import random_string, full_scan, full_query, create_test_table, scylla_config_temporary
+from test.pylib.skip_types import skip_env
+
 
 # The "with_tracing" fixture ensures that tracing is enabled throughout
 # the run of a test function, and disabled when it ends. If tracing cannot be
-# enabled, the test is pytest.skip()ed. This will of course happens if we run
-# the test with "--aws" (tracing is a Scylla-only feature).
+# enabled, the test is skipped via skip_env(). This will of course happens
+# if we run the test with "--aws" (tracing is a Scylla-only feature).
 # Note that to support (in the future) the ability for Alternator tests to
 # run in parallel, the tests here need to be prepared that completely
 # unrelated requests get traced during a test with with_tracing.
 @pytest.fixture(scope="function")
-def with_tracing(dynamodb):
-    print("with_tracing enabling tracing")
-    if dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com'):
-        pytest.skip('Scylla-only feature not supported by AWS')
-    url = dynamodb.meta.client._endpoint.host
-    # The REST API is on port 10000, and always http, not https.
-    url = re.sub(r':[0-9]+(/|$)', ':10000', url)
-    url = re.sub(r'^https:', 'http:', url)
-    probability_resp = requests.get(url+'/storage_service/trace_probability')
+def with_tracing(rest_api):
+    probability_resp = requests.get(rest_api+'/storage_service/trace_probability')
     if probability_resp.status_code != 200:
-        pytest.skip('Failed to fetch tracing probability')
+        skip_env('Failed to fetch tracing probability')
     probability = probability_resp.text
-    response = requests.post(url+'/storage_service/trace_probability?probability=1')
+    response = requests.post(rest_api+'/storage_service/trace_probability?probability=1')
     if response.status_code != 200:
-        pytest.skip('Failed to enable tracing')
-    # verify tha tracing is really enabled
-    response = requests.get(url+'/storage_service/trace_probability')
+        skip_env('Failed to enable tracing')
+    # verify that tracing is really enabled
+    response = requests.get(rest_api+'/storage_service/trace_probability')
     if response.status_code != 200 or response.content.decode('utf-8') != '1':
-        pytest.skip('Failed to verify tracing')
+        skip_env('Failed to verify tracing')
     yield
     print("with_tracing restoring tracing")
-    response = requests.post(url+'/storage_service/trace_probability?probability='+probability)
+    response = requests.post(rest_api+'/storage_service/trace_probability?probability='+probability)
     if response.status_code != 200:
         pytest.fail('Failed to disable tracing after with_tracing test')
-    response = requests.get(url+'/storage_service/trace_probability')
+    response = requests.get(rest_api+'/storage_service/trace_probability')
     if response.status_code != 200 or response.content.decode('utf-8') != '0':
-        pytest.skip('Failed to verify tracing disabled')
+        skip_env('Failed to verify tracing disabled')
 
 # Similarly to the fixture above, slow query logging is enabled only for the run of the
 # test function. Slow logging is set up with threshold equal to 0 microseconds,
 # which effectively means that each query will be qualified as slow and logged.
 @pytest.fixture(scope="function")
-def with_slow_query_logging(dynamodb):
+def with_slow_query_logging(rest_api):
     print("with_slow_query_logging enabling slow query logging")
-    if dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com'):
-        pytest.skip('Scylla-only feature not supported by AWS')
-    url = dynamodb.meta.client._endpoint.host
-    # The REST API is on port 10000, and always http, not https.
-    url = re.sub(r':[0-9]+(/|$)', ':10000', url)
-    url = re.sub(r'^https:', 'http:', url)
-    slow_query_info = requests.get(url+'/storage_service/slow_query')
+    slow_query_info = requests.get(rest_api+'/storage_service/slow_query')
     if slow_query_info.status_code != 200:
-        pytest.skip('Failed to fetch slow query logging info')
+        skip_env('Failed to fetch slow query logging info')
     slow_query_json = json.loads(slow_query_info.text)
     print(slow_query_json)
-    response = requests.post(url+'/storage_service/slow_query?enable=true')
+    response = requests.post(rest_api+'/storage_service/slow_query?enable=true')
     if response.status_code != 200:
-        pytest.skip('Failed to enable slow query logging')
-    response = requests.post(url+'/storage_service/slow_query?threshold=0')
+        skip_env('Failed to enable slow query logging')
+    response = requests.post(rest_api+'/storage_service/slow_query?threshold=0')
     if response.status_code != 200:
-        pytest.skip('Failed to enable slow query logging threshold')
+        skip_env('Failed to enable slow query logging threshold')
     # verify that logging is really enabled
-    response = requests.get(url+'/storage_service/slow_query')
+    response = requests.get(rest_api+'/storage_service/slow_query')
     if response.status_code != 200:
-        pytest.skip('Failed to verify slow query logging')
+        skip_env('Failed to verify slow query logging')
     response_json = json.loads(response.text)
     if response_json['enable'] != True or response_json['threshold'] != 0:
-        pytest.skip('Failed to verify slow query logging values')
+        skip_env('Failed to verify slow query logging values')
     print(response_json)
     yield
     print("with_slow_query_logging restoring slow query logging")
-    response = requests.post(url+'/storage_service/slow_query?enable='+str(slow_query_json['enable']))
+    response = requests.post(rest_api+'/storage_service/slow_query?enable='+str(slow_query_json['enable']))
     if response.status_code != 200:
         pytest.fail('Failed to restore slow query logging')
-    response = requests.post(url+'/storage_service/slow_query?threshold='+str(slow_query_json['threshold']))
+    response = requests.post(rest_api+'/storage_service/slow_query?threshold='+str(slow_query_json['threshold']))
     if response.status_code != 200:
         pytest.fail('Failed to restore slow query logging threshold')
 
@@ -109,7 +99,7 @@ def with_slow_query_logging(dynamodb):
 # longer), but is good enough for tests on a throwable boot of Scylla as in
 # test/alternator/run.
 last_scan = None
-def find_tracing_session(dynamodb, str):
+def iterate_tracing_sessions(dynamodb):
     # The tracing session table does not get updated immediately - we may need
     # to sleep a bit until the requested string appears. We save the previous
     # session table in last_scan, so if we're looking for sessions of number of
@@ -125,11 +115,20 @@ def find_tracing_session(dynamodb, str):
         last_scan = full_scan(trace_sessions_table, ConsistentRead=False)
     while time.time() - start < 100:
         for entry in last_scan:
-            if str in entry['parameters']:
-                print(f'find_tracing_session time {time.time()-start}')
-                return entry['session_id']
+            yield entry
         time.sleep(0.3)
         last_scan = full_scan(trace_sessions_table, ConsistentRead=False)
+
+def iterate_tracing_sessions_with_table_filter(dynamodb, table_name):
+    expected_table_re = re.compile(fr'table(\[\d+\])? : {table_name}}}')
+    for entry in iterate_tracing_sessions(dynamodb):
+        if expected_table_re.search(entry["parameters"]):
+            yield entry
+
+def find_tracing_session(dynamodb, session_key, table_name):
+    for entry in iterate_tracing_sessions_with_table_filter(dynamodb, table_name):
+        if session_key in entry['parameters']:
+            return entry['session_id']
     pytest.fail("Couldn't find tracing session")
 
 # For the given tracing session_id of a request, read the list of "activities"
@@ -150,6 +149,10 @@ def get_tracing_events(dynamodb, session_id):
         ret.append(result['activity'])
     return ret
 
+def expect_tracing_events(dynamodb, session_key, expected_events, table_name):
+    session = find_tracing_session(dynamodb, session_key, table_name)
+    expect_tracing_events_with_session(dynamodb, session, expected_events)
+
 # We have no way to know whether the tracing events returned by
 # get_tracing_events() is the entire trace. Even though we have already seen
 # the tracing session, it doesn't guarantee that all the events were fully
@@ -157,8 +160,7 @@ def get_tracing_events(dynamodb, session_id):
 # expect_tracing_events() has to retry the get_tracing_events() call until
 # a timeout. In the successful case, we'll finish very quickly (usually,
 # even immediately).
-def expect_tracing_events(dynamodb, str, expected_events):
-    session = find_tracing_session(dynamodb, str)
+def expect_tracing_events_with_session(dynamodb, session, expected_events):
     start = time.time()
     while time.time() - start < 100:
         events = get_tracing_events(dynamodb, session)
@@ -179,14 +181,21 @@ def expect_tracing_events(dynamodb, str, expected_events):
         assert event in events
 
 # A test table based on test_table_s, but with isolation level defined to 'always'
-@pytest.fixture(scope="module")
-def test_table_s_isolation_always(dynamodb):
+def create_yield_destroy_test_table_s_isolation_always(dynamodb):
     table = create_test_table(dynamodb,
         KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
         AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ],
         Tags=[{'Key': 'system:write_isolation', 'Value': 'always'}])
     yield table
     table.delete()
+
+@pytest.fixture(scope="module")
+def test_table_s_isolation_always(dynamodb):
+    yield from create_yield_destroy_test_table_s_isolation_always(dynamodb)
+
+@pytest.fixture(scope="module")
+def test_table_s_isolation_always_2(dynamodb):
+    yield from create_yield_destroy_test_table_s_isolation_always(dynamodb)
 
 # Because tracing is asynchronous and usually appears as much as two
 # seconds after the request, it is inefficient to have separate tests
@@ -195,9 +204,14 @@ def test_table_s_isolation_always(dynamodb):
 # different request types. This test enables tracing, runs a bunch of
 # different requests - and only then looks for all of them in the trace
 # table.
-def test_tracing_all(with_tracing, test_table_s_isolation_always, dynamodb):
+def test_tracing_all(with_tracing, test_table_s_isolation_always, test_table_s_isolation_always_2, dynamodb):
     # Run the different requests, each one containing a long random string
-    # that we can later use to find with find_tracing_session():
+    # that we can later use to find with find_tracing_session()
+
+    if test_table_s_isolation_always.name > test_table_s_isolation_always_2.name:
+        # we don't care about those names, but we care about the order name wise, as later we check
+        # for `table[0]` and `table[1]` in tracing and tables in tracing are outputed sorted
+        test_table_s_isolation_always, test_table_s_isolation_always_2 = test_table_s_isolation_always_2, test_table_s_isolation_always
 
     table = test_table_s_isolation_always
     # PutItem:
@@ -225,16 +239,79 @@ def test_tracing_all(with_tracing, test_table_s_isolation_always, dynamodb):
     p_scan = random_string(20)
     full_scan(table, FilterExpression='p = :p', ExpressionAttributeValues={':p': p_scan})
 
+    # we will fetch tracing sessions based on operation and beginning of the long unique string
+    # we have set max trace output size to the length of the string, so we can expect truncation
+    # to happen at the end of the string and the beginning should be present
+
+    p_putitem_really_long = random_string(1024 * 8)
+    beginning_of_p_putitem_really_long = p_putitem_really_long[:1024]
+    with scylla_config_temporary(dynamodb, 'alternator_max_users_query_size_in_trace_output', str(len(p_putitem_really_long))):
+        table.put_item(Item={'p': p_putitem_really_long})
+
+    with scylla_config_temporary(dynamodb, 'alternator_max_users_query_size_in_trace_output', str(len(p_putitem_really_long) + 1024 * 256)):
+        table.put_item(Item={'p': '_' + p_putitem_really_long})
+
+    p_batchwriteitem1 = random_string(20)
+    p_batchwriteitem2 = random_string(20)
+    p_batchgetitem1 = random_string(20)
+    p_batchgetitem2 = random_string(20)
+
+    table.meta.client.batch_write_item(RequestItems = {
+        test_table_s_isolation_always.name: [{'PutRequest': {'Item': {'p': p_batchwriteitem1}}}],
+        test_table_s_isolation_always_2.name: [{'PutRequest': {'Item': {'p': p_batchwriteitem2}}}],
+    })
+    table.meta.client.batch_get_item(RequestItems = {
+        test_table_s_isolation_always.name: {'Keys': [{'p': p_batchgetitem1}]},
+        test_table_s_isolation_always_2.name: {'Keys': [{'p': p_batchgetitem2}]},
+    })
+
     # Check the traces. NOTE: the following checks are fairly arbitrary, and
     # may break in the future if we change the tracing messages...
-    expect_tracing_events(dynamodb, p_putitem, ['PutItem', 'CAS successful'])
-    expect_tracing_events(dynamodb, p_getitem, ['GetItem', 'Querying is done'])
-    expect_tracing_events(dynamodb, p_deleteitem, ['DeleteItem', 'CAS successful'])
-    expect_tracing_events(dynamodb, p_updateitem, ['UpdateItem', 'CAS successful'])
-    expect_tracing_events(dynamodb, p_batchgetitem, ['BatchGetItem', 'Querying is done'])
-    expect_tracing_events(dynamodb, p_batchwriteitem, ['BatchWriteItem', 'CAS successful'])
-    expect_tracing_events(dynamodb, p_query, ['Query', 'Querying is done'])
-    expect_tracing_events(dynamodb, p_scan, ['Scan', 'Performing a database query'])
+    expect_tracing_events(dynamodb, p_putitem, ['PutItem', 'CAS successful'], table.name)
+    expect_tracing_events(dynamodb, p_getitem, ['GetItem', 'Querying is done'], table.name)
+    expect_tracing_events(dynamodb, p_deleteitem, ['DeleteItem', 'CAS successful'], table.name)
+    expect_tracing_events(dynamodb, p_updateitem, ['UpdateItem', 'CAS successful'], table.name)
+    expect_tracing_events(dynamodb, p_batchgetitem, ['BatchGetItem', 'Querying is done'], table.name)
+    expect_tracing_events(dynamodb, p_batchwriteitem, ['BatchWriteItem', 'CAS successful'], table.name)
+    expect_tracing_events(dynamodb, p_query, ['Query', 'Querying is done'], table.name)
+    expect_tracing_events(dynamodb, p_scan, ['Scan', 'Performing a database query'], table.name)
+
+    op_1 = 'Alternator PutItem'
+    op_2 = 'Alternator BatchWriteItem'
+    op_3 = 'Alternator BatchGetItem'
+    found_truncated = False
+    found_not_truncated = False
+    batch_get_item_double_tables_session_id = None
+    batch_write_item_double_tables_session_id = None
+    for entry in iterate_tracing_sessions_with_table_filter(dynamodb, table.name):
+        p = entry['parameters']
+        if entry['request'] == op_1:
+            if beginning_of_p_putitem_really_long in p:
+                if '<truncated>' in p:
+                    found_truncated = True
+                else:
+                    found_not_truncated = True
+        elif entry['request'] == op_2:
+            if p_batchwriteitem1 in p and p_batchwriteitem2 in p:
+                assert f'table[0] : {test_table_s_isolation_always.name}' in p
+                assert f'table[1] : {test_table_s_isolation_always_2.name}' in p
+                batch_write_item_double_tables_session_id = entry['session_id']
+        elif entry['request'] == op_3:
+            if p_batchgetitem1 in p and p_batchgetitem2 in p:
+                assert f'table[0] : {test_table_s_isolation_always.name}' in p
+                assert f'table[1] : {test_table_s_isolation_always_2.name}' in p
+                batch_get_item_double_tables_session_id = entry['session_id']
+        if found_truncated and found_not_truncated and batch_get_item_double_tables_session_id and batch_write_item_double_tables_session_id:
+            break
+
+    assert found_truncated
+    assert found_not_truncated
+    assert batch_get_item_double_tables_session_id
+    assert batch_write_item_double_tables_session_id
+
+    expect_tracing_events_with_session(dynamodb, batch_get_item_double_tables_session_id, ['BatchGetItem', 'Querying is done'])
+    expect_tracing_events_with_session(dynamodb, batch_write_item_double_tables_session_id, ['BatchWriteItem', 'CAS successful'])
+
 
 # TODO:
 # We could use traces to show that the right things actually happen during a
@@ -254,9 +331,9 @@ def test_slow_query_log(with_slow_query_logging, test_table_s, dynamodb):
     while time.time() < start_time + 60:
         results = full_scan(slow_query_table, ConsistentRead=False)
         put_item_found = any("PutItem" in result['parameters'] and p in result['parameters']
-                and result['username'] == "alternator" for result in results)
+                and result['username'] == "cassandra" for result in results)
         delete_item_found = any("DeleteItem" in result['parameters'] and p in result['parameters']
-                and result['username'] == "alternator" for result in results)
+                and result['username'] == "cassandra" for result in results)
         if put_item_found and delete_item_found:
             return
         else:

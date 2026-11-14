@@ -3,10 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
+
+#include <memory>
+#include <vector>
+#include <seastar/core/sharded.hh>
 
 namespace replica {
 
@@ -15,16 +19,16 @@ class database;
 class keyspace;
 class table;
 using column_family = table;
-
+class memtable_list;
+class keyspace_change;
 }
 
-class memtable_list;
 
 // mutation.hh
 class mutation;
 class mutation_partition;
 
-// schema.hh
+// schema/schema.hh
 class schema;
 class column_definition;
 class column_mapping;
@@ -42,4 +46,6 @@ using clustering_key = clustering_key_prefix;
 using clustering_key_view = clustering_key_prefix_view;
 
 // memtable.hh
+namespace replica {
 class memtable;
+}

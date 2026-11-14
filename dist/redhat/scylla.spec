@@ -4,16 +4,28 @@ Release:        %{release}
 Summary:        Scylla is a highly scalable, eventually consistent, distributed, partitioned row DB.
 Group:          Applications/Databases
 
-License:        AGPLv3
+License:        ScyllaDB-Source-Available-1.0
 URL:            http://www.scylladb.com/
 Source0:        %{reloc_pkg}
-Requires:       %{product}-server = %{version} %{product}-conf = %{version} %{product}-python3 = %{version} %{product}-kernel-conf = %{version} %{product}-jmx = %{version} %{product}-tools = %{version} %{product}-tools-core = %{version} %{product}-node-exporter = %{version}
-Obsoletes:	scylla-server < 1.1
+Requires:       %{product}-server = %{version}-%{release}
+Requires:       %{product}-conf = %{version}-%{release}
+Requires:       %{product}-python3 = %{version}-%{release}
+Requires:       %{product}-kernel-conf = %{version}-%{release}
+Recommends:     %{product}-perf-collector = %{version}-%{release}
+Requires:       scylla-node-exporter
+Requires:       %{product}-cqlsh = %{version}-%{release}
+Provides:       scylla-enterprise = %{version}-%{release}
+Obsoletes:      scylla-enterprise < 2025.1.0
 
 %global _debugsource_template %{nil}
 %global _debuginfo_subpackages %{nil}
 %global __brp_python_bytecompile %{nil}
 %global __brp_mangle_shebangs %{nil}
+
+# On Fedora 42, _sbindir was redefined to /usr/bin; redefine it back
+# Eventually we should migrate to /usr/bin too, but let's not touch
+# it until it becomes widely used in RHEL.
+%global _sbindir /usr/sbin
 
 %undefine _find_debuginfo_dwz_opts
 
@@ -21,14 +33,22 @@ Obsoletes:	scylla-server < 1.1
 %undefine _unique_build_ids
 %global _no_recompute_build_ids 1
 
-# rpm causes missing build-id error on node_exporter, so ignore it
 %undefine _missing_build_ids_terminate_build
+
+# The relocatable package bundles unmodified distro libraries and commands,
+# which keep their original build-ids. The default "compat" mode puts a
+# /usr/lib/.build-id link for each of them in scylla-server, clashing with the
+# same links owned by the distro packages when the RPM is installed on the
+# Fedora release it was built on (#21057, SCYLLADB-4841).
+# "alldebug" moves all build-id links into scylla-debuginfo, so gdb/perf/
+# debuginfod still find scylla's debug info by build-id.
+%global _build_id_links alldebug
 
 %description
 Scylla is a highly scalable, eventually consistent, distributed,
 partitioned row DB.
 This package installs all required packages for ScyllaDB,  including
-%{product}-server, %{product}-jmx, %{product}-tools, %{product}-tools-core %{product}-node-exporter.
+%{product}-server.
 
 # this is needed to prevent python compilation error on CentOS (#2235)
 %if 0%{?rhel}
@@ -49,27 +69,30 @@ This package installs all required packages for ScyllaDB,  including
 %prep
 %setup -q -n scylla
 
+%build
+
+%install
+./install.sh --packaging --root "$RPM_BUILD_ROOT" --p11-trust-paths /etc/pki/ca-trust/source:/usr/share/pki/ca-trust-source
+
+%clean
+rm -rf $RPM_BUILD_ROOT
+
 %package        server
 Group:          Applications/Databases
 Summary:        The Scylla database server
-License:        AGPLv3
-URL:            http://www.scylladb.com/
-Requires:       %{product}-conf  = %{version} %{product}-python3 = %{version}
-Conflicts:      abrt
+Requires:       %{product}-conf = %{version}-%{release}
+Requires:       %{product}-python3 = %{version}-%{release}
+Requires:       procps-ng, shadow-utils
 AutoReqProv:    no
+Provides:       %{product}-tools:%{_bindir}/nodetool
+Provides:       %{product}-tools:%{_sysconfigdir}/bash_completion.d/nodetool-completion
+Provides:       scylla-enterprise-tools:%{_bindir}/nodetool
+Provides:       scylla-enterprise-tools:%{_sysconfigdir}/bash_completion.d/nodetool-completion
+Provides:       scylla-enterprise-server = %{version}-%{release}
+Obsoletes:      scylla-enterprise-server < 2025.1.0
 
 %description server
 This package contains ScyllaDB server.
-
-%build
-
-defines=()
-
-%install
-%if 0%{housekeeping}
-install_arg="--housekeeping"
-%endif
-./install.sh --packaging --root "$RPM_BUILD_ROOT" $install_arg
 
 %pre server
 getent group scylla || /usr/sbin/groupadd scylla 2> /dev/null || :
@@ -80,6 +103,18 @@ getent passwd scylla || /usr/sbin/useradd -g scylla -s /sbin/nologin -r -d %{_sh
 
 if [ $1 -eq 1 ] ; then
     /usr/bin/systemctl preset scylla-server.service ||:
+fi
+
+if [ $1 -ge 2 ] ; then
+    # upgrade from a version that shipped housekeeping: disable and remove leftovers
+    /usr/bin/systemctl disable --now scylla-housekeeping-daily.timer scylla-housekeeping-restart.timer 2>/dev/null ||:
+    rm -f /opt/scylladb/scripts/scylla-housekeeping
+    rm -f %{_sysconfdir}/sysconfig/scylla-housekeeping %{_sysconfdir}/scylla.d/housekeeping.cfg
+    rm -f %{_unitdir}/scylla-housekeeping-daily.service %{_unitdir}/scylla-housekeeping-restart.service
+    rm -f %{_unitdir}/scylla-housekeeping-daily.timer %{_unitdir}/scylla-housekeeping-restart.timer
+    rm -rf %{_sharedstatedir}/scylla-housekeeping
+    rm -rf /etc/systemd/system/scylla-housekeeping-daily.service.d /etc/systemd/system/scylla-housekeeping-restart.service.d
+    /usr/bin/systemctl daemon-reload ||:
 fi
 
 %preun server
@@ -98,26 +133,22 @@ if  [ -d /tmp/%{name}-%{version}-%{release} ]; then
 fi
 ln -sfT /etc/scylla /var/lib/scylla/conf
 
-%clean
-rm -rf $RPM_BUILD_ROOT
-
 %files server
 %defattr(-,root,root)
 
 %config(noreplace) %{_sysconfdir}/sysconfig/scylla-server
-%config(noreplace) %{_sysconfdir}/sysconfig/scylla-housekeeping
 %attr(0755,root,root) %dir %{_sysconfdir}/scylla.d
 %config(noreplace) %{_sysconfdir}/scylla.d/*.conf
 /opt/scylladb/share/doc/scylla/*
 %{_unitdir}/scylla-fstrim.service
-%{_unitdir}/scylla-housekeeping-daily.service
-%{_unitdir}/scylla-housekeeping-restart.service
 %{_unitdir}/scylla-server.service
 %{_unitdir}/*.timer
 %{_unitdir}/*.slice
 %{_bindir}/scylla
 %{_bindir}/iotune
 %{_bindir}/scyllatop
+%{_bindir}/scylla-tablets
+%{_bindir}/nodetool
 %{_sbindir}/scylla*
 %{_sbindir}/node_health_check
 %{_sbindir}/seastar-cpu-map.sh
@@ -125,8 +156,10 @@ rm -rf $RPM_BUILD_ROOT
 /opt/scylladb/swagger-ui/dist/*
 /opt/scylladb/api/api-doc/*
 /opt/scylladb/scyllatop/*
+/opt/scylladb/lib-python/*
 /opt/scylladb/bin/*
 /opt/scylladb/libreloc/*
+/opt/scylladb/libreloc/.*.hmac
 /opt/scylladb/libexec/*
 %{_prefix}/lib/scylla/*
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/
@@ -135,71 +168,48 @@ rm -rf $RPM_BUILD_ROOT
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/hints
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/view_hints
 %attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla/coredump
-%attr(0755,scylla,scylla) %dir %{_sharedstatedir}/scylla-housekeeping
 %ghost /etc/systemd/system/scylla-helper.slice.d/
 %ghost /etc/systemd/system/scylla-helper.slice.d/memory.conf
 %ghost /etc/systemd/system/scylla-server.service.d/capabilities.conf
 %ghost /etc/systemd/system/scylla-server.service.d/mounts.conf
+%ghost /etc/systemd/system/scylla-server.service.d/limitnofile.conf
 /etc/systemd/system/scylla-server.service.d/dependencies.conf
 %ghost %config /etc/systemd/system/var-lib-systemd-coredump.mount
 %ghost /etc/systemd/system/scylla-cpupower.service
 %ghost %config /etc/systemd/system/var-lib-scylla.mount
+%{_sysconfdir}/bash_completion.d/nodetool-completion
 
 %package conf
 Group:          Applications/Databases
 Summary:        Scylla configuration package
-License:        AGPLv3
-URL:            http://www.scylladb.com/
-Obsoletes:	scylla-server < 1.1
+Obsoletes:      scylla-server < 1.1
+Provides:       scylla-enterprise-conf = %{version}-%{release}
+Obsoletes:      scylla-enterprise-conf < 2025.1.0
 
 %description conf
 This package contains the main scylla configuration file.
-
-# we need to refuse upgrade if current scylla < 1.7.3 && commitlog remains
-%pretrans conf
-ver=$(rpm -qi scylla-server | grep Version | awk '{print $3}')
-if [ -n "$ver" ]; then
-    ver_fmt=$(echo $ver | awk -F. '{printf "%d%02d%02d", $1,$2,$3}')
-    if [ $ver_fmt -lt 10703 ]; then
-        # for <scylla-1.2
-        if [ ! -f /opt/scylladb/lib/scylla/scylla_config_get.py ]; then
-            echo
-            echo "Error: Upgrading from scylla-$ver to scylla-%{version} is not supported."
-            echo "Please upgrade to scylla-1.7.3 or later, before upgrade to %{version}."
-            echo
-            exit 1
-        fi
-        commitlog_directory=$(/opt/scylladb/lib/scylla/scylla_config_get.py -g commitlog_directory)
-        commitlog_files=$(ls $commitlog_directory | wc -l)
-        if [ $commitlog_files -ne 0 ]; then
-            echo
-            echo "Error: Upgrading from scylla-$ver to scylla-%{version} is not supported when commitlog is not clean."
-            echo "Please upgrade to scylla-1.7.3 or later, before upgrade to %{version}."
-            echo "Also make sure $commitlog_directory is empty."
-            echo
-            exit 1
-        fi
-    fi
-fi
 
 %files conf
 %defattr(-,root,root)
 %attr(0755,root,root) %dir %{_sysconfdir}/scylla
 %config(noreplace) %{_sysconfdir}/scylla/scylla.yaml
 %config(noreplace) %{_sysconfdir}/scylla/cassandra-rackdc.properties
-%if 0%{housekeeping}
-%config(noreplace) %{_sysconfdir}/scylla.d/housekeeping.cfg
-%endif
 
 
 %package kernel-conf
 Group:          Applications/Databases
 Summary:        Scylla configuration package for the Linux kernel
-License:        AGPLv3
-URL:            http://www.scylladb.com/
-Requires:       kmod
+Requires:       sed
 # tuned overwrites our sysctl settings
-Obsoletes:	tuned
+Obsoletes:      tuned >= 2.11.0
+# tuned-profiles-oci (preinstalled on OCI images) hard-requires an exact
+# version of tuned, which blocks the Obsoletes above unless it is removed too.
+# tuned-profiles-oci-recommend in turn hard-requires tuned-profiles-oci, so it
+# must be obsoleted in the same transaction as well.
+Obsoletes:      tuned-profiles-oci
+Obsoletes:      tuned-profiles-oci-recommend
+Provides:       scylla-enterprise-kernel-conf = %{version}-%{release}
+Obsoletes:      scylla-enterprise-kernel-conf < 2025.1.0
 
 %description kernel-conf
 This package contains Linux kernel configuration changes for the Scylla database.  Install this package
@@ -208,49 +218,56 @@ if Scylla is the main application on your server and you wish to optimize its la
 %post kernel-conf
 # We cannot use the sysctl_apply rpm macro because it is not present in 7.0
 # following is a "manual" expansion
-/usr/lib/systemd/systemd-sysctl 99-scylla-sched.conf >/dev/null 2>&1 || :
 /usr/lib/systemd/systemd-sysctl 99-scylla-vm.conf >/dev/null 2>&1 || :
 /usr/lib/systemd/systemd-sysctl 99-scylla-inotify.conf >/dev/null 2>&1 || :
 /usr/lib/systemd/systemd-sysctl 99-scylla-aio.conf >/dev/null 2>&1 || :
 /usr/lib/systemd/systemd-sysctl 99-scylla-filemax.conf >/dev/null 2>&1 || :
+/opt/scylladb/kernel_conf/post_install.sh
+
+%preun kernel-conf
+if [ $1 -eq 0 ] ; then
+    /usr/bin/systemctl --no-reload disable scylla-tune-sched.service ||:
+    /usr/bin/systemctl stop scylla-tune-sched.service ||:
+fi
+
+%postun kernel-conf
+/usr/bin/systemctl daemon-reload ||:
 
 %files kernel-conf
 %defattr(-,root,root)
 %{_sysctldir}/*.conf
+%{_unitdir}/scylla-tune-sched.service
+/opt/scylladb/kernel_conf/*
+%ghost /etc/sysctl.d/99-scylla-perfevent.conf
+%ghost /etc/sysctl.d/99-scylla-tcp.conf
 
 
-%package node-exporter
+%package perf-collector
 Group:          Applications/Databases
-Summary:        Prometheus exporter for machine metrics
-License:        ASL 2.0
-URL:            https://github.com/prometheus/node_exporter
+Summary:        Scylla system-wide perf data collector
+Requires:       perf
+%description perf-collector
+This package contains the system-wide perf data collector for ScyllaDB.
+It collects low-overhead CPU profiling samples and rotates them automatically.
 
-%description node-exporter
-Prometheus exporter for machine metrics, written in Go with pluggable metric collectors.
-
-%post node-exporter
-if [ $1 -eq 1 ] ; then
-    /usr/bin/systemctl preset scylla-node-exporter.service ||:
-fi
-
-%preun node-exporter
-if [ $1 -eq 0 ] ; then
-    /usr/bin/systemctl --no-reload disable scylla-node-exporter.service ||:
-    /usr/bin/systemctl stop scylla-node-exporter.service ||:
-fi
-
-%postun node-exporter
+%post perf-collector
 /usr/bin/systemctl daemon-reload ||:
 
-%files node-exporter
+%preun perf-collector
+if [ $1 -eq 0 ] ; then
+    /usr/bin/systemctl --no-reload disable scylla-perf-collector.service ||:
+    /usr/bin/systemctl stop scylla-perf-collector.service ||:
+fi
+
+%postun perf-collector
+/usr/bin/systemctl daemon-reload ||:
+
+%files perf-collector
 %defattr(-,root,root)
-%config(noreplace) %{_sysconfdir}/sysconfig/scylla-node-exporter
-%{_unitdir}/scylla-node-exporter.service
-/opt/scylladb/node_exporter/node_exporter
-/opt/scylladb/node_exporter/licenses/LICENSE
-/opt/scylladb/node_exporter/licenses/NOTICE
-/etc/systemd/system/scylla-node-exporter.service.d/dependencies.conf
+%attr(0644,root,root) %{_unitdir}/scylla-perf-collector.service
+%attr(0755,root,root) %dir /var/log/scylla-perf
+
 
 %changelog
 * Tue Jul 21 2015 Takuya ASADA <syuu@cloudius-systems.com>
-- inital version of scylla.spec
+- initial version of scylla.spec

@@ -1,29 +1,22 @@
 /*
- */
-
-/*
  * Copyright (C) 2018-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "cql3/functions/function.hh"
 #include "cql3/functions/scalar_function.hh"
 #include "cql3/functions/function_name.hh"
 #include "cql3/cql3_type.hh"
-#include "cql3/type_json.hh"
 
 #include "bytes_ostream.hh"
-#include "types.hh"
-#include "cql_serialization_format.hh"
-
-#include <boost/algorithm/cxx11/any_of.hpp>
+#include "types/types.hh"
+#include "types/json_utils.hh"
 
 namespace cql3 {
 
@@ -50,14 +43,14 @@ public:
 
     virtual bool requires_thread() const override;
 
-    virtual bytes_opt execute(cql_serialization_format sf, const std::vector<bytes_opt>& parameters) override {
+    virtual managed_bytes_opt execute(std::span<const managed_bytes_opt> parameters) override {
         bytes_ostream encoded_row;
         encoded_row.write("{", 1);
         for (size_t i = 0; i < _selector_names.size(); ++i) {
             if (i > 0) {
                 encoded_row.write(", ", 2);
             }
-            bool has_any_upper = boost::algorithm::any_of(_selector_names[i], [](unsigned char c) { return std::isupper(c); });
+            bool has_any_upper = std::ranges::any_of(_selector_names[i], [](unsigned char c) { return std::isupper(c); });
             encoded_row.write("\"", 1);
             if (has_any_upper) {
                 encoded_row.write("\\\"", 2);
@@ -67,11 +60,13 @@ public:
                 encoded_row.write("\\\"", 2);
             }
             encoded_row.write("\": ", 3);
-            sstring row_sstring = to_json_string(*_selector_types[i], parameters[i]);
+            sstring row_sstring = parameters[i]
+                    ? to_json_string(*_selector_types[i], managed_bytes_view(*parameters[i]))
+                    : "null";
             encoded_row.write(row_sstring.c_str(), row_sstring.size());
         }
         encoded_row.write("}", 1);
-        return bytes(encoded_row.linearize());
+        return std::move(encoded_row).to_managed_bytes();
     }
 
     virtual const function_name& name() const override {

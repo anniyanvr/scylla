@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,9 +11,8 @@
 #include <vector>
 #include <seastar/core/shared_ptr.hh>
 
-#include "schema_fwd.hh"
+#include "schema/schema_fwd.hh"
 #include "sstables/types.hh"
-#include "utils/UUID.hh"
 #include "db/marshal/type_parser.hh"
 
 namespace sstables {
@@ -27,7 +26,7 @@ inline column_values_fixed_lengths get_clustering_values_fixed_lengths(const ser
     column_values_fixed_lengths lengths;
     lengths.reserve(header.clustering_key_types_names.elements.size());
     for (auto&& t : header.clustering_key_types_names.elements) {
-        auto type = db::marshal::type_parser::parse(to_sstring_view(t.value));
+        auto type = db::marshal::type_parser::parse(to_string_view(t.value));
         lengths.push_back(type->value_length_if_fixed());
     }
 
@@ -61,10 +60,12 @@ private:
                 const sstable_enabled_features& features,
                 bool is_static);
 
-        utils::UUID schema_uuid;
+        schema_ptr _schema;
+        table_schema_version schema_uuid;
         std::vector<column_info> regular_schema_columns_from_sstable;
         std::vector<column_info> static_schema_columns_from_sstable;
         column_values_fixed_lengths clustering_column_value_fix_lengths;
+        bool _empty = false;
 
         state() = default;
         state(const state&) = delete;
@@ -73,22 +74,60 @@ private:
         state& operator=(state&&) = default;
 
         state(const schema& s, const serialization_header& header, const sstable_enabled_features& features)
-            : schema_uuid(s.version())
+            : _schema(s.shared_from_this())
+            , schema_uuid(s.version())
             , regular_schema_columns_from_sstable(build(s, header.regular_columns.elements, features, false))
             , static_schema_columns_from_sstable(build(s, header.static_columns.elements, features, true))
             , clustering_column_value_fix_lengths (get_clustering_values_fixed_lengths(header))
+            , _empty(false)
+        {}
+
+        state(const schema& s)
+            : schema_uuid(s.version())
+            , _empty(true)
         {}
     };
 
-    lw_shared_ptr<const state> _state = make_lw_shared<const state>();
+    // The initial state is an empty, immutable default-constructed state shared
+    // by all column_translation instances on the same shard. It is replaced
+    // (copy-on-write, by reassigning the pointer) the first time get_for_schema()
+    // is called with a matching format, so sharing the default avoids a heap
+    // allocation per sstable that, in practice, is almost always immediately
+    // overwritten or never used.
+    //
+    // thread_local (per-shard): lw_shared_ptr refcounting is not thread-safe, so
+    // the shared default must not be touched from more than one shard.
+    static const lw_shared_ptr<const state>& default_state() {
+        static thread_local const lw_shared_ptr<const state> s = make_lw_shared<const state>();
+        return s;
+    }
+
+    lw_shared_ptr<const state> _state = default_state();
 
 public:
+    // Use for formats >= mc.
     column_translation get_for_schema(
             const schema& s, const serialization_header& header, const sstable_enabled_features& features) {
-        if (s.version() != _state->schema_uuid) {
+        if (s.version() != _state->schema_uuid) [[unlikely]] {
             _state = make_lw_shared<const state>(s, header, features);
         }
         return *this;
+    }
+
+    // Use this when we don't have a serialization header (format older than mc).
+    column_translation get_for_schema(const schema& s) {
+        if (s.version() != _state->schema_uuid) [[unlikely]] {
+            _state = make_lw_shared<const state>(s);
+        }
+        return *this;
+    }
+
+    bool empty() const {
+        return _state->_empty;
+    }
+
+    table_schema_version version() const {
+        return _state->schema_uuid;
     }
 
     const std::vector<column_info>& regular_columns() const {

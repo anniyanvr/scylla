@@ -3,20 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "resource_manager.hh"
 #include "manager.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include <boost/range/algorithm/for_each.hpp>
-#include <boost/range/adaptor/map.hpp>
 #include "utils/disk-error-handler.hh"
 #include "seastarx.hh"
 #include <seastar/core/sleep.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/when_all.hh>
 #include "utils/div_ceil.hh"
-#include "lister.hh"
+#include "utils/lister.hh"
 
 namespace db {
 namespace hints {
@@ -35,7 +35,7 @@ future<bool> is_mountpoint(const fs::path& path) {
         return make_ready_future<bool>(true);
     }
     return when_all(get_device_id(path), get_device_id(path.parent_path())).then([](std::tuple<future<dev_t>, future<dev_t>> ids) {
-        return std::get<0>(ids).get0() != std::get<1>(ids).get0();
+        return std::get<0>(ids).get() != std::get<1>(ids).get();
     });
 }
 
@@ -44,7 +44,7 @@ future<semaphore_units<named_semaphore::exception_factory>> resource_manager::ge
     // require each hint to reserve at least 1/(max concurrency) of the shard budget
     const size_t per_node_concurrency_limit = _max_hints_send_queue_length();
     const size_t per_shard_concurrency_limit = (per_node_concurrency_limit > 0)
-            ? div_ceil(per_node_concurrency_limit, smp::count)
+            ? div_ceil(per_node_concurrency_limit, this_smp_shard_count())
             : default_per_shard_concurrency_limit;
     const size_t min_send_hint_budget = _max_send_in_flight_memory / per_shard_concurrency_limit;
     // Let's approximate the memory size the mutation is going to consume by the size of its serialized form
@@ -91,28 +91,25 @@ future<> space_watchdog::stop() noexcept {
 }
 
 // Called under the end_point_hints_manager::file_update_mutex() of the corresponding end_point_hints_manager instance.
-future<> space_watchdog::scan_one_ep_dir(fs::path path, manager& shard_manager, ep_key_type ep_key) {
-    return do_with(std::move(path), [this, ep_key, &shard_manager] (fs::path& path) {
-        // It may happen that we get here and the directory has already been deleted in the context of manager::drain_for().
-        // In this case simply bail out.
-        return file_exists(path.native()).then([this, ep_key, &shard_manager, &path] (bool exists) {
-            if (!exists) {
-                return make_ready_future<>();
-            } else {
-                return lister::scan_dir(path, { directory_entry_type::regular }, [this, ep_key, &shard_manager] (fs::path dir, directory_entry de) {
-                    // Put the current end point ID to state.eps_with_pending_hints when we see the second hints file in its directory
-                    if (_files_count == 1) {
-                        shard_manager.add_ep_with_pending_hints(ep_key);
-                    }
-                    ++_files_count;
+future<> space_watchdog::scan_one_ep_dir(fs::path path, manager& shard_manager,
+        std::optional<locator::host_id> maybe_ep_key) {
+    // It may happen that we get here and the directory has already been deleted in the context of manager::drain_for().
+    // In this case simply bail out.
+    if (!co_await file_exists(path.native())) {
+        co_return;
+    }
 
-                    return io_check(file_size, (dir / de.name.c_str()).c_str()).then([this] (uint64_t fsize) {
-                        _total_size += fsize;
-                    });
-                });
-            }
-        });
-    });
+    co_await lister::scan_dir(path, lister::dir_entry_types::of<directory_entry_type::regular>(),
+            coroutine::lambda([this, maybe_ep_key, &shard_manager] (fs::path dir, directory_entry de) -> future<> {
+        // Put the current end point ID to state.eps_with_pending_hints when we see the second hints file in its directory
+        if (maybe_ep_key && _files_count == 1) {
+            shard_manager.add_ep_with_pending_hints(*maybe_ep_key);
+        }
+        ++_files_count;
+
+        const auto filename = (std::move(dir) / std::move(de.name)).native();
+        _total_size += co_await io_check(file_size, filename);
+    }));
 }
 
 // Called from the context of a seastar::thread.
@@ -134,11 +131,11 @@ void space_watchdog::on_timer() {
     //    |  |- ...
     //
 
-    for (auto& per_device_limits : _per_device_limits_map | boost::adaptors::map_values) {
+    for (auto& per_device_limits : _per_device_limits_map | std::views::values) {
         _total_size = 0;
         for (manager& shard_manager : per_device_limits.managers) {
             shard_manager.clear_eps_with_pending_hints();
-            lister::scan_dir(shard_manager.hints_dir(), {directory_entry_type::directory}, [this, &shard_manager] (fs::path dir, directory_entry de) {
+            lister::scan_dir(shard_manager.hints_dir(), lister::dir_entry_types::of<directory_entry_type::directory>(), [this, &shard_manager] (fs::path dir, directory_entry de) {
                 _files_count = 0;
                 // Let's scan per-end-point directories and enumerate hints files...
                 //
@@ -146,20 +143,37 @@ void space_watchdog::on_timer() {
                 // not hintable).
                 // If exists - let's take a file update lock so that files are not changed under our feet. Otherwise, simply
                 // continue to enumeration - there is no one to change them.
-                auto it = shard_manager.find_ep_manager(de.name);
-                if (it != shard_manager.ep_managers_end()) {
-                    return with_file_update_mutex(it->second, [this, &shard_manager, dir = std::move(dir), ep_name = std::move(de.name)] () mutable {
-                        return scan_one_ep_dir(dir / ep_name, shard_manager, ep_key_type(ep_name));
+                auto maybe_host_id = std::invoke([&] () -> std::optional<locator::host_id> {
+                    try {
+                        return locator::host_id(utils::UUID(de.name));
+                    } catch (...) {
+                        return std::nullopt;
+                    }
+                });
+
+                // Case 1: The directory is managed by an endpoint manager.
+                if (maybe_host_id && shard_manager.have_ep_manager(*maybe_host_id)) {
+                    const auto host_id = *maybe_host_id;
+                    return shard_manager.with_file_update_mutex_for(host_id, [this, host_id, &shard_manager, dir = std::move(dir), ep_name = std::move(de.name)] () mutable {
+                        return scan_one_ep_dir(dir / ep_name, shard_manager, host_id);
                     });
-                } else {
-                    return scan_one_ep_dir(dir / de.name, shard_manager, ep_key_type(de.name));
+                }
+                // Case 2: The directory isn't managed by an endpoint manager, but it represents a host ID.
+                else if (maybe_host_id) {
+                    return scan_one_ep_dir(dir / de.name, shard_manager, *maybe_host_id);
+                }
+                // Case 3: The directory isn't managed by an endpoint manager, and it doesn't represent a host ID.
+                else {
+                    // We use trace here to prevent flooding logs with unnecessary information.
+                    resource_manager_logger.trace("Encountered a hint directory of invalid name while scanning: {}", de.name);
+                    return scan_one_ep_dir(dir / de.name, shard_manager, {});
                 }
             }).get();
         }
 
         // Adjust the quota to take into account the space we guarantee to every end point manager
         size_t adjusted_quota = 0;
-        size_t delta = boost::accumulate(per_device_limits.managers, 0, [] (size_t sum, manager& shard_manager) {
+        size_t delta = std::ranges::fold_left(per_device_limits.managers, 0, [] (size_t sum, manager& shard_manager) {
             return sum + shard_manager.ep_managers_size() * resource_manager::hint_segment_size_in_mb * 1024 * 1024;
         });
         if (per_device_limits.max_shard_disk_space_size > delta) {
@@ -173,13 +187,12 @@ void space_watchdog::on_timer() {
     }
 }
 
-future<> resource_manager::start(shared_ptr<service::storage_proxy> proxy_ptr, shared_ptr<gms::gossiper> gossiper_ptr) {
-    _proxy_ptr = std::move(proxy_ptr);
+future<> resource_manager::start(shared_ptr<const gms::gossiper> gossiper_ptr) {
     _gossiper_ptr = std::move(gossiper_ptr);
 
     return with_semaphore(_operation_lock, 1, [this] () {
         return parallel_for_each(_shard_managers, [this](manager& m) {
-            return m.start(_proxy_ptr, _gossiper_ptr);
+            return m.start(_gossiper_ptr);
         }).then([this]() {
             return do_for_each(_shard_managers, [this](manager& m) {
                 return prepare_per_device_limits(m);
@@ -209,6 +222,15 @@ future<> resource_manager::stop() noexcept {
     });
 }
 
+future<> resource_manager::drain_hints_for_left_nodes() {
+    for (manager& m : _shard_managers) {
+        // It's safe to discard the future here. It's awaited in `manager::stop()`.
+        (void) m.drain_left_nodes();
+    }
+
+    co_return;
+}
+
 future<> resource_manager::register_manager(manager& m) {
     return with_semaphore(_operation_lock, 1, [this, &m] () {
         return with_semaphore(_space_watchdog.update_lock(), 1, [this, &m] {
@@ -223,7 +245,7 @@ future<> resource_manager::register_manager(manager& m) {
             }
 
             // If the resource_manager was started, start the hints manager, too.
-            return m.start(_proxy_ptr, _gossiper_ptr).then([this, &m] {
+            return m.start(_gossiper_ptr).then([this, &m] {
                 // Calculate device limits for this manager so that it is accounted for
                 // by the space_watchdog
                 return prepare_per_device_limits(m).then([this, &m] {
@@ -248,7 +270,7 @@ future<> resource_manager::prepare_per_device_limits(manager& shard_manager) {
             // Since we possibly deferred, we need to recheck the _per_device_limits_map.
             if (inserted) {
                 // By default, give each group of managers 10% of the available disk space. Give each shard an equal share of the available space.
-                it->second.max_shard_disk_space_size = std::filesystem::space(shard_manager.hints_dir().c_str()).capacity / (10 * smp::count);
+                it->second.max_shard_disk_space_size = std::filesystem::space(shard_manager.hints_dir().c_str()).capacity / (10 * this_smp_shard_count());
                 // If hints directory is a mountpoint, we assume it's on dedicated (i.e. not shared with data/commitlog/etc) storage.
                 // Then, reserve 90% of all space instead of 10% above.
                 if (is_mountpoint) {

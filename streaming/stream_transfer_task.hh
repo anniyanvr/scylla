@@ -5,20 +5,18 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "utils/UUID.hh"
+#include "streaming/stream_fwd.hh"
 #include "streaming/stream_task.hh"
-#include "streaming/stream_detail.hh"
-#include <map>
+#include "dht/i_partitioner_fwd.hh"
 #include <seastar/core/semaphore.hh>
 
 namespace streaming {
 
-class stream_session;
 class send_info;
 
 /**
@@ -30,10 +28,10 @@ private:
     dht::token_range_vector _ranges;
     std::map<unsigned, dht::partition_range_vector> _shard_ranges;
     long _total_size;
+    bool _mutation_done_sent = false;
 public:
-    using UUID = utils::UUID;
     stream_transfer_task(stream_transfer_task&&) = default;
-    stream_transfer_task(shared_ptr<stream_session> session, UUID cf_id, dht::token_range_vector ranges, long total_size = 0);
+    stream_transfer_task(shared_ptr<stream_session> session, table_id cf_id, dht::token_range_vector ranges, long total_size = 0);
     ~stream_transfer_task();
 public:
     virtual void abort() override {

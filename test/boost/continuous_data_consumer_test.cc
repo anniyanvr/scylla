@@ -3,34 +3,41 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "vint-serialization.hh"
 #include "sstables/consumer.hh"
 
 #include "bytes.hh"
-#include "utils/buffer_input_stream.hh"
+#include "test/lib/limiting_data_source.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/random_utils.hh"
+#include "schema/schema.hh"
 #include "sstables/processing_result_generator.hh"
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/testing/test_case.hh>
+#include <seastar/util/memory-data-source.hh>
+#include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 #include <random>
 
 namespace {
+
+input_stream<char> make_buffer_input_stream(temporary_buffer<char>&& buf, size_t limit) {
+    auto res = data_source{std::make_unique<seastar::util::temporary_buffer_data_source>(std::move(buf))};
+    return input_stream < char > { make_limiting_data_source(std::move(res), limit) };
+}
 
 class test_consumer final : public data_consumer::continuous_data_consumer<test_consumer> {
     static const int MULTIPLIER = 10;
     uint64_t _tested_value;
     int _state = 0;
     int _count = 0;
-    reader_permit::used_guard _used_guard;
+    reader_permit::need_cpu_guard _need_cpu_guard;
 
     void check(uint64_t got) {
         BOOST_REQUIRE_EQUAL(_tested_value, got);
@@ -47,14 +54,14 @@ class test_consumer final : public data_consumer::continuous_data_consumer<test_
         for (int i = 0; i < MULTIPLIER; ++i) {
             pos += unsigned_vint::serialize(tested_value, out + pos);
         }
-        return make_buffer_input_stream(std::move(buf), [] {return 1;});
+        return make_buffer_input_stream(std::move(buf), 1);
     }
 
 public:
     test_consumer(reader_permit permit, uint64_t tested_value)
         : continuous_data_consumer(std::move(permit), prepare_stream(tested_value), 0, calculate_length(tested_value))
         , _tested_value(tested_value)
-        , _used_guard(_permit)
+        , _need_cpu_guard(_permit)
     { }
 
     bool non_consuming() { return false; }
@@ -68,7 +75,7 @@ public:
                 _state = 1;
                 break;
             }
-            // fall-through
+            [[fallthrough]];
         case 1:
             check(_u64);
             ++_count;
@@ -120,7 +127,7 @@ class skipping_consumer final : public data_consumer::continuous_data_consumer<s
         std::memset(buf.get_write(), 'a', initial_data_size);
         std::memset(buf.get_write() + initial_data_size, 'b', to_skip);
         std::memset(buf.get_write() + initial_data_size + to_skip, 'a', next_data_size);
-        return make_buffer_input_stream(std::move(buf), [] {return 1;});
+        return make_buffer_input_stream(std::move(buf), 1);
     }
     static size_t prepare_initial_consumer_length(int initial_data_size, int to_skip) {
         // some bytes that we want to skip may end up even after the initial consumer range

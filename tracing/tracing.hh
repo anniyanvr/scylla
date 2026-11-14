@@ -1,141 +1,38 @@
 /*
- */
-
-/*
  * Copyright (C) 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #pragma once
 
 #include <vector>
-#include <atomic>
 #include <random>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/metrics_registration.hh>
 #include "gc_clock.hh"
-#include "utils/UUID.hh"
 #include "gms/inet_address.hh"
-#include "enum_set.hh"
-#include "log.hh"
-#include "seastarx.hh"
+#include "utils/log.hh"
+#include "tracing/tracing_fwd.hh"
+
+namespace service {
+class migration_manager;
+}
 
 namespace cql3 { class query_processor; }
 
 namespace tracing {
 
-using elapsed_clock = std::chrono::steady_clock;
-
 extern logging::logger tracing_logger;
 
-class trace_state_ptr;
 class tracing;
-class backend_registry;
 
-enum class trace_type : uint8_t {
-    NONE,
-    QUERY,
-    REPAIR,
-};
 
-extern std::vector<sstring> trace_type_names;
-
-inline const sstring& type_to_string(trace_type t) {
-    return trace_type_names.at(static_cast<int>(t));
-}
-
-/**
- * Returns a TTL for a given trace type
- * @param t trace type
- *
- * @return TTL
- */
-inline std::chrono::seconds ttl_by_type(const trace_type t) {
-    switch (t) {
-    case trace_type::NONE:
-    case trace_type::QUERY:
-        return std::chrono::seconds(86400);  // 1 day
-    case trace_type::REPAIR:
-        return std::chrono::seconds(604800); // 7 days
-    default:
-        // unknown type value - must be a SW bug
-        throw std::invalid_argument("unknown trace type: " + std::to_string(int(t)));
-    }
-}
-
-/**
- * @brief represents an ID of a single tracing span.
- *
- * Currently span ID is a random 64-bit integer.
- */
-class span_id {
-private:
-    uint64_t _id = illegal_id;
-
-public:
-    static constexpr uint64_t illegal_id = 0;
-
-public:
-    span_id() = default;
-    uint64_t get_id() const { return _id; }
-    span_id(uint64_t id) : _id(id) {}
-
-    /**
-     * @return New span_id with a random legal value
-     */
-    static span_id make_span_id();
-};
-
-std::ostream& operator<<(std::ostream& os, const span_id& id);
-
-// !!!!IMPORTANT!!!!
-//
-// The enum_set based on this enum is serialized using IDL, therefore new items
-// should always be added to the end of this enum - never before the existing
-// ones.
-//
-// Otherwise this may break IDL's backward compatibility.
-enum class trace_state_props {
-    write_on_close, primary, log_slow_query, full_tracing, ignore_events
-};
-
-using trace_state_props_set = enum_set<super_enum<trace_state_props,
-    trace_state_props::write_on_close,
-    trace_state_props::primary,
-    trace_state_props::log_slow_query,
-    trace_state_props::full_tracing,
-    trace_state_props::ignore_events>>;
-
-class trace_info {
-public:
-    utils::UUID session_id;
-    trace_type type;
-    bool write_on_close;
-    trace_state_props_set state_props;
-    uint32_t slow_query_threshold_us; // in microseconds
-    uint32_t slow_query_ttl_sec; // in seconds
-    span_id parent_id;
-
-public:
-    trace_info(utils::UUID sid, trace_type t, bool w_o_c, trace_state_props_set s_p, uint32_t slow_query_threshold, uint32_t slow_query_ttl, span_id p_id)
-        : session_id(std::move(sid))
-        , type(t)
-        , write_on_close(w_o_c)
-        , state_props(s_p)
-        , slow_query_threshold_us(slow_query_threshold)
-        , slow_query_ttl_sec(slow_query_ttl)
-        , parent_id(std::move(p_id))
-    {
-        state_props.set_if<trace_state_props::write_on_close>(write_on_close);
-    }
-};
-
-struct one_session_records;
+class one_session_records;
 using records_bulk = std::deque<lw_shared_ptr<one_session_records>>;
 
 struct backend_session_state_base {
@@ -153,8 +50,8 @@ public:
 
     i_tracing_backend_helper(tracing& tr) : _local_tracing(tr) {}
     virtual ~i_tracing_backend_helper() {}
-    virtual future<> start(cql3::query_processor& qp) = 0;
-    virtual future<> stop() = 0;
+    virtual future<> start(cql3::query_processor& qp, service::migration_manager& mm) = 0;
+    virtual future<> shutdown() = 0;
 
     /**
      * Write a bulk of tracing records.
@@ -173,9 +70,10 @@ private:
 };
 
 struct event_record {
-    sstring message;
+    std::string message;
     elapsed_clock::duration elapsed;
     i_tracing_backend_helper::wall_clock::time_point event_time_point;
+    sstring scheduling_group_name = current_scheduling_group().name();
 
     event_record(sstring message_, elapsed_clock::duration elapsed_, i_tracing_backend_helper::wall_clock::time_point event_time_point_)
         : message(std::move(message_))
@@ -203,9 +101,12 @@ private:
     bool _consumed = false;
 
 public:
-    session_record()
+    session_record(trace_type cmd, std::chrono::seconds ttl)
         : username("<unauthenticated request>")
-        , elapsed(-1) {}
+        , command(cmd)
+        , elapsed(-1)
+        , slow_query_record_ttl(ttl)
+    {}
 
     bool ready() const {
         return elapsed.count() >= 0 && !_consumed;
@@ -239,7 +140,8 @@ public:
     span_id parent_id;
     span_id my_span_id;
 
-    one_session_records();
+    one_session_records(tracing& tr, trace_type type, std::chrono::seconds slow_query_ttl, std::chrono::seconds slow_query_rec_ttl,
+            std::optional<utils::UUID> session_id = std::nullopt, span_id parent_id = span_id::illegal_id);
 
     /**
      * Consume a single record from the per-shard budget.
@@ -284,7 +186,7 @@ private:
     bool _is_pending_for_write = false;
 };
 
-class tracing : public seastar::async_sharded_service<tracing> {
+class tracing : public seastar::async_sharded_service<tracing>, public seastar::peering_sharded_service<tracing> {
 public:
     static const gc_clock::duration write_period;
     // maximum number of sessions pending for write per shard
@@ -378,7 +280,6 @@ private:
     bool _ignore_trace_events = false;
     std::unique_ptr<i_tracing_backend_helper> _tracing_backend_helper_ptr;
     sstring _thread_name;
-    const backend_registry& _backend_registry;
     sstring _tracing_backend_helper_class_name;
     seastar::metrics::metric_groups _metrics;
     double _trace_probability = 0.0; // keep this one for querying purposes
@@ -415,13 +316,10 @@ public:
         return !_down;
     }
 
-    static future<> create_tracing(const backend_registry& br, sstring tracing_backend_helper_class_name);
-    static future<> start_tracing(sharded<cql3::query_processor>& qp);
-    static future<> stop_tracing();
-    tracing(const backend_registry& br, sstring tracing_backend_helper_class_name);
+    tracing(sstring tracing_backend_helper_class_name);
 
     // Initialize a tracing backend (e.g. tracing_keyspace or logstash)
-    future<> start(cql3::query_processor& qp);
+    future<> start(cql3::query_processor& qp, service::migration_manager& mm);
 
     future<> stop();
 
@@ -527,7 +425,7 @@ public:
      * Checks if there is enough budget for the @param nr new records
      * @param nr number of new records
      *
-     * @return TRUE if there is enough budget, FLASE otherwise
+     * @return TRUE if there is enough budget, FALSE otherwise
      */
     bool have_records_budget(uint64_t nr = 1) {
         // We don't want the total amount of pending, active and flushing records to
@@ -638,25 +536,7 @@ private:
      *
      * @return TRUE if conditions are allowing creating a new tracing session
      */
-    bool may_create_new_session(const std::optional<utils::UUID>& session_id = std::nullopt) {
-        // Don't create a session if its records are likely to be dropped
-        if (!have_records_budget(exp_trace_events_per_session) || _active_sessions >= max_pending_sessions + write_event_sessions_threshold) {
-            if (session_id) {
-                tracing_logger.trace("{}: Too many outstanding tracing records or sessions. Dropping a secondary session", *session_id);
-            } else {
-                tracing_logger.trace("Too many outstanding tracing records or sessions. Dropping a primary session");
-            }
-
-            if (++stats.dropped_sessions % tracing::log_warning_period == 1) {
-                tracing_logger.warn("Dropped {} sessions: open_sessions {}, cached_records {} pending_for_write_records {}, flushing_records {}",
-                            stats.dropped_sessions, _active_sessions, _cached_records, _pending_for_write_records_count, _flushing_records);
-            }
-
-            return false;
-        }
-
-        return true;
-    }
+    bool may_create_new_session(const std::optional<utils::UUID>& session_id = std::nullopt);
 };
 
 void one_session_records::set_pending_for_write() {
@@ -673,8 +553,9 @@ void one_session_records::data_consumed() {
     budget_ptr = _local_tracing_ptr->get_cached_records_ptr();
 }
 
-inline span_id span_id::make_span_id() {
+inline span_id span_id::make_span_id(tracing& tr) {
     // make sure the value is always greater than 0
-    return 1 + (tracing::get_local_tracing_instance().get_next_rand_uint64() << 1);
+    return 1 + (tr.get_next_rand_uint64() << 1);
 }
 }
+

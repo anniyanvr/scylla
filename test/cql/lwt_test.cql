@@ -1,3 +1,7 @@
+CREATE KEYSPACE ks
+    WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND
+    tablets = {'enabled': false};
+USE ks;
 --
 -- basic: ensure the grammar works
 --
@@ -433,7 +437,7 @@ update lwt set i = 3 where a = 1 if i < 1;
 update lwt set i = 4 where a = 1 if i > 1;
 update lwt set i = 5 where a = 1 if i >= 1;
 update lwt set i = 6 where a = 1 if i <= 1;
--- Compare with another column: cassandra doesnt allow anyting but a
+-- Compare with another column: cassandra doesn't allow anything but a
 -- constant on the right hand side :(
 update lwt set i = 7 where a = 1 if i = t;
 update lwt set i = 7 where a = 1 if i = d;
@@ -476,6 +480,7 @@ update lwt set b[true] = false where a = 1 if b[true] != 1;
 update lwt set b[false] = null where a = 1 if b[true] > null;
 update lwt set b[false] = true where a = 1 if b[1] != true;
 update lwt set b = {true:false, true:true, false:false} where a = 1 if b[null] = null;
+update lwt set b = {false:false} where a = 1 if b[null] = null;
 update lwt set b = b + {false:true} where a = 1 if b[null] = true;
 update lwt set b[null] = false where a = 1 if b[true] != true;
 update lwt set b[null] = false where a = 1 if b[true] = true;
@@ -507,6 +512,7 @@ update lwt set c = c + [true] where a = 1 if c[100000000] = null;
 update lwt set c = c + [false] where a = 1 if c[100000000] = true;
 update lwt set c = c + [true, false] where a = 1 if c[null] = false;
 update lwt set c = [false] where a = 1 if c[null] = null;
+update lwt set c = [true, false, true, true, true] where a = 1 if c[null] = null;
 update lwt set c = c + [false] where a = 1 if c[null] = 1;
 update lwt set c = [true] + c where a = 1 if c = [false];
 select c from lwt where a = 1;
@@ -563,6 +569,8 @@ update lwt set c = [false] where a = 1 if c = [];
 update lwt set c = [false] where a = 1 if c = [false];
 update lwt set c = [false] where a = 1 if c = [null];
 update lwt set c = [false] where a = 1 if c = [null, true];
+-- lists with NULL are allowed, but cannot be stored
+update lwt set c = [false, null] where a = 1 if c = [false];
 select c from lwt where a = 1;
 -- negative list index
 update lwt set c = [true, false] where a = 1 if c[-1] = false;
@@ -572,6 +580,7 @@ update lwt set c = [true] where a = 1 if c[1] = false;
 update lwt set c = [true, false] where a = 1 if c[2] = null;
 update lwt set c = [true] where a = 1 if c[100000000] = null;
 update lwt set c = [false] where a = 1 if c[null] = null;
+update lwt set c = [true] where a = 1 if c[null] = null;
 update lwt set c = [true] + c where a = 1 if c = [false];
 update lwt set c = [true,true,true,false,false,false] where a = 1 if exists;
 update lwt set c = null where a = 1 if c[1] = true and c[5] = false and c[7] = null;
@@ -633,7 +642,8 @@ select s from lwt where a= 1;
 drop table lwt;
 -- collections of collections
 -- non-frozen nested sets are not supported
-create table lwt (a int, b set<map<int,int>>, c list<set<int>>, primary key (a));
+create table lwt (a int, b set<map<int,int>>, primary key (a));
+create table lwt (a int, c list<set<int>>, primary key (a));
 -- frozen collection elements are however ok
 create table lwt (a int, b set<frozen<list<int>>>, c list<frozen<set<int>>>, primary key (a));
 insert into lwt (a, b, c) values (1, {[1,2], [1,2]}, [{1,2}, {1,2}]);
@@ -760,13 +770,68 @@ create table lwt (a list<int>, b int, c int, primary key (a, b, c));
 create table lwt (a int, b int, c int, primary key (a, b));
 -- error: can't use token and non-token restrictions
 update lwt set c = 1 where a = 1 and b = 1 and token(a) > 0 and token(a) < 0 if c = 1;
--- error: can't use eq and non-eq restriction 
+-- error: can't use eq and non-eq restriction
 update lwt set c = 1 where a = 1 and b = 1 and a < 0 if c = 1;
 update lwt set c = 1 where a = 1 and b = 1 and a < 0 if c = 1;
 -- error: partition key must be fully restricted
 update lwt set c = 1 where a > 0 and a < 0 and b = 1 if c = 1;
--- error: partition key and IN is not supported 
+-- error: partition key and IN is not supported
 update lwt set c = 1 where a in () and b = 1 if c = 1;
 update lwt set c = 1 where a = 1 and b IN (1, 2) if c = 1;
 update lwt set c = 1 where a = 1 and (b) IN ((1), (2)) if c = 1;
 drop table lwt;
+
+-- gh-10081 Conditional UPDATE fails to apply when IF includes both static
+-- and non-static columns.
+create table t (p int, c int, r int, s int static, primary key(p, c));
+insert into t (p, s) values (1, 1);
+update t set s=2, r=1 where p=1 and c=1 if s=1 and r=null;
+-- in case of LWT batch, each statement in the batch should
+-- use correct regular or static row to evaluate the condition.
+-- Specifically, the following batch must apply because
+-- condition of statement 1 is true for regular row (1,1),
+-- and condition of statements 2 and 3 are true for regular rows (1,2)
+-- (1,3), which do not exist in the table, but are incarnated
+-- to check the condition
+begin batch
+    update t set s=3, r=10 where p=1 and c=1 if s=2 and r=1
+    update t set s=4, r=2 where p=1 and c=2 if s=2 and r=null
+    update t set s=5, r=3 where p=1 and c=3 if s=2 and r=null
+apply batch;
+-- test select behaviour for static rows
+-- the table contains 3 rows, right?
+select count(*) from t;
+-- count(*)  returns 3 rows. So let's delete 3 rows
+delete from t where p=1 and c = 1 if exists;
+delete from t where p=1 and c = 2 if exists;
+delete from t where p=1 and c = 3 if exists;
+-- WAT, count(*) returns 1 row even though
+-- there were 3 rows and we deleted 3 rows!
+select count(*) from t;
+-- there is no DELETE statement syntax to
+-- delete a static row; yep, that's right,
+-- the row is there but you can't DELETE it!
+delete from t where p=1 if exists;
+-- let's kill the sneaky static row now
+update t set s = null where p=1 if exists;
+-- no more sneaky static rows.
+select count(*) from t;
+-- let's add a row back!
+insert into t (p, s) values (1,1) if not exists;
+-- that's right, there is a row now; what row though?
+select count(*) from t;
+-- let's add more rows
+insert into t (p, c, s) values (1,1,1) if not exists;
+-- WAT, we did not add more rows?
+select count(*) from t;
+-- WAT, you can't add a static row by inserting a partition
+-- key alone, but you can add a clustering row by inserting
+-- clustering key alone
+insert into t (p, c) values (1,2) if not exists;
+select count(*) from t;
+-- stop this travesty
+drop table t;
+
+-- cleanup
+DROP KEYSPACE ks;
+

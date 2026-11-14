@@ -1,0 +1,4526 @@
+#
+# Copyright (C) 2025-present ScyllaDB
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+#
+
+import re
+from datetime import datetime
+from typing import Tuple
+
+from test.pylib.scylla_cluster_manager import ScyllaClusterManager
+from test.pylib.util import gather_safely, unique_name, wait_for, Host
+from test.cluster.util import ensure_raft_group_leader_on, get_topology_coordinator, create_new_test_keyspace, new_test_keyspace, new_test_table
+from test.pylib.internal_types import HostID, ServerInfo
+from cassandra import InvalidRequest, ReadTimeout, Unavailable, WriteTimeout, WriteFailure
+from cassandra.cluster import ConsistencyLevel
+from cassandra.connection import UnixSocketEndPoint
+from cassandra.policies import FallthroughRetryPolicy, WhiteListRoundRobinPolicy
+from cassandra.query import BatchStatement, SimpleStatement, BoundStatement
+from test.pylib.tablets import get_all_tablet_replicas, get_tablet_info, get_tablet_replicas
+from test.pylib.driver_utils import safe_shutting_down
+from test.pylib.rest_client import read_barrier, ScyllaMetrics, ScyllaMetricsLine
+
+import asyncio
+import pytest
+import logging
+import time
+import uuid
+import random
+import asyncio
+
+
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_CONFIG = {'experimental_features': ['strongly-consistent-tables']}
+DEFAULT_CMDLINE = [
+        '--logger-log-level', 'sc_groups_manager=debug',
+        '--logger-log-level', 'sc_coordinator=debug',
+        '--logger-log-level', 'sc_state_machine=debug',
+        '--logger-log-level', 'raft_groups_storage=debug'
+    ]
+
+
+async def wait_for_leader(manager: ScyllaClusterManager, s: ServerInfo, group_id: str,
+                          expected_host_id: str | None = None, timeout: float = 60):
+    """Wait until `s` reports a leader for `group_id` - with `expected_host_id`, until it
+    reports that one.
+
+    current_leader() on a follower is the last leader it heard from, so a replica that a
+    migration has just removed keeps being reported until the follower's election timeout
+    fires. A caller that knows which node has to end up leading must wait that window out
+    instead of asserting on the first reading.
+    """
+    async def get_leader_host_id():
+        result = await manager.api.get_raft_leader(s.ip_addr, group_id)
+        return result if expected_host_id is None or result == expected_host_id else None
+    label = f"group {group_id} to be led by {expected_host_id}" if expected_host_id else f"a leader of group {group_id}"
+    return await wait_for(get_leader_host_id, time.time() + timeout, label=label)
+
+async def collect_all_raft_state(cql, host):
+    state = {}
+    # vote_term and snapshot_idx are regular columns and the table has no
+    # clustering key, so there is exactly one row per group.
+    rows = await cql.run_async(f"SELECT shard, group_id, vote_term, snapshot_idx FROM system.raft_groups", host=host)
+    logger.info(f"Collected raft state from host {host}:")
+    for row in rows:
+        assert str(row.group_id) not in state, f"Duplicate raft state for group {row.group_id} shard {row.shard}"
+        state[str(row.group_id)] = (row.shard, row.vote_term, row.snapshot_idx)
+    return state
+
+
+# Verify that:
+# - All raft groups present before an event are still present after the event.
+# - For each raft group, the shard did not change.
+# - For each raft group, vote_term did not decrease (if present).
+# - For each raft group, snapshot_idx did not decrease (if present).
+def assert_raft_state_continuity(state_before: dict, state_after: dict, context: str):
+    for group_id, (shard_before, vote_term_before, snapshot_idx_before) in state_before.items():
+        assert group_id in state_after, (
+            f"Raft state for group {group_id} shard {shard_before} missing after {context}."
+        )
+        shard_after, vote_term_after, snapshot_idx_after = state_after[group_id]
+
+        assert shard_before == shard_after, (
+            f"Raft state for group {group_id} changed shard from {shard_before} to {shard_after} after {context}."
+        )
+
+        if vote_term_before is not None:
+            assert vote_term_after is not None and vote_term_after >= vote_term_before, (
+                f"vote_term decreased for group {group_id} shard {shard_before} after {context}: "
+                f"{vote_term_before} -> {vote_term_after}."
+            )
+
+        if snapshot_idx_before is not None:
+            assert snapshot_idx_after is not None and snapshot_idx_after >= snapshot_idx_before, (
+                f"snapshot_idx decreased for group {group_id} shard {shard_before} after {context}: "
+                f"{snapshot_idx_before} -> {snapshot_idx_after}."
+            )
+
+# Verify that reads and writes to raft tables for strongly consistent tablets
+# are always routed to the expected shards, according to the tablet's
+# assignment.
+async def assert_no_cross_shard_routing(manager: ScyllaClusterManager, server: ServerInfo):
+    log = await manager.server_open_log(server.server_id)
+
+    # Check partitioner logs
+    partitioner_logs = await log.grep(r"fixed_shard.*get_token: shard=(\d+), token=(\d+)")
+    computed_tokens = {}
+    for _, match in partitioner_logs:
+        shard = int(match.group(1))
+        token = int(match.group(2))
+        computed_tokens[token] = shard
+
+    # Check sharder logs
+    sharder_logs = await log.grep(r"fixed_shard.*shard_of\((\d+)\) = (\d+)")
+    for _, match in sharder_logs:
+        token = int(match.group(1))
+        shard = int(match.group(2))
+        if token not in computed_tokens:
+            # This can happen when we read the raft tables as a client, through CQL.
+            # In that case, we may try to route a token that does not correspond
+            # to any existing raft group.
+            continue
+        shard_from_partitioner = computed_tokens[token]
+        assert shard == shard_from_partitioner, (
+            f"Sharder routed token {token} to shard {shard}, "
+            f"but partitioner computed shard {shard_from_partitioner}."
+        )
+
+async def get_table_raft_group_id(manager: ScyllaClusterManager, ks: str, table: str):
+    table_id = await manager.get_table_id(ks, table)
+    rows = await manager.get_cql().run_async(f"SELECT raft_group_id FROM system.tablets where table_id = {table_id}")
+    return str(rows[0].raft_group_id)
+
+async def expect_retry_before_timeout(manager: ScyllaClusterManager, server: ServerInfo, query: str,
+                                      error: type[Exception], retries_metric: str, reason: str, scale_timeout,
+                                      host: Host | None = None, consistency_level=None) -> None:
+    """Expect `query` to be retried on `server` with `reason`, and then to fail with `error`.
+    The timeout starts at 10ms to keep the test fast, and doubles while the request
+    times out before it gets to retry."""
+    async def retries() -> float:
+        metrics = await manager.metrics.query(server.ip_addr)
+        return metrics.get(retries_metric, {'reason': reason}) or 0
+
+    # One request per attempt: by default the driver may retry a read timeout.
+    no_retry = FallthroughRetryPolicy()
+    timeout_ms = scale_timeout(10)
+    while timeout_ms <= scale_timeout(5000):
+        retries_before = await retries()
+        statement = SimpleStatement(f"{query} USING TIMEOUT {timeout_ms}ms", consistency_level=consistency_level,
+                                    retry_policy=no_retry)
+        with pytest.raises(error):
+            await manager.get_cql().run_async(statement, host=host)
+        if await retries() > retries_before:
+            return
+        timeout_ms *= 2
+    pytest.fail(f"no {reason} retry counted on {server}")
+
+async def test_basic_write_read(manager: ScyllaClusterManager, build_mode: str):
+
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE
+    # In dev mode, stretch the strongly consistent raft group tick interval to
+    # 20s so that any unwanted waiting on a raft tick during group startup shows
+    # up as a multi-second delay, caught by the <10s assertion below.
+    default_config = DEFAULT_CONFIG | {'error_injections_at_startup': []}
+    config_with_big_ticks = DEFAULT_CONFIG | {'error_injections_at_startup': [{
+        'name': 'strongly-consistent-raft-group-tick-interval-in-ms',
+        'value': '20000'
+    }]}
+    config = config_with_big_ticks if build_mode == "dev" else default_config
+    servers = await manager.servers_add(3, config=config, cmdline=cmdline, auto_rack_dc='my_dc')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    logger.info("Load host_id-s for servers")
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    logger.info("Creating a strongly-consistent keyspace")
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        # Open logs before CREATE TABLE so we can measure raft group bootstrap time.
+        server_logs = [await manager.server_open_log(s.server_id) for s in servers]
+        marks = [await log.mark() for log in server_logs]
+
+        logger.info("Creating a table")
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+        logger.info("Select raft group id for the tablet")
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+
+        tablet_replicas = await get_tablet_replicas(manager, servers[0], ks, "test", 0)
+        assert len(tablet_replicas) == 2
+        replica_host_ids = [replica[0] for replica in tablet_replicas]
+
+        logger.info(f"Get current leader for the group {group_id}")
+        if host_ids[0] in replica_host_ids:
+            leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+        else:
+            leader_host_id = await wait_for_leader(manager, servers[1], group_id)
+        leader_host = host_by_host_id(leader_host_id)
+
+        # Verify that strongly consistent raft group bootstrap (election + read_barrier) completed
+        # quickly on both replicas. With the start_as_candidate and retry_now
+        # optimizations, this should be nearly instant. Without them, the huge
+        # raft tick interval configured above makes startup depend on a 10s tick.
+        # Only check in dev mode because the test uses error injection.
+        if build_mode == "dev":
+            ts_pattern = r'(\d{2}:\d{2}:\d{2},\d{3})'
+            total_startup_ms = 0.0
+            replicas_checked = 0
+            for i, (log, mark) in enumerate(zip(server_logs, marks)):
+                matches = await log.grep(
+                    f"update\\(\\): starting raft server for tablet .*, group id {group_id}",
+                    from_mark=mark)
+                if not matches:
+                    continue
+                done_matches = await log.grep(
+                    f"update\\(\\): raft server for tablet .* and group id {group_id} is started",
+                    from_mark=mark)
+                assert done_matches, (
+                    f"Server {i+1}: found 'starting raft server' but not 'is started' "
+                    f"for group {group_id}")
+                start_ts = re.search(ts_pattern, matches[0][0])
+                done_ts = re.search(ts_pattern, done_matches[0][0])
+                assert start_ts and done_ts, (
+                    f"Server {i+1}: could not parse timestamps from log lines")
+                t0 = datetime.strptime(start_ts.group(1), "%H:%M:%S,%f")
+                t1 = datetime.strptime(done_ts.group(1), "%H:%M:%S,%f")
+                elapsed_ms = (t1 - t0).total_seconds() * 1000
+                total_startup_ms += elapsed_ms
+                replicas_checked += 1
+
+            assert replicas_checked == 2, (
+                f"Expected 2 replicas with strongly consistent raft group logs, found {replicas_checked}")
+            logger.info(f"Strongly consistent raft group startup: total={total_startup_ms:.0f}ms")
+
+            # Under normal conditions this should finish in <10 milliseconds, but we can't trust
+            # anything regarding time and random delays in our CI infrastructure, so we use
+            # this absurdly high limit instead. Thanks to the injected tick_period of 20 seconds,
+            # this check should still find a problem if we ever rely on raft ticks in
+            # strongly consistent group startup.
+            assert total_startup_ms < 10000, (
+                f"Strongly consistent raft group startup took {total_startup_ms:.0f}ms, "
+                f"expected <10000ms with raft tick interval set to 20s")
+
+        logger.info(f"Get the non-leader replica for the group {group_id}")
+        non_leader_replica_host_id = [host_id for host_id in replica_host_ids if str(host_id) != str(leader_host_id)][0]
+        non_leader_replica_host = host_by_host_id(non_leader_replica_host_id)
+
+        logger.info(f"Get the non-replica for the group {group_id}")
+        non_replica_host_id = [host_id for host_id in host_ids if str(host_id) not in replica_host_ids][0]
+        non_replica_host = host_by_host_id(non_replica_host_id)
+
+        async def collect_metrics():
+            leader_metrics_query = await manager.metrics.query(leader_host.address)
+            leader_metrics = {
+                'scylla_strong_consistency_coordinator_write_latency_count': leader_metrics_query.get('scylla_strong_consistency_coordinator_write_latency_count') or 0,
+                'scylla_strong_consistency_coordinator_read_latency_count':  leader_metrics_query.get('scylla_strong_consistency_coordinator_read_latency_count', {'read_type': 'linearizable'}) or 0,
+            }
+            non_leader_metrics_query = await manager.metrics.query(non_leader_replica_host.address)
+            non_leader_metrics = {
+                'scylla_strong_consistency_coordinator_write_node_bounces': non_leader_metrics_query.get('scylla_strong_consistency_coordinator_write_node_bounces') or 0,
+                'scylla_strong_consistency_coordinator_read_node_bounces': non_leader_metrics_query.get('scylla_strong_consistency_coordinator_read_node_bounces') or 0,
+            }
+            non_replica_metrics_query = await manager.metrics.query(non_replica_host.address)
+            non_replica_metrics = {
+                'scylla_strong_consistency_coordinator_write_node_bounces': non_replica_metrics_query.get('scylla_strong_consistency_coordinator_write_node_bounces') or 0,
+                'scylla_strong_consistency_coordinator_read_node_bounces':  non_replica_metrics_query.get('scylla_strong_consistency_coordinator_read_node_bounces') or 0,
+            }
+
+            return {
+                'leader': leader_metrics,
+                'replica': non_leader_metrics,
+                'non_replica': non_replica_metrics,
+            }     
+        metrics_before = await collect_metrics()
+
+        logger.info(f"Run INSERT statement on leader {leader_host}")
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (10, 20)", host=leader_host)
+
+        logger.info(f"Run SELECT statement on leader {leader_host}")
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test WHERE pk = 10;", host=leader_host)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 20
+
+        logger.info(f"Run INSERT statement on non-leader replica {non_leader_replica_host}")
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (10, 30)", host=non_leader_replica_host)
+
+        logger.info(f"Run SELECT statement on non-leader replica {non_leader_replica_host}")
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test WHERE pk = 10;", host=non_leader_replica_host)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 30
+
+        logger.info(f"Run INSERT statement on non-replica {non_replica_host}")
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (10, 40)", host=non_replica_host)
+
+        logger.info(f"Run SELECT statement on non-replica {non_replica_host}")
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test WHERE pk = 10;", host=non_replica_host)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 40
+
+        # Test with prepared statements as well
+        insert_stmt = cql.prepare(f"INSERT INTO {ks}.test (pk, c) VALUES (?, ?)")
+        bound_insert_stmt = BoundStatement(insert_stmt)
+        select_stmt = cql.prepare(f"SELECT * FROM {ks}.test WHERE pk = ?")
+        bound_select_stmt = BoundStatement(select_stmt, consistency_level=ConsistencyLevel.QUORUM)
+        bound_select_stmt.bind([10])
+
+        logger.info(f"Run prepared INSERT statement on leader {leader_host}")
+        bound_insert_stmt.bind([10, 50])
+        await cql.run_async(bound_insert_stmt, host=leader_host)
+
+        logger.info(f"Run prepared SELECT statement on leader {leader_host}")
+        rows = await cql.run_async(bound_select_stmt, host=leader_host)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 50
+
+        logger.info(f"Run prepared INSERT statement on non-leader replica {non_leader_replica_host}")
+        bound_insert_stmt.bind([10, 60])
+        await cql.run_async(bound_insert_stmt, host=non_leader_replica_host)
+
+        logger.info(f"Run prepared SELECT statement on non-leader replica {non_leader_replica_host}")
+        rows = await cql.run_async(bound_select_stmt, host=non_leader_replica_host)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 60
+
+        logger.info(f"Run prepared INSERT statement on non-replica {non_replica_host}")
+        bound_insert_stmt.bind([10, 70])
+        await cql.run_async(bound_insert_stmt, host=non_replica_host)
+
+        logger.info(f"Run prepared SELECT statement on non-replica {non_replica_host}")
+        rows = await cql.run_async(bound_select_stmt, host=non_replica_host)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 70
+
+        metrics_after = await collect_metrics()
+        # Validate that all matrics were increased after read/write operations
+        for host in metrics_after.keys():
+            for metric_name in metrics_after[host].keys():
+                assert metrics_after[host][metric_name] > metrics_before[host][metric_name]
+
+        # Check that we can restart a server with an active tablets raft group.
+        # A restarting replica re-creates its raft group and must rediscover a
+        # leader, which legitimately depends on raft ticks. Restore the default
+        # (short) tick interval on this server first; with the stretched 10s tick
+        # the reboot would stall for the whole leader-wait timeout.
+        if build_mode == "dev":
+            await manager.server_update_config(servers[2].server_id, config_options=default_config)
+        await manager.server_restart(servers[2].server_id)
+
+    # To check that the servers can be stopped gracefully. By default the test runner just kills them.
+    await gather_safely(*[manager.server_stop_gracefully(s.server_id) for s in servers])
+
+async def test_multi_shard_write_read(manager: ScyllaClusterManager):
+    """
+    Verify that strongly consistent tables work correctly on non-shard-0.
+
+    We create a strongly consistent table with 4 tablets and RF=3
+    and a cluster with 3 nodes and 4 shards per node.
+    Assuming a uniform distribution of tablets to shards,
+    each tablet should be assigned to a different shard.
+    We have 3 "shard zeros", so at least one tablet should be
+    replicated on non-shard-0 nodes only, including its leader.
+
+    We then perform multiple writes to all nodes, some of which
+    should go to non-shard-0 leaders, and verify that all writes
+    succeed and that we can read back all data correctly.
+    """
+    logger.info("Bootstrapping cluster with 4 shards per node")
+    cmdline = DEFAULT_CMDLINE + ['--smp=4']
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=cmdline, auto_rack_dc='my_dc')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    logger.info("Creating a strongly-consistent keyspace with 4 tablets")
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 4} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            for j in range(50):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({j}, {j})")
+
+            # Read all data
+            for j in range(50):
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {j};")
+                assert len(rows) == 1, f"Expected 1 row for pk={j}, got {len(rows)}"
+                row = rows[0]
+                assert row.c == j, f"Data integrity check failed for pk={j}: expected c={j}, got c={row.c}"
+
+    await gather_safely(*[manager.server_stop_gracefully(s.server_id) for s in servers])
+
+async def test_sc_multishard_metadata_reads(manager: ScyllaClusterManager):
+    """
+    Verify that multi-shard reads of raft metadata for strongly-consistent tables work correctly.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--smp=4',
+        '--logger-log-level', 'fixed_shard=trace',
+    ]
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=cmdline)
+    (cql, hosts) = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 8} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            table_id = await manager.get_table_id(ks, table_name)
+
+            # Write some rows to trigger raft table updates
+            for pk in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk})")
+
+            # Verify that tablets are allocated also on non-0 shards
+            tablets = await get_all_tablet_replicas(manager, server, ks, table_name)
+            logger.info(f"Tablet distribution: {tablets}")
+            assert set(shard for tablet in tablets for _, shard in tablet.replicas) != set([0]), "Strongly consistent tables shoud be allocated also on non-0 shards"
+
+            # Verify the state is non-empty. vote_term, not snapshot_idx:
+            # snapshot_idx only advances when a record is released, which needs
+            # the record's segment closed, so after a handful of small writes
+            # snapshot_idx is still 0.
+            state = await collect_all_raft_state(cql, hosts[0])
+            has_nonempty_state = any(
+                vote_term is not None and vote_term > 0
+                for _, vote_term, _ in state.values()
+            )
+            assert has_nonempty_state, "Expected at least one group to have vote_term > 0 before crash"
+
+            # Prepare the list of (shard, group_id) pairs for all tablets of the table.
+            raft_partition_keys = []
+            for row in await cql.run_async(f"SELECT raft_group_id, replicas FROM system.tablets where table_id = {table_id}"):
+                assert len(row.replicas) == 1, "Expected RF=1 for the test table"
+                (_, shard) = row.replicas[0]
+                raft_partition_keys.append((shard, row.raft_group_id))
+            assert len(raft_partition_keys) == 8, f"Expected 8 tablets, got {len(raft_partition_keys)}"
+
+            # system.raft_groups has a collection column, and a Row holding a list
+            # cannot go in a set, so compare normalized tuples instead.
+            def hashable(row):
+                return tuple(tuple(v) if isinstance(v, list) else v for v in row)
+
+            # Collect raft metadata for all tablets using single-shard queries
+            raft_data = {}
+            for (shard, group_id) in raft_partition_keys:
+                raft_data[(shard, group_id)] = {hashable(r) for r in await cql.run_async(f"SELECT * FROM system.raft_groups WHERE shard = {shard} AND group_id = {group_id}")}
+                # Verify that we can also obtain the same data without knowing the shard using ALLOW FILTERING
+                filtered_data = {hashable(r) for r in await cql.run_async(f"SELECT * FROM system.raft_groups WHERE group_id = {group_id} ALLOW FILTERING")}
+                assert raft_data[(shard, group_id)] == filtered_data, f"Data mismatch for group {group_id} when read by shard vs ALLOW FILTERING: {raft_data[(shard, group_id)]} vs {filtered_data}"
+
+            # Now read raft metadata using multi-shard queries and verify correctness
+            for k in range(2, 9):
+                sample_keys = random.sample(raft_partition_keys, k)
+                shards = tuple(shard for (shard, _) in sample_keys)
+                group_ids = ", ".join(f"{group_id}" for group_id in set(group_id for (_, group_id) in sample_keys))
+                logger.info(f"Testing multi-shard read with {k} keys: {sample_keys}")
+                # We can't specify (shard, group_id) partition key pairs in the IN clause because multi-column restriction are only allowed for clustering keys.
+                # Instead, we read using a product of all involved shards and group_ids. This should return the same rows because every group_id
+                # is only assigned to one shard.
+                rows = await cql.run_async(f"SELECT * FROM system.raft_groups WHERE shard IN {shards} AND group_id IN ({group_ids})")
+                read_rows = {hashable(r) for r in rows}
+                for key in sample_keys:
+                    for row_data in raft_data[key]:
+                        assert row_data in read_rows, f"Missing data for raft group {key} in multi-shard read: {row_data}"
+                for row in rows:
+                    assert hashable(row) in raft_data[(row.shard, row.group_id)], f"Unexpected data for raft group {(row.shard, row.group_id)} in multi-shard read: {row}"
+
+            # Read ranges of partitions using TOKEN()
+            for (boundary_shard, boundary_group_id) in raft_partition_keys:
+                ith_token = await cql.run_async(f"SELECT TOKEN(shard, group_id) as t FROM system.raft_groups WHERE shard = {boundary_shard} AND group_id = {boundary_group_id} LIMIT 1")
+                token_value = ith_token[0].t
+                range_below = {hashable(r) for r in await cql.run_async(f"SELECT * FROM system.raft_groups WHERE TOKEN(shard, group_id) <= {token_value}")}
+                range_above = {hashable(r) for r in await cql.run_async(f"SELECT * FROM system.raft_groups WHERE TOKEN(shard, group_id) > {token_value}")}
+                assert range_below & range_above == set(), f"Overlapping data in range reads up to and above token {token_value}"
+                for (shard, group_id) in raft_partition_keys:
+                    for row_data in raft_data[(shard, group_id)]:
+                        if shard < boundary_shard:
+                            assert row_data in range_below, f"Missing data for raft group {(shard, group_id)} in range read up to token {token_value}: {row_data}"
+                        elif shard > boundary_shard:
+                            assert row_data in range_above, f"Missing data for raft group {(shard, group_id)} in range read above token {token_value}: {row_data}"
+                        else:
+                            if group_id == boundary_group_id:
+                                assert row_data in range_below, f"Missing data for raft group {(shard, group_id)} in range read up to token {token_value}: {row_data}"
+                            else:
+                                assert row_data in range_below or row_data in range_above, f"Missing data for raft group {(shard, group_id)} in range read up to token {token_value}: {row_data}"
+
+    await manager.server_stop_gracefully(server.server_id)
+
+async def test_sc_persistence_restart_with_smp_increase(manager: ScyllaClusterManager):
+    """
+    Verify that the metadata for strongly-consistent tables
+    is preserved after increasing shard count (--smp).
+
+    The raft tables for strongly consistent tables use a custom partitioner
+    and sharder which should not change the shard assignments when the
+    number of shards changes. This test verifies that after increasing the SMP
+    on a single-node cluster, we don't start reading/writing raft metadata
+    from/to incorrect shards.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--smp=2',
+        '--logger-log-level', 'fixed_shard=trace',
+    ]
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=cmdline)
+    (cql, hosts) = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 2} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+
+            # Write some rows to trigger raft table updates
+            for pk in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk})")
+
+            state_before = await collect_all_raft_state(cql, hosts[0])
+
+            await manager.server_update_cmdline(server.server_id, ['--smp=4'])
+            await manager.server_restart(server.server_id)
+            (cql, hosts) = await manager.get_ready_cql([server])
+
+            # We can't read the internal raft state directly, so we perform extra writes
+            # which should cause raft table updates based on the loaded state after restart.
+            for pk in range(10, 20):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk})")
+
+            state_after = await collect_all_raft_state(cql, hosts[0])
+            assert_raft_state_continuity(state_before, state_after, "SMP increase")
+
+            await assert_no_cross_shard_routing(manager, server)
+
+            for pk in range(20):
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {pk};")
+                assert len(rows) == 1, f"Expected 1 row for pk={pk}, got {len(rows)}"
+                row = rows[0]
+                assert row.c == pk, f"Incorrect row read for pk={pk}: expected c={pk}, got c={row.c}"
+
+    await manager.server_stop_gracefully(server.server_id)
+
+
+async def test_sc_persistence_with_compaction(manager: ScyllaClusterManager):
+    """
+    Verify that compaction of system.raft_groups works correctly.
+
+    Regular (non-reshard) compaction does not use the custom partitioner/sharder
+    directly, bit it does compact SSTables written with them, so in this test we
+    verify that after compaction the raft metadata is still readable and correct.
+    """
+    cmdline = DEFAULT_CMDLINE + ['--logger-log-level', 'fixed_shard=trace']
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=cmdline)
+    (cql, hosts) = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+
+            # Create multiple SSTables by doing writes with flushes in between
+            for batch in range(3):
+                for pk in range(batch * 10, (batch + 1) * 10):
+                    await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk})")
+                await manager.api.keyspace_flush(server.ip_addr, "system", "raft_groups")
+
+            state_before_compaction = await collect_all_raft_state(cql, hosts[0])
+
+            await manager.api.keyspace_compaction(server.ip_addr, "system", "raft_groups")
+
+            state_after_compaction = await collect_all_raft_state(cql, hosts[0])
+            assert_raft_state_continuity(state_before_compaction, state_after_compaction, "compaction")
+
+            # Restart to verify compacted SSTables are correctly readable by raft server
+            await manager.server_restart(server.server_id)
+            (cql, hosts) = await manager.get_ready_cql([server])
+
+            # We can't read the internal raft state directly, so we perform extra writes
+            # which should cause raft table updates based on the loaded state after restart.
+            for pk in range(30, 40):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk})")
+
+            state_after_restart = await collect_all_raft_state(cql, hosts[0])
+            assert_raft_state_continuity(state_after_compaction, state_after_restart, "compaction + restart")
+
+            await assert_no_cross_shard_routing(manager, server)
+
+    await manager.server_stop_gracefully(server.server_id)
+
+
+async def test_sc_persistence_after_crash(manager: ScyllaClusterManager):
+    """
+    Verify that metadata for strongly-consistent tables is recovered
+    after a non-graceful stop (crash simulation).
+    """
+    cmdline = DEFAULT_CMDLINE + ['--logger-log-level', 'fixed_shard=trace']
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=cmdline)
+    (cql, hosts) = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            # Write some rows to trigger raft table updates
+            for pk in range(20):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk})")
+
+            # Collect raft state and log entry counts before crash
+            state_before_crash = await collect_all_raft_state(cql, hosts[0])
+
+            await manager.server_stop(server.server_id, convict=False)
+
+            await manager.server_start(server.server_id)
+            (cql, hosts) = await manager.get_ready_cql([server])
+
+            # We can't read the internal raft state directly, so we perform extra writes
+            # which should cause raft table updates based on the loaded state after restart.
+            for pk in range(20, 30):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk})")
+
+            state_after_crash = await collect_all_raft_state(cql, hosts[0])
+            assert_raft_state_continuity(state_before_crash, state_after_crash, "crash recovery")
+
+            await assert_no_cross_shard_routing(manager, server)
+
+    await manager.server_stop_gracefully(server.server_id)
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_no_schema_when_apply_write(manager: ScyllaClusterManager):
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    # We don't want `servers[2]` to be a Raft leader (for both group0 and strong consistency groups),
+    # because we want `servers[2]` to receive Raft commands from others.
+    config = DEFAULT_CONFIG | {'error_injections_at_startup': ['avoid_being_raft_leader']}
+    servers += [await manager.server_add(config=config, cmdline=DEFAULT_CMDLINE, property_file={'dc':'my_dc', 'rack': 'rack3'})]
+    (cql, hosts) = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+        # Drop incoming append entries from group0 (schema changes) on `servers[2]` after the table is created,
+        # so strong consistency raft groups are created on the node but it won't receive next alter table mutations.
+        group0_id = (await cql.run_async("SELECT value FROM system.scylla_local WHERE key = 'raft_group0_id'"))[0].value
+        await manager.api.enable_injection(servers[2].ip_addr, "raft_drop_incoming_append_entries_for_specified_group", one_shot=False, parameters={'value': group0_id})
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD new_col int;", host=hosts[0])
+
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+        assert leader_host_id != host_ids[2]
+        leader_host = host_by_host_id(leader_host_id)
+
+        s2_log = await manager.server_open_log(servers[2].server_id)
+        s2_mark = await s2_log.mark()
+
+        await manager.api.enable_injection(servers[2].ip_addr, "disable_raft_drop_append_entries_for_specified_group", one_shot=True)
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, c, new_col) VALUES (10, 20, 30)", host=leader_host)
+
+        await s2_log.wait_for(f"Column definitions for {ks}.test changed", timeout=60, from_mark=s2_mark)
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test WHERE pk = 10;", host=hosts[2])
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 20
+        assert row.new_col == 30
+
+        metrics = await manager.metrics.query(servers[2].ip_addr)
+        assert metrics.get(f'{SC_APPLY_METRICS_PREFIX}schema_barrier_waits', {'ks': ks, 'cf': 'test'}) == 1
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_old_schema_when_apply_write(manager: ScyllaClusterManager):
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    # We don't want `servers[2]` to be a Raft leader (for both group0 and strong consistency groups),
+    # because we want `servers[2]` to receive Raft commands from others.
+    config = DEFAULT_CONFIG | {'error_injections_at_startup': ['avoid_being_raft_leader']}
+    servers += [await manager.server_add(config=config, cmdline=DEFAULT_CMDLINE, property_file={'dc':'my_dc', 'rack': 'rack3'})]
+    (cql, hosts) = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+        assert leader_host_id != host_ids[2]
+        leader_host = host_by_host_id(leader_host_id)
+
+        table_schema_version = (await cql.run_async(f"SELECT version FROM system_schema.scylla_tables WHERE keyspace_name = '{ks}' AND table_name = 'test'"))[0].version
+
+        await manager.api.enable_injection(servers[2].ip_addr, "strong_consistency_state_machine_wait_before_apply", one_shot=False)
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (10, 20)", host=leader_host)
+
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD new_col int;", host=leader_host)
+        # Following injection simulates that old schema version was already removed from the memory
+        await manager.api.enable_injection(servers[2].ip_addr, "schema_registry_ignore_version", one_shot=False, parameters={'value': table_schema_version})
+        await manager.api.message_injection(servers[2].ip_addr, "strong_consistency_state_machine_wait_before_apply")
+        await manager.api.disable_injection(servers[2].ip_addr, "strong_consistency_state_machine_wait_before_apply")
+
+        rows = await cql.run_async(f"SELECT * FROM {ks}.test WHERE pk = 10;", host=hosts[2])
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.pk == 10
+        assert row.c == 20
+        assert row.new_col is None
+
+async def test_forward_cql_prepared_with_bound_values(manager: ScyllaClusterManager):
+    """
+    When we prepare an statement not on the leader, we should
+    still be able to forward it to the leader with bound values.
+    In this test we prepare a statement that should be forwarded to
+    the leader (so an INSERT statement) and then execute it.
+    It should correctly insert the value.
+    Then, we execute it again and check that we used the cache
+    on the leader side and that it updated the value correctly again.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'cql_server=trace',
+        '--experimental-features', 'strongly-consistent-tables',
+    ]
+    servers = await manager.servers_add(2, cmdline=cmdline, auto_rack_dc='dc1')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    ks_opts = ("WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND consistency = 'global'")
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, value int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+            leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+            non_leader_host = [host for host in hosts if str(host.host_id) != str(leader_host_id)][0]
+
+            # Prepare statement
+            stmt = cql.prepare(f"INSERT INTO {table} (pk, value) VALUES (0, ?)")
+
+            # Execute prepared INSERT once to verify results and populate the cache on the leader
+            await cql.run_async(stmt, [0], host=non_leader_host)
+            res = await cql.run_async(f"SELECT value FROM {table} WHERE pk = 0")
+            assert len(res) == 1 and res[0].value == 0
+
+            # Execute prepared INSERT again to verify that we use the cache on the leader
+            traced_execute = cql.execute(stmt, (0,), host=non_leader_host, trace=True)
+            res = await cql.run_async(f"SELECT value FROM {table} WHERE pk = 0")
+            assert len(res) == 1 and res[0].value == 0
+            trace = traced_execute.get_query_trace()
+            for event in trace.events:
+                logger.info(f"Trace event: {event.description}")
+                assert "Prepared statement not found on target" not in event.description
+
+async def test_forward_cql_cache_invalidation(manager: ScyllaClusterManager):
+    """
+    Test that cql forwarding works after invalidation of prepared statement cache on schema changes.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'cql_server=trace',
+        '--experimental-features', 'strongly-consistent-tables',
+    ]
+    servers = await manager.servers_add(2, cmdline=cmdline, auto_rack_dc='dc1')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    ks_opts = ("WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1} AND consistency = 'global'")
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, value int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+            leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+            non_leader_host = [host for host in hosts if str(host.host_id) != str(leader_host_id)][0]
+
+            insert_stmt = cql.prepare(f"INSERT INTO {table} (pk, value) VALUES (?, ?)")
+            select_stmt = cql.prepare(f"SELECT pk, value FROM {table} WHERE pk = ?")
+
+            await cql.run_async(insert_stmt, [1, 100])
+            rows = await cql.run_async(select_stmt, [1])
+            assert len(rows) == 1
+            assert rows[0].value == 100
+
+            metrics_before = await manager.metrics.query(non_leader_host.address)
+            prepared_not_found_before = metrics_before.get('scylla_transport_requests_forwarded_prepared_not_found') or 0
+
+            # Altering schema invalidates prepared statement cache
+            await cql.run_async(f"ALTER TABLE {table} ADD extra_column text")
+            await cql.run_async(insert_stmt, [2, 200], host=non_leader_host)
+            rows = await cql.run_async(select_stmt, [2], host=non_leader_host)
+            assert len(rows) == 1
+            assert rows[0].value == 200
+
+            metrics_after = await manager.metrics.query(non_leader_host.address)
+            prepared_not_found_after = metrics_after.get('scylla_transport_requests_forwarded_prepared_not_found') or 0
+            assert prepared_not_found_after > prepared_not_found_before
+
+@pytest.mark.skip_mode('release', "error injections aren't enabled in release mode")
+async def test_forward_cql_exception_passthrough(manager: ScyllaClusterManager):
+    """
+    Verify that coordinator exception returned on the target replica is correctly returned to the client.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'cql_server=trace',
+        '--experimental-features', 'strongly-consistent-tables',
+    ]
+    servers = await manager.servers_add(3, cmdline=cmdline, auto_rack_dc='dc1')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    ks_opts = ("WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1} AND consistency = 'global'")
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, value int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+
+            tablet_replicas = await get_tablet_replicas(manager, servers[0], ks, table_name, 0)
+            assert len(tablet_replicas) == 2
+            replica_host_ids = [replica[0] for replica in tablet_replicas]
+
+            logger.info(f"Get current leader for the group {group_id}")
+            if host_ids[0] in replica_host_ids:
+                leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+            else:
+                leader_host_id = await wait_for_leader(manager, servers[1], group_id)
+            leader_host = [host for host in hosts if str(host.host_id) == str(leader_host_id)][0]
+
+            logger.info(f"Get the non-leader replica for the group {group_id}")
+            non_leader_replica_host_id = [host_id for host_id in replica_host_ids if str(host_id) != str(leader_host_id)][0]
+            non_leader_replica_host = [host for host in hosts if str(host.host_id) == str(non_leader_replica_host_id)][0]
+
+            logger.info(f"Get the non-replica for the group {group_id}")
+            non_replica_host_id = [host_id for host_id in host_ids if str(host_id) not in replica_host_ids][0]
+            non_replica_host = [host for host in hosts if str(host.host_id) == str(non_replica_host_id)][0]
+
+
+            logger.info(f"Verify that timeout on the target node is returned to the client and fail metric is incremented")
+            await manager.api.enable_injection(leader_host.address, "sc_modification_statement_timeout", one_shot=False)
+            metrics = await manager.metrics.query(non_leader_replica_host.address)
+            errors_before = metrics.get('scylla_transport_requests_forwarded_failed') or 0
+
+            with pytest.raises(WriteTimeout):
+                await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, value) VALUES (1, 1)", retry_policy=FallthroughRetryPolicy()), host=non_leader_replica_host)
+
+            metrics = await manager.metrics.query(non_leader_replica_host.address)
+            errors_after = metrics.get('scylla_transport_requests_forwarded_failed') or 0
+            assert errors_after > errors_before
+            await manager.api.disable_injection(leader_host.address, "sc_modification_statement_timeout")
+
+            # Now test that we get correct exception if the cross-node forwarding RPC times out.
+            logger.info("Verify that timeout of the forwarding RPC is returned as the correct exception to the client")
+            await manager.api.enable_injection(leader_host.address, "wait_before_handling_forwarded_request", one_shot=False)
+            with pytest.raises(WriteTimeout):
+                await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, value) VALUES (1, 1) USING TIMEOUT 500ms", retry_policy=FallthroughRetryPolicy()), host=non_leader_replica_host)
+
+            await manager.api.enable_injection(non_leader_replica_host.address, "wait_before_handling_forwarded_request", one_shot=False)
+            with pytest.raises(ReadTimeout):
+                await cql.run_async(SimpleStatement(f"SELECT * FROM {table} WHERE pk = 1 USING TIMEOUT 500ms", retry_policy=FallthroughRetryPolicy()), host=non_replica_host)
+
+            await manager.api.message_injection(leader_host.address, "wait_before_handling_forwarded_request")
+            await manager.api.message_injection(non_leader_replica_host.address, "wait_before_handling_forwarded_request")
+
+@pytest.mark.skip_mode('release', "error injections aren't enabled in release mode")
+async def test_forward_cql_prepare_exception_passthrough(manager: ScyllaClusterManager):
+    """
+    Regression test for SCYLLADB-5549: when the target of a forwarded request has to prepare
+    the statement again and that fails, the client gets the target's error, not SERVER_ERROR.
+    """
+    cmdline = ['--logger-log-level', 'cql_server=trace']
+    target, forwarder = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=cmdline,
+                                                  property_file=[{'dc': 'dc1', 'rack': 'rack1'}, {'dc': 'dc2', 'rack': 'rack1'}])
+    (cql, hosts) = await manager.get_ready_cql([target, forwarder])
+    target_host = next(h for h in hosts if h.address == target.rpc_address)
+    forwarder_host = next(h for h in hosts if h.address == forwarder.rpc_address)
+    # The driver's schema agreement wait would stall once the forwarding node stops applying schema changes.
+    cql.cluster.max_schema_agreement_wait = 0
+
+    ks_opts = "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1} AND tablets = {'initial': 1} AND consistency = 'global'"
+    async with new_test_keyspace(manager, ks_opts, host=target_host) as ks:
+        table = f"{ks}.tbl"
+        await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)", host=target_host)
+        await read_barrier(manager.api, forwarder.ip_addr)
+        stmt = cql.prepare(f"INSERT INTO {table} (pk, v) VALUES (?, ?)")
+        stmt.retry_policy = FallthroughRetryPolicy()
+
+        logger.info("Drop the table while the forwarding node doesn't apply schema changes")
+        await manager.api.enable_injection(forwarder.ip_addr, "group0_state_machine::block_apply", one_shot=True)
+        try:
+            await cql.run_async(f"DROP TABLE {table}", host=target_host)
+
+            metrics = await manager.metrics.query(forwarder.ip_addr)
+            prepared_not_found_before = metrics.get('scylla_transport_requests_forwarded_prepared_not_found') or 0
+
+            with pytest.raises(InvalidRequest, match="unconfigured table"):
+                await cql.run_async(stmt, [0, 0], host=forwarder_host)
+
+            metrics = await manager.metrics.query(forwarder.ip_addr)
+            prepared_not_found_after = metrics.get('scylla_transport_requests_forwarded_prepared_not_found') or 0
+            logger.info(f"Forwarded requests whose statement was not prepared on the target: {prepared_not_found_before} -> {prepared_not_found_after}")
+            assert prepared_not_found_after > prepared_not_found_before
+        finally:
+            await manager.api.message_injection(forwarder.ip_addr, "group0_state_machine::block_apply")
+
+
+@pytest.mark.skip_mode('release', "error injections aren't enabled in release mode")
+@pytest.mark.parametrize("opcode", ['QUERY', 'EXECUTE', 'BATCH'])
+async def test_forwarded_write_keeps_its_deadline(manager: ScyllaClusterManager, scale_timeout, opcode: str):
+    """
+    A write forwarded to the leader keeps the deadline it got on the node that forwarded it,
+    whether it comes in a QUERY, an EXECUTE or a BATCH request. Once that deadline has passed,
+    the leader doesn't apply the write, whose client was already told that it timed out
+    (SCYLLADB-6160).
+    """
+    injection = "wait_before_handling_forwarded_request"
+    shift_injection = "forward_cql_shift_deadline_seconds"
+    timeout_ms = scale_timeout(1000)
+    # A BATCH request can't set its own timeout, so every opcode uses the configured one.
+    config = DEFAULT_CONFIG | {'write_request_timeout_in_ms': timeout_ms}
+    leader, forwarder = await manager.servers_add(2, config=config, cmdline=DEFAULT_CMDLINE,
+                                                  property_file=[{'dc': 'dc1', 'rack': 'rack1'}, {'dc': 'dc2', 'rack': 'rack1'}])
+    (cql, hosts) = await manager.get_ready_cql([leader, forwarder])
+    leader_host, forwarder_host = hosts
+
+    ks_opts = "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1} AND tablets = {'initial': 1} AND consistency = 'global'"
+    ks = await create_new_test_keyspace(cql, ks_opts, host=leader_host)
+    table = f"{ks}.test"
+    await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)", host=leader_host)
+    await read_barrier(manager.api, forwarder.ip_addr)
+    insert = cql.prepare(f"INSERT INTO {table} (pk, v) VALUES (?, ?)")
+    if opcode == 'QUERY':
+        statement = SimpleStatement(f"INSERT INTO {table} (pk, v) VALUES (1, 1)")
+    elif opcode == 'EXECUTE':
+        statement = insert.bind([1, 1])
+    else:
+        statement = BatchStatement()
+        statement.add(insert, [1, 1])
+    statement.retry_policy = FallthroughRetryPolicy()
+    select = SimpleStatement(f"SELECT v FROM {table} WHERE pk = 1", consistency_level=ConsistencyLevel.QUORUM)
+
+    async def leader_write_timeouts() -> int:
+        metrics = await manager.metrics.query(leader.ip_addr)
+        return metrics.get('scylla_strong_consistency_coordinator_write_errors', {'reason': 'timeout'}) or 0
+
+    timeouts_before = await leader_write_timeouts()
+    logger.info("Make the forwarding node send a wall-clock deadline an hour later, so that only the RPC timeout bounds the write")
+    await manager.api.enable_injection(forwarder.ip_addr, shift_injection, one_shot=False, parameters={'value': 3600})
+    await manager.api.enable_injection(leader.ip_addr, injection, one_shot=True)
+    try:
+        logger.info("Write through the forwarding node, held on the leader before the leader executes it")
+        write = asyncio.ensure_future(cql.run_async(statement, host=forwarder_host))
+        await manager.api.wait_for_injection_enter(leader.ip_addr, injection)
+        with pytest.raises(WriteTimeout, match="while forwarding"):
+            await write
+
+        logger.info("Release the write after the leader's copy of its deadline has passed too")
+        await asyncio.sleep(timeout_ms / 1000)
+        await manager.api.message_injection(leader.ip_addr, injection)
+    finally:
+        await manager.api.disable_injection(leader.ip_addr, injection)
+        await manager.api.disable_injection(forwarder.ip_addr, shift_injection)
+
+    logger.info("Wait until the leader has either timed the write out or applied it")
+
+    async def leader_finished_write() -> bool | None:
+        timed_out = await leader_write_timeouts() > timeouts_before
+        applied = bool(await cql.run_async(select, host=leader_host))
+        return timed_out or applied or None
+    await wait_for(leader_finished_write, time.time() + 60)
+
+    rows = await cql.run_async(select, host=leader_host)
+    assert not rows
+
+
+@pytest.mark.skip_mode('release', "error injections aren't enabled in release mode")
+@pytest.mark.parametrize("kind", ['insert', 'select'])
+async def test_forwarded_request_arriving_after_its_deadline(manager: ScyllaClusterManager, kind: str):
+    """
+    A request that reaches the leader after its deadline times out there, even though the
+    forwarding RPC, which counts its timeout from the request's arrival, still has time left.
+    A write is not applied (SCYLLADB-6160).
+    """
+    injection = "forward_cql_shift_deadline_seconds"
+    timeout_s = 60
+    query, timeout_error, errors_metric = {
+        'insert': ("INSERT INTO {table} (pk, v) VALUES (1, 1) USING TIMEOUT {timeout_s}s", WriteTimeout, 'write_errors'),
+        'select': ("SELECT v FROM {table} WHERE pk = 0 USING TIMEOUT {timeout_s}s", ReadTimeout, 'read_errors')}[kind]
+    leader, forwarder = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE,
+                                                  property_file=[{'dc': 'dc1', 'rack': 'rack1'}, {'dc': 'dc2', 'rack': 'rack1'}])
+    (cql, hosts) = await manager.get_ready_cql([leader, forwarder])
+    leader_host, forwarder_host = hosts
+
+    ks_opts = "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1} AND tablets = {'initial': 1} AND consistency = 'global'"
+    ks = await create_new_test_keyspace(cql, ks_opts, host=leader_host)
+    table = f"{ks}.test"
+    await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)", host=leader_host)
+    await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 0)", host=leader_host)
+    await read_barrier(manager.api, forwarder.ip_addr)
+    statement = SimpleStatement(query.format(table=table, timeout_s=timeout_s),
+                                consistency_level=ConsistencyLevel.QUORUM, retry_policy=FallthroughRetryPolicy())
+
+    async def leader_timeouts() -> int:
+        metrics = await manager.metrics.query(leader.ip_addr)
+        return metrics.get(f'scylla_strong_consistency_coordinator_{errors_metric}', {'reason': 'timeout'}) or 0
+
+    timeouts_before = await leader_timeouts()
+    await manager.api.enable_injection(forwarder.ip_addr, injection, one_shot=False, parameters={'value': -(timeout_s + 1)})
+    try:
+        logger.info(f"Send the {kind} through the forwarding node, which forwards it with a wall-clock deadline that passed a second ago")
+        start = time.time()
+        with pytest.raises(timeout_error, match=f"Query timed out for {table}"):
+            await cql.run_async(statement, host=forwarder_host)
+        elapsed = time.time() - start
+    finally:
+        await manager.api.disable_injection(forwarder.ip_addr, injection)
+
+    logger.info(f"The {kind} failed after {elapsed:.3f}s, check that the leader timed it out before its {timeout_s}s timeout")
+    assert elapsed < timeout_s / 2
+    assert await leader_timeouts() == timeouts_before + 1
+    if kind == 'insert':
+        rows = await cql.run_async(SimpleStatement(f"SELECT v FROM {table} WHERE pk = 1",
+                                                   consistency_level=ConsistencyLevel.QUORUM), host=leader_host)
+        assert not rows
+
+
+@pytest.mark.skip_mode('release', "error injections aren't enabled in release mode")
+@pytest.mark.parametrize("kind", ['insert', 'select', 'non_linearizable_select'])
+async def test_shard_bounced_request_keeps_its_deadline(manager: ScyllaClusterManager, scale_timeout, kind: str):
+    """
+    A write, a linearizable read or a non-linearizable read bounced to the shard of its tablet
+    keeps the deadline it got on the shard that bounced it. Once that deadline has passed, the
+    request times out instead of being executed (SCYLLADB-6160).
+    """
+    injection = "sc_wait_before_bounce_to_shard"
+    select = "SELECT v FROM {table} WHERE pk = {pk} USING TIMEOUT {timeout_ms}ms"
+    query, consistency_level, timeout_error = {
+        'insert': ("INSERT INTO {table} (pk, v) VALUES ({pk}, {pk}) USING TIMEOUT {timeout_ms}ms", ConsistencyLevel.QUORUM, WriteTimeout),
+        'select': (select, ConsistencyLevel.QUORUM, ReadTimeout),
+        'non_linearizable_select': (select, ConsistencyLevel.ONE, ReadTimeout)}[kind]
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql, _ = await manager.get_ready_cql([server])
+
+    ks_opts = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'"
+    ks = await create_new_test_keyspace(cql, ks_opts)
+    table = f"{ks}.test"
+    await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)")
+    logger.info("Write once, so that the requests below don't wait for the first leader")
+    await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (-1, -1)")
+    timeout_ms = scale_timeout(1000)
+    await manager.api.enable_injection(server.ip_addr, injection, one_shot=False)
+    try:
+        logger.info(f"Send text statements, which land on random shards, until a {kind} lands on a shard other than its tablet's")
+        for pk in range(30):
+            request = asyncio.ensure_future(cql.run_async(SimpleStatement(
+                query.format(table=table, pk=pk, timeout_ms=timeout_ms),
+                consistency_level=consistency_level, retry_policy=FallthroughRetryPolicy())))
+            held = asyncio.ensure_future(manager.api.wait_for_injection_enter(server.ip_addr, injection))
+            await asyncio.wait([request, held], return_when=asyncio.FIRST_COMPLETED)
+            if held.done():
+                break
+            held.cancel()
+            await request
+        else:
+            pytest.fail(f"None of the {kind}s was bounced to another shard")
+
+        logger.info(f"Release the {kind} of pk={pk}, held before its bounce, after its deadline has passed")
+        await asyncio.sleep(2 * timeout_ms / 1000)
+        await manager.api.message_injection(server.ip_addr, injection)
+        with pytest.raises(timeout_error, match=f"Query timed out for {table}"):
+            await request
+    finally:
+        await manager.api.disable_injection(server.ip_addr, injection)
+
+    if kind == 'insert':
+        rows = await cql.run_async(SimpleStatement(f"SELECT v FROM {table} WHERE pk = {pk}",
+                                                   consistency_level=ConsistencyLevel.QUORUM))
+        assert not rows
+
+
+@pytest.mark.skip_mode("release", "error injections aren't enabled in release mode")
+async def test_drop_table_during_insert(manager: ScyllaClusterManager):
+    """Regression test for SCYLLADB-1450: node crashes when DROP TABLE races with
+    an in-flight DML on a strongly-consistent table.
+
+    An error injection pauses INSERT inside create_operation_ctx (after obtaining
+    the ERM but before acquire_server).  While it is paused the table is dropped,
+    which erases the raft group.  Resuming the INSERT used to hit on_internal_error
+    in acquire_server and abort the node."""
+
+    config = {"experimental_features": ["strongly-consistent-tables"]}
+    server = await manager.server_add(config=config, cmdline=DEFAULT_CMDLINE)
+    (cql, hosts) = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(
+        manager,
+        "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}"
+        " AND tablets = {'initial': 1} AND consistency = 'global'",
+    ) as ks:
+        table = f"{ks}.tbl"
+        await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)")
+
+        log = await manager.server_open_log(server.server_id)
+        mark = await log.mark()
+
+        await manager.api.enable_injection(server.ip_addr, "sc_coordinator_wait_before_acquire_server", one_shot=False)
+
+        # Fire INSERT in the background – it will pause at the injection point.
+        insert_fut = cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 0)")
+
+        # Wait until the injection is actually hit.
+        await manager.api.wait_for_injection_enter(server.ip_addr, "sc_coordinator_wait_before_acquire_server")
+
+        # Drop the table while INSERT is paused.
+        await cql.run_async(f"DROP TABLE {table}")
+
+        # Wait for the raft group to be destroyed.
+        await log.wait_for("schedule_raft_group_deletion.*raft server.*is destroyed", from_mark=mark, timeout=30)
+
+        # Resume the INSERT – with the bug present, the node will abort here.
+        await manager.api.message_injection(server.ip_addr, "sc_coordinator_wait_before_acquire_server")
+
+        # The INSERT should fail gracefully, not crash the node.
+        try:
+            await insert_fut
+        except Exception as e:
+            logger.info(f"INSERT failed with expected error: {e}")
+
+        # Verify the node is still alive.
+        await manager.api.get_host_id(server.ip_addr)
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_timed_out_queries(manager: ScyllaClusterManager):
+    """
+    A simple test verifying that we don't get stuck for an indefinite amount
+    of time while reading from or writing to a strongly consistent table.
+    As soon as the deadline for a query ends, the operation should be canceled\
+    and a time-out exception should be returned.
+
+    This test focuses on a Raft operation being the potential reason for
+    getting stuck. It should be aborted when we reach the deadline.
+    """
+
+    s1 = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql, _ = await manager.get_ready_cql([s1])
+
+    async def try_query_with_timeout(exception_type, stmt: str, error_injection_name: str, timeout_sec: float, add_timeout: bool):
+        await manager.api.enable_injection(s1.ip_addr, error_injection_name, one_shot=True)
+
+        # A read bounced to the shard of its tablet must not time out before it reaches the injection.
+        request_timeout_ms = 1000
+
+        stmt_fut = cql.run_async(f"{stmt} USING TIMEOUT {request_timeout_ms}ms" if add_timeout else stmt)
+        await manager.api.wait_for_injection_enter(s1.ip_addr, error_injection_name)
+
+        sleep_length = timeout_sec + (request_timeout_ms / 1000)
+        await asyncio.sleep(sleep_length)
+
+        await manager.api.message_injection(s1.ip_addr, error_injection_name)
+
+        try:
+            await stmt_fut
+            return False
+        except Exception as e:
+            if isinstance(e, exception_type):
+                assert f"Query timed out for {table}" in str(e)
+                return True
+            pytest.fail(f"Unexpected exception: {e}")
+
+    async def try_query(exception_type, stmt: str, error_injection_name: str, add_timeout: bool = True):
+        # We cannot predict if the relevant timer will be triggered in time.
+        # Even in not-really-extreme situations, it can take more time
+        # than we expect. To avoid flakiness, we're going to attempt to
+        # observe a timeout with an ever increasing margin of error.
+        #
+        # Most of the time, this will succeed during the first try,
+        # so it shouldn't have a relevant impact on the length of the test.
+        timeout_sec = 0.1
+        while True:
+            result = await try_query_with_timeout(exception_type, stmt, error_injection_name, timeout_sec, add_timeout)
+            if result:
+                break
+            if timeout_sec > 60:
+                pytest.fail("Reached the maximum number of attempts")
+            timeout_sec *= 2
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 13)")
+
+
+            async def try_read(error_injection_name: str):
+                await try_query(ReadTimeout, f"SELECT * FROM {table} WHERE pk = 0", error_injection_name)
+
+            async def try_write(error_injection_name: str):
+                await try_query(WriteTimeout, f"INSERT INTO {table} (pk, v) VALUES (7, 23)", error_injection_name)
+
+            # Case 1: Reads.
+            read_error_injecitons = [
+                "sc_coordinator_wait_before_acquire_server",
+                "sc_coordinator_wait_before_query_read_barrier"
+            ]
+            for error_injection_name in read_error_injecitons:
+                await try_read(error_injection_name)
+
+            # Sanity check: Nothing broke and we can still read from the table.
+            res = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 0")
+            assert res[0].v == 13
+
+            # Case 2: Writes.
+            write_error_injections = [
+                "sc_coordinator_wait_before_acquire_server",
+                "sc_coordinator_wait_before_begin_mutate"
+            ]
+            for error_injection_name in write_error_injections:
+                await try_write(error_injection_name)
+
+            # The wait before acquire_server doesn't watch the deadline, and the group is already running,
+            # so that request also times out after reaching the raft group.
+            metrics = await manager.metrics.query(s1.ip_addr)
+            timeouts = {'ks': ks, 'cf': table.split('.')[-1], 'reason': 'timeout'}
+            assert metrics.get(f'{SC_REQUEST_METRICS_PREFIX}read_errors', timeouts) == 2
+            assert metrics.get(f'{SC_REQUEST_METRICS_PREFIX}write_errors', timeouts) == 2
+
+            # Case 3: Batch.
+            batch_stmt = f"""
+                BEGIN BATCH USING TIMEOUT 100ms
+                INSERT INTO {table} (pk, v) VALUES (19, 23);
+                INSERT INTO {table} (pk, v) VALUES (19, 24);
+                APPLY BATCH
+            """
+            for error_injection_name in write_error_injections:
+                await try_query(WriteTimeout, batch_stmt, error_injection_name, add_timeout=False)
+
+            # Sanity check: Nothing broke and we can still write to the table.
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (17, 7)")
+
+    # Case 4: Waiting for the leader during a write.
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            # We can only emulate the leader not being chosen yet. Otherwise, we would
+            # prolong completing creating the table (cf. groups_manager::update).
+            await manager.api.enable_injection(s1.ip_addr, "sc_begin_mutate_wait_for_leader", one_shot=False)
+            with pytest.raises(WriteTimeout, match=f"Query timed out for {table}"):
+                await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (11, 13) USING TIMEOUT 100ms")
+
+            metrics = await manager.metrics.query(s1.ip_addr)
+            timeouts = {'ks': ks, 'cf': table.split('.')[-1], 'reason': 'timeout'}
+            assert metrics.get(f'{SC_REQUEST_METRICS_PREFIX}write_errors', timeouts) == 1
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_queries_while_dropping_table(manager: ScyllaClusterManager):
+    """Verify that in-flight reads and writes are promptly aborted when
+    a strongly consistent table is dropped.
+
+    Setup: 2 nodes, RF=2, 1 tablet (raft quorum = 2).
+
+    We pause a read (before read_barrier) and a write (before begin_mutate)
+    on the leader, then drop the table. The follower destroys its raft group
+    immediately (no in-flight ops). On the leader, the raft server is aborted
+    as part of group deletion (SCYLLADB-2080 fix), causing the paused
+    operations to fail with raft::stopped_error which the coordinator converts
+    to "unconfigured table".
+
+    We also verify that new reads/writes after the drop are rejected
+    immediately.
+    """
+
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = [await manager.get_host_id(s.server_id) for s in servers]
+
+    async with new_test_keyspace(manager,
+        "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}"
+        " AND tablets = {'initial': 1} AND consistency = 'global'"
+    ) as ks:
+        table_name = "tbl"
+        table = f"{ks}.{table_name}"
+        await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)")
+        await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 13)")
+
+        # Identify the leader node for this tablet's raft group.
+        group_id = await get_table_raft_group_id(manager, ks, table_name)
+        leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+
+        leader_idx = next(i for i, hid in enumerate(host_ids) if str(hid) == leader_host_id)
+        leader_server = servers[leader_idx]
+        leader_host = hosts[leader_idx]
+        follower_server = servers[1 - leader_idx]
+
+        leader_log = await manager.server_open_log(leader_server.server_id)
+        follower_log = await manager.server_open_log(follower_server.server_id)
+
+        mark_leader = await leader_log.mark()
+
+        # Pause both a read and a write on the leader.
+        await asyncio.gather(
+            manager.api.enable_injection(leader_server.ip_addr,
+                "sc_coordinator_wait_before_query_read_barrier", one_shot=True),
+            manager.api.enable_injection(leader_server.ip_addr,
+                "sc_coordinator_wait_before_begin_mutate", one_shot=True))
+
+        read_fut = asyncio.ensure_future(
+            cql.run_async(SimpleStatement(
+                f"SELECT * FROM {table} WHERE pk = 0",
+                retry_policy=FallthroughRetryPolicy()), host=leader_host))
+        write_fut = asyncio.ensure_future(
+            cql.run_async(SimpleStatement(
+                f"INSERT INTO {table} (pk, v) VALUES (7, 17)",
+                retry_policy=FallthroughRetryPolicy()), host=leader_host))
+
+        # Wait for both to hit their injection points.
+        await asyncio.gather(
+            leader_log.wait_for("sc_coordinator_wait_before_query_read_barrier: waiting",
+                from_mark=mark_leader, timeout=30),
+            leader_log.wait_for("sc_coordinator_wait_before_begin_mutate: waiting",
+                from_mark=mark_leader, timeout=30))
+
+        mark_leader = await leader_log.mark()
+        mark_follower = await follower_log.mark()
+
+        # Drop the table.
+        await cql.run_async(f"DROP TABLE {table}")
+
+        # Sanity check: new queries are rejected immediately.
+        with pytest.raises(InvalidRequest, match="unconfigured table"):
+            await cql.run_async(f"SELECT * FROM {table} WHERE pk = 0")
+        with pytest.raises(InvalidRequest, match="unconfigured table"):
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (13, 11)")
+
+        # Confirm the follower destroyed its raft group.
+        await follower_log.wait_for("schedule_raft_group_deletion.*raft server.*is destroyed",
+            from_mark=mark_follower, timeout=30)
+
+        # Resume both operations.
+        await asyncio.gather(
+            manager.api.message_injection(leader_server.ip_addr,
+                "sc_coordinator_wait_before_query_read_barrier"),
+            manager.api.message_injection(leader_server.ip_addr,
+                "sc_coordinator_wait_before_begin_mutate"))
+
+        # Both in-flight operations should expose their first missing-table response.
+        # FallthroughRetryPolicy prevents a driver retry from replacing ServerError
+        # with InvalidRequest from a new request.
+        # Use a timeout to detect the old buggy behavior (write stuck forever).
+        missing_table_error = f"unconfigured table {table_name}"
+        try:
+            with pytest.raises(InvalidRequest, match=missing_table_error):
+                await asyncio.wait_for(asyncio.shield(write_fut), timeout=15)
+        except asyncio.TimeoutError:
+            cql.cluster.shutdown()
+            for s in servers:
+                await manager.server_stop(s.server_id, convict=True)
+            pytest.fail("SCYLLADB-2080: write is stuck waiting for quorum that can never "
+                        "be reached because the follower's raft group was already destroyed. "
+                        "The leader should abort the raft server to unblock the write.")
+
+        with pytest.raises(InvalidRequest, match=missing_table_error):
+            await read_fut
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+@pytest.mark.parametrize("target", ["leader", "follower"])
+async def test_queries_when_shutting_down(manager: ScyllaClusterManager, target: str):
+    """
+    Verify that Scylla has be stopped despite hanging opeartions
+    to strongly consistent tables. The test drops AppendEntries
+    requests on the followers to simulate a hanging call to
+    raft_server::add_entry.
+
+    The read path is more difficult to verify and it's under active
+    work, so we skip it. It uses the same abortion mechanisms
+    as the write path, though.
+
+    We test writes sent to both the coordinator and a follower.
+    """
+
+    smp = 2
+    config = DEFAULT_CONFIG | {"request_timeout_on_shutdown_in_seconds": 1}
+    cmdline = DEFAULT_CMDLINE + [
+        f"--smp={smp}",
+        "--logger-log-level", "cql_server=debug",
+        "--logger-log-level", "sc_coordinator=trace",
+        "--logger-log-level", "raft_group_registry=debug"
+    ]
+    leader = await manager.server_add(config=config, cmdline=cmdline, property_file={"dc": "dc1", "rack": "r1"})
+
+    follower_config = config | {"error_injections_at_startup": ["avoid_being_raft_leader"]}
+    followers = await manager.servers_add(2, config=follower_config, cmdline=cmdline, property_file=[
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r3"}
+    ])
+
+    cql, hosts = await manager.get_ready_cql([leader, *followers])
+
+    leader_host = hosts[0]
+    nonleader_host = hosts[1]
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            _, table_name = table.split(".")
+
+            logger.info(f"Select raft group id for the tablet of {ks}.{table_name}")
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            await asyncio.gather(*[asyncio.create_task(manager.api.enable_injection(
+                follower.ip_addr,
+                "raft_drop_incoming_append_entries_for_specified_group",
+                one_shot=False,
+                parameters={"value": group_id}
+            )) for follower in followers])
+
+            logs = [await manager.server_open_log(follower.server_id) for follower in followers]
+            marks = [await log.mark() for log in logs]
+
+            target_host = None
+            if target == "leader":
+                target_host = leader_host
+            elif target == "follower":
+                target_host = nonleader_host
+            write_fut = cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 13)", host=target_host)
+
+            error_log = rf"Dropping append request .* for group {group_id}"
+            await gather_safely(*[
+                asyncio.create_task(logs[0].wait_for(error_log, from_mark=marks[0])),
+                asyncio.create_task(logs[1].wait_for(error_log, from_mark=marks[1]))
+            ])
+
+            await manager.server_stop_gracefully(leader.server_id)
+
+            try:
+                await asyncio.wait_for(write_fut, timeout=60)
+                logger.debug(f"Write awaited successfully")
+            except Exception as e:
+                # Acceptable. It doesn't matter what the result is.
+                logger.debug(f"Exception when awaiting write: {e}")
+
+            # We need to disable the injections to be able to drop the keyspace and table.
+            await asyncio.gather(*[asyncio.create_task(manager.api.disable_injection(
+                follower.ip_addr,
+                "raft_drop_incoming_append_entries_for_specified_group"
+            )) for follower in followers])
+            await asyncio.gather(*[asyncio.create_task(manager.api.disable_injection(
+                follower.ip_addr,
+                "avoid_being_raft_leader"
+            )) for follower in followers])
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_abort_state_machine_apply_after_dropping_table(manager: ScyllaClusterManager):
+    """
+    This test verifies that ongoing executions of state_machine::apply are
+    aborted when their corresponding Raft group is being removed. We test
+    that by dropping the table, but it should also correspond to other cases
+    like tablet migration.
+
+    apply() is made to wait for the group0 barrier, which is blocked for the
+    whole test, so it can only finish by being aborted. Removing the Raft group
+    must not wait for it: the Raft server aborts the state machine before it
+    waits for the applier fiber (SCYLLADB-1056).
+
+    For a similar scenario during a node shutdown, see test_abort_state_machine_apply_during_shutdown.
+    """
+
+    cmdline = DEFAULT_CMDLINE + ["--logger-log-level", "sc_state_machine=debug:raft=debug"]
+    leader_server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=cmdline,
+                                             property_file={"dc": "dc1", "rack": "rack1"})
+
+    # We want to prevent target_server from becoming the leader of either group0
+    # or the strongly consistent Raft group so it might not have the latest
+    # schema version and is forced to perform a read barrier.
+    config = DEFAULT_CONFIG | {"error_injections_at_startup": ["avoid_being_raft_leader"]}
+    target_server = await manager.server_add(config=config, cmdline=cmdline, property_file={"dc": "dc1", "rack": "rack2"})
+
+    cql, [leader_host, _] = await manager.get_ready_cql([leader_server, target_server])
+
+    leader_host_id, target_host_id = await gather_safely(*[
+        manager.get_host_id(leader_server.server_id),
+        manager.get_host_id(target_server.server_id)
+    ])
+
+    block_barrier_injection = "migration_manager_block_group0_barrier"
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        table_name = "my_table"
+        table = f"{ks}.{table_name}"
+
+        await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)")
+
+        group_id = await get_table_raft_group_id(manager, ks, table_name)
+        leader_host_id = await wait_for_leader(manager, leader_server, group_id)
+        assert leader_host_id != target_host_id
+
+        await gather_safely(*[
+            manager.api.enable_injection(target_server.ip_addr, block_barrier_injection, one_shot=True),
+            manager.api.enable_injection(target_server.ip_addr, "sc_state_machine_return_empty_schema", one_shot=True)
+        ])
+
+        log = await manager.server_open_log(target_server.server_id)
+        mark = await log.mark()
+
+        try:
+            # We won't wait for the follower to apply the state, so we can await this right away.
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 13)", host=leader_host)
+
+            # The follower doesn't find the schema of the mutation, so apply()
+            # waits for the group0 barrier, which is blocked.
+            await log.wait_for(rf"apply\(\): waiting for the group0 barrier for tablet \S+, group_id={group_id}",
+                               from_mark=mark)
+            await manager.api.wait_for_injection_enter(target_server.ip_addr, block_barrier_injection)
+            mark = await log.mark()
+
+            # Coordinated by the leader: nothing on the target may need the
+            # blocked barrier to drop the table.
+            await cql.run_async(f"DROP TABLE {table}", host=leader_host)
+            # Verify that state_machine::apply was really aborted.
+            await log.wait_for(rf"apply\(\): execution for tablet \S+, group_id={group_id} aborted",
+                               from_mark=mark, timeout=120)
+            # And that the removal of the Raft group finished, still with the
+            # barrier blocked.
+            await log.wait_for(rf"schedule_raft_group_deletion\(\): raft server for group id {group_id} is destroyed",
+                               from_mark=mark, timeout=120)
+        finally:
+            # A shutdown waits for the group0 barrier.
+            await manager.api.message_injection(target_server.ip_addr, block_barrier_injection)
+            await manager.api.disable_injection(target_server.ip_addr, block_barrier_injection)
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_abort_state_machine_apply_during_shutdown(manager: ScyllaClusterManager):
+    """
+    This test verifies that ongoing executions of state_machine::apply are
+    aborted when a node is shutting down. The resumed apply() needs the group0
+    barrier, so the shutdown must stop the Raft group before it stops the barrier.
+
+    For a similar scenario after dropping a table, see test_abort_state_machine_apply_after_dropping_table.
+
+    Reproduces SCYLLADB-4459.
+    """
+
+    cmdline = DEFAULT_CMDLINE + ["--logger-log-level", "sc_state_machine=debug:raft=debug"]
+    leader_server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=cmdline,
+                                             property_file={"dc": "dc1", "rack": "rack1"})
+
+    # We want to prevent target_server from becoming the leader of either group0
+    # or the strongly consistent Raft group so it might not have the latest
+    # schema version and is forced to perform a read barrier.
+    config = DEFAULT_CONFIG | {"error_injections_at_startup": ["avoid_being_raft_leader"]}
+    target_server = await manager.server_add(config=config, cmdline=cmdline, property_file={"dc": "dc1", "rack": "rack2"})
+
+    cql, [leader_host, target_host] = await manager.get_ready_cql([leader_server, target_server])
+
+    leader_host_id, target_host_id = await gather_safely(*[
+        manager.get_host_id(leader_server.server_id),
+        manager.get_host_id(target_server.server_id)
+    ])
+
+    wait_before_apply_injection = "strong_consistency_state_machine_wait_before_apply"
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        table_name = "my_table"
+        table = f"{ks}.{table_name}"
+
+        await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)")
+
+        group_id = await get_table_raft_group_id(manager, ks, table_name)
+        leader_host_id = await wait_for_leader(manager, leader_server, group_id)
+        assert leader_host_id != target_host_id
+
+        await gather_safely(*[
+            manager.api.enable_injection(target_server.ip_addr, wait_before_apply_injection, one_shot=True),
+            manager.api.enable_injection(target_server.ip_addr, "sc_state_machine_return_empty_schema", one_shot=True)
+        ])
+
+        log = await manager.server_open_log(target_server.server_id)
+
+        # We won't wait for the follower to apply the state, so we can await this right away.
+        await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 13)", host=leader_host)
+
+        await manager.api.wait_for_injection_enter(target_server.ip_addr, wait_before_apply_injection)
+        mark = await log.mark()
+
+        stop_task = asyncio.create_task(manager.server_stop_gracefully(target_server.server_id))
+        try:
+            # Wait until the Raft group has started being removed.
+            await log.wait_for(rf"schedule_raft_group_deletion\(\): group id {group_id}: starting", from_mark=mark)
+            mark = await log.mark()
+        finally:
+            # At this point, the Raft server should already be getting aborted,
+            # so we can resume state_machine::apply. If the wait failed, resume it
+            # anyway, so that the shutdown does not wait for it.
+            await manager.api.message_injection(target_server.ip_addr, wait_before_apply_injection)
+
+        # Verify that state_machine::apply reached the group0 barrier and was aborted.
+        await log.wait_for(rf"apply\(\): waiting for the group0 barrier for tablet \S+, group_id={group_id}",
+                           rf"apply\(\): execution for tablet \S+, group_id={group_id} aborted", from_mark=mark)
+
+        # The test framework should verify that we haven't observed any errors
+        # during the stopping procedure.
+        await stop_task
+
+        await manager.server_start(target_server.server_id)
+        cql, [target_host] = await manager.get_ready_cql([target_server])
+
+        # The leader serves linearizable reads. To read the target's own data,
+        # catch up with a read barrier on the target and read at ONE.
+        await read_barrier(manager.api, target_server.ip_addr, group_id=group_id, timeout=30)
+        rows = await cql.run_async(SimpleStatement(f"SELECT * FROM {table} WHERE pk = 0",
+                                                   consistency_level=ConsistencyLevel.ONE), host=target_host)
+        assert len(rows) == 1
+        assert rows[0].v == 13
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_write_resumed_during_shutdown_succeeds(manager: ScyllaClusterManager):
+    """
+    A graceful shutdown lets the requests running on its CQL server finish. A
+    strongly consistent write that resumes while the CQL server stops must
+    succeed: the node's Raft groups stop only after the CQL server. With two
+    replicas, the leader also needs the stopping node's vote to commit it.
+    """
+
+    # One shard, so that the write runs on the shard of its connection. A request
+    # moved to another shard uses the abort source of that shard's CQL server,
+    # which the shutdown requests as soon as that shard has no connections
+    # (SCYLLADB-5405).
+    cmdline = DEFAULT_CMDLINE + ["--smp", "1"]
+    leader_server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=cmdline,
+                                             property_file={"dc": "dc1", "rack": "rack1"})
+    config = DEFAULT_CONFIG | {"error_injections_at_startup": ["avoid_being_raft_leader"]}
+    target_server = await manager.server_add(config=config, cmdline=cmdline,
+                                             property_file={"dc": "dc1", "rack": "rack2"})
+
+    cql, [_, target_host] = await manager.get_ready_cql([leader_server, target_server])
+    target_host_id = await manager.get_host_id(target_server.server_id)
+
+    wait_before_acquire_injection = "sc_coordinator_wait_before_acquire_server"
+
+    ks = await create_new_test_keyspace(cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1} AND consistency = 'global'")
+    table_name = "my_table"
+    table = f"{ks}.{table_name}"
+
+    await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)")
+
+    group_id = await get_table_raft_group_id(manager, ks, table_name)
+    leader_host_id = await wait_for_leader(manager, leader_server, group_id)
+    assert leader_host_id != target_host_id
+
+    # Hold the write on the target before it takes the target's Raft group.
+    await manager.api.enable_injection(target_server.ip_addr, wait_before_acquire_injection, one_shot=True)
+    log = await manager.server_open_log(target_server.server_id)
+    mark = await log.mark()
+    write = cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, v) VALUES (0, 13)",
+                                          retry_policy=FallthroughRetryPolicy()), host=target_host)
+    await manager.api.wait_for_injection_enter(target_server.ip_addr, wait_before_acquire_injection)
+
+    stop_task = asyncio.create_task(manager.server_stop_gracefully(target_server.server_id))
+    try:
+        await log.wait_for("Shutting down native transport server", from_mark=mark)
+    finally:
+        # Resume the write while the CQL server stops, or, if the wait failed,
+        # so that the shutdown does not wait for it.
+        await manager.api.message_injection(target_server.ip_addr, wait_before_acquire_injection)
+
+    await write
+    await stop_task
+
+async def test_maintenance_socket_write_after_drain(manager: ScyllaClusterManager):
+    """
+    A drain stops the transport, the strongly consistent groups and the
+    database, but the CQL server of the maintenance socket keeps running.
+    A strongly consistent write that comes through it must fail with a
+    timeout, and the node must stay up.
+
+    Reproduces SCYLLADB-2423.
+    """
+
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql = manager.get_cql()
+
+    ks = await create_new_test_keyspace(cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'")
+    table = f"{ks}.my_table"
+    await cql.run_async(f"CREATE TABLE {table} (pk int PRIMARY KEY, v int)")
+
+    await manager.api.drain(server.ip_addr)
+
+    socket_endpoint = UnixSocketEndPoint(await manager.server_get_maintenance_socket_path(server.server_id))
+    maintenance_cluster = manager.con_gen([socket_endpoint],
+                                          load_balancing_policy=WhiteListRoundRobinPolicy([socket_endpoint]))
+    with safe_shutting_down(maintenance_cluster):
+        maintenance_cql = maintenance_cluster.connect()
+        insert = SimpleStatement(f"INSERT INTO {table} (pk, v) VALUES (0, 13)",
+                                 consistency_level=ConsistencyLevel.QUORUM, retry_policy=FallthroughRetryPolicy())
+        with pytest.raises(WriteTimeout):
+            await maintenance_cql.run_async(insert)
+
+    assert await manager.server_is_alive(server.server_id), "the node died after the refused write"
+
+async def test_leader_cache_eliminates_redirect(manager: ScyllaClusterManager):
+    """
+    Verify that after a non-replica node learns the leader location via a redirect,
+    subsequent write requests from that node go directly to the leader without a redirect.
+
+    Uses 4 nodes in 2 racks (2 per rack) with RF=2 and 1 tablet.
+    Tablet-aware replication places one replica per rack.
+    The non-replica node in the non-leader rack always picks the same-rack
+    (non-leader) replica as closest, causing a redirect to the leader.
+    After the first write populates the cache, subsequent writes skip the redirect.
+
+    We verify this via the scylla_transport_requests_forwarded_redirected metric
+    on the non-replica node.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'cql_server=trace',
+        '--experimental-features', 'strongly-consistent-tables',
+    ]
+    # 2 racks with 2 nodes each
+    property_file = [
+        {"dc": "dc1", "rack": "rack1"},
+        {"dc": "dc1", "rack": "rack1"},
+        {"dc": "dc1", "rack": "rack2"},
+        {"dc": "dc1", "rack": "rack2"},
+    ]
+    servers = await manager.servers_add(4, cmdline=cmdline, property_file=property_file)
+    (cql, hosts) = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    ks_opts = ("WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}"
+               " AND tablets = {'initial': 1} AND consistency = 'global'")
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, value int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablet_replicas = await get_tablet_replicas(manager, servers[0], ks, table_name, 0)
+            assert len(tablet_replicas) == 2
+            replica_host_ids = [replica[0] for replica in tablet_replicas]
+
+            if host_ids[0] in replica_host_ids:
+                leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+            else:
+                leader_host_id = await wait_for_leader(manager, servers[1], group_id)
+            # Find the rack of the leader
+            leader_server = next(s for hid, s in zip(host_ids, servers) if str(hid) == leader_host_id)
+            leader_rack = leader_server.rack
+
+            # Pick the non-replica in the non-leader rack.
+            # This node's closest replica is the same-rack (non-leader) replica,
+            # so writes always cause a redirect on the first attempt.
+            non_replica_host_id = None
+            for hid, s in zip(host_ids, servers):
+                if str(hid) not in replica_host_ids and s.rack != leader_rack:
+                    non_replica_host_id = hid
+                    break
+            assert non_replica_host_id is not None, "Could not find non-replica in non-leader rack"
+            non_replica_server = next(s for hid, s in zip(host_ids, servers) if hid == non_replica_host_id)
+            non_replica_host = host_by_host_id(non_replica_host_id)
+
+            logger.info(f"Non-replica node: {non_replica_host} (rack {non_replica_server.rack}), leader: {leader_host_id} (rack {leader_rack})")
+
+            # Warmup phase: run enough requests to populate the leader cache
+            # on all shards of the non-replica node. The driver may distribute
+            # requests across multiple connections (shards), so we need to
+            # warm them all up. 20 requests should be enough to cover all shards.
+            for i in range(20):
+                await cql.run_async(f"INSERT INTO {table} (pk, value) VALUES ({i}, {i})", host=non_replica_host)
+
+            # Measure redirect counter after warmup (all shards should be warm).
+            metrics = await manager.metrics.query(non_replica_host.address)
+            redirects_before = metrics.get('scylla_transport_requests_forwarded_redirected') or 0
+
+            # Run another batch of requests; all should use the cached leader
+            # and NOT cause any redirects.
+            num_requests = 20
+            for i in range(20, 20 + num_requests):
+                await cql.run_async(f"INSERT INTO {table} (pk, value) VALUES ({i}, {i})", host=non_replica_host)
+
+            metrics = await manager.metrics.query(non_replica_host.address)
+            redirects_after = metrics.get('scylla_transport_requests_forwarded_redirected') or 0
+
+            new_redirects = redirects_after - redirects_before
+            logger.info(f"Redirects before: {redirects_before}, after: {redirects_after}, new: {new_redirects}")
+            assert new_redirects == 0, \
+                f"Expected no new redirects after cache warmup, but got {new_redirects}"
+
+            # Verify data correctness
+            rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 25", host=non_replica_host)
+            assert len(rows) == 1
+            assert rows[0].value == 25
+
+@pytest.mark.asyncio
+async def test_read_forwarding(manager: ScyllaClusterManager):
+    """
+    Verify read forwarding behavior for strongly consistent tables:
+    - CL=QUORUM reads (linearizable) are forwarded to the raft leader
+    - CL=ONE reads (non-linearizable) work on any replica without forwarding
+    - Linearizability: a CL=QUORUM read after a write always sees the write
+    Use a 4-node cluster with RF=3 to have:
+    - a leader replica
+    - 2 follower replicas, one of which is not required for quorum
+    - a non-replica node
+    """
+
+    logger.info("Bootstrapping cluster")
+    servers = await manager.servers_add(4, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+            tablet_replicas = await get_tablet_replicas(manager, servers[0], ks, table_name, 0)
+            replica_host_ids = [replica[0] for replica in tablet_replicas]
+
+            for i in range(4):
+                if host_ids[i] in replica_host_ids:
+                    leader_host_id = await wait_for_leader(manager, servers[i], group_id)
+                    break
+            leader_host = host_by_host_id(leader_host_id)
+
+            non_leader_replica_host_id = [hid for hid in replica_host_ids if str(hid) != str(leader_host_id)][0]
+            non_leader_replica_host = host_by_host_id(non_leader_replica_host_id)
+            non_replica_host_id = [hid for hid in host_ids if str(hid) not in [str(r) for r in replica_host_ids]][0]
+            non_replica_host = host_by_host_id(non_replica_host_id)
+
+            async def get_metric(host, name, labels={}):
+                metrics = await manager.metrics.query(host.address)
+                return metrics.get(name, labels) or 0
+
+            async def check_read(cl, send_to, expect_fwd, read_type=None, sc_metric_host=None):
+                """Execute a read and verify forwarding behavior and coordinator metrics."""
+                label = f"CL={ConsistencyLevel.value_to_name[cl]} on {send_to.address}"
+                logger.info(f"Testing read: {label}")
+
+                stmt = SimpleStatement(f"SELECT * FROM {table} WHERE pk = 1", consistency_level=cl)
+
+                fwd_before = await get_metric(send_to, 'scylla_transport_requests_forwarded_successfully')
+                sc_before = await get_metric(sc_metric_host, f'scylla_strong_consistency_coordinator_read_latency_count', {'read_type': read_type}) if read_type else None
+
+                rows = await cql.run_async(stmt, host=send_to)
+                assert len(rows) == 1
+                assert rows[0].c == 100
+
+                fwd_after = await get_metric(send_to, 'scylla_transport_requests_forwarded_successfully')
+                if expect_fwd:
+                    assert fwd_after > fwd_before, f"{label}: expected forwarding"
+                else:
+                    assert fwd_after == fwd_before, f"{label}: unexpected forwarding"
+
+                if read_type:
+                    sc_after = await get_metric(sc_metric_host, f'scylla_strong_consistency_coordinator_read_latency_count', {'read_type': read_type})
+                    assert sc_after > sc_before, f"{label}: expected {read_type} scylla_strong_consistency_coordinator_read_latency_count to increment on {sc_metric_host.address}"
+
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (1, 100)", host=leader_host)
+
+            # CL=QUORUM: linearizable, forwarded to leader
+            await check_read(ConsistencyLevel.QUORUM, leader_host, expect_fwd=False,
+                             read_type='linearizable', sc_metric_host=leader_host)
+            await check_read(ConsistencyLevel.QUORUM, non_leader_replica_host, expect_fwd=True,
+                             read_type='linearizable', sc_metric_host=leader_host)
+            await check_read(ConsistencyLevel.QUORUM, non_replica_host, expect_fwd=True,
+                             read_type='linearizable', sc_metric_host=leader_host)
+
+            # CL=ONE: no forwarding, executed on the local replica
+            await read_barrier(manager.api, non_leader_replica_host.address, group_id=group_id, timeout=30)
+            await check_read(ConsistencyLevel.ONE, non_leader_replica_host, expect_fwd=False,
+                             read_type='non_linearizable', sc_metric_host=non_leader_replica_host)
+
+            # --- Linearizability: write then CL=QUORUM read from follower ---
+            logger.info("Testing linearizability: write + CL=QUORUM read from follower (10 iterations)")
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({100 + i}, {i * 10})")
+                read_stmt = SimpleStatement(f"SELECT * FROM {table} WHERE pk = {100 + i}", consistency_level=ConsistencyLevel.QUORUM)
+                rows = await cql.run_async(read_stmt, host=non_leader_replica_host)
+                assert len(rows) == 1, f"Expected 1 row for pk={100 + i}, got {len(rows)}"
+                assert rows[0].c == i * 10, f"Linearizability violation: pk={100 + i}, expected c={i * 10}, got c={rows[0].c}"
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_linearizable_read_waits_for_leader_apply(manager: ScyllaClusterManager):
+    """
+    A write is acked once its raft entry is committed, not once it's applied, so
+    the leader can hold a committed write its table doesn't have yet. A CL=QUORUM
+    read on the leader still has to return it: read_barrier() waits until the
+    leader has applied everything committed before the read, and only then the
+    table is read. With the leader's applier parked, the read can't complete and
+    times out - if it returned, it would return the older value, and a client
+    that saw its write acked would read its own write undone.
+
+    A CL=ONE read on the same leader has no read barrier and returns the older
+    value right away. It's what shows that the table really lacks the write, so
+    the CL=QUORUM timeout is the barrier waiting, not something else stuck.
+    """
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc="dc1")
+    leader_server = servers[0]
+    cql, [leader_host, _, _] = await manager.get_ready_cql(servers)
+
+    wait_before_apply_injection = "strong_consistency_state_machine_wait_before_apply"
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            group_id = await get_table_raft_group_id(manager, ks, table.split('.')[-1])
+            await ensure_raft_group_leader_on(manager, leader_server, group_id)
+
+            # None until the row exists in the leader's table.
+            async def read_on_leader(cl, timeout=""):
+                stmt = SimpleStatement(f"SELECT v FROM {table} WHERE pk = 1 {timeout}", consistency_level=cl,
+                                       retry_policy=FallthroughRetryPolicy())
+                rows = await cql.run_async(stmt, host=leader_host)
+                return rows[0].v if rows else None
+
+            async def leader_has_applied(v):
+                return True if await read_on_leader(ConsistencyLevel.ONE) == v else None
+
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (1, 1)", host=leader_host)
+            # The leader may still be applying this write when the ack arrives, and then
+            # the injection below would park this entry rather than the next one.
+            await wait_for(lambda: leader_has_applied(1), time.time() + 60)
+
+            logger.info("Parking the applier of the leader")
+            await manager.api.enable_injection(leader_server.ip_addr, wait_before_apply_injection, one_shot=True)
+            # Release the applier even if a check below fails: the parked apply doesn't
+            # see the node's shutdown and would hold up its stop for 20 minutes.
+            try:
+                await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (1, 2)", host=leader_host)
+                await manager.api.wait_for_injection_enter(leader_server.ip_addr, wait_before_apply_injection)
+
+                assert await read_on_leader(ConsistencyLevel.ONE) == 1, \
+                    "CL=ONE: expected the leader's table to lack the acked write while its applier is parked"
+                with pytest.raises(ReadTimeout):
+                    v = await read_on_leader(ConsistencyLevel.QUORUM, timeout="USING TIMEOUT 1s")
+                    pytest.fail(f"CL=QUORUM returned v={v} before the leader applied the acked write")
+            finally:
+                logger.info("Releasing the applier of the leader")
+                await manager.api.message_injection(leader_server.ip_addr, wait_before_apply_injection)
+            assert await read_on_leader(ConsistencyLevel.QUORUM) == 2
+
+
+async def test_write_from_non_replica_after_leader_down(manager: ScyllaClusterManager):
+    """
+    Verify that if a raft group leader goes down, a non-replica node can still
+    successfully write by detecting the stale leader cache entry and evicting it.
+
+    Setup: 4-node cluster (RF=3, 1 tablet, --smp=1).
+    - --smp=1 ensures both writes hit the same shard on the non-replica, so
+      the leader-cache entry written by the first write is visible during
+      the second write.
+    - RF=3 gives 3 replicas and 1 non-replica.
+    - Stopping one of the 3 replicas (the leader) still leaves a quorum of 2,
+      so a new leader can be elected and the second write can succeed.
+    """
+    cmdline = DEFAULT_CMDLINE + ['--smp=1']
+    servers = await manager.servers_add(4, config=DEFAULT_CONFIG, cmdline=cmdline, auto_rack_dc='my_dc')
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    async with new_test_keyspace(manager,
+            "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}"
+            " AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablet_replicas = await get_tablet_replicas(manager, servers[0], ks, table_name, 0)
+            replica_host_ids = [str(replica[0]) for replica in tablet_replicas]
+            assert len(replica_host_ids) == 3
+
+            # Identify the initial leader.
+            for i in range(4):
+                if host_ids[i] in replica_host_ids:
+                    leader_host_id = await wait_for_leader(manager, servers[i], group_id)
+                    break
+            for i in range(4):
+                if leader_host_id == host_ids[i]:
+                    leader_server = servers[i]
+                    break
+
+            # Pick the one node that is not a replica.
+            non_replica_host_id = [host_id for host_id in host_ids if str(host_id) not in replica_host_ids][0]
+            non_replica_host = [host for host in hosts if str(host.host_id) == str(non_replica_host_id)][0]
+            logger.info(f"Non-replica: {non_replica_host}, initial leader: {leader_host_id}")
+
+            # First write from the non-replica. This forces the node to resolve
+            # the leader (via a redirect roundtrip) and populate its leader cache.
+            logger.info("First write from non-replica - populates leader cache")
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (1, 1)", host=non_replica_host)
+
+            logger.info(f"Stopping leader {leader_host_id}")
+            await manager.server_stop(leader_server.server_id, convict=True)
+            await manager.others_not_see_server(leader_server.ip_addr)
+
+            # Wait until new election finishes. If we don't do that, the next write may be forwarded to the downed
+            # leader not because of a stale cache entry, but because the raft group hasn't started electing the new leader yet.
+            for i in range(4):
+                if host_ids[i] in replica_host_ids and host_ids[i] != leader_host_id:
+                    async def wait_for_new_leader():
+                        new_leader = await wait_for_leader(manager, servers[i], group_id)
+                        return None if new_leader == leader_host_id else new_leader
+                    await wait_for(wait_for_new_leader, time.time() + 60)
+
+            # Second write from the non-replica. Without the fix the non-replica
+            # would try to forward to the dead cached leader and get a write
+            # failure, because the stale cache entry is never evicted.
+            logger.info("Second write from non-replica after leader change")
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (2, 2)", host=non_replica_host)
+
+            # Verify the row was written.
+            rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 2", host=non_replica_host)
+            assert len(rows) == 1
+            assert rows[0].c == 2
+
+            # The first write was acked by the stopped leader, the new leader has to serve it too.
+            rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 1", host=non_replica_host)
+            assert [(row.pk, row.c) for row in rows] == [(1, 1)]
+
+@pytest.mark.asyncio
+async def test_unavailable_errors_metrics(manager: ScyllaClusterManager):
+    """
+    Verify that requests failing with Unavailable, because no replica of the tablet
+    is alive, are counted in the coordinator's error metrics with reason "unavailable".
+
+    Setup: 2 nodes, RF=1, 1 tablet, so one node is the replica and the other one is
+    not. The replica is stopped, and the non-replica coordinates a write, a QUORUM
+    read and a CL=ONE read.
+    """
+    # The leader cache is per shard. With one shard, both writes below use the same one.
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE + ['--smp=1'], property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            [(replica_host_id, _)] = await get_tablet_replicas(manager, servers[0], ks, table.split('.')[-1], 0)
+            replica_idx = host_ids.index(str(replica_host_id))
+            non_replica_idx = 1 - replica_idx  # the other of the 2 nodes
+            replica, non_replica = servers[replica_idx], servers[non_replica_idx]
+            non_replica_host = hosts[non_replica_idx]
+
+            # The non-replica forwards this write to the replica and caches the replica
+            # as the leader. The write below then finds that cached leader down, evicts
+            # it, and fails with Unavailable.
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (0, 0)", host=non_replica_host)
+
+            await manager.server_stop(replica.server_id, convict=True)
+            try:
+                await manager.server_not_sees_other_server(non_replica.ip_addr, replica.ip_addr)
+
+                # The driver retries a request refused with Unavailable one time by default.
+                # Without retries, each request is refused and counted once.
+                no_retry = FallthroughRetryPolicy()
+                with pytest.raises(Unavailable, match="All replicas of tablet 0 are down"):
+                    await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, c) VALUES (0, 1)",
+                                                        retry_policy=no_retry), host=non_replica_host)
+                for cl in (ConsistencyLevel.QUORUM, ConsistencyLevel.ONE):
+                    with pytest.raises(Unavailable, match="All replicas of tablet 0 are down"):
+                        await cql.run_async(SimpleStatement(f"SELECT * FROM {table} WHERE pk = 0", consistency_level=cl,
+                                                            retry_policy=no_retry), host=non_replica_host)
+
+                metrics = await manager.metrics.query(non_replica.ip_addr)
+                assert metrics.get('scylla_strong_consistency_coordinator_write_errors', {'reason': 'unavailable'}) == 1
+                assert metrics.get('scylla_strong_consistency_coordinator_read_errors', {'reason': 'unavailable'}) == 2  # QUORUM, ONE
+            finally:
+                # The replica may be the only group0 voter, and dropping the table needs a
+                # group0 quorum.
+                await manager.server_start(replica.server_id)
+                await manager.get_ready_cql(servers)
+
+@pytest.mark.asyncio
+async def test_redirected_requests_latency_metrics(manager: ScyllaClusterManager):
+    """
+    Verify that the latency of a request is recorded only on the node that executes it,
+    not on the node that redirects it there, which counts it as a bounce instead.
+
+    Setup: 2 nodes, RF=1, 1 tablet. Every write and read sent to the non-replica is
+    redirected to the replica.
+    """
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            [(replica_host_id, _)] = await get_tablet_replicas(manager, servers[0], ks, table.split('.')[-1], 0)
+            replica_idx = host_ids.index(str(replica_host_id))
+            non_replica_idx = 1 - replica_idx  # the other of the 2 nodes
+            replica, non_replica = servers[replica_idx], servers[non_replica_idx]
+            non_replica_host = hosts[non_replica_idx]
+
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (1, 1)", host=non_replica_host)
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (2, 2)", host=non_replica_host)
+            await cql.run_async(f"SELECT * FROM {table} WHERE pk = 1", host=non_replica_host)
+
+            on_non_replica = await manager.metrics.query(non_replica.ip_addr)
+            assert on_non_replica.get('scylla_strong_consistency_coordinator_write_node_bounces') == 2
+            assert on_non_replica.get('scylla_strong_consistency_coordinator_read_node_bounces') == 1
+            # Not exported: nothing was timed on this node.
+            assert on_non_replica.get('scylla_strong_consistency_coordinator_write_latency_count') is None
+            assert on_non_replica.get('scylla_strong_consistency_coordinator_read_latency_count') is None
+
+            on_replica = await manager.metrics.query(replica.ip_addr)
+            assert on_replica.get('scylla_strong_consistency_coordinator_write_latency_count') == 2
+            assert on_replica.get('scylla_strong_consistency_coordinator_read_latency_count') == 1
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_stale_leader_retries_metrics(manager: ScyllaClusterManager, scale_timeout):
+    """
+    Verify that a write and a read whose local raft server names a leader that can't
+    lead at the tablet's stage are counted as retries with reason "stale_leader". The
+    error injection names such a leader on every attempt, so each request waits for a
+    new leader until its timeout.
+    """
+    [server] = await manager.servers_add(1, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql, _ = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            write = f"INSERT INTO {table} (pk, v) VALUES (0, 0)"
+            read = f"SELECT * FROM {table} WHERE pk = 0"
+
+            await manager.api.enable_injection(server.ip_addr, "sc_report_stale_leader", one_shot=False)
+            try:
+                await expect_retry_before_timeout(manager, server, write, WriteTimeout,
+                    'scylla_strong_consistency_coordinator_write_retries', 'stale_leader', scale_timeout)
+                await expect_retry_before_timeout(manager, server, read, ReadTimeout,
+                    'scylla_strong_consistency_coordinator_read_retries', 'stale_leader', scale_timeout)
+            finally:
+                await manager.api.disable_injection(server.ip_addr, "sc_report_stale_leader")
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_dropped_table_errors_metrics(manager: ScyllaClusterManager):
+    """
+    Verify that a write and a read failing because their table was dropped while they
+    ran are counted in the coordinator's error metrics with reason "table_dropped".
+    Case 1 drops the table before the requests get their raft server, case 2 while
+    they hold it.
+    """
+    [server] = await manager.servers_add(1, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql, _ = await manager.get_ready_cql([server])
+    log = await manager.server_open_log(server.server_id)
+
+    def start_write_and_read(table: str) -> tuple[asyncio.Future, asyncio.Future]:
+        write = f"INSERT INTO {table} (pk, v) VALUES (1, 1)"
+        read = f"SELECT * FROM {table} WHERE pk = 0"
+        return asyncio.ensure_future(cql.run_async(write)), asyncio.ensure_future(cql.run_async(read))
+
+    async def drop_table_and_release(table: str, injections: list[str]) -> None:
+        mark = await log.mark()
+        await cql.run_async(f"DROP TABLE {table}")
+        await log.wait_for("schedule_raft_group_deletion.*server aborted", from_mark=mark, timeout=30)
+        for injection in injections:
+            await manager.api.message_injection(server.ip_addr, injection)
+            await manager.api.disable_injection(server.ip_addr, injection)
+
+    async def write_errors() -> float:
+        metrics = await manager.metrics.query(server.ip_addr)
+        return metrics.get('scylla_strong_consistency_coordinator_write_errors', {'reason': 'table_dropped'}) or 0
+
+    async def read_errors() -> float:
+        metrics = await manager.metrics.query(server.ip_addr)
+        return metrics.get('scylla_strong_consistency_coordinator_read_errors', {'reason': 'table_dropped'}) or 0
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        # Case 1: the table is gone before the requests get their raft server.
+        await cql.run_async(f"CREATE TABLE {ks}.tbl1 (pk int PRIMARY KEY, v int)")
+        await cql.run_async(f"INSERT INTO {ks}.tbl1 (pk, v) VALUES (0, 0)")
+        write_errors_before = await write_errors()
+        read_errors_before = await read_errors()
+
+        # Pause both requests at the same injection, before they get their raft server.
+        injection = "sc_coordinator_wait_before_acquire_server"
+        await manager.api.enable_injection(server.ip_addr, injection, one_shot=False)
+        write, read = start_write_and_read(f"{ks}.tbl1")
+        await manager.api.wait_for_injection_enter(server.ip_addr, injection, threshold=2)
+
+        # Drop the table and wait until its raft server is stopped, then release the requests.
+        await drop_table_and_release(f"{ks}.tbl1", [injection])
+
+        # Both fail, and each is counted once as table_dropped.
+        with pytest.raises(InvalidRequest, match="unconfigured table tbl1"):
+            await write
+        with pytest.raises(InvalidRequest, match="unconfigured table tbl1"):
+            await read
+        assert await write_errors() - write_errors_before == 1
+        assert await read_errors() - read_errors_before == 1
+
+        # Case 2: the requests hold their raft server, and the drop stops it under them.
+        await cql.run_async(f"CREATE TABLE {ks}.tbl2 (pk int PRIMARY KEY, v int)")
+        await cql.run_async(f"INSERT INTO {ks}.tbl2 (pk, v) VALUES (0, 0)")
+        write_errors_before = await write_errors()
+        read_errors_before = await read_errors()
+
+        # Pause the write and the read, each at its own injection after it got its raft server.
+        write_injection = "sc_coordinator_wait_before_begin_mutate"
+        read_injection = "sc_coordinator_wait_before_query_read_barrier"
+        await manager.api.enable_injection(server.ip_addr, write_injection, one_shot=False)
+        await manager.api.enable_injection(server.ip_addr, read_injection, one_shot=False)
+        write, read = start_write_and_read(f"{ks}.tbl2")
+        await manager.api.wait_for_injection_enter(server.ip_addr, write_injection)
+        await manager.api.wait_for_injection_enter(server.ip_addr, read_injection)
+
+        # Drop the table and wait until its raft server is stopped, then release the requests.
+        await drop_table_and_release(f"{ks}.tbl2", [write_injection, read_injection])
+
+        # Both fail, and each is counted once as table_dropped.
+        with pytest.raises(InvalidRequest, match="unconfigured table tbl2"):
+            await write
+        with pytest.raises(InvalidRequest, match="unconfigured table tbl2"):
+            await read
+        assert await write_errors() - write_errors_before == 1
+        assert await read_errors() - read_errors_before == 1
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_prepared_write_across_table_recreation(manager: ScyllaClusterManager):
+    """
+    Regression test for SCYLLADB-4655: a prepared write in flight while its table is
+    dropped and created again fails with INVALID rather than SERVER_ERROR, so the
+    driver returns it without retrying. The failed write leaves no row in the new
+    table, and the next execution of the same prepared statement writes to it.
+    """
+    [server] = await manager.servers_add(1, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql, _ = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        create_table = f"CREATE TABLE {ks}.tbl (pk int PRIMARY KEY, v int)"
+        await cql.run_async(create_table)
+        insert = cql.prepare(f"INSERT INTO {ks}.tbl (pk, v) VALUES (?, ?)")
+
+        logger.info("Pausing a prepared write before it gets its raft server")
+        injection = "sc_coordinator_wait_before_acquire_server"
+        await manager.api.enable_injection(server.ip_addr, injection, one_shot=False)
+        write = asyncio.ensure_future(cql.run_async(insert, [1, 1]))
+        await manager.api.wait_for_injection_enter(server.ip_addr, injection)
+
+        logger.info("Recreating the table and releasing the write")
+        await cql.run_async(f"DROP TABLE {ks}.tbl")
+        await cql.run_async(create_table)
+        await manager.api.message_injection(server.ip_addr, injection)
+        await manager.api.disable_injection(server.ip_addr, injection)
+        with pytest.raises(InvalidRequest, match="unconfigured table tbl"):
+            await write
+
+        logger.info("Executing the same prepared write again")
+        await cql.run_async(insert, [2, 2])
+        assert not await cql.run_async(f"SELECT v FROM {ks}.tbl WHERE pk = 1")
+        rows = await cql.run_async(f"SELECT v FROM {ks}.tbl WHERE pk = 2")
+        assert [row.v for row in rows] == [2]
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_foreground_requests_metrics(manager: ScyllaClusterManager):
+    """
+    Verify that a write and a read are counted in foreground_writes and foreground_reads
+    while the coordinator executes them, and no longer once they are done.
+    """
+    [server] = await manager.servers_add(1, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql, _ = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 0)")
+
+            write_injection = "sc_coordinator_wait_before_begin_mutate"
+            read_injection = "sc_coordinator_wait_before_query_read_barrier"
+            await manager.api.enable_injection(server.ip_addr, write_injection, one_shot=True)
+            await manager.api.enable_injection(server.ip_addr, read_injection, one_shot=True)
+            write = cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (10, 10)")
+            read = cql.run_async(f"SELECT * FROM {table} WHERE pk = 0")
+            await manager.api.wait_for_injection_enter(server.ip_addr, write_injection)
+            await manager.api.wait_for_injection_enter(server.ip_addr, read_injection)
+
+            metrics = await manager.metrics.query(server.ip_addr)
+            assert metrics.get('scylla_strong_consistency_coordinator_foreground_writes') == 1
+            assert metrics.get('scylla_strong_consistency_coordinator_foreground_reads') == 1
+
+            await manager.api.message_injection(server.ip_addr, write_injection)
+            await manager.api.message_injection(server.ip_addr, read_injection)
+            await write
+            await read
+
+            metrics = await manager.metrics.query(server.ip_addr)
+            assert metrics.get('scylla_strong_consistency_coordinator_foreground_writes') == 0
+            assert metrics.get('scylla_strong_consistency_coordinator_foreground_reads') == 0
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_stepdown_on_graceful_shutdown(manager: ScyllaClusterManager):
+    """
+    Verify that a node which is being shut down gracefully hands the leadership
+    of the strongly consistent tablets it leads over to another replica, instead
+    of leaving the group leaderless until the remaining replicas expire their
+    election timeouts.
+
+    All nodes run with a stretched raft tick interval, so expiring an election
+    timeout (at least 10 ticks) takes much longer than the leader's shutdown plus
+    the time this test gives the group to show its new leader.
+    """
+    tick_interval = 4
+    config = DEFAULT_CONFIG | {'error_injections_at_startup': [{
+        'name': 'strongly-consistent-raft-group-tick-interval-in-ms',
+        'value': str(tick_interval * 1000)
+    }]}
+    cmdline = DEFAULT_CMDLINE + ['--smp=1']
+    servers = await manager.servers_add(3, config=config, cmdline=cmdline, auto_rack_dc='my_dc')
+    cql, _ = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    async with new_test_keyspace(manager,
+            "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}"
+            " AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            # Every node is a replica, so any of them can be asked for the leader.
+            leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+            leader_server = next(s for s, host_id in zip(servers, host_ids) if host_id == leader_host_id)
+            others = [s for s, host_id in zip(servers, host_ids) if host_id != leader_host_id]
+            logger.info(f"Group {group_id} is led by {leader_host_id}")
+
+            # Replicate something, so that the followers' match index reaches the
+            # leader's last log index and the stepdown below has a successor to
+            # pick immediately.
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (1, 1)")
+
+            log = await manager.server_open_log(leader_server.server_id)
+            mark = await log.mark()
+
+            logger.info(f"Stopping the leader {leader_host_id} gracefully")
+            await manager.server_stop_gracefully(leader_server.server_id)
+
+            matches = await log.grep(r"stepdown_leaders\(\): transferred leadership for 1 raft group",
+                                     from_mark=mark)
+            assert matches, "The node being shut down did not transfer the leadership of its raft group"
+
+            # stepdown() only completes once the successor has started its election, which
+            # it wins long before the old leader's process exits, so a new leader should be
+            # there already. The other replicas cannot elect one on their own sooner than
+            # ELECTION_TIMEOUT (10 raft ticks) after losing the leader, so one that shows up
+            # this early can only be the stepdown's successor.
+            async def get_new_leader():
+                new_leader_host_id = await manager.api.get_raft_leader(others[0].ip_addr, group_id)
+                if new_leader_host_id is None or new_leader_host_id == leader_host_id:
+                    return None
+                return new_leader_host_id
+            new_leader_host_id = await wait_for(get_new_leader, time.time() + 2 * tick_interval)
+            logger.info(f"Group {group_id} is now led by {new_leader_host_id}")
+
+            # The new leader can serve writes right away.
+            cql, _ = await manager.get_ready_cql(others)
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (2, 2)")
+
+
+async def test_tablet_migration(manager: ScyllaClusterManager):
+    # Exercise SC tablet migration end-to-end by moving each replica to the
+    # other node in the same rack, forcing the raft group membership to fully
+    # rotate, and verify previously written data remains readable.
+    logger.info("Bootstrapping cluster")
+    config = {
+        'experimental_features': ['strongly-consistent-tables']
+    }
+    cmdline = [
+        '--logger-log-level', 'sc_groups_manager=debug',
+        '--logger-log-level', 'sc_coordinator=debug',
+        '--logger-log-level', 'sc_state_machine=debug',
+        '--logger-log-level', 'raft_groups_storage=debug',
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'raft=debug'
+    ]
+    servers = await manager.servers_add(6, config=config, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'}
+    ])
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    await manager.disable_tablet_balancing()
+
+    logger.info("Creating a strongly-consistent keyspace")
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+
+            logger.info("Select raft group id for the tablet")
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet = tablets[0]
+            tablet_token = tablet.last_token
+            original_replicas = tablet.replicas
+            assert len(original_replicas) == 3, f"Expected 3 replicas, got {len(original_replicas)}"
+
+            logger.info(f"Get current leader for the group {group_id}")
+            replica_server = next(server for server, host_id in zip(servers, host_ids) if host_id == original_replicas[0][0])
+            leader_host_id = await wait_for_leader(manager, replica_server, group_id)
+            leader_host = host_by_host_id(leader_host_id)
+
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i+1})", host=leader_host)
+
+            async def check():
+                for i in range(10):
+                    rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
+                    assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                    assert rows[0].c == i + 1, f"Data integrity check failed for pk={i}: expected c={i+1}, got c={rows[0].c}"
+
+            await check()
+
+            # Rack membership: rack1=[0,1], rack2=[2,3], rack3=[4,5]
+            racks = [
+                [host_ids[0], host_ids[1]],
+                [host_ids[2], host_ids[3]],
+                [host_ids[4], host_ids[5]],
+            ]
+            next_inserted_pk = 100
+
+            # Migrate each replica to the other node in the same rack sequentially,
+            # so the replica set changes completely
+            for src_host_id, src_shard in original_replicas:
+                rack = next(rack for rack in racks if src_host_id in rack)
+                dst_host_id = next(host_id for host_id in rack if host_id != src_host_id)
+                dst_shard = 0
+                logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:{dst_shard}")
+                await manager.api.move_tablet(servers[0].ip_addr, ks, table_name, src_host_id, src_shard, dst_host_id, dst_shard, tablet_token)
+                await manager.api.quiesce_topology(servers[0].ip_addr)
+
+                tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+                assert len(tablets) == 1
+                current_replicas = tablets[0].replicas
+
+                # Verify all written data is readable after the migration
+                await check()
+
+                # Verify writing new values
+                current_replica_server = next(server for server, host_id in zip(servers, host_ids) if host_id == current_replicas[0][0])
+                current_leader_host_id = await wait_for_leader(manager, current_replica_server, group_id)
+                current_leader_host = host_by_host_id(current_leader_host_id)
+                inserted_pk = next_inserted_pk
+                next_inserted_pk += 1
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({inserted_pk}, {inserted_pk + 1})", host=current_leader_host)
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {inserted_pk}")
+                assert len(rows) == 1
+                assert rows[0].c == inserted_pk + 1
+
+
+async def test_tablet_migration_rf1(manager: ScyllaClusterManager):
+    # Exercise SC tablet migration with RF=1 by moving the only replica across
+    # multiple nodes, verifying that leadership follows the replica and that
+    # previously written data remains readable throughout the relocations.
+    logger.info("Bootstrapping cluster")
+    config = {
+        'experimental_features': ['strongly-consistent-tables']
+    }
+    cmdline = [
+        '--logger-log-level', 'sc_groups_manager=debug',
+        '--logger-log-level', 'sc_coordinator=debug',
+        '--logger-log-level', 'sc_state_machine=debug',
+        '--logger-log-level', 'raft_groups_storage=debug',
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'raft=debug'
+    ]
+    servers = await manager.servers_add(3, config=config, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    def server_by_host_id(host_id):
+        for server, hid in zip(servers, host_ids):
+            if hid == host_id:
+                return server
+        raise RuntimeError(f"Can't find server for host_id {host_id}")
+
+    await manager.disable_tablet_balancing()
+
+    logger.info("Creating a strongly-consistent keyspace")
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+
+            logger.info("Select raft group id for the tablet")
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet = tablets[0]
+            tablet_token = tablet.last_token
+            assert len(tablet.replicas) == 1, f"Expected 1 replica, got {len(tablet.replicas)}"
+
+            current_replica_host_id, current_replica_shard = tablet.replicas[0]
+            current_replica_server = server_by_host_id(current_replica_host_id)
+
+            logger.info(f"Get current leader for the group {group_id}")
+            leader_host_id = await wait_for_leader(manager, current_replica_server, group_id,
+                                                   expected_host_id=current_replica_host_id)
+            leader_host = host_by_host_id(leader_host_id)
+
+            written_pks = list(range(10))
+            for pk in written_pks:
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({pk}, {pk + 1})", host=leader_host)
+
+            async def check():
+                for pk in written_pks:
+                    rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {pk}")
+                    assert len(rows) == 1, f"Expected 1 row for pk={pk}, got {len(rows)}"
+                    assert rows[0].c == pk + 1, f"Data integrity check failed for pk={pk}: expected c={pk + 1}, got c={rows[0].c}"
+
+            await check()
+
+            next_inserted_pk = 100
+            migration_targets = [host_id for host_id in host_ids if host_id != current_replica_host_id]
+
+            for dst_host_id in migration_targets:
+                dst_shard = 0
+                logger.info(f"Migrating tablet from {current_replica_host_id}:{current_replica_shard} to {dst_host_id}:{dst_shard}")
+                await manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                              current_replica_host_id, current_replica_shard,
+                                              dst_host_id, dst_shard, tablet_token)
+                await manager.api.quiesce_topology(servers[0].ip_addr)
+
+                tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+                assert len(tablets) == 1
+                current_replicas = tablets[0].replicas
+                assert len(current_replicas) == 1, f"Expected 1 replica after migration, got {len(current_replicas)}"
+                assert current_replicas[0][0] == dst_host_id, (
+                    f"Expected replica to move to {dst_host_id}, got {current_replicas[0][0]}"
+                )
+
+                current_replica_host_id, current_replica_shard = current_replicas[0]
+                current_replica_server = server_by_host_id(current_replica_host_id)
+
+                # The replica that just left is the one the new replica last heard from,
+                # so it keeps naming it until its own election timeout fires. Leadership
+                # has to follow the replica, but not instantly.
+                current_leader_host_id = await wait_for_leader(manager, current_replica_server, group_id,
+                                                               expected_host_id=current_replica_host_id)
+
+                await check()
+
+                current_leader_host = host_by_host_id(current_leader_host_id)
+                inserted_pk = next_inserted_pk
+                next_inserted_pk += 1
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({inserted_pk}, {inserted_pk + 1})", host=current_leader_host)
+                written_pks.append(inserted_pk)
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {inserted_pk}")
+                assert len(rows) == 1
+                assert rows[0].c == inserted_pk + 1
+
+            await check()
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_tablet_migration_rollback(manager: ScyllaClusterManager):
+    logger.info("Bootstrapping cluster")
+    config = {
+        'experimental_features': ['strongly-consistent-tables']
+    }
+    cmdline = [
+        '--logger-log-level', 'sc_groups_manager=debug',
+        '--logger-log-level', 'sc_coordinator=debug',
+        '--logger-log-level', 'sc_state_machine=debug',
+        '--logger-log-level', 'raft_groups_storage=debug',
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'raft=debug',
+        '--logger-log-level', 'debug_error_injection=debug'
+    ]
+    servers = await manager.servers_add(4, config=config, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    def server_by_host_id(host_id):
+        for server, hid in zip(servers, host_ids):
+            if hid == host_id:
+                return server
+        raise RuntimeError(f"Can't find server for host_id {host_id}")
+
+    await manager.disable_tablet_balancing()
+
+    logger.info("Creating a strongly-consistent keyspace")
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+
+            logger.info("Select raft group id for the tablet")
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet = tablets[0]
+            tablet_token = tablet.last_token
+            original_replicas = tablet.replicas
+            assert len(original_replicas) == 3, f"Expected 3 replicas, got {len(original_replicas)}"
+
+            logger.info(f"Get current leader for the group {group_id}")
+            replica_server = next(server for server, host_id in zip(servers, host_ids) if host_id == original_replicas[0][0])
+            leader_host_id = await wait_for_leader(manager, replica_server, group_id)
+            leader_host = host_by_host_id(leader_host_id)
+
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i+1})", host=leader_host)
+
+            async def check_initial_data():
+                for i in range(10):
+                    rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
+                    assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                    assert rows[0].c == i + 1, f"Data integrity check failed for pk={i}: expected c={i+1}, got c={rows[0].c}"
+
+            await check_initial_data()
+
+            rack3 = [host_ids[1], host_ids[2]]
+            src_host_id, src_shard = next((host_id, shard) for host_id, shard in original_replicas if host_id in rack3)
+            dst_host_id = next(host_id for host_id in rack3 if host_id != src_host_id)
+            dst_shard = 0
+            dst_server = server_by_host_id(dst_host_id)
+
+            logger.info(
+                "Triggering rollback by stopping pending replica during snapshot transfer from %s:%s to %s:%s",
+                src_host_id, src_shard, dst_host_id, dst_shard)
+
+            # Mark the log before arming the injection: a message it emits in between
+            # would be invisible to the wait below.
+            dst_log = await manager.server_open_log(dst_server.server_id)
+            mark = await dst_log.mark()
+            await manager.api.enable_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer", one_shot=True)
+
+            move_task = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, ks, table_name, src_host_id, src_shard, dst_host_id, dst_shard, tablet_token)
+            )
+
+            await dst_log.wait_for("sc_wait_for_snapshot_transfer: waiting for message", from_mark=mark, timeout=60)
+
+            await manager.server_stop(dst_server.server_id, convict=True)
+            await manager.server_not_sees_other_server(servers[0].ip_addr, dst_server.ip_addr)
+            await manager.api.exclude_node(servers[0].ip_addr, [dst_host_id])
+
+            try:
+                await move_task
+            except Exception as exc:
+                logger.info("move_tablet failed while rollback converged as expected: %s", exc)
+
+            async def rollback_finished():
+                tablet_info = await get_tablet_info(manager, servers[0], ks, table_name, tablet_token)
+                return True if tablet_info is not None and tablet_info.stage is None else None
+            await wait_for(rollback_finished, time.time() + 60)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet = tablets[0]
+            assert tablet.replicas == original_replicas, (
+                f"Expected replicas to roll back to {original_replicas}, got {tablet.replicas}"
+            )
+
+            current_replica_server = next(server for server, host_id in zip(servers, host_ids) if host_id == tablet.replicas[0][0])
+            current_leader_host_id = await wait_for_leader(manager, current_replica_server, group_id)
+            current_leader_host = host_by_host_id(current_leader_host_id)
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (100, 101)", host=current_leader_host)
+
+            await check_initial_data()
+            rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 100")
+            assert len(rows) == 1
+            assert rows[0].c == 101
+
+
+async def test_rf_change(manager: ScyllaClusterManager):
+    """Test RF increase for strongly consistent keyspaces.
+
+    Starts with RF=2, increases to RF=3, then verifies that writes still succeed
+    after one node is stopped (quorum = 2/3 is sufficient).
+    """
+    logger.info("Bootstrapping cluster")
+    config = {'experimental_features': ['strongly-consistent-tables']}
+    cmdline = [
+        '--logger-log-level', 'sc_groups_manager=debug',
+        '--logger-log-level', 'sc_coordinator=debug',
+        '--logger-log-level', 'sc_state_machine=debug',
+        '--logger-log-level', 'raft_groups_storage=debug',
+    ]
+    servers = await manager.servers_add(3, config=config, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    await manager.disable_tablet_balancing()
+
+    logger.info("Creating a strongly-consistent keyspace with RF=2")
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': ['rack1', 'rack2']} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            logger.info("Writing initial data")
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i})")
+
+            logger.info("Checking initial RF=2 allocation")
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            assert len(tablets[0].replicas) == 2, f"Expected 2 replicas, got {len(tablets[0].replicas)}"
+
+            logger.info("Increasing RF from 2 to 3")
+            await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['rack1', 'rack2', 'rack3']}}")
+            await manager.api.quiesce_topology(servers[0].ip_addr)
+
+            logger.info("Stopping one node to verify quorum writes still work (quorum = 2/3)")
+            await manager.server_stop_gracefully(servers[1].server_id)
+
+            cql, _ = await manager.get_ready_cql([servers[0], servers[2]])
+
+            # After stopping a node, wait for the raft group to elect a new leader.
+            async def wait_for_new_leader(deadline):
+                while True:
+                    leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+                    if leader_host_id != host_ids[1]:
+                        return leader_host_id
+                    if time.time() > deadline:
+                        raise TimeoutError("Timed out waiting for a new leader to be elected")
+                    await asyncio.sleep(0.1)
+
+            leader_host_id = await wait_for_new_leader(time.time() + 60)
+            leader_host = host_by_host_id(leader_host_id)
+
+            logger.info("Writing data with one node down")
+            for i in range(10, 20):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i})", host=leader_host)
+
+            logger.info("Verifying all written data is readable")
+            for i in range(20):
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}", host=leader_host)
+                assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                assert rows[0].c == i, f"Expected c={i}, got {rows[0].c}"
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_tablet_migration_config_change_retried(manager: ScyllaClusterManager):
+    """A raft configuration change that fails once must be re-driven.
+
+    Re-driving is the sync's job. If it were coupled to the next token
+    metadata change instead, a failed attempt on an otherwise quiet cluster
+    would leave the coordinator failing the same sync forever.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    servers = await manager.servers_add(6, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, _ = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+            assert len(tablets[0].replicas) == 3, f"Expected 3 replicas, got {len(tablets[0].replicas)}"
+
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i + 1})")
+
+            async def check():
+                for i in range(10):
+                    rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
+                    assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                    assert rows[0].c == i + 1, f"Expected c={i + 1} for pk={i}, got {rows[0].c}"
+
+            await check()
+
+            # Each rack holds two nodes, so a replica can move within its rack
+            # without changing the rack distribution. Every migration below picks a
+            # destination that never hosted this raft group before.
+            racks = [[host_ids[0], host_ids[1]], [host_ids[2], host_ids[3]], [host_ids[4], host_ids[5]]]
+
+            async def migrate_within_rack(rack, fail_first_config_change):
+                replicas = (await get_all_tablet_replicas(manager, servers[0], ks, table_name))[0].replicas
+                src_host_id, src_shard = next((h, s) for h, s in replicas if h in rack)
+                dst_host_id = next(h for h in rack if h != src_host_id)
+                if fail_first_config_change:
+                    # Fail the first attempt on every node, so that whichever replica
+                    # is the group leader fails its first attempt.
+                    for server in servers:
+                        await manager.api.enable_injection(server.ip_addr, "sc_config_sync_fail", one_shot=True)
+
+                logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
+                await manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                              src_host_id, src_shard, dst_host_id, 0, tablet_token)
+                await manager.api.quiesce_topology(servers[0].ip_addr)
+
+                replicas = (await get_all_tablet_replicas(manager, servers[0], ks, table_name))[0].replicas
+                assert (dst_host_id, 0) in replicas, f"Expected {dst_host_id} among replicas, got {replicas}"
+                assert not any(h == src_host_id for h, _ in replicas), \
+                    f"Expected {src_host_id} to be gone from replicas, got {replicas}"
+
+            await migrate_within_rack(racks[0], fail_first_config_change=True)
+            await check()
+
+            # The topology state machine must still be responsive after the failed
+            # attempt, so migrate another replica, this time without any injection.
+            await migrate_within_rack(racks[1], fail_first_config_change=False)
+            await check()
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_tablet_migration_rollback_from_sc_become_voter(manager: ScyllaClusterManager):
+    """Rolling back from sc_become_voter must not require completing the change
+    being rolled back.
+
+    The coordinator enters sc_rollback with a plain transition, so the rollback
+    is reachable even though the forward configuration change can't complete -
+    here because attempts keep failing and the pending replica is dead. The
+    forward change never landed, so the sync of sc_rollback finds the group
+    converged, and the migration parks at sc_remove_pending, whose sync has to
+    remove the dead pending replica.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    servers = await manager.servers_add(4, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    def server_by_host_id(host_id):
+        for server, hid in zip(servers, host_ids):
+            if hid == host_id:
+                return server
+        raise RuntimeError(f"Can't find server for host_id {host_id}")
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+            original_replicas = tablets[0].replicas
+            assert len(original_replicas) == 3, f"Expected 3 replicas, got {len(original_replicas)}"
+
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i + 1})")
+
+            async def check():
+                for i in range(10):
+                    rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
+                    assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                    assert rows[0].c == i + 1, f"Expected c={i + 1} for pk={i}, got {rows[0].c}"
+
+            await check()
+
+            rack3 = [host_ids[2], host_ids[3]]
+            src_host_id, src_shard = next((h, s) for h, s in original_replicas if h in rack3)
+            dst_host_id = next(h for h in rack3 if h != src_host_id)
+            dst_server = server_by_host_id(dst_host_id)
+
+            # Park the migration in sc_snapshot_transfer, by which point the
+            # pending replica has already been added to the group as a non-voter.
+            # Mark the log before arming the injection: a message it emits in between
+            # would be invisible to the wait below.
+            dst_log = await manager.server_open_log(dst_server.server_id)
+            mark = await dst_log.mark()
+            await manager.api.enable_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer", one_shot=True)
+
+            logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            move_task = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                        src_host_id, src_shard, dst_host_id, 0, tablet_token)
+            )
+            await dst_log.wait_for("sc_wait_for_snapshot_transfer: waiting for message", from_mark=mark, timeout=60)
+
+            # From now on every configuration change attempt fails, so the
+            # sync of sc_become_voter can't complete and the migration parks there.
+            logger.info("Making all further configuration change attempts fail")
+            for server in servers:
+                await manager.api.enable_injection(server.ip_addr, "sc_config_sync_fail", one_shot=False)
+
+            await manager.api.message_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer")
+
+            async def stage_is(stage):
+                tablet_info = await get_tablet_info(manager, servers[0], ks, table_name, tablet_token)
+                return True if tablet_info is not None and tablet_info.stage == stage else None
+
+            logger.info("Waiting for the migration to reach sc_become_voter")
+            await wait_for(lambda: stage_is("write_both_read_new"), time.time() + 120)
+
+            logger.info(f"Stopping and excluding the pending replica {dst_host_id}")
+            await manager.server_stop(dst_server.server_id, convict=True)
+            await manager.server_not_sees_other_server(servers[0].ip_addr, dst_server.ip_addr)
+            await manager.api.exclude_node(servers[0].ip_addr, [dst_host_id])
+
+            logger.info("Waiting for the coordinator to reach sc_remove_pending")
+            await wait_for(lambda: stage_is("sc_remove_pending"), time.time() + 120)
+
+            # The rollback's own configuration change has to be able to complete.
+            logger.info("Letting configuration changes succeed again")
+            for server in servers:
+                if server.server_id != dst_server.server_id:
+                    await manager.api.disable_injection(server.ip_addr, "sc_config_sync_fail")
+
+            try:
+                await move_task
+            except Exception as exc:
+                logger.info("move_tablet failed while the migration rolled back as expected: %s", exc)
+
+            async def rollback_finished():
+                tablet_info = await get_tablet_info(manager, servers[0], ks, table_name, tablet_token)
+                return True if tablet_info is not None and tablet_info.stage is None else None
+
+            await wait_for(rollback_finished, time.time() + 120)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            assert tablets[0].replicas == original_replicas, \
+                f"Expected replicas to roll back to {original_replicas}, got {tablets[0].replicas}"
+
+            # The group must be usable again: the old replica set is back as the
+            # configuration, so it can elect a leader and accept writes.
+            live_replica_server = server_by_host_id(tablets[0].replicas[0][0])
+            leader_host_id = await wait_for_leader(manager, live_replica_server, group_id)
+            leader_host = host_by_host_id(leader_host_id)
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (100, 101)", host=leader_host)
+
+            await check()
+            rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 100")
+            assert len(rows) == 1
+            assert rows[0].c == 101
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_leader_not_among_tablet_replicas(manager: ScyllaClusterManager):
+    """A leader reported by the local raft server that isn't a tablet replica must not
+    be treated as an internal error.
+
+    current_leader() on a follower is the last leader it heard from, so a replica that
+    a tablet migration has just removed from the raft group keeps being reported until
+    the follower's election timeout fires. There is nowhere to redirect the request to,
+    but the condition is transient: the request waits for a new leader and, if none
+    arrives before its deadline, times out. The error injection emulates the condition
+    directly, because the real window closes as soon as the group elects a new leader.
+    """
+    servers = await manager.servers_add(1, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql, _ = await manager.get_ready_cql(servers)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 13)")
+
+            await manager.api.enable_injection(servers[0].ip_addr, "sc_report_stale_leader", one_shot=False)
+
+            with pytest.raises(WriteTimeout, match=f"Query timed out for {table}"):
+                await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (7, 23) USING TIMEOUT 100ms")
+
+            with pytest.raises(ReadTimeout, match=f"Query timed out for {table}"):
+                await cql.run_async(f"SELECT * FROM {table} WHERE pk = 0 USING TIMEOUT 100ms")
+
+            await manager.api.disable_injection(servers[0].ip_addr, "sc_report_stale_leader")
+
+            # Sanity check: nothing broke and the table is still usable.
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (17, 7)")
+            rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 17")
+            assert len(rows) == 1
+            assert rows[0].v == 7
+
+
+async def boot_cluster_led_from_rack3(manager: ScyllaClusterManager):
+    """Boot four nodes, two of them in rack3, for moving a tablet's replica from one node of
+    rack3 to the other, where the leaving replica is the raft group's leader.
+
+    With RF=3 the tablet has a replica in each rack. The nodes of rack1 and rack2 never
+    campaign, so the replica in rack3 leads until it demotes itself, and the pending one
+    can take over after it. The two rack3 nodes come first in the returned lists.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    servers += await manager.servers_add(2, cmdline=cmdline,
+                                         config=DEFAULT_CONFIG | {'error_injections_at_startup': ['avoid_being_raft_leader']},
+                                         property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    await manager.disable_tablet_balancing()
+    return servers, cql, hosts, host_ids
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_requests_on_leaving_leader_after_its_demotion(manager: ScyllaClusterManager):
+    """Requests coordinated by a leaving replica after the migration demoted it must be
+    served while the migration is still at sc_become_voter (SCYLLADB-4704).
+
+    The leaving replica is the leader, so it commits its own demotion at sc_become_voter
+    and steps down. It stays a member of the group until the requests of that stage are
+    drained, so the next leader contacts it and it redirects the requests there. The
+    migration is held right after the leaving replica's sync, and the requests must
+    complete before it is let through: no raft wait may end only on topology progress.
+    """
+    servers, cql, hosts, host_ids = await boot_cluster_led_from_rack3(manager)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (0, 1)")
+
+            rack3 = host_ids[:2]
+            src_host_id, src_shard = next((h, s) for h, s in tablets[0].replicas if h in rack3)
+            dst_host_id = next(h for h in rack3 if h != src_host_id)
+            src_idx = host_ids.index(src_host_id)
+            src_server, src_host = servers[src_idx], hosts[src_idx]
+            dst_server = servers[host_ids.index(dst_host_id)]
+
+            await wait_for_leader(manager, src_server, group_id, expected_host_id=src_host_id)
+
+            # Park the migration in sc_snapshot_transfer, before the stage whose
+            # configuration change demotes the leaving replica. Mark the log before
+            # arming the injection: a message it emits in between would be invisible to
+            # the wait below.
+            dst_log = await manager.server_open_log(dst_server.server_id)
+            mark = await dst_log.mark()
+            await manager.api.enable_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer", one_shot=True)
+
+            logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            move_task = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                        src_host_id, src_shard, dst_host_id, 0, tablet_token)
+            )
+            await dst_log.wait_for("sc_wait_for_snapshot_transfer: waiting for message", from_mark=mark, timeout=60)
+
+            # Hold the migration at sc_become_voter once the leaving replica has
+            # converged the configuration there, which it does by committing its own
+            # demotion: use_new is published only after the leaving replica answers.
+            src_log = await manager.server_open_log(src_server.server_id)
+            mark = await src_log.mark()
+            await manager.api.enable_injection(src_server.ip_addr, "sc_pause_after_config_sync", one_shot=True)
+            await manager.api.message_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer")
+            await src_log.wait_for("sc_pause_after_config_sync: waiting for message", from_mark=mark, timeout=60)
+            tablet_info = await get_tablet_info(manager, servers[0], ks, table_name, tablet_token)
+            assert tablet_info.stage == "write_both_read_new", f"Expected to be parked at sc_become_voter, got {tablet_info.stage}"
+            await src_log.wait_for(f"this replica {src_host_id} is no longer a leader", from_mark=mark, timeout=60)
+
+            logger.info(f"Sending a write and a linearizable read to the leaving replica {src_host_id}")
+            write = cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (0, 2)", host=src_host)
+            read = cql.run_async(
+                SimpleStatement(f"SELECT c FROM {table} WHERE pk = 0", consistency_level=ConsistencyLevel.QUORUM),
+                host=src_host)
+            await asyncio.wait_for(write, timeout=30)
+            rows = await asyncio.wait_for(read, timeout=30)
+            assert len(rows) == 1 and rows[0].c in (1, 2), f"Unexpected read result {rows}"
+
+            tablet_info = await get_tablet_info(manager, servers[0], ks, table_name, tablet_token)
+            assert tablet_info.stage == "write_both_read_new", \
+                f"The requests completed only after the migration moved on, to {tablet_info.stage}"
+
+            logger.info("Publishing use_new")
+            await manager.api.message_injection(src_server.ip_addr, "sc_pause_after_config_sync")
+            await move_task
+
+            rows = await cql.run_async(SimpleStatement(f"SELECT c FROM {table} WHERE pk = 0",
+                                                       consistency_level=ConsistencyLevel.QUORUM))
+            assert len(rows) == 1 and rows[0].c == 2, f"Expected the write to be applied, got {rows}"
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_read_barrier_on_leaving_leader_across_its_demotion(manager: ScyllaClusterManager):
+    """A linearizable read whose read barrier starts on a leaving replica after the
+    migration demoted it must be served while the migration is still at sc_become_voter
+    (SCYLLADB-4704).
+
+    Unlike in test_requests_on_leaving_leader_after_its_demotion, the read arrives while
+    the leaving replica is still the leader, so it passes the coordinator's leader check
+    and only then runs into the demotion. The replica is still a member, so the read
+    barrier finds the new leader, and the replica keeps receiving the log it waits for.
+    """
+    servers, cql, hosts, host_ids = await boot_cluster_led_from_rack3(manager)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (0, 1)")
+
+            rack3 = host_ids[:2]
+            src_host_id, src_shard = next((h, s) for h, s in tablets[0].replicas if h in rack3)
+            dst_host_id = next(h for h in rack3 if h != src_host_id)
+            src_idx = host_ids.index(src_host_id)
+            src_server, src_host = servers[src_idx], hosts[src_idx]
+            dst_server = servers[host_ids.index(dst_host_id)]
+
+            await wait_for_leader(manager, src_server, group_id, expected_host_id=src_host_id)
+
+            # Park the migration in sc_snapshot_transfer. Mark the log before arming the
+            # injection: a message it emits in between would be invisible to the wait below.
+            dst_log = await manager.server_open_log(dst_server.server_id)
+            mark = await dst_log.mark()
+            await manager.api.enable_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer", one_shot=True)
+
+            logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            move_task = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                        src_host_id, src_shard, dst_host_id, 0, tablet_token)
+            )
+            await dst_log.wait_for("sc_wait_for_snapshot_transfer: waiting for message", from_mark=mark, timeout=60)
+
+            # Let the migration reach sc_become_voter, but not demote the leaving
+            # replica yet: every configuration change attempt fails.
+            await gather_safely(*[manager.api.enable_injection(s.ip_addr, "sc_config_sync_fail", one_shot=False)
+                                  for s in servers])
+            await manager.api.message_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer")
+
+            async def at_sc_become_voter():
+                tablet_info = await get_tablet_info(manager, src_server, ks, table_name, tablet_token)
+                return True if tablet_info is not None and tablet_info.stage == "write_both_read_new" else None
+            await wait_for(at_sc_become_voter, time.time() + 60)
+            # The read below has to pin the view of sc_become_voter: one that pinned the
+            # view of the previous stage would hold up the barrier of sc_become_voter, and
+            # with it the sync this test waits for. Applying a group0 entry writes
+            # system.tablets before it updates the tablet map requests use, so seeing the
+            # stage there isn't enough. A read barrier started after the entry committed
+            # waits for its whole apply.
+            await read_barrier(manager.api, src_server.ip_addr)
+
+            # The leaving replica is still the leader, so the read gets as far as the
+            # read barrier, and is held there.
+            logger.info(f"Sending a linearizable read to the leaving replica {src_host_id}")
+            await manager.api.enable_injection(src_server.ip_addr, "sc_coordinator_wait_before_query_read_barrier", one_shot=True)
+            read = cql.run_async(
+                SimpleStatement(f"SELECT c FROM {table} WHERE pk = 0", consistency_level=ConsistencyLevel.QUORUM),
+                host=src_host)
+            await manager.api.wait_for_injection_enter(src_server.ip_addr, "sc_coordinator_wait_before_query_read_barrier")
+
+            # Now let the leaving replica demote itself, and hold the migration before
+            # use_new, as in test_requests_on_leaving_leader_after_its_demotion.
+            src_log = await manager.server_open_log(src_server.server_id)
+            mark = await src_log.mark()
+            await manager.api.enable_injection(src_server.ip_addr, "sc_pause_after_config_sync", one_shot=True)
+            await gather_safely(*[manager.api.disable_injection(s.ip_addr, "sc_config_sync_fail") for s in servers])
+            await src_log.wait_for("sc_pause_after_config_sync: waiting for message", from_mark=mark, timeout=60)
+            await src_log.wait_for(f"this replica {src_host_id} is no longer a leader", from_mark=mark, timeout=60)
+
+            logger.info("Releasing the read into its read barrier")
+            await manager.api.message_injection(src_server.ip_addr, "sc_coordinator_wait_before_query_read_barrier")
+            rows = await asyncio.wait_for(read, timeout=30)
+            assert len(rows) == 1 and rows[0].c == 1, f"Unexpected read result {rows}"
+
+            tablet_info = await get_tablet_info(manager, servers[0], ks, table_name, tablet_token)
+            assert tablet_info.stage == "write_both_read_new", \
+                f"The read completed only after the migration moved on, to {tablet_info.stage}"
+
+            logger.info("Publishing use_new")
+            await manager.api.message_injection(src_server.ip_addr, "sc_pause_after_config_sync")
+            await move_task
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_tablet_migration_during_insert(manager: ScyllaClusterManager):
+    """An INSERT that resolved its raft group on the leaving replica at sc_become_voter
+    is served, and the leaving replica keeps its raft server until the INSERT is done
+    (SCYLLADB-4703).
+
+    The INSERT pins the view of sc_become_voter, in which the leaving replica serves, and
+    is held right before acquiring the group's server. The migration moves on to use_new,
+    but the barrier of use_new waits for the INSERT, so the server is not torn down under
+    it.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=cmdline)
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} "
+                                          "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+            [(src_host_id, src_shard)] = tablets[0].replicas
+            src_idx = host_ids.index(src_host_id)
+            src_server, src_host = servers[src_idx], hosts[src_idx]
+            dst_server, dst_host_id = servers[1 - src_idx], host_ids[1 - src_idx]
+
+            await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES (0, 0)")
+
+            # Park the migration in sc_snapshot_transfer, by which point the pending replica has
+            # been added to the group as a non-voter. Mark the log before arming the injection: a
+            # message it emits in between would be invisible to the wait below.
+            dst_log = await manager.server_open_log(dst_server.server_id)
+            mark = await dst_log.mark()
+            await manager.api.enable_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer", one_shot=True)
+            logger.info(f"Migrating the tablet from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            move_task = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                        src_host_id, src_shard, dst_host_id, 0, tablet_token))
+            await dst_log.wait_for("sc_wait_for_snapshot_transfer: waiting for message", from_mark=mark, timeout=60)
+
+            # From now on every configuration change attempt fails, so the migration parks in
+            # sc_become_voter.
+            for server in servers:
+                await manager.api.enable_injection(server.ip_addr, "sc_config_sync_fail", one_shot=False)
+            await manager.api.message_injection(dst_server.ip_addr, "sc_wait_for_snapshot_transfer")
+
+            async def stage_is(stage):
+                tablet_info = await get_tablet_info(manager, src_server, ks, table_name, tablet_token)
+                return True if tablet_info is not None and tablet_info.stage == stage else None
+            logger.info("Waiting for the migration to reach sc_become_voter")
+            await wait_for(lambda: stage_is("write_both_read_new"), time.time() + 120)
+            # Applying a group0 entry writes system.tablets before it updates the tablet map
+            # requests use. A read barrier started after the entry committed waits for its
+            # whole apply, so the INSERT below pins the view of sc_become_voter; one that
+            # pinned the previous stage's would hold up the barrier of sc_become_voter.
+            await read_barrier(manager.api, src_server.ip_addr)
+
+            # The INSERT resolves the group from the tablet map of sc_become_voter and stops right
+            # before acquiring it.
+            await manager.api.enable_injection(src_server.ip_addr, "sc_coordinator_wait_before_acquire_server", one_shot=True)
+            insert_fut = cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, v) VALUES (1, 1)",
+                                                       retry_policy=FallthroughRetryPolicy()), host=src_host)
+            await manager.api.wait_for_injection_enter(src_server.ip_addr, "sc_coordinator_wait_before_acquire_server")
+
+            # Let the migration move on to use_new. Its barrier waits for the held INSERT.
+            src_log = await manager.server_open_log(src_server.server_id)
+            mark = await src_log.mark()
+            for server in servers:
+                await manager.api.disable_injection(server.ip_addr, "sc_config_sync_fail")
+            logger.info("Waiting for the migration to reach use_new")
+            await wait_for(lambda: stage_is("use_new"), time.time() + 120)
+            assert not await src_log.grep(f"raft server for group id {group_id} is destroyed", from_mark=mark), \
+                "The leaving replica's raft server was torn down under a request that may still enter it"
+
+            await manager.api.message_injection(src_server.ip_addr, "sc_coordinator_wait_before_acquire_server")
+            await insert_fut
+            await move_task
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert [host for host, _ in tablets[0].replicas] == [dst_host_id]
+            rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 1")
+            assert len(rows) == 1 and rows[0].v == 1
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_pending_replica_skips_start_migration(manager: ScyllaClusterManager):
+    """A pending replica that applies start_migration together with the next stages, in one
+    group0 apply, has the tablet's storage before its raft server applies anything
+    (SCYLLADB-5638).
+
+    No barrier makes every node see start_migration of a strongly consistent tablet, so a
+    pending replica that lags in group0 may never see it. The test holds the pending
+    replica's group0 applier on an unrelated command until the migration has moved past
+    start_migration, so the stage changes queued behind it are applied together.
+    """
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'group0_raft_sm=trace',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=cmdline)
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} "
+                                          "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            table_name = table.split('.')[-1]
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+            [(src_host_id, src_shard)] = tablets[0].replicas
+
+            # The pending replica must not be the topology coordinator: the coordinator's group0
+            # operations would wait for the held applier.
+            coordinator_host_id = await get_topology_coordinator(manager)
+            dst_idx = next(i for i, h in enumerate(host_ids) if h not in (src_host_id, coordinator_host_id))
+            dst_server, dst_host_id = servers[dst_idx], host_ids[dst_idx]
+            other_idx = next(i for i in range(len(servers)) if i != dst_idx)
+            other_server, other_host = servers[other_idx], hosts[other_idx]
+
+            # Entries in the group's log, which the pending replica applies once it joins.
+            for pk in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, v) VALUES ({pk}, {pk})")
+
+            # Hold the pending replica's applier on a group0 command that involves neither the
+            # schema nor the topology. The command completes only once every node has applied it,
+            # so it is awaited after the release.
+            dst_log = await manager.server_open_log(dst_server.server_id)
+            mark = await dst_log.mark()
+            await manager.api.enable_injection(dst_server.ip_addr, "group0_state_machine::block_apply", one_shot=True)
+            held_command = cql.run_async(f"CREATE SERVICE LEVEL {unique_name('sl_')}", host=other_host)
+            await dst_log.wait_for("group0_state_machine::block_apply: waiting for message", from_mark=mark, timeout=60)
+
+            logger.info(f"Migrating the tablet from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            move_task = asyncio.create_task(
+                manager.api.move_tablet(other_server.ip_addr, ks, table_name,
+                                        src_host_id, src_shard, dst_host_id, 0, tablet_token))
+
+            # The snapshot transfer runs a group0 read barrier on the pending replica, so the
+            # migration stops at sc_snapshot_transfer until the applier is released.
+            async def at_snapshot_transfer():
+                tablet_info = await get_tablet_info(manager, other_server, ks, table_name, tablet_token)
+                return (tablet_info and tablet_info.stage == "streaming") or None
+            await wait_for(at_snapshot_transfer, time.time() + 60)
+
+            mark = await dst_log.mark()
+            await manager.api.message_injection(dst_server.ip_addr, "group0_state_machine::block_apply")
+            await held_command
+
+            # A pending replica without storage aborts on its first raft apply, and the migration
+            # then waits for it, so watch its log alongside.
+            storage_missing = asyncio.create_task(
+                    dst_log.wait_for("Storage wasn't found for tablet", from_mark=mark, timeout=120))
+            await asyncio.wait([move_task, storage_missing], return_when=asyncio.FIRST_COMPLETED)
+            if storage_missing.done() and not storage_missing.exception():
+                move_task.cancel()
+                pytest.fail("The pending replica applied raft entries without the tablet's storage")
+            storage_missing.cancel()
+            await move_task
+
+            # Without a batch the test would pass without exercising the bug. The held apply logged
+            # its command count before the mark, so the first apply after it is the one that took
+            # the stage changes queued behind the held command.
+            applies = await dst_log.grep(r"apply\(\) is called with (\d+) commands", from_mark=mark, max_count=1)
+            assert applies and int(applies[0][1].group(1)) >= 2, \
+                f"The pending replica didn't apply the stage changes in one batch: {applies}"
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert [host for host, _ in tablets[0].replicas] == [dst_host_id]
+            for pk in range(10):
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {pk}")
+                assert len(rows) == 1 and rows[0].v == pk
+
+
+async def test_raft_group_torn_down_before_tablet_cleanup(manager: ScyllaClusterManager):
+    """A migrated-away tablet's raft group must be torn down before its storage is
+    cleaned up.
+
+    Tablet cleanup stops the tablet's compaction groups, and a raft entry applied
+    after that kills the raft server's applier fiber, which is a fatal background
+    error. The teardown therefore has to complete first - see
+    test_late_raft_apply_after_tablet_cleanup for the failure it prevents.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + ['--logger-log-level', 'raft_topology=debug']
+    servers = await manager.servers_add(4, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, _ = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i + 1})")
+
+            # Both nodes of rack3 can hold the replica without changing the rack
+            # distribution, so the replica can move from one to the other.
+            rack3 = [host_ids[2], host_ids[3]]
+            src_host_id, src_shard = next((h, s) for h, s in tablets[0].replicas if h in rack3)
+            dst_host_id = next(h for h in rack3 if h != src_host_id)
+            src_server = next(s for s, h in zip(servers, host_ids) if h == src_host_id)
+
+            src_log = await manager.server_open_log(src_server.server_id)
+            mark = await src_log.mark()
+
+            logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            await manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                          src_host_id, src_shard, dst_host_id, 0, tablet_token)
+            await manager.api.quiesce_topology(servers[0].ip_addr)
+
+            # Both events happen on the leaving replica, so their order in its log is
+            # the order they happened in.
+            matches = await src_log.grep(f"raft server for group id {group_id} is destroyed"
+                                         f"|Cleaned up tablet .* of table {ks}.{table_name} successfully",
+                                         from_mark=mark)
+            assert len(matches) == 2, f"Expected a teardown and a cleanup on {src_host_id}, got {[m[0] for m in matches]}"
+            assert "is destroyed" in matches[0][0], \
+                f"The raft group was torn down after the tablet cleanup: {[m[0] for m in matches]}"
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_late_raft_apply_after_tablet_cleanup(manager: ScyllaClusterManager):
+    """A raft entry that the leaving replica hasn't applied yet must not be applied
+    after the tablet cleanup of the migration that removed it.
+
+    The entry is committed, so the group makes progress and the migration completes
+    while the leaving replica's applier is parked. Once it resumes, the tablet's
+    compaction groups must still be there - which means the raft group has to be gone
+    before the cleanup ran, so that aborting the raft server drains the applier first.
+    Otherwise the apply fails, killing the applier fiber, and the resulting background
+    error kills the node.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    servers = await manager.servers_add(6, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    await manager.disable_tablet_balancing()
+
+    wait_before_apply_injection = "strong_consistency_state_machine_wait_before_apply"
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i + 1})")
+
+            # The leaving replica must not be the leader: parking the leader's applier
+            # would stall the read barriers the migration itself needs. Only a replica
+            # of the group knows who its leader is.
+            replica_server = next(s for s, h in zip(servers, host_ids) if h == tablets[0].replicas[0][0])
+            leader_host_id = await wait_for_leader(manager, replica_server, group_id)
+            racks = [[host_ids[0], host_ids[1]], [host_ids[2], host_ids[3]], [host_ids[4], host_ids[5]]]
+            src_host_id, src_shard = next((h, s) for h, s in tablets[0].replicas if h != leader_host_id)
+            src_rack = next(rack for rack in racks if src_host_id in rack)
+            dst_host_id = next(h for h in src_rack if h != src_host_id)
+            src_server = next(s for s, h in zip(servers, host_ids) if h == src_host_id)
+
+            # The leaving replica is a follower, and a write is acked once a quorum
+            # holds it, so its applier can still be behind the inserts above. Wait
+            # until all of them are in its local storage - a CL=ONE read on a replica
+            # is served from there, and applies are ordered, so the last row standing
+            # for all of them - otherwise a straggler consumes the one-shot injection
+            # below instead of the entry this test wants parked.
+            src_host = next(h for hid, h in zip(host_ids, hosts) if hid == src_host_id)
+
+            async def has_applied_the_inserts():
+                stmt = SimpleStatement(f"SELECT * FROM {table} WHERE pk = 9",
+                                       consistency_level=ConsistencyLevel.ONE)
+                return True if len(await cql.run_async(stmt, host=src_host)) == 1 else None
+            await wait_for(has_applied_the_inserts, time.time() + 60)
+
+            logger.info(f"Parking the applier of the leaving replica {src_host_id}")
+            # Mark the log before arming the injection: a message it emits in between
+            # would be invisible to the wait below.
+            src_log = await manager.server_open_log(src_server.server_id)
+            mark = await src_log.mark()
+            await manager.api.enable_injection(src_server.ip_addr, wait_before_apply_injection, one_shot=True)
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (100, 101)")
+            await src_log.wait_for(f"{wait_before_apply_injection}: waiting for message", from_mark=mark, timeout=60)
+
+            logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            move_task = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                        src_host_id, src_shard, dst_host_id, 0, tablet_token)
+            )
+
+            # Wait until the leaving replica's raft group is being torn down. Without
+            # the teardown ordering this happens only at the end of the migration, by
+            # which time the tablet cleanup already stopped the tablet's storage, and
+            # releasing the applier below kills the node.
+            await src_log.wait_for(f"schedule_raft_group_deletion\\(\\): group id {group_id}: scheduling",
+                                   from_mark=mark, timeout=120)
+
+            logger.info("Releasing the parked applier")
+            await manager.api.message_injection(src_server.ip_addr, wait_before_apply_injection)
+
+            await move_task
+            await manager.api.quiesce_topology(servers[0].ip_addr)
+
+            replicas = (await get_all_tablet_replicas(manager, servers[0], ks, table_name))[0].replicas
+            assert (dst_host_id, 0) in replicas, f"Expected {dst_host_id} among replicas, got {replicas}"
+            assert not any(h == src_host_id for h, _ in replicas), \
+                f"Expected {src_host_id} to be gone from replicas, got {replicas}"
+
+            # The node that was migrated away from must still be running: a failed
+            # apply kills the applier fiber, and the resulting background error is
+            # fatal.
+            assert await manager.api.get_host_id(src_server.ip_addr) == src_host_id, \
+                f"The leaving replica {src_host_id} is not responding after the migration"
+
+            for i in list(range(10)) + [100]:
+                expected = i + 1
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
+                assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                assert rows[0].c == expected, f"Expected c={expected} for pk={i}, got {rows[0].c}"
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_no_raft_replay_into_a_tablet_that_moved_away(manager: ScyllaClusterManager):
+    """Commitlog replay must not feed a raft group's entries back into a tablet this
+    shard no longer holds a replica of.
+
+    The group is still in tablet metadata - it lives on its other replicas - so its
+    presence there says nothing about whether this node should replay it. Restarting
+    the former replica without a clean shutdown leaves the group's entries in segments
+    that are replayed on the next boot.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'raft_commitlog_replay=debug',
+    ]
+    servers = await manager.servers_add(4, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def server_by_host_id(host_id):
+        for server, hid in zip(servers, host_ids):
+            if hid == host_id:
+                return server
+        raise RuntimeError(f"Can't find server for host_id {host_id}")
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+            original_replicas = tablets[0].replicas
+
+            for i in range(10):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i + 1})")
+
+            rack3 = [host_ids[2], host_ids[3]]
+            src_host_id, src_shard = next((h, s) for h, s in original_replicas if h in rack3)
+            dst_host_id = next(h for h in rack3 if h != src_host_id)
+            src_server = server_by_host_id(src_host_id)
+
+            logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
+            await manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                          src_host_id, src_shard, dst_host_id, 0, tablet_token)
+            await manager.api.quiesce_topology(servers[0].ip_addr)
+
+            replicas = (await get_all_tablet_replicas(manager, servers[0], ks, table_name))[0].replicas
+            assert not any(h == src_host_id for h, _ in replicas), \
+                f"Expected {src_host_id} to be gone from replicas, got {replicas}"
+
+            # Hard stop, so the group's entries stay in commitlog segments that the next
+            # boot replays instead of being dropped by a clean shutdown.
+            logger.info(f"Restarting the former replica {src_host_id} without a clean shutdown")
+            await manager.server_stop(src_server.server_id, convict=False)
+            log = await manager.server_open_log(src_server.server_id)
+            mark = await log.mark()
+            await manager.server_start(src_server.server_id)
+            await manager.servers_see_each_other(servers)
+
+            # Replay must have refused the group, on either of the two counts: the
+            # tablet has no replica here anymore, or the cleanup erased its raft state.
+            discarded = await log.grep(
+                rf"raft_commitlog_replay - group {group_id} (is no longer hosted by this shard"
+                rf"|has no persisted raft state on this shard), discarding",
+                from_mark=mark)
+            # resolve_group() logs the recovered floor for a group it accepts, so its
+            # absence is what says the entries were not replayed.
+            entries_replayed = await log.grep(
+                rf"raft_commitlog_replay - group {group_id}: recovered floor", from_mark=mark)
+            assert not entries_replayed, \
+                f"Replay processed entries of group {group_id} on a node that left it: {entries_replayed}"
+            assert discarded, f"Expected replay to discard the entries of group {group_id}"
+            logger.info(f"Replay discard messages for group {group_id}: {discarded}")
+
+            # No assertion on the cleanup's erase: the ownership test above refuses the
+            # group whether or not the state is still there.
+            cql, hosts = await manager.get_ready_cql(servers)
+            for i in range(10):
+                rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
+                assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                assert rows[0].c == i + 1, f"Expected c={i + 1} for pk={i}, got {rows[0].c}"
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_write_paused_across_leadership_change(manager: ScyllaClusterManager):
+    """
+    Verifies that a strongly consistent write operation is correctly executed
+    if leadership gets transferred away and back, between the moment of choosing
+    the write timestamp and the moment of appending the entry (scylladb/scylladb#26189).
+
+    The test starts a write on one leader, pauses it, transfers leadership
+    and issues a write on the new leader, transfers leadership back and unpauses
+    the first write. The coordinator of the first operation should notice that
+    the term has changed since the timestamp was chosen, and retry the operation,
+    choosing a new, higher timestamp. If the coordinator would instead proceed
+    with the first timestamp, the effect of the write would appear obscured
+    by the other write, breaking linearizability.
+    """
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE,
+                                        auto_rack_dc='my_dc')
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    async with new_test_keyspace(manager,
+            "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}"
+            " AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, v int") as table:
+            table_name = table.split('.')[-1]
+            insert = cql.prepare(f"INSERT INTO {table} (pk, v) VALUES (0, ?)")
+            select = cql.prepare(f"SELECT v FROM {table} WHERE pk = 0")
+            await cql.run_async(insert, [1])
+
+            group_id = await get_table_raft_group_id(manager, ks, table_name)
+            leader_host_id = await wait_for_leader(manager, servers[0], group_id)
+            leader_idx = host_ids.index(leader_host_id)
+            leader_server = servers[leader_idx]
+            leader_host = hosts[leader_idx]
+            other_idx = 1 - leader_idx
+            other_server = servers[other_idx]
+            other_host = hosts[other_idx]
+            other_host_id = host_ids[other_idx]
+            logger.info(f"Initial leader of group {group_id}: {leader_host_id}")
+
+            # Pause a write on the leader after the timestamp and the term
+            # are determined, but before an attempt is made to append the entry.
+            await manager.api.enable_injection(leader_server.ip_addr,
+                "block_raft_add_entry_before_waiting_for_memory", one_shot=True)
+            # We need to get the ResponseFuture to get the trace, hence to_thread + cql.execute
+            paused_write = asyncio.create_task(asyncio.to_thread(cql.execute, insert, [2],
+                                                                 host=leader_host, trace=True, timeout=120.0))
+            await manager.api.wait_for_injection_enter(leader_server.ip_addr, "block_raft_add_entry_before_waiting_for_memory")
+
+            # Move leadership away and let the new leader write a value to the
+            # same row. The new leader will most likely choose a higher timestamp
+            # than the one chosen for the paused write.
+            await ensure_raft_group_leader_on(manager, other_server, group_id)
+            logger.info(f"Leadership moved to {other_host_id}, writing a newer value")
+            await cql.run_async(insert, [3], host=other_host)
+
+            # Transfer the leadership back and unblock the paused write.
+            await ensure_raft_group_leader_on(manager, leader_server, group_id)
+            logger.info(f"Leadership moved back to {leader_host_id}, releasing the paused write")
+
+            leader_log = await manager.server_open_log(leader_server.server_id)
+            mark = await leader_log.mark()
+            await manager.api.message_injection(leader_server.ip_addr,
+                                                "block_raft_add_entry_before_waiting_for_memory")
+
+            # Wait until the paused write successfully completes
+            paused_write_result = await paused_write
+
+            # Verify that the effect of the paused write is visible. The coordinator
+            # of the previously paused write is a leader again, but it must notice
+            # that leadership got temporarily transferred away and it must choose
+            # a new timestamp for the write. If it didn't do that, then the write
+            # would lose to the write of the other coordinator and the query
+            # would return "3" instead of "2".
+            rows = await cql.run_async(select)
+            assert rows[0].v == 2
+
+            # Assert that there was a retry on the previously-paused leader.
+            await leader_log.wait_for("add_entry, got retriable error.*Not a leader",
+                                      from_mark=mark, timeout=60)
+
+            # Assert that no forwarding to a different node took place
+            # and everything was executed within the coordinator
+            trace = paused_write_result.get_query_trace()
+            sources = frozenset(event.source for event in trace.events)
+            assert sources == frozenset([leader_server.ip_addr])
+
+
+async def test_bootstrap_with_existing_sc_table(manager: ScyllaClusterManager):
+    """
+    A node joining a cluster that already has a strongly-consistent table
+    receives system.tablets rows with raft_group_id in the group0 snapshot
+    before it learns the cluster's enabled features. Reading those rows
+    must not depend on the feature being enabled yet, otherwise the
+    snapshot transfer fails and the node never joins.
+    """
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES (1, 1)")
+
+            new_server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+            cql, hosts = await manager.get_ready_cql([server, new_server])
+
+            rows = await cql.run_async(f"SELECT c FROM {table} WHERE pk = 1", host=hosts[1])
+            assert [r.c for r in rows] == [1]
+
+
+SC_RAFT_METRICS_PREFIX = 'scylla_strong_consistency_raft_'
+SC_REQUEST_METRICS_PREFIX = 'scylla_strong_consistency_table_'
+SC_APPLY_METRICS_PREFIX = 'scylla_strong_consistency_state_machine_'
+
+def sc_raft_metric_lines(metrics: ScyllaMetrics) -> list[ScyllaMetricsLine]:
+    return [line for l in metrics.lines_by_prefix(SC_RAFT_METRICS_PREFIX)
+            if (line := ScyllaMetricsLine.from_string(l)) is not None]
+
+async def get_host_ids(manager: ScyllaClusterManager, servers: list[ServerInfo]) -> list[str]:
+    return [str(host_id) for host_id in await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])]
+
+async def wait_for_sc_raft_series_gone(manager: ScyllaClusterManager, server: ServerInfo):
+    async def series_gone():
+        metrics = await manager.metrics.query(server.ip_addr)
+        return True if not sc_raft_metric_lines(metrics) else None
+    await wait_for(series_gone, time.time() + 60)
+
+async def wait_for_sc_applies(manager: ScyllaClusterManager, servers: list[ServerInfo], labels: dict, writes: int):
+    async def all_applied():
+        applied = [(await manager.metrics.query(s.ip_addr)).get(f'{SC_APPLY_METRICS_PREFIX}apply_latency_count', labels)
+                   for s in servers]
+        logger.info(f"Writes applied per node: {applied}")
+        return True if applied == [writes] * len(servers) else None
+    await wait_for(all_applied, time.time() + 60)
+
+async def test_sc_raft_metrics_aggregated_per_table(manager: ScyllaClusterManager):
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql = manager.get_cql()
+    host_ids = await get_host_ids(manager, servers)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int)")
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        leader_host_id = str(await wait_for_leader(manager, servers[0], group_id))
+        leader = servers[host_ids.index(leader_host_id)]
+        follower = next(s for s in servers if s.server_id != leader.server_id)
+        labels = {'ks': ks, 'cf': 'test'}
+        commands = labels | {'log_entry_type': 'command'}
+
+        logger.info(f"Group {group_id} is led by {leader}, reading its metrics before writing")
+        before = await manager.metrics.query(leader.ip_addr)
+        commands_before = before.get(f'{SC_RAFT_METRICS_PREFIX}add_entries', commands) or 0
+
+        writes = 10
+        for i in range(writes):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({i}, {i})")
+
+        logger.info("The writes show up in the counters of the table on the leader")
+        after = await manager.metrics.query(leader.ip_addr)
+        commands_after = after.get(f'{SC_RAFT_METRICS_PREFIX}add_entries', commands) or 0
+        assert commands_after - commands_before >= writes
+        assert after.get(f'{SC_RAFT_METRICS_PREFIX}leaders', labels) == 1
+        follower_metrics = await manager.metrics.query(follower.ip_addr)
+        assert follower_metrics.get(f'{SC_RAFT_METRICS_PREFIX}leaders', labels) == 0
+
+        logger.info("The series are labelled with the table and aggregated over the shards like the node-level table metrics")
+        lines = sc_raft_metric_lines(after)
+        assert lines
+        for line in lines:
+            assert line.labels['ks'] == ks
+            assert line.labels['cf'] == 'test'
+            assert 'shard' not in line.labels
+
+        logger.info("The group0 metrics keep their own series")
+        group0_lines = [ScyllaMetricsLine.from_string(l) for l in after.lines_by_prefix('scylla_raft_add_entries')]
+        assert group0_lines
+        for line in group0_lines:
+            assert 'id' in line.labels
+            assert 'ks' not in line.labels
+
+        logger.info("Dropping the table removes its series")
+        await cql.run_async(f"DROP TABLE {ks}.test")
+        await wait_for_sc_raft_series_gone(manager, leader)
+
+async def test_sc_raft_metrics_rpc_memory(manager: ScyllaClusterManager):
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql = manager.get_cql()
+    host_ids = await get_host_ids(manager, servers)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int)")
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        leader_host_id = str(await wait_for_leader(manager, servers[0], group_id))
+        leader = servers[host_ids.index(leader_host_id)]
+        labels = {'ks': ks, 'cf': 'test'}
+
+        writes = 50
+        logger.info(f"Writing {writes} rows concurrently through the leader {leader}")
+        await gather_safely(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({i}, {i})") for i in range(writes)])
+
+        logger.info("The memory charged for the append requests is released once they are sent")
+        async def memory_released():
+            metrics = await manager.metrics.query(leader.ip_addr)
+            values = {
+                'table in flight': metrics.get(f'{SC_RAFT_METRICS_PREFIX}append_entries_in_flight_bytes', labels),
+                'table waiters': metrics.get(f'{SC_RAFT_METRICS_PREFIX}append_entries_memory_waiters', labels),
+                'group0 in flight': metrics.get('scylla_raft_group0_append_entries_in_flight_bytes'),
+                'group0 waiters': metrics.get('scylla_raft_group0_append_entries_memory_waiters'),
+            }
+            logger.info(f"{values}")
+            return True if all(value == 0 for value in values.values()) else None
+        await wait_for(memory_released, time.time() + 60)
+
+        logger.info("Group 0 exports the wait counter even though nothing had to wait")
+        metrics = await manager.metrics.query(leader.ip_addr)
+        assert metrics.get('scylla_raft_group0_append_entries_memory_waits') is not None
+
+async def test_sc_raft_metrics_per_shard(manager: ScyllaClusterManager):
+    config = DEFAULT_CONFIG | {'enable_keyspace_column_family_metrics': True}
+    servers = await manager.servers_add(3, config=config, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql = manager.get_cql()
+    host_ids = await get_host_ids(manager, servers)
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 4} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int, v blob)")
+        table_id = await manager.get_table_id(ks, 'test')
+        rows = await cql.run_async(f"SELECT raft_group_id FROM system.tablets WHERE table_id = {table_id}")
+        group_ids = [str(row.raft_group_id) for row in rows]
+        assert len(group_ids) == 4
+
+        leaders_per_host = {host_id: 0 for host_id in host_ids}
+        for group_id in group_ids:
+            leaders_per_host[str(await wait_for_leader(manager, servers[0], group_id))] += 1
+        logger.info(f"Groups led per host: {leaders_per_host}")
+
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({i}, {i})")
+
+        labels = {'ks': ks, 'cf': 'test'}
+        tablets = await get_all_tablet_replicas(manager, servers[0], ks, 'test')
+        for server, host_id in zip(servers, host_ids):
+            logger.info(f"Checking the metrics of {server}, which leads {leaders_per_host[host_id]} groups")
+            metrics = await manager.metrics.query(server.ip_addr)
+            lines = sc_raft_metric_lines(metrics)
+            assert lines
+            for line in lines:
+                assert line.labels['ks'] == ks
+                assert line.labels['cf'] == 'test'
+                assert 'shard' in line.labels
+            assert metrics.get(f'{SC_RAFT_METRICS_PREFIX}leaders', labels) == leaders_per_host[host_id]
+
+            replica_shards = {str(shard) for tablet in tablets for host, shard in tablet.replicas if str(host) == host_id}
+            reporting_shards = {line.labels['shard'] for line in lines if line.name == f'{SC_RAFT_METRICS_PREFIX}leaders'}
+            assert reporting_shards == replica_shards
+
+        logger.info("Every replica applies every write, the followers possibly after the write returned")
+        await wait_for_sc_applies(manager, servers, labels, 10)
+
+        logger.info("A write over the raft command size limit fails and counts as an error of the table")
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        with pytest.raises(InvalidRequest, match="exceeds the limit"):
+            await cql.run_async(insert, [10, b'x' * 200 * 1024])
+
+        logger.info("The request and apply histograms are summed over the shards, while the request errors and the raft series are reported per shard")
+        metrics = [await manager.metrics.query(s.ip_addr) for s in servers]
+        for prefix in (SC_REQUEST_METRICS_PREFIX, SC_APPLY_METRICS_PREFIX):
+            lines = [line for m in metrics for l in m.lines_by_prefix(prefix)
+                     if (line := ScyllaMetricsLine.from_string(l)) is not None and '_latency_' in line.name]
+            assert lines
+            for line in lines:
+                assert 'shard' not in line.labels
+        errors = [line for m in metrics for l in m.lines_by_prefix(f'{SC_REQUEST_METRICS_PREFIX}write_errors')
+                  if (line := ScyllaMetricsLine.from_string(l)) is not None]
+        assert len(errors) == 1
+        assert errors[0].labels['reason'] == 'other'
+        assert errors[0].value == 1
+        assert 'shard' in errors[0].labels
+
+async def test_sc_raft_metrics_disabled(manager: ScyllaClusterManager):
+    config = DEFAULT_CONFIG | {'enable_node_aggregated_table_metrics': False}
+    servers = await manager.servers_add(3, config=config, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int)")
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        await wait_for_leader(manager, servers[0], group_id)
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({i}, {i})")
+
+        logger.info("Turning the node-aggregated table metrics off leaves out the raft, request and apply metrics of the table, group 0 keeps its own")
+        for server in servers:
+            metrics = await manager.metrics.query(server.ip_addr)
+            assert not sc_raft_metric_lines(metrics)
+            assert not metrics.lines_by_prefix(SC_REQUEST_METRICS_PREFIX)
+            assert not metrics.lines_by_prefix(SC_APPLY_METRICS_PREFIX)
+            assert metrics.lines_by_prefix('scylla_raft_add_entries')
+
+async def test_sc_raft_metrics_survive_tablet_migration(manager: ScyllaClusterManager):
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql = manager.get_cql()
+    host_ids = await get_host_ids(manager, servers)
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int)")
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        tablet = (await get_all_tablet_replicas(manager, servers[0], ks, 'test'))[0]
+        src_host_id, src_shard = tablet.replicas[0]
+        src_host_id = str(src_host_id)
+        src = servers[host_ids.index(src_host_id)]
+        await wait_for_leader(manager, src, group_id, expected_host_id=src_host_id)
+        commands = {'ks': ks, 'cf': 'test', 'log_entry_type': 'command'}
+        applied = {'ks': ks, 'cf': 'test'}
+
+        writes = 10
+        for i in range(writes):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({i}, {i})")
+        # A write waits for its entry to be committed, not applied.
+        async def writes_applied():
+            metrics = await manager.metrics.query(src.ip_addr)
+            applied_entries = metrics.get(f'{SC_RAFT_METRICS_PREFIX}applied_entries', applied) or 0
+            return metrics if applied_entries >= writes else None
+        before = await wait_for(writes_applied, time.time() + 60)
+        commands_before = before.get(f'{SC_RAFT_METRICS_PREFIX}add_entries', commands) or 0
+        applied_before = before.get(f'{SC_RAFT_METRICS_PREFIX}applied_entries', applied) or 0
+        assert commands_before >= writes
+        assert applied_before >= writes
+
+        dst_host_id = next(host_id for host_id in host_ids if host_id != src_host_id)
+        dst = servers[host_ids.index(dst_host_id)]
+        logger.info(f"Moving the only tablet of the table from {src} to {dst}")
+        await manager.api.move_tablet(servers[0].ip_addr, ks, 'test', src_host_id, src_shard,
+                                      dst_host_id, 0, tablet.last_token)
+        await manager.api.quiesce_topology(servers[0].ip_addr)
+        await wait_for_leader(manager, dst, group_id, expected_host_id=dst_host_id)
+
+        logger.info("The node the tablet left keeps the counters of the table, they do not go backwards")
+        after = await manager.metrics.query(src.ip_addr)
+        commands_after = after.get(f'{SC_RAFT_METRICS_PREFIX}add_entries', commands)
+        applied_after = after.get(f'{SC_RAFT_METRICS_PREFIX}applied_entries', applied)
+        assert commands_after is not None
+        assert applied_after is not None
+        assert commands_after >= commands_before
+        assert applied_after >= applied_before
+
+        logger.info("Dropping the table removes the series of that node too")
+        await cql.run_async(f"DROP TABLE {ks}.test")
+        await wait_for_sc_raft_series_gone(manager, src)
+
+async def test_sc_request_metrics_per_table(manager: ScyllaClusterManager):
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql, hosts = await manager.get_ready_cql(servers)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int)")
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        await wait_for_leader(manager, servers[0], group_id)
+        labels = {'ks': ks, 'cf': 'test'}
+
+        logger.info("Sending the requests through every node, so that the followers redirect most of them to the leader")
+        writes = 3 * len(hosts)
+        for i in range(writes):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({i}, {i})", host=hosts[i % len(hosts)])
+        linearizable = SimpleStatement(f"SELECT * FROM {ks}.test WHERE pk = 0", consistency_level=ConsistencyLevel.QUORUM)
+        for host in hosts:
+            await cql.run_async(linearizable, host=host)
+        non_linearizable = SimpleStatement(f"SELECT * FROM {ks}.test WHERE pk = 0", consistency_level=ConsistencyLevel.ONE)
+        await cql.run_async(non_linearizable, host=hosts[0])
+
+        metrics = [await manager.metrics.query(s.ip_addr) for s in servers]
+        def total(name: str, extra_labels: dict = {}):
+            return sum(m.get(f'{SC_REQUEST_METRICS_PREFIX}{name}', labels | extra_labels) or 0 for m in metrics)
+
+        logger.info("A request counts for the table once, on the node it ended on")
+        assert total('write_latency_count') == writes
+        assert total('read_latency_count', {'read_type': 'linearizable'}) == len(hosts)
+        assert metrics[0].get(f'{SC_REQUEST_METRICS_PREFIX}read_latency_count', labels | {'read_type': 'non_linearizable'}) == 1
+        assert total('write_errors') == 0
+        assert total('read_errors') == 0
+
+        logger.info("The series are labelled with the table and summed over the shards")
+        lines = [line for m in metrics for l in m.lines_by_prefix(SC_REQUEST_METRICS_PREFIX)
+                 if (line := ScyllaMetricsLine.from_string(l)) is not None]
+        assert lines
+        for line in lines:
+            assert line.labels['ks'] == ks
+            assert line.labels['cf'] == 'test'
+            assert 'shard' not in line.labels
+
+        logger.info("Dropping the table removes its series")
+        await cql.run_async(f"DROP TABLE {ks}.test")
+        async def series_gone():
+            for server in servers:
+                if (await manager.metrics.query(server.ip_addr)).lines_by_prefix(SC_REQUEST_METRICS_PREFIX):
+                    return None
+            return True
+        await wait_for(series_gone, time.time() + 60)
+
+async def test_sc_apply_metrics_per_table(manager: ScyllaClusterManager):
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int)")
+        group_id = await get_table_raft_group_id(manager, ks, 'test')
+        await wait_for_leader(manager, servers[0], group_id)
+        labels = {'ks': ks, 'cf': 'test'}
+
+        writes = 10
+        for i in range(writes):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({i}, {i})")
+
+        logger.info("Every replica applies every write once, the followers possibly after the write returned")
+        await wait_for_sc_applies(manager, servers, labels, writes)
+
+        logger.info("Every node knew the schema of the writes, so none of them waited for group 0")
+        for server in servers:
+            metrics = await manager.metrics.query(server.ip_addr)
+            assert metrics.get(f'{SC_APPLY_METRICS_PREFIX}schema_barrier_waits', labels) is None
+
+QUERY = {'insert': "INSERT INTO {table} (pk, c) VALUES ({key}, {i})",
+         'select': "SELECT c FROM {table} WHERE pk = {key}"}
+
+async def routing_counters(manager: ScyllaClusterManager, coordinator: ServerInfo, others: list[ServerInfo], kind: str) -> dict[str, float]:
+    NODE_BOUNCES = {'insert': 'scylla_strong_consistency_coordinator_write_node_bounces',
+                    'select': 'scylla_strong_consistency_coordinator_read_node_bounces'}
+    SHARD_BOUNCES = {'insert': 'scylla_strong_consistency_coordinator_write_shard_bounces',
+                    'select': 'scylla_strong_consistency_coordinator_read_shard_bounces'}
+
+    counters = {'redirected': (await manager.metrics.query(coordinator.ip_addr)).get('scylla_transport_requests_forwarded_redirected') or 0}
+    for s in others:
+        metrics = await manager.metrics.query(s.ip_addr)
+        counters[f'node_bounces@{s.ip_addr}'] = metrics.get(NODE_BOUNCES[kind]) or 0
+        counters[f'shard_bounces@{s.ip_addr}'] = metrics.get(SHARD_BOUNCES[kind]) or 0
+    return counters
+
+@pytest.mark.parametrize("kind", ['insert', 'select'])
+async def test_non_pure_pk_function_is_evaluated_once_per_request(manager: ScyllaClusterManager, kind: str):
+    """A request whose key comes from `uuid()` must be routed like a request with a plain key:
+    `uuid()` runs once, on the node that got the request from the client, and every later hop
+    uses that value.
+
+    2 nodes, RF=2, 8 tablets. Every request goes to the same node, which is a replica of
+    every tablet and so learns the leader from raft. A control run with plain keys shows what
+    a request costs: it goes straight to the leader, nobody redirects it and nobody bounces
+    it. The same requests with `uuid()` as the key must leave the counters just as they are.
+    """
+    servers = await manager.servers_add(2, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='dc1')
+    # A tablet that moves during the run is redirected for a reason that has nothing to do
+    # with uuid().
+    await manager.disable_tablet_balancing()
+    cql, hosts = await manager.get_ready_cql(servers)
+    coordinator, others = servers[0], servers[1:]
+    via = hosts[0]
+
+    ks_opts = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 8} AND consistency = 'global'"
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        async with new_test_table(manager, ks, "pk uuid PRIMARY KEY, c int") as table:
+            def delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
+                return {k: after[k] - before[k] for k in before if after[k] != before[k]}
+
+            async def rerouted(n: int, key: str | None = None) -> dict[int, dict[str, float]]:
+                """Run n requests, each with `key` or a fresh literal; the counter deltas of the re-routed ones."""
+                found = {}
+                for i in range(n):
+                    before = await routing_counters(manager, coordinator, others, kind)
+                    query = QUERY[kind].format(table=table, key=key or uuid.uuid4(), i=i)
+                    rows = await cql.run_async(SimpleStatement(query, consistency_level=ConsistencyLevel.QUORUM), host=via)
+                    assert not rows, f"a read of a fresh key returned rows: {rows}"
+                    if d := delta(before, await routing_counters(manager, coordinator, others, kind)):
+                        found[i] = d
+                return found
+
+            # Control: literal keys. This is what "one key per request" costs.
+            CONTROL_STATEMENTS_CNT = 20
+            if control := await rerouted(CONTROL_STATEMENTS_CNT):
+                pytest.fail(f"premise: with literal keys the routing is not settled yet: {control}")
+
+            # The same requests, key computed by the server.
+            STATEMENTS_CNT = 30
+            offenders = await rerouted(STATEMENTS_CNT, 'uuid()')
+
+            logger.info(f"{kind} with uuid(): {len(offenders)} of {STATEMENTS_CNT} requests were re-routed after the coordinator: {offenders}")
+            assert not offenders, (
+                f"{len(offenders)} of {STATEMENTS_CNT} {kind}s with uuid() as the key were re-routed after the node the client "
+                f"talked to had routed them, while {CONTROL_STATEMENTS_CNT} {kind}s with literal keys were not: {offenders}")
+
+@pytest.mark.parametrize("kind", ['insert', 'select'])
+async def test_non_pure_pk_function_shard_bounce_is_at_most_one(manager: ScyllaClusterManager, kind: str):
+    """On one node, a request whose key comes from `uuid()` is sent to another shard at most
+    once. The token picks the shard, and the computed value travels with the request, so the
+    shard that receives it has nothing left to route.
+
+    One node, RF=1, 8 tablets spread over its shards. A text statement lands on a random
+    shard, so about half of the requests need one bounce. A second bounce for the same
+    request means the receiving shard ran `uuid()` again and got a different token.
+    """
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    # A tablet that moves between shards during the run is bounced twice for a reason that has
+    # nothing to do with uuid().
+    await manager.disable_tablet_balancing()
+    cql, _ = await manager.get_ready_cql([server])
+
+    ks_opts = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 8} AND consistency = 'global'"
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        async with new_test_table(manager, ks, "pk uuid PRIMARY KEY, c int") as table:
+            table_id = await manager.get_table_id(*table.split('.'))
+            shards = {r.replicas[0][1] for r in await cql.run_async(f"SELECT replicas FROM system.tablets WHERE table_id = {table_id}")}
+            if len(shards) < 2:
+                pytest.fail(f"premise: all tablets on one shard ({shards}), nothing to bounce between")
+
+            async def bounces() -> float:
+                SHARD_BOUNCES = {'insert': 'scylla_strong_consistency_coordinator_write_shard_bounces',
+                                'select': 'scylla_strong_consistency_coordinator_read_shard_bounces'}
+                return (await manager.metrics.query(server.ip_addr)).get(SHARD_BOUNCES[kind]) or 0
+
+            STATEMENTS_CNT = 30
+            offenders = {}
+            for i in range(STATEMENTS_CNT):
+                before = await bounces()
+                query = QUERY[kind].format(table=table, key='uuid()', i=i)
+                await cql.run_async(SimpleStatement(query, consistency_level=ConsistencyLevel.QUORUM))
+                if (d := await bounces() - before) > 1:
+                    offenders[i] = d
+
+            assert not offenders, (
+                f"{len(offenders)} of {STATEMENTS_CNT} {kind}s with uuid() as the key were bounced between shards more "
+                f"than once (bounces per request: {offenders}): the receiving shard evaluated uuid() again")
+
+async def select_rows(cql, stmt: str, **kwargs):
+    """A read forwarded to the group's leader fails with a read failure while a node the
+    forwarding node still takes for alive is down or just restarted, so retry it."""
+    return await wait_for(lambda: cql.run_async(stmt, **kwargs), time.time() + 60)
+
+async def count_rows_by_key(cql, ks: str, table: str, keys) -> int:
+    """Strongly consistent reads target one partition, so count key by key."""
+    rows = await asyncio.gather(*[select_rows(cql, f"SELECT pk FROM {ks}.{table} WHERE pk = {k}") for k in keys])
+    return sum(len(r) for r in rows)
+
+
+async def get_topology_coordinator_server(manager: ScyllaClusterManager, servers) -> ServerInfo:
+    coord_host_id = await get_topology_coordinator(manager)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+    return next(s for s, hid in zip(servers, host_ids) if hid == coord_host_id)
+
+
+async def test_truncate_basic(manager: ScyllaClusterManager):
+    """TRUNCATE goes through the raft log of each tablet: every tablet is empty afterwards, writes
+    issued after it are visible, and every replica records the truncate in system.raft_groups once
+    its state machine applies the entry."""
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 4} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        keys = range(200)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+        await cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        assert await count_rows_by_key(cql, ks, 'test', keys) == 0
+
+        # The tablets keep taking writes right after the truncate
+        new_keys = range(1000, 1010)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in new_keys])
+        assert await count_rows_by_key(cql, ks, 'test', new_keys) == len(new_keys)
+
+        # Success means every tablet's group committed its entry; a replica records the truncate
+        # only once its state machine applies it, which may be a moment later.
+        table_id = await manager.get_table_id(ks, 'test')
+        group_ids = {r.raft_group_id for r in await cql.run_async(f"SELECT raft_group_id FROM system.tablets WHERE table_id = {table_id}")}
+        assert len(group_ids) == 4
+        for host in hosts:
+            async def all_groups_recorded():
+                rows = await cql.run_async("SELECT group_id, last_truncate_request_id, truncate_index FROM system.raft_groups", host=host)
+                recorded = {r.group_id for r in rows if r.last_truncate_request_id is not None and r.truncate_index > 0}
+                return group_ids <= recorded or None
+            await wait_for(all_groups_recorded, time.time() + 60)
+
+
+async def wait_for_truncate_records(cql, group_ids, above: dict | None = None) -> dict:
+    """Waits until every group has a truncate_index above the one in `above` (0 if absent) and
+    returns them. The record is written by the state machine a moment after TRUNCATE returns."""
+    async def recorded():
+        rows = await cql.run_async("SELECT group_id, truncate_index FROM system.raft_groups")
+        indexes = {r.group_id: r.truncate_index for r in rows
+                   if r.group_id in group_ids and r.truncate_index and r.truncate_index > (above or {}).get(r.group_id, 0)}
+        return indexes if len(indexes) == len(group_ids) else None
+    return await wait_for(recorded, time.time() + 60)
+
+
+async def kill_and_restart(manager: ScyllaClusterManager, servers):
+    """A kill, not a shutdown: the memtables are not flushed, so the replay finds every write
+    of the test table in the commitlog. All servers stop before any starts."""
+    for s in servers:
+        await manager.server_stop(s.server_id, convict=False)
+    await asyncio.gather(*[manager.server_start(s.server_id) for s in servers])
+    return await manager.get_ready_cql(servers)
+
+
+@pytest.mark.parametrize("flush_table", [True, False])
+async def test_truncate_record_survives_replay(manager: ScyllaClusterManager, flush_table: bool):
+    """The node is killed while the commitlog still holds the writes the truncate dropped. The
+    record is durable by the time the truncate returns, so the replay drops the entries at or
+    below the recorded truncate index and keeps the writes after it, whether they are still in
+    the commitlog or already in an sstable the replayed truncate would otherwise delete."""
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    (cql, hosts) = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        keys = range(200)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+        await cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        new_keys = range(1000, 1010)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in new_keys])
+
+        table_id = await manager.get_table_id(ks, 'test')
+        group_ids = {r.raft_group_id for r in await cql.run_async(f"SELECT raft_group_id FROM system.tablets WHERE table_id = {table_id}")}
+        await wait_for_truncate_records(cql, group_ids)
+        if flush_table:
+            await manager.api.keyspace_flush(server.ip_addr, ks, 'test')
+
+        (cql, hosts) = await kill_and_restart(manager, [server])
+
+        assert await count_rows_by_key(cql, ks, 'test', keys) == 0
+        assert await count_rows_by_key(cql, ks, 'test', new_keys) == len(new_keys)
+
+
+@pytest.mark.parametrize("flush_table", [True, False])
+async def test_truncate_twice_survives_replay(manager: ScyllaClusterManager, flush_table: bool):
+    """Two truncates with writes between them, then a kill. The replay has to tell the second
+    truncate from a retry of the first and drop the writes between them too, keeping only the
+    writes after the second one, in the commitlog or already flushed."""
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    (cql, hosts) = await manager.get_ready_cql([server])
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        table_id = await manager.get_table_id(ks, 'test')
+        group_ids = {r.raft_group_id for r in await cql.run_async(f"SELECT raft_group_id FROM system.tablets WHERE table_id = {table_id}")}
+
+        keys_a, keys_b, keys_c = range(100), range(1000, 1100), range(2000, 2010)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys_a])
+        await cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        first = await wait_for_truncate_records(cql, group_ids)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys_b])
+        await cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        await wait_for_truncate_records(cql, group_ids, above=first)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys_c])
+        if flush_table:
+            await manager.api.keyspace_flush(server.ip_addr, ks, 'test')
+
+        (cql, hosts) = await kill_and_restart(manager, [server])
+
+        assert await count_rows_by_key(cql, ks, 'test', keys_a) == 0
+        assert await count_rows_by_key(cql, ks, 'test', keys_b) == 0
+        assert await count_rows_by_key(cql, ks, 'test', keys_c) == len(keys_c)
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_truncate_replays_entry_when_record_not_flushed(manager: ScyllaClusterManager):
+    """The node is killed after the tablet was emptied but before the truncate record was
+    written. The entry is still in the commitlog: the replay applies the writes it finds
+    below the entry and then the entry itself, which drops them again."""
+    server = await manager.server_add(config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE)
+    (cql, hosts) = await manager.get_ready_cql([server])
+    log = await manager.server_open_log(server.server_id)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        keys = range(200)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+        await manager.api.enable_injection(server.ip_addr, 'truncate_apply_before_record', one_shot=True)
+        trunc_future = cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        await log.wait_for('truncating tablet')
+
+        # The TRUNCATE may still be waiting for the entry's apply; the kill ends it either way.
+        await manager.server_stop(server.server_id, convict=False)
+        trunc_future.cancel()
+        await manager.server_start(server.server_id)
+        (cql, hosts) = await manager.get_ready_cql([server])
+
+        assert await count_rows_by_key(cql, ks, 'test', keys) == 0
+        rows = await cql.run_async("SELECT truncate_index FROM system.raft_groups")
+        assert any(r.truncate_index for r in rows)
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_truncate_in_one_batch_with_writes_survives_replay(manager: ScyllaClusterManager):
+    """The followers are cut off while writes and the truncate are appended on the leader, so
+    once reconnected they get all of it in one batch whose header commit_idx is below the
+    writes. Nothing is written after it and every node is killed: the replay floor from the
+    batch headers is below the truncate, and the record alone has to keep the writes from
+    going back to raft and being applied again."""
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+    host_ids = {await manager.get_host_id(s.server_id): s for s in servers}
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        table_id = await manager.get_table_id(ks, 'test')
+        group_id = str((await cql.run_async(f"SELECT raft_group_id FROM system.tablets WHERE table_id = {table_id}"))[0].raft_group_id)
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (1000, 1000);")
+
+        async def leader_of():
+            for s in servers:
+                try:
+                    r = await manager.api.get_raft_leader(s.ip_addr, group_id)
+                except Exception:
+                    continue
+                if r and uuid.UUID(r).int != 0:
+                    return r
+            return None
+        leader = host_ids[await wait_for(leader_of, time.time() + 60)]
+        followers = [s for s in servers if s.server_id != leader.server_id]
+        leader_log = await manager.server_open_log(leader.server_id)
+        mark = await leader_log.mark()
+
+        for f in followers:
+            await manager.api.enable_injection(f.ip_addr, "raft_drop_incoming_append_entries_for_specified_group",
+                                               one_shot=False, parameters={"value": group_id})
+        keys = range(20)
+        inserts = [cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys]
+        await asyncio.sleep(0.5)
+        trunc = cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        await leader_log.wait_for("adding a truncate", from_mark=mark, timeout=60)
+        for f in followers:
+            await manager.api.disable_injection(f.ip_addr, "raft_drop_incoming_append_entries_for_specified_group")
+        await asyncio.gather(*inserts, trunc)
+
+        async def recorded_everywhere():
+            for h in hosts:
+                rows = await cql.run_async("SELECT group_id, truncate_index FROM system.raft_groups", host=h)
+                if not any(str(r.group_id) == group_id and r.truncate_index for r in rows):
+                    return None
+            return True
+        await wait_for(recorded_everywhere, time.time() + 60)
+        assert await count_rows_by_key(cql, ks, 'test', keys) == 0
+
+        (cql, hosts) = await kill_and_restart(manager, servers)
+        assert await count_rows_by_key(cql, ks, 'test', keys) == 0
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_truncate_coordinator_crash_dedup(manager: ScyllaClusterManager):
+    """The topology coordinator is killed right after the tablet's truncate entry is committed. The
+    new coordinator re-drives the request and the group gets a second entry with the same request
+    id, which the state machine applies as a no-op: a row written between the two entries survives."""
+    servers = await manager.servers_add(3, config=DEFAULT_CONFIG, cmdline=DEFAULT_CMDLINE, auto_rack_dc='my_dc')
+    (cql, hosts) = await manager.get_ready_cql(servers)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+        keys = range(100)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES ({k}, {k});") for k in keys])
+
+        coord = await get_topology_coordinator_server(manager, servers)
+        coord_log = await manager.server_open_log(coord.server_id)
+        other = next(s for s in servers if s != coord)
+        other_host = next(h for h in hosts if h.address == other.ip_addr)
+
+        await manager.api.enable_injection(coord.ip_addr, 'truncate_sc_crash_after_tablet_commit', one_shot=True)
+        trunc_future = cql.run_async(f"TRUNCATE TABLE {ks}.test", host=other_host)
+        await coord_log.wait_for('truncate_sc_crash_after_tablet_commit hit, killing the node')
+        await manager.server_stop(coord.server_id, convict=False)
+
+        # The entry is committed and two replicas are up, so the tablet serves reads and writes
+        # while the request waits for a new coordinator. This write is ordered after the first
+        # entry and a read observed it, so the entry the re-driven request adds must not drop it.
+        # The write goes to the group's leader, which may still be the killed node until the
+        # group elects a new one, so retry until it succeeds.
+        async def insert_marker_row():
+            try:
+                await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (9999, 9999);", host=other_host)
+                return True
+            except (WriteFailure, WriteTimeout):
+                return None
+        await wait_for(insert_marker_row, time.time() + 60)
+        rows = await select_rows(cql, f"SELECT c FROM {ks}.test WHERE pk = 9999", host=other_host)
+        assert [r.c for r in rows] == [9999]
+
+        await manager.server_start(coord.server_id)
+        await trunc_future
+
+        assert await count_rows_by_key(cql, ks, 'test', keys) == 0
+        rows = await select_rows(cql, f"SELECT c FROM {ks}.test WHERE pk = 9999")
+        assert [r.c for r in rows] == [9999]
+
+        # The same two entries and the write between them are now replayed from the commitlog
+        # on every replica. The second entry must be a no-op there as well.
+        (cql, hosts) = await kill_and_restart(manager, servers)
+        assert await count_rows_by_key(cql, ks, 'test', keys) == 0
+        rows = await select_rows(cql, f"SELECT c FROM {ks}.test WHERE pk = 9999")
+        assert [r.c for r in rows] == [9999]
+

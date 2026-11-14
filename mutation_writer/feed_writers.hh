@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "flat_mutation_reader.hh"
-#include "mutation_reader.hh"
-#include "seastar/core/coroutine.hh"
+#include <seastar/coroutine/as_future.hh>
+
+#include "readers/queue.hh"
 
 namespace mutation_writer {
 
@@ -20,77 +20,19 @@ class bucket_writer {
     future<> _consume_fut;
 
 private:
-    bucket_writer(schema_ptr schema, std::pair<flat_mutation_reader, queue_reader_handle> queue_reader, reader_consumer& consumer);
+    bucket_writer(schema_ptr schema, std::pair<mutation_reader, queue_reader_handle> queue_reader, mutation_reader_consumer& consumer);
+
+    // Called when the handle is found to be terminated (reader closed or aborted).
+    // Awaits _consume_fut to surface the root-cause error from the consumer side,
+    // then rethrows it.
+    future<> propagate_consumer_error();
 
 public:
-    bucket_writer(schema_ptr schema, reader_permit permit, reader_consumer& consumer);
-
-    future<> consume(mutation_fragment mf);
-
-    void consume_end_of_stream();
-
-    void abort(std::exception_ptr ep) noexcept;
-
-    future<> close() noexcept;
-};
-
-template <typename Writer>
-requires MutationFragmentConsumer<Writer, future<>>
-future<> feed_writer(flat_mutation_reader&& rd_ref, Writer wr) {
-    // Only move in reader if stack was successfully allocated, so caller can close reader otherwise.
-    auto rd = std::move(rd_ref);
-    std::exception_ptr ex;
-    try {
-        while (!rd.is_end_of_stream() || !rd.is_buffer_empty()) {
-            co_await rd.fill_buffer();
-            while (!rd.is_buffer_empty()) {
-                co_await rd.pop_mutation_fragment().consume(wr);
-            }
-        }
-    } catch (...) {
-        ex = std::current_exception();
-    }
-
-    co_await rd.close();
-
-    try {
-        if (ex) {
-            wr.abort(ex);
-        } else {
-            wr.consume_end_of_stream();
-        }
-    } catch (...) {
-        if (!ex) {
-            ex = std::current_exception();
-        }
-    }
-
-    try {
-        co_await wr.close();
-    } catch (...) {
-        if (!ex) {
-            ex = std::current_exception();
-        }
-    }
-    if (ex) {
-        std::rethrow_exception(ex);
-    }
-}
-
-class bucket_writer_v2 {
-    schema_ptr _schema;
-    queue_reader_handle_v2 _handle;
-    future<> _consume_fut;
-
-private:
-    bucket_writer_v2(schema_ptr schema, std::pair<flat_mutation_reader_v2, queue_reader_handle_v2> queue_reader_v2, reader_consumer_v2& consumer);
-
-public:
-    bucket_writer_v2(schema_ptr schema, reader_permit permit, reader_consumer_v2& consumer);
+    bucket_writer(schema_ptr schema, reader_permit permit, mutation_reader_consumer& consumer);
 
     future<> consume(mutation_fragment_v2 mf);
 
-    void consume_end_of_stream();
+    future<> consume_end_of_stream();
 
     void abort(std::exception_ptr ep) noexcept;
 
@@ -99,12 +41,12 @@ public:
 
 template <typename Writer>
 requires MutationFragmentConsumerV2<Writer, future<>>
-future<> feed_writer(flat_mutation_reader_v2&& rd_ref, Writer wr) {
+future<> feed_writer(mutation_reader&& rd_ref, Writer wr) {
     // Only move in reader if stack was successfully allocated, so caller can close reader otherwise.
     auto rd = std::move(rd_ref);
     std::exception_ptr ex;
     try {
-        while (!rd.is_end_of_stream() || !rd.is_buffer_empty()) {
+        while (!rd.is_end_of_stream()) {
             co_await rd.fill_buffer();
             while (!rd.is_buffer_empty()) {
                 co_await rd.pop_mutation_fragment().consume(wr);
@@ -120,7 +62,7 @@ future<> feed_writer(flat_mutation_reader_v2&& rd_ref, Writer wr) {
         if (ex) {
             wr.abort(ex);
         } else {
-            wr.consume_end_of_stream();
+            co_await wr.consume_end_of_stream();
         }
     } catch (...) {
         if (!ex) {
@@ -128,14 +70,15 @@ future<> feed_writer(flat_mutation_reader_v2&& rd_ref, Writer wr) {
         }
     }
 
-    try {
-        co_await wr.close();
-    } catch (...) {
+    auto f = co_await coroutine::as_future(wr.close());
+    if (f.failed()) [[unlikely]] {
+        // Need to consume the failed future exception even if not used
+        auto close_ex = f.get_exception();
         if (!ex) {
-            ex = std::current_exception();
+            ex = std::move(close_ex);
         }
     }
-    if (ex) {
+    if (ex) [[unlikely]] {
         std::rethrow_exception(ex);
     }
 }

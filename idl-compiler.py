@@ -5,7 +5,7 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 import argparse
 import pyparsing as pp
@@ -47,23 +47,7 @@ def print_cw(f):
  * Copyright 2016-present ScyllaDB
  */
 
-/*
- * This file is part of Scylla.
- *
- * Scylla is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * Scylla is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with Scylla.  If not, see <http://www.gnu.org/licenses/>.
- */
-
+// SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
  /*
   * This is an auto-generated code, do not modify directly.
@@ -89,6 +73,22 @@ class ASTBase:
     def ns_qualified_name(self):
         return self.name if not self.ns_context \
             else self.combine_ns(self.ns_context) + "::" + self.name
+
+class Include(ASTBase):
+    '''AST node representing a single `include file/module`.'''
+
+    def __init__(self, name):
+        super().__init__(name)
+        sfx = '.idl.hh'
+        self.is_module = name.endswith(sfx)
+        if self.is_module:
+            self.module_name = self.name[0:-len(sfx)]
+
+    def __str__(self):
+        return f"<Include(name={self.name}, is_module={self.is_module})>"
+
+    def __repr__(self):
+        return self.__str__()
 
 class BasicType(ASTBase):
     '''AST node that represents terminal grammar nodes for the non-template
@@ -193,7 +193,17 @@ void serializer<{name}>::write(Output& buf, const {name}& v) {{
 {self.template_declaration}
 template<typename Input>
 {name} serializer<{name}>::read(Input& buf) {{
-  return static_cast<{name}>(deserialize(buf, boost::type<{self.underlying_type}>()));
+  return static_cast<{name}>(deserialize(buf, std::type_identity<{self.underlying_type}>()));
+}}""")
+
+    def serializer_skip_impl(self, cout):
+        name = self.ns_qualified_name()
+
+        fprintln(cout, f"""
+{self.template_declaration}
+template<typename Input>
+void serializer<{name}>::skip(Input& buf) {{
+  buf.skip(sizeof({self.underlying_type}));
 }}""")
 
 
@@ -327,10 +337,10 @@ template <typename Input>
  return seastar::with_serialized_stream(buf, [] (auto& buf) {{""")
         if not self.members:
             if not self.final:
-                fprintln(cout, f"""  {SIZETYPE} size = {DESERIALIZER}(buf, boost::type<{SIZETYPE}>());
+                fprintln(cout, f"""  {SIZETYPE} size = {DESERIALIZER}(buf, std::type_identity<{SIZETYPE}>());
   buf.skip(size - sizeof({SIZETYPE}));""")
         elif not self.final:
-            fprintln(cout, f"""  {SIZETYPE} size = {DESERIALIZER}(buf, boost::type<{SIZETYPE}>());
+            fprintln(cout, f"""  {SIZETYPE} size = {DESERIALIZER}(buf, std::type_identity<{SIZETYPE}>());
   auto in = buf.read_substream(size - sizeof({SIZETYPE}));""")
         else:
             fprintln(cout, """  auto& in = buf;""")
@@ -348,9 +358,9 @@ template <typename Input>
                 if deflt in local_names:
                     deflt = local_names[deflt]
                 fprintln(cout, f"""  auto {local_param} = (in.size()>0) ?
-    {DESERIALIZER}(in, boost::type<{param_type(param.type)}>()) : {deflt};""")
+    {DESERIALIZER}(in, std::type_identity<{param_type(param.type)}>()) : {deflt};""")
             else:
-                fprintln(cout, f"""  auto {local_param} = {DESERIALIZER}(in, boost::type<{param_type(param.type)}>());""")
+                fprintln(cout, f"""  auto {local_param} = {DESERIALIZER}(in, std::type_identity<{param_type(param.type)}>());""")
             params.append("std::move(" + local_param + ")")
         fprintln(cout, f"""
   {name}{self.template_param_names_str} res {{{", ".join(params)}}};
@@ -368,12 +378,12 @@ template <typename Input>
 void serializer<{name}{self.template_param_names_str}>::skip(Input& buf) {{
  seastar::with_serialized_stream(buf, [] (auto& buf) {{""")
         if not self.final:
-            fprintln(cout, f"""  {SIZETYPE} size = {DESERIALIZER}(buf, boost::type<{SIZETYPE}>());
+            fprintln(cout, f"""  {SIZETYPE} size = {DESERIALIZER}(buf, std::type_identity<{SIZETYPE}>());
   buf.skip(size - sizeof({SIZETYPE}));""")
         else:
             for m in get_members(self):
                 full_type = param_view_type(m.type)
-                fprintln(cout, f"  ser::skip(buf, boost::type<{full_type}>());")
+                fprintln(cout, f"  ser::skip(buf, std::type_identity<{full_type}>());")
         fprintln(cout, """ });\n}""")
 
 
@@ -395,8 +405,8 @@ class RpcVerbParam(ASTBase):
     argument as an `foreign_ptr<lw_shared_ptr<>>`
     If the [[ref]] attribute is specified the send function signature will contain this type as const reference"""
     def __init__(self, type, name, attributes=Attributes()):
+        super().__init__(name)
         self.type = type
-        self.name = name
         self.attributes = attributes
 
     def __str__(self):
@@ -461,6 +471,7 @@ class RpcVerb(ASTBase):
             static void register_my_verb(netw::messaging_service* ms, std::function<return_value(args...)>&&);
             static future<> unregister_my_verb(netw::messaging_service* ms);
             static future<> send_my_verb(netw::messaging_service* ms, netw::msg_addr id, args...);
+            static future<> send_my_verb(netw::messaging_service* ms, locator::host_id id, args...);
 
     Each method accepts a pointer to an instance of messaging_service
     object, which contains the underlying seastar RPC protocol
@@ -478,24 +489,31 @@ class RpcVerb(ASTBase):
     - [[with_timeout]] - an additional time_point parameter is supplied
       to the handler function and send* method uses send_message_*_timeout
       variant of internal function to actually send the message.
+    - [[cancellable]] - an additional abort_source& parameter is supplied
+      to the handler function and send* method uses send_message_*_cancellable
+      variant of internal function to actually send the message.
     - [[one_way]] - the handler function is annotated by
       future<rpc::no_wait_type> return type to designate that a client
       doesn't need to wait for an answer.
+    - [[ip]] - ip addressable send function will be generated instead of
+               host id addressable
 
     The `-> return_values` clause is optional for two-way messages. If omitted,
     the return type is set to be `future<>`.
     For one-way verbs, the use of return clause is prohibited and the
     signature of `send*` function always returns `future<>`."""
-    def __init__(self, name, parameters, return_values, with_client_info, with_timeout, one_way):
+    def __init__(self, name, parameters, return_values, with_client_info, with_timeout, cancellable, one_way, ip):
         super().__init__(name)
         self.params = parameters
         self.return_values = return_values
         self.with_client_info = with_client_info
         self.with_timeout = with_timeout
+        self.cancellable = cancellable
         self.one_way = one_way
+        self.ip = ip
 
     def __str__(self):
-        return f"<RpcVerb(name={self.name}, params={self.params}, return_values={self.return_values}, with_client_info={self.with_client_info}, with_timeout={self.with_timeout}, one_way={self.one_way})>"
+        return f"<RpcVerb(name={self.name}, params={self.params}, return_values={self.return_values}, with_client_info={self.with_client_info}, with_timeout={self.with_timeout}, cancellable={self.cancellable}, one_way={self.one_way}, ip={self.ip})>"
 
     def __repr__(self):
         return self.__str__()
@@ -506,6 +524,8 @@ class RpcVerb(ASTBase):
             send_fn += '_oneway'
         if self.with_timeout:
             send_fn += '_timeout'
+        if self.cancellable:
+            send_fn += '_cancellable'
         return send_fn
 
     def handler_function_return_values(self):
@@ -547,10 +567,12 @@ class RpcVerb(ASTBase):
             res.extend(self.params)
         return ', '.join([p.to_string() for p in res])
 
-    def send_function_signature_params_list(self, include_placeholder_names):
-        res = 'netw::messaging_service* ms, netw::msg_addr id'
+    def send_function_signature_params_list(self, include_placeholder_names, dst_type):
+        res = f'netw::messaging_service* ms, {dst_type} id'
         if self.with_timeout:
             res += ', netw::messaging_service::clock_type::time_point timeout'
+        if self.cancellable:
+            res += ', abort_source& as'
         if self.params:
             for idx, p in enumerate(self.params):
                 res += ', ' + p.to_string_send_fn_signature()
@@ -559,15 +581,11 @@ class RpcVerb(ASTBase):
         return res
 
     def send_message_argument_list(self):
-        res = f'ms, '
-        if self.with_timeout and self.one_way:
-            # For some reason the timeout argument position in
-            # `send_message_oneway_timeout` is different from `send_message_timeout`.
-            res += f'timeout, {self.messaging_verb_enum_case()}, id'
-        else:
-            res += f'{self.messaging_verb_enum_case()}, id'
-            if self.with_timeout:
-                res += ', timeout'
+        res = f'ms, {self.messaging_verb_enum_case()}, id'
+        if self.with_timeout:
+            res += ', timeout'
+        if self.cancellable:
+            res += ', as'
         if self.params:
             for idx, p in enumerate(self.params):
                 res += ', ' + f'std::move({p.name if p.name else f"_{idx + 1}"})'
@@ -605,6 +623,8 @@ class NamespaceDef(ASTBase):
 def basic_type_parse_action(tokens):
     return BasicType(name=tokens[0])
 
+def include_parse_action(tokens):
+    return Include(name=tokens[0])
 
 def template_type_parse_action(tokens):
     return TemplateType(name=tokens['template_name'], template_parameters=tokens["template_parameters"].asList())
@@ -660,7 +680,9 @@ def class_def_parse_action(tokens):
     template_params = None
     if 'template' in tokens:
         template_params = [ClassTemplateParam(typename=tp[0], name=tp[1]) for tp in tokens['template']]
-    return ClassDef(name=tokens['name'], members=class_members, final=is_final, stub=is_stub, attribute=attribute, template_params=template_params)
+    cls = ClassDef(name=tokens['name'], members=class_members, final=is_final, stub=is_stub, attribute=attribute, template_params=template_params)
+    validate_member_versioning(cls)
+    return cls
 
 
 def rpc_verb_param_parse_action(tokens):
@@ -679,11 +701,13 @@ def rpc_verb_parse_action(tokens):
     raw_attrs = tokens['attributes']
     params = tokens['params'] if 'params' in tokens else []
     with_timeout = not raw_attrs.empty() and 'with_timeout' in raw_attrs.attr_items
+    cancellable = not raw_attrs.empty() and 'cancellable' in raw_attrs.attr_items
     with_client_info = not raw_attrs.empty() and 'with_client_info' in raw_attrs.attr_items
+    ip = not raw_attrs.empty() and 'ip' in raw_attrs.attr_items
     one_way = not raw_attrs.empty() and 'one_way' in raw_attrs.attr_items
     if one_way and 'return_values' in tokens:
         raise Exception(f"Invalid return type specification for one-way RPC verb '{name}'")
-    return RpcVerb(name=name, parameters=params, return_values=tokens.get('return_values'), with_client_info=with_client_info, with_timeout=with_timeout, one_way=one_way)
+    return RpcVerb(name=name, parameters=params, return_values=tokens.get('return_values'), with_client_info=with_client_info, with_timeout=with_timeout, cancellable=cancellable, one_way=one_way, ip=ip)
 
 
 def namespace_parse_action(tokens):
@@ -696,6 +720,7 @@ def parse_file(file_name):
     number = pp.pyparsing_common.signed_integer
     identifier = pp.pyparsing_common.identifier
 
+    include_kw = pp.Keyword('#include').suppress()
     lbrace = pp.Literal('{').suppress()
     rbrace = pp.Literal('}').suppress()
     cls = pp.Keyword('class').suppress()
@@ -730,6 +755,9 @@ def parse_file(file_name):
 
     type <<= tmpl | (pp.Optional(const) + btype)
     type.setParseAction(type_parse_action)
+
+    include_stmt = include_kw - pp.QuotedString('"')
+    include_stmt.setParseAction(include_parse_action)
 
     enum_class = enum_lit - cls
 
@@ -777,9 +805,9 @@ def parse_file(file_name):
     namespace = ns - identifier("name") - lbrace - pp.OneOrMore(content)("ns_members") - rbrace
     namespace.setParseAction(namespace_parse_action)
 
-    content <<= enum | class_def | rpc_verb | namespace
+    content <<= include_stmt | enum | class_def | rpc_verb | namespace
 
-    for varname in ("enum", "class_def", "class_member", "content", "namespace", "template_def"):
+    for varname in ("include_stmt", "enum", "class_def", "class_member", "content", "namespace", "template_def"):
         locals()[varname].setName(varname)
 
     rt = pp.OneOrMore(content)
@@ -823,6 +851,7 @@ def handle_enum(enum, hout, cout):
 
     enum.serializer_write_impl(cout)
     enum.serializer_read_impl(cout)
+    enum.serializer_skip_impl(cout)
 
 
 def join_template(template_params):
@@ -902,6 +931,62 @@ def get_members(cls):
     return [p for p in cls.members if not isinstance(p, ClassDef) and not isinstance(p, EnumDef)]
 
 
+def has_version(member):
+    '''True if a member's [[version]] attribute makes it optional on the wire.'''
+    return member.attribute is not None and member.attribute.startswith('version')
+
+
+def parse_version(attribute):
+    '''Parse the "version X.Y[.Z]" attribute string into a tuple of ints.'''
+    version = tuple(int(p) for p in attribute[len('version'):].strip().split('.'))
+    if len(version) not in (2, 3):
+        raise ValueError(f"version attribute '{attribute}' must have 2 or 3 components")
+    return version
+
+
+def validate_member_versioning(cls):
+    '''Enforce the [[version]] wire-format invariant for a class' members:
+    once a member is versioned, every member after it (in declaration/wire
+    order) must be versioned too, and version numbers must not decrease.
+    This is required because a versioned field is deserialized as
+    `(in.size()>0) ? deserialize(...) : default`, which only works correctly
+    for a field appended at the end of the wire layout. Also rejects
+    [[version]] members in a `final` class, since final classes carry no
+    size frame for skip() to fall back on.'''
+    prev_version = None
+    prev_name = None
+    for member in get_members(cls):
+        if has_version(member):
+            if cls.final:
+                raise TypeError(
+                    f"field '{member.name}' in class '{cls.name}' is [[version]] but the class is 'final' — "
+                    f"final classes have no size frame, so skip() cannot leave a missing versioned tail "
+                    f"unread; drop 'final' or drop [[version]] from '{member.name}'")
+            try:
+                version = parse_version(member.attribute)
+            except ValueError:
+                raise ValueError(
+                    f"field '{member.name}' in class '{cls.name}' has a malformed version attribute "
+                    f"'[[{member.attribute}]]' — expected [[version X.Y[.Z]]]") from None
+            if prev_version is not None:
+                n = max(len(prev_version), len(version))
+                padded_prev = prev_version + (0,) * (n - len(prev_version))
+                padded_cur = version + (0,) * (n - len(version))
+                if padded_cur < padded_prev:
+                    raise ValueError(
+                        f"field '{member.name}' in class '{cls.name}' has [[version {'.'.join(map(str, version))}]] "
+                        f"which is lower than the version of the preceding versioned field '{prev_name}' "
+                        f"([[version {'.'.join(map(str, prev_version))}]]) — [[version]] numbers must be "
+                        f"non-decreasing within a class")
+            prev_version = version
+            prev_name = member.name
+        elif prev_version is not None:
+            raise TypeError(
+                f"field '{member.name}' in class '{cls.name}' is not versioned but follows versioned field "
+                f"'{prev_name}' — new mandatory fields must come before all [[version]] fields, or be "
+                f"versioned themselves")
+
+
 def get_variant_type(t):
     if is_variant(t):
         return "variant"
@@ -963,7 +1048,7 @@ def optional_add_methods(typ):
         added_type = param_type(typ) + "_view"
     else:
         print("non supported optional type ", typ)
-        raise "non supported optional type " + param_type(typ)
+        raise TypeError("non supported optional type " + param_type(typ))
     res = res + reindent(4, f"""
     void write(const {added_type}& obj) {{
         serialize(_out, true);
@@ -1077,6 +1162,15 @@ def add_param_writer_object(name, base_state, typ, var_type="", var_index=None, 
                 f(writer_of_{typename}<Output>(_out));
                 {set_command}
                 return {return_command};
+            }}""").format(**locals())
+        ret += reindent(4, """
+            template<typename AsyncSerializer>
+            future<after_{base_state}__{name}<Output>> {name}{var_type}_gently(AsyncSerializer&& f) && {{
+                {set_variant_index}
+                return futurize_invoke(f, writer_of_{typename}<Output>(_out)).then([this] {{
+                    {set_command}
+                    return after_{base_state}__{name}<Output>{return_command};
+                }});
             }}""").format(**locals())
     return ret
 
@@ -1369,6 +1463,13 @@ def param_view_type(t):
         return t.name + join_template_view(t.template_parameters, additional_types)
 
 
+def element_type(t):
+    assert isinstance(t, TemplateType)
+    assert len(t.template_parameters) == 1
+    assert t.name != "boost::variant" and t.name != "std::variant"
+    return param_view_type(t.template_parameters[0])
+
+
 read_sizes = set()
 
 
@@ -1385,28 +1486,28 @@ def add_variant_read_size(hout, typ):
     read_sizes.add(t)
     fprintln(hout, f"""
 template<typename Input>
-inline void skip(Input& v, boost::type<{t}>) {{
+inline void skip(Input& v, std::type_identity<{t}>) {{
   return seastar::with_serialized_stream(v, [] (auto& v) {{
-    size_type ln = deserialize(v, boost::type<size_type>());
+    size_type ln = deserialize(v, std::type_identity<size_type>());
     v.skip(ln - sizeof(size_type));
   }});
 }}""")
 
     fprintln(hout, f"""
 template<typename Input>
-{t} deserialize(Input& v, boost::type<{t}>) {{
+{t} deserialize(Input& v, std::type_identity<{t}>) {{
   return seastar::with_serialized_stream(v, [] (auto& v) {{
     auto in = v;
-    deserialize(in, boost::type<size_type>());
-    size_type o = deserialize(in, boost::type<size_type>());
+    deserialize(in, std::type_identity<size_type>());
+    size_type o = deserialize(in, std::type_identity<size_type>());
     """)
     for index, param in enumerate(typ.template_parameters):
         fprintln(hout, f"""
     if (o == {index}) {{
         v.skip(sizeof(size_type)*2);
-        return {t}(deserialize(v, boost::type<{param_view_type(param)}>()));
+        return {t}(deserialize(v, std::type_identity<{param_view_type(param)}>()));
     }}""")
-    fprintln(hout, f'    return {t}(deserialize(v, boost::type<unknown_variant_type>()));\n  }});\n}}')
+    fprintln(hout, f'    return {t}(deserialize(v, std::type_identity<unknown_variant_type>()));\n  }});\n}}')
 
 
 def add_view(cout, cls):
@@ -1422,11 +1523,11 @@ def add_view(cout, cls):
         fprintln(cout, reindent(4, f"""
             operator {cls.name}() const {{
                auto in = v;
-               return deserialize(in, boost::type<{cls.name}>());
+               return deserialize(in, std::type_identity<{cls.name}>());
             }}
         """))
 
-    skip = "" if cls.final else "ser::skip(in, boost::type<size_type>());"
+    skip = "" if cls.final else "ser::skip(in, std::type_identity<size_type>());"
     local_names = {}
     for m in members:
         name = get_member_name(m.name)
@@ -1436,21 +1537,34 @@ def add_view(cout, cls):
             deflt = m.default_value if m.default_value else param_type(m.type) + "()"
             if deflt in local_names:
                 deflt = local_names[deflt]
-            deser = f"(in.size()>0) ? {DESERIALIZER}(in, boost::type<{full_type}>()) : {deflt}"
+            deser = f"(in.size()>0) ? {DESERIALIZER}(in, std::type_identity<{full_type}>()) : {deflt}"
         else:
-            deser = f"{DESERIALIZER}(in, boost::type<{full_type}>())"
+            deser = f"{DESERIALIZER}(in, std::type_identity<{full_type}>())"
 
-        fprintln(cout, reindent(4, """
-            auto {name}() const {{
-              return seastar::with_serialized_stream(v, [this] (auto& v) -> decltype({f}(std::declval<utils::input_stream&>(), boost::type<{full_type}>())) {{
-               auto in = v;
-               {skip}
-               return {deser};
-              }});
-            }}
-        """).format(f=DESERIALIZER, **locals()))
+        if is_vector(m.type):
+            elem_type = element_type(m.type)
+            fprintln(cout, reindent(4, """
+                auto {name}() const {{
+                  return seastar::with_serialized_stream(v, [] (auto& v) {{
+                   auto in = v;
+                   {skip}
+                   return vector_deserializer<{elem_type}>(in);
+                  }});
+                }}
+            """).format(f=DESERIALIZER, **locals()))
+        else:
+            fprintln(cout, reindent(4, """
+                auto {name}() const {{
+                  return seastar::with_serialized_stream(v, [this] (auto& v) -> decltype({f}(std::declval<utils::input_stream&>(), std::type_identity<{full_type}>())) {{
+                   std::ignore = this;
+                   auto in = v;
+                   {skip}
+                   return {deser};
+                  }});
+                }}
+            """).format(f=DESERIALIZER, **locals()))
 
-        skip = skip + f"\n       ser::skip(in, boost::type<{full_type}>());"
+        skip = skip + f"\n       ser::skip(in, std::type_identity<{full_type}>());"
 
     fprintln(cout, "};")
     skip_impl = "auto& in = v;\n       " + skip if cls.final else "v.skip(read_frame_size(v));"
@@ -1500,6 +1614,23 @@ def add_visitors(cout):
         handle_visitors_nodes(local_writable_types[k], cout)
 
 
+def handle_include(obj, hout, cout):
+    '''Generate #include directives.
+    '''
+
+    if obj.is_module:
+        fprintln(hout, f'#include "{obj.module_name}.dist.hh"')
+        fprintln(cout, f'#include "{obj.module_name}.dist.impl.hh"')
+    else:
+        fprintln(hout, f'#include "{obj.name}"')
+
+def handle_includes(tree, hout, cout):
+    for obj in tree:
+        if isinstance(obj, Include):
+            handle_include(obj, hout, cout)
+        else:
+            pass
+
 def handle_class(cls, hout, cout):
     '''Generate serializer class declarations and definitions for a class
     defined in IDL.
@@ -1539,6 +1670,8 @@ def handle_objects(tree, hout, cout):
             handle_objects(obj.members, hout, cout)
         elif isinstance(obj, RpcVerb):
             pass
+        elif isinstance(obj, Include):
+            pass
         else:
             print(f"Unknown type: {obj}")
 
@@ -1550,8 +1683,10 @@ def generate_rpc_verbs_declarations(hout, module_name):
         fprintln(hout, reindent(4, f'''static void register_{name}(netw::messaging_service* ms,
     std::function<{verb.handler_function_return_values()} ({verb.handler_function_parameters_str()})>&&);
 static future<> unregister_{name}(netw::messaging_service* ms);
-static {verb.send_function_return_type()} send_{name}({verb.send_function_signature_params_list(include_placeholder_names=False)});
+static {verb.send_function_return_type()} send_{name}({verb.send_function_signature_params_list(include_placeholder_names=False, dst_type="locator::host_id")});
 '''))
+        if verb.ip:
+            fprintln(hout, reindent(4, f'''static {verb.send_function_return_type()} send_{name}({verb.send_function_signature_params_list(include_placeholder_names=False, dst_type="netw::msg_addr")});'''))
 
     fprintln(hout, reindent(4, 'static future<> unregister(netw::messaging_service* ms);'))
     fprintln(hout, '};\n')
@@ -1570,7 +1705,12 @@ future<> {module_name}_rpc_verbs::unregister_{name}(netw::messaging_service* ms)
     return ms->unregister_handler({verb.messaging_verb_enum_case()});
 }}
 
-{verb.send_function_return_type()} {module_name}_rpc_verbs::send_{name}({verb.send_function_signature_params_list(include_placeholder_names=True)}) {{
+{verb.send_function_return_type()} {module_name}_rpc_verbs::send_{name}({verb.send_function_signature_params_list(include_placeholder_names=True, dst_type="locator::host_id")}) {{
+    {verb.send_function_invocation()}
+}}''')
+        if verb.ip:
+            fprintln(cout, f'''
+{verb.send_function_return_type()} {module_name}_rpc_verbs::send_{name}({verb.send_function_signature_params_list(include_placeholder_names=True, dst_type="netw::msg_addr")}) {{
     {verb.send_function_invocation()}
 }}''')
 
@@ -1602,6 +1742,8 @@ def handle_types(tree):
             pass
         elif isinstance(obj, NamespaceDef):
             handle_types(obj.members)
+        elif isinstance(obj, Include):
+            pass
         else:
             print(f"Unknown object type: {obj}")
 
@@ -1609,7 +1751,7 @@ def handle_types(tree):
 def setup_additional_metadata(tree, ns_context = [], parent_template_params=[]):
     '''Cache additional metadata for each type declaration directly in the AST node.
 
-    This currenty includes namespace info and template parameters for the
+    This currently includes namespace info and template parameters for the
     parent scope (applicable only to enums and classes).'''
     for obj in tree:
         if isinstance(obj, NamespaceDef):
@@ -1643,12 +1785,10 @@ def setup_additional_metadata(tree, ns_context = [], parent_template_params=[]):
 
 
 def load_file(name):
-    if config.o:
-        cout = open(config.o.replace('.hh', '.impl.hh'), "w+")
-        hout = open(config.o, "w+")
-    else:
-        cout = open(name.replace(EXTENSION, '.dist.impl.hh'), "w+")
-        hout = open(name.replace(EXTENSION, '.dist.hh'), "w+")
+    cname = config.o.replace('.hh', '.impl.hh') if config.o else name.replace(EXTENSION, '.dist.impl.hh')
+    hname = config.o or name.replace(EXTENSION, '.dist.hh')
+    cout = open(cname, "w+")
+    hout = open(hname, "w+")
     print_cw(hout)
     fprintln(hout, """
  /*
@@ -1656,13 +1796,24 @@ def load_file(name):
   * The object definition
   */
     """)
-    print_cw(cout)
     fprintln(hout, "#include \"serializer.hh\"\n")
-    if config.ns != '':
-        fprintln(hout, f"namespace {config.ns} {{")
-        fprintln(cout, f"namespace {config.ns} {{")
+
+    print_cw(cout)
+    fprintln(cout, f"#include \"{os.path.basename(hname)}\"")
+    fprintln(cout, "#include \"serializer_impl.hh\"")
+    fprintln(cout, "#include \"serialization_visitors.hh\"")
+
+    def maybe_open_namespace(printed=False):
+        if config.ns != '' and not printed:
+            fprintln(hout, f"namespace {config.ns} {{")
+            fprintln(cout, f"namespace {config.ns} {{")
+            printed = True
+        return printed
+
     data = parse_file(name)
     if data:
+        handle_includes(data, hout, cout)
+        printed = maybe_open_namespace()
         setup_additional_metadata(data)
         handle_types(data)
         handle_objects(data, hout, cout)
@@ -1670,6 +1821,7 @@ def load_file(name):
         module_name = os.path.basename(name)
         module_name = module_name[:module_name.find('.')]
         generate_rpc_verbs(hout, cout, module_name)
+    maybe_open_namespace(printed)
     add_visitors(cout)
     if config.ns != '':
         fprintln(hout, f"}} // {config.ns}")
@@ -1701,7 +1853,7 @@ if __name__ == "__main__":
     parser.add_argument('-f', help='input file', default='')
     parser.add_argument('--ns', help="""namespace, when set function will be created
     under the given namespace""", default='')
-    parser.add_argument('file', nargs='*', help="combine one or more file names for the genral include files")
+    parser.add_argument('file', nargs='*', help="combine one or more file names for the general include files")
 
     config = parser.parse_args()
     if config.file:

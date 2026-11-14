@@ -25,55 +25,56 @@
 #include <memory>
 #include <seastar/core/seastar.hh>
 
-#include "schema.hh"
-#include "schema_builder.hh"
-#include "row_cache.hh"
+#include "schema/schema.hh"
+#include "schema/schema_builder.hh"
+#include "db/row_cache.hh"
 #include "replica/database.hh"
-#include "cell_locking.hh"
+#include "replica/cell_locking.hh"
 #include "compaction/compaction_manager.hh"
-#include "db/large_data_handler.hh"
+#include "compaction/compaction_group_view.hh"
 #include "sstables/sstables_manager.hh"
+#include "replica/compaction_group.hh"
 
-extern db::nop_large_data_handler nop_lp_handler;
-extern db::config test_db_config;
-extern gms::feature_service test_feature_service;
-
-replica::column_family::config column_family_test_config(sstables::sstables_manager& sstables_manager, reader_concurrency_semaphore& compaction_semaphore);
-
-struct column_family_for_tests {
+struct table_for_tests {
+    class compaction_group_view;
     struct data {
         schema_ptr s;
-        reader_concurrency_semaphore semaphore;
-        cache_tracker tracker;
         replica::cf_stats cf_stats{0};
-        replica::column_family::config cfg;
         cell_locker_stats cl_stats;
-        compaction_manager cm;
         lw_shared_ptr<replica::column_family> cf;
-
+        std::unique_ptr<compaction_group_view> table_s;
+        data_dictionary::storage_options storage;
         data();
+        ~data();
     };
     lw_shared_ptr<data> _data;
 
-    explicit column_family_for_tests(sstables::sstables_manager& sstables_manager);
+    static schema_ptr make_default_schema();
 
-    explicit column_family_for_tests(sstables::sstables_manager& sstables_manager, schema_ptr s, std::optional<sstring> datadir = {});
+    explicit table_for_tests(sstables::sstables_manager& sstables_manager, compaction::compaction_manager& cm, schema_ptr s, replica::table::config cfg, data_dictionary::storage_options storage = {});
 
     schema_ptr schema() { return _data->s; }
+
+    const replica::cf_stats& cf_stats() const noexcept { return _data->cf_stats; }
 
     operator lw_shared_ptr<replica::column_family>() { return _data->cf; }
 
     replica::column_family& operator*() { return *_data->cf; }
     replica::column_family* operator->() { return _data->cf.get(); }
+    const replica::column_family* operator->() const { return _data->cf.get(); }
 
-    future<> stop() {
-        return when_all_succeed(_data->cm.stop(), _data->semaphore.stop()).discard_result();
-    }
+    compaction::compaction_group_view& as_compaction_group_view() noexcept;
+    compaction::compaction_backlog_source& as_compaction_backlog_source() noexcept;
 
-    future<> stop_and_keep_alive() {
-        return stop().finally([cf = *this] {});
-    }
+    future<> stop() noexcept;
+
+    void set_tombstone_gc_enabled(bool tombstone_gc_enabled) noexcept;
+    void set_compaction_enforce_min_threshold(bool enforce_min_threshold) noexcept;
+    void set_repair_sstable_classifier(replica::repair_classifier_func repair_sstable_classifier);
 };
 
-dht::token create_token_from_key(const dht::i_partitioner&, sstring key);
-range<dht::token> create_token_range_from_keys(const dht::sharder& sharder, const dht::i_partitioner&, sstring start_key, sstring end_key);
+namespace sstables {
+
+std::vector<db::object_storage_endpoint_param> make_storage_options_config(const data_dictionary::storage_options& so);
+
+}

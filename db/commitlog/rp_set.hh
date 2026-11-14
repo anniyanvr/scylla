@@ -1,13 +1,10 @@
 /*
- */
-
-/*
  * Modified by ScyllaDB
  * Copyright (C) 2016-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -32,6 +29,15 @@ public:
 
     rp_set& operator=(rp_set&&) = default;
 
+    // Lets a later put() in the same segment skip allocating.
+    void reserve(const replay_position& rp) {
+        _usage.try_emplace(rp.id, 0);
+    }
+    void reserve(const rp_handle& h) {
+        if (h) {
+            reserve(h.rp());
+        }
+    }
     void put(const replay_position& rp) {
         _usage[rp.id]++;
     }

@@ -1,0 +1,925 @@
+/*
+ * Copyright (C) 2025-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#include "vector_store_client.hh"
+#include "dns.hh"
+#include "clients.hh"
+#include "uri.hh"
+#include "utils.hh"
+#include "truststore.hh"
+#include "db/config.hh"
+#include "exceptions/exceptions.hh"
+#include "dht/i_partitioner.hh"
+#include "keys/keys.hh"
+#include "utils/rjson.hh"
+#include "types/json_utils.hh"
+#include "schema/schema.hh"
+#include <charconv>
+#include <exception>
+#include <fmt/ranges.h>
+#include <ranges>
+#include <regex>
+#include <span>
+#include <seastar/core/sstring.hh>
+#include <seastar/core/metrics.hh>
+#include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/http/client.hh>
+#include <seastar/http/request.hh>
+#include <seastar/net/dns.hh>
+#include <seastar/net/inet_address.hh>
+#include <seastar/net/socket_defs.hh>
+#include <seastar/util/lazy.hh>
+#include <seastar/util/short_streams.hh>
+
+namespace {
+
+using namespace std::chrono_literals;
+
+using ann_error = vector_search::vector_store_client::ann_error;
+using fts_error = vector_search::vector_store_client::fts_error;
+using like_error = vector_search::vector_store_client::like_error;
+using configuration_exception = exceptions::configuration_exception;
+using duration = lowres_clock::duration;
+using vs_vector = vector_search::vector_store_client::vs_vector;
+using query_string = vector_search::vector_store_client::query_string;
+using limit = vector_search::vector_store_client::limit;
+using host_name = vector_search::vector_store_client::host_name;
+using http_path = sstring;
+using inet_address = seastar::net::inet_address;
+using json_content = sstring;
+using milliseconds = std::chrono::milliseconds;
+using operation_type = httpd::operation_type;
+using port_number = vector_search::vector_store_client::port_number;
+using primary_key = vector_search::primary_key;
+using primary_keys = vector_search::vector_store_client::primary_keys;
+using reply_content = std::vector<seastar::temporary_buffer<char>>;
+using documents = vector_search::vector_store_client::documents;
+using highlights = vector_search::vector_store_client::highlights;
+using service_reply_format_error = vector_search::vector_store_client::service_reply_format_error;
+using uri = vector_search::uri;
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+logging::logger vslogger("vector_store_client");
+
+auto parse_port(std::string const& port_txt) -> std::optional<port_number> {
+    auto port = port_number{};
+    auto [ptr, ec] = std::from_chars(&*port_txt.begin(), &*port_txt.end(), port);
+    if (*ptr != '\0' || ec != std::errc{}) {
+        return std::nullopt;
+    }
+    return port;
+}
+auto parse_service_uri(std::string_view uri_) -> std::optional<uri> {
+    constexpr auto URI_REGEX = R"(^(http|https):\/\/([a-z0-9._-]+):([0-9]+)$)";
+    auto const uri_regex = std::regex(URI_REGEX);
+    auto uri_match = std::smatch{};
+    auto uri_txt = std::string(uri_);
+
+    if (!std::regex_match(uri_txt, uri_match, uri_regex) || uri_match.size() != 4) {
+        return {};
+    }
+    auto schema = uri_match[1].str() == "https" ? uri::schema_type::https : uri::schema_type::http;
+    auto host = uri_match[2].str();
+    auto port = parse_port(uri_match[3].str());
+    if (!port) {
+        return {};
+    }
+    return {{schema, host, *port}};
+}
+
+auto decode_error_message(const std::vector<seastar::temporary_buffer<char>>& content) -> sstring {
+    auto body = vector_search::response_content_to_sstring(content);
+    auto json = rjson::try_parse(body);
+    if (json) {
+        if (json->IsString()) {
+            return sstring(rjson::to_string_view(*json));
+        }
+        auto message = rjson::find(*json, "message");
+        if (message && message->IsString()) {
+            return sstring(rjson::to_string_view(*message));
+        }
+    }
+    return body;
+}
+
+auto get_key_column_value(const rjson::value& item, std::size_t idx, const column_definition& column) -> std::expected<bytes, ann_error> {
+    auto const& column_name = column.name_as_text();
+    auto const* keys_obj = rjson::find(item, column_name);
+    if (keys_obj == nullptr) {
+        vslogger.error("Vector Store returned invalid JSON: missing key column '{}'", column_name);
+        return std::unexpected{service_reply_format_error{}};
+    }
+    if (!keys_obj->IsArray()) {
+        vslogger.error("Vector Store returned invalid JSON: key column '{}' is not an array", column_name);
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto const& keys_arr = keys_obj->GetArray();
+    if (keys_arr.Size() <= idx) {
+        vslogger.error("Vector Store returned invalid JSON: key column '{}' array too small", column_name);
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto const& key = keys_arr[idx];
+    return from_json_object(*column.type, key);
+}
+
+auto pk_from_json(rjson::value const& item, std::size_t idx, schema_ptr const& schema) -> std::expected<partition_key, ann_error> {
+    std::vector<bytes> raw_pk;
+    for (const column_definition& cdef : schema->partition_key_columns()) {
+        auto raw_value = get_key_column_value(item, idx, cdef);
+        if (!raw_value) {
+            return std::unexpected{raw_value.error()};
+        }
+        raw_pk.emplace_back(*raw_value);
+    }
+    return partition_key::from_exploded(raw_pk);
+}
+
+auto ck_from_json(rjson::value const& item, std::size_t idx, schema_ptr const& schema) -> std::expected<clustering_key_prefix, ann_error> {
+    if (schema->clustering_key_size() == 0) {
+        return clustering_key_prefix::make_empty();
+    }
+
+    std::vector<bytes> raw_ck;
+    for (const column_definition& cdef : schema->clustering_key_columns()) {
+        auto raw_value = get_key_column_value(item, idx, cdef);
+        if (!raw_value) {
+            return std::unexpected{raw_value.error()};
+        }
+        raw_ck.emplace_back(*raw_value);
+    }
+
+    return clustering_key_prefix::from_exploded(raw_ck);
+}
+
+auto write_ann_json(vs_vector vs_vector, limit limit, const rjson::value& filter, bool routing, const std::vector<std::string>& return_columns)
+        -> json_content {
+    // Omit "routing" entirely rather than sending "routing":true, so the
+    // request stays wire-compatible with a vector store that only ever
+    // routed by default (routing is currently the common case, needed by
+    // CQL, and its absence in the request must mean "route as before").
+    auto routing_suffix = routing ? "" : R"(,"routing":false)";
+    // Likewise, omit "return_columns" entirely when empty, rather than
+    // sending an empty array, so the request stays wire-compatible with a
+    // vector store that doesn't know about this option (its absence must
+    // mean "return no column values", which is also the empty-array
+    // behavior on a vector store that does know about it).
+    sstring return_columns_suffix;
+    if (!return_columns.empty()) {
+        rjson::value arr = rjson::empty_array();
+        for (const std::string& attr : return_columns) {
+            rjson::push_back(arr, rjson::from_string(attr));
+        }
+        return_columns_suffix = seastar::format(R"(,"return_columns":{})", rjson::print(arr));
+    }
+    if (filter.ObjectEmpty()) {
+        return seastar::format(R"({{"vector":[{}],"limit":{}{}{}}})", fmt::join(vs_vector, ","), limit, routing_suffix, return_columns_suffix);
+    }
+    return seastar::format(R"({{"vector":[{}],"limit":{},"filter":{}{}{}}})", fmt::join(vs_vector, ","), limit, rjson::print(filter), routing_suffix,
+            return_columns_suffix);
+}
+
+// One column of results, giving the name of the column and an array of its
+// values for each row in the response. The name and values are references
+// into the "requested" and "json" parameters of result_columns_from_json()
+// function, so a result_column must not outlive either of these parameters.
+struct result_column {
+    std::string_view name;
+    rjson::value::ConstArray values;
+};
+
+// result_columns_from_json() splits the result `json`, which contains `nrows`
+// values for each of the requested columns `requested`, into separate objects
+// result_column, one per requested column. This split is efficient - the
+// original JSON already contains a separate array for each column so no
+// copying is needed. The benefit of doing this split once is that it allows
+// us to look up fields in `json` and validate them just once, and not for
+// each row. Then read_column_values() below can extract a single row's values
+// without any lookups or validations.
+// A requested column absent from `json`'s "column_values" simply had no
+// stored value in any row, and is left out of the returned list. If
+// `requested` is empty the vector store wouldn't have sent "column_values"
+// at all; otherwise it is required, and a missing, wrong-typed or too-short
+// one is a malformed response and generates a service_reply_format_error.
+auto result_columns_from_json(rjson::value const& json, const std::vector<std::string>& requested, std::size_t nrows)
+        -> std::expected<std::vector<result_column>, ann_error> {
+    std::vector<result_column> columns;
+    if (requested.empty()) {
+        return columns;
+    }
+    auto const* column_values_json = rjson::find(json, "column_values");
+    if (column_values_json == nullptr || !column_values_json->IsObject()) {
+        vslogger.error("Vector Store returned invalid JSON: missing 'column_values' or it is not an object");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    columns.reserve(requested.size());
+    for (const std::string& attr : requested) {
+        auto const* col_arr = rjson::find(*column_values_json, attr);
+        if (col_arr == nullptr) {
+            // The column wasn't returned at all - no stored value for any
+            // of the rows.
+            continue;
+        }
+        if (!col_arr->IsArray()) {
+            vslogger.error("Vector Store returned invalid JSON: 'column_values' member '{}' is not an array", attr);
+            return std::unexpected{service_reply_format_error{}};
+        }
+        if (col_arr->Size() < nrows) {
+            vslogger.error("Vector Store returned invalid JSON: 'column_values' member '{}' array too small", attr);
+            return std::unexpected{service_reply_format_error{}};
+        }
+        columns.push_back(result_column{attr, col_arr->GetArray()});
+    }
+    return columns;
+}
+
+// Pick out of the already-looked-up `columns` the values belonging to a
+// single result row `idx`. A null value means the column had no stored value
+// for that row, and is left out of the returned map.
+auto read_column_values(std::span<result_column const> columns, std::size_t idx)
+        -> std::unordered_map<std::string, rjson::value> {
+    std::unordered_map<std::string, rjson::value> values;
+    values.reserve(columns.size());
+    for (auto const& [name, per_row] : columns) {
+        auto const& val = per_row[idx];
+        if (!val.IsNull()) {
+            values.emplace(name, rjson::copy(val));
+        }
+    }
+    return values;
+}
+
+auto read_scored_primary_keys_json(rjson::value const& json, schema_ptr const& schema, std::optional<std::string_view> score_field_name,
+        const std::vector<std::string>& return_columns = {}) -> std::expected<primary_keys, ann_error> {
+    if (!json.IsObject()) {
+        vslogger.error("Vector Store returned invalid JSON: the reply is not an object");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    if (!json.HasMember("primary_keys")) {
+        vslogger.error("Vector Store returned invalid JSON: missing 'primary_keys'");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto const& keys_json = json["primary_keys"];
+    if (!keys_json.IsObject()) {
+        vslogger.error("Vector Store returned invalid JSON: 'primary_keys' is not an object");
+        return std::unexpected{service_reply_format_error{}};
+    }
+
+    auto const first_key_column_name = schema->partition_key_columns().begin()->name_as_text();
+    auto const* first_key_json = rjson::find(keys_json, first_key_column_name);
+    if (first_key_json == nullptr) {
+        vslogger.error("Vector Store returned invalid JSON: missing key column '{}'", first_key_column_name);
+        return std::unexpected{service_reply_format_error{}};
+    }
+    if (!first_key_json->IsArray()) {
+        vslogger.error("Vector Store returned invalid JSON: key column '{}' is not an array", first_key_column_name);
+        return std::unexpected{service_reply_format_error{}};
+    }
+    // We assume that the score array, if any, and all the key arrays in keys_json
+    // have the same length, which is the number of results returned
+    // by the vector store.
+    auto size = first_key_json->GetArray().Size();
+
+    rjson::value const* score_json = nullptr;
+    if (score_field_name) {
+        score_json = rjson::find(json, *score_field_name);
+        if (score_json == nullptr) {
+            vslogger.error("Vector Store returned invalid JSON: missing '{}'", *score_field_name);
+            return std::unexpected{service_reply_format_error{}};
+        }
+        if (!score_json->IsArray()) {
+            vslogger.error("Vector Store returned invalid JSON: '{}' is not an array", *score_field_name);
+            return std::unexpected{service_reply_format_error{}};
+        }
+        if (score_json->Size() != size) {
+            vslogger.error("Vector Store returned invalid JSON: '{}' array size differs from the key columns", *score_field_name);
+            return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
+    auto columns = result_columns_from_json(json, return_columns, size);
+    if (!columns) {
+        return std::unexpected{columns.error()};
+    }
+
+    auto keys = primary_keys{};
+    keys.reserve(size);
+    for (auto idx = 0U; idx < size; ++idx) {
+        auto pk = pk_from_json(keys_json, idx, schema);
+        if (!pk) {
+            return std::unexpected{pk.error()};
+        }
+        auto ck = ck_from_json(keys_json, idx, schema);
+        if (!ck) {
+            return std::unexpected{ck.error()};
+        }
+        float score = 0;
+        if (score_json) {
+            auto const& score_val = score_json->GetArray()[idx];
+            if (!score_val.IsNumber()) {
+                vslogger.error("Vector Store returned invalid JSON: '{}[{}]'={} is not a number", *score_field_name, idx, rjson::print(score_val));
+                return std::unexpected{service_reply_format_error{}};
+            }
+            score = score_val.GetFloat();
+        }
+        keys.push_back(primary_key{dht::decorate_key(*schema, *pk), *ck, score, read_column_values(*columns, idx)});
+    }
+    return std::move(keys);
+}
+
+auto read_ann_json(rjson::value const& json, schema_ptr const& schema, const std::vector<std::string>& return_columns)
+        -> std::expected<primary_keys, ann_error> {
+    return read_scored_primary_keys_json(json, schema, "similarity_scores", return_columns);
+}
+
+auto write_bm25_json(query_string query, limit limit) -> json_content {
+    return seastar::format(R"({{"query":{},"limit":{}}})", rjson::from_string(query), limit);
+}
+
+auto read_bm25_json(rjson::value const& json, schema_ptr const& schema) -> std::expected<primary_keys, fts_error> {
+    return read_scored_primary_keys_json(json, schema, "scores");
+}
+
+auto write_like_json(query_string pattern, limit limit) -> json_content {
+    return seastar::format(R"({{"pattern":{},"limit":{}}})", rjson::from_string(pattern), limit);
+}
+
+auto read_like_json(rjson::value const& json, schema_ptr const& schema) -> std::expected<primary_keys, like_error> {
+    return read_scored_primary_keys_json(json, schema, std::nullopt);
+}
+
+auto write_highlight_json(query_string query, documents docs) -> json_content {
+    auto quoted_docs = docs | std::views::transform([](auto const& doc) {
+        return rjson::quote_json_string(doc);
+    });
+    return seastar::format(R"({{"query":{},"documents":[{}]}})", rjson::from_string(query), fmt::join(quoted_docs, ","));
+}
+
+auto read_highlight_json(rjson::value const& json, std::size_t documents_sent) -> std::expected<highlights, fts_error> {
+    if (!json.IsObject()) {
+        vslogger.error("Vector Store returned invalid JSON: the reply is not an object");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto const* fragments_json = rjson::find(json, "highlights");
+    if (fragments_json == nullptr) {
+        vslogger.error("Vector Store returned invalid JSON: missing 'highlights'");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    if (!fragments_json->IsArray()) {
+        vslogger.error("Vector Store returned invalid JSON: 'highlights' is not an array");
+        return std::unexpected{service_reply_format_error{}};
+    }
+    auto const& fragments_arr = fragments_json->GetArray();
+
+    // The fragments are matched to the documents by position and by nothing else, so a reply of a
+    // different length says nothing about which document each one came from.
+    if (fragments_arr.Size() != documents_sent) {
+        vslogger.error("Vector Store returned invalid JSON: 'highlights' has {} entries for {} documents", fragments_arr.Size(), documents_sent);
+        return std::unexpected{service_reply_format_error{}};
+    }
+
+    auto fragments = highlights{};
+    fragments.reserve(fragments_arr.Size());
+    for (auto const& fragment : fragments_arr) {
+        if (fragment.IsNull()) {
+            fragments.emplace_back(std::nullopt);
+        } else if (fragment.IsString()) {
+            fragments.emplace_back(sstring(rjson::to_string_view(fragment)));
+        } else {
+            vslogger.error("Vector Store returned invalid JSON: 'highlights[{}]'={} is neither a string nor null", fragments.size(), rjson::print(fragment));
+            return std::unexpected{service_reply_format_error{}};
+        }
+    }
+    return std::move(fragments);
+}
+
+bool should_vector_store_service_be_disabled(std::vector<sstring> const& uris) {
+    return uris.empty() || uris[0].empty();
+}
+
+using index_status = vector_search::vector_store_client::index_status;
+using index_node_status = vector_search::vector_store_client::index_node_status;
+using index_state = vector_search::vector_store_client::index_state;
+
+auto index_status_from_string(std::string_view sv) -> index_status {
+    if (sv == "SERVING") {
+        return index_status::serving;
+    }
+    if (sv == "BOOTSTRAPPING") {
+        return index_status::bootstrapping;
+    }
+    if (sv == "INITIALIZING") {
+        return index_status::initializing;
+    }
+    return index_status::unknown;
+}
+
+/// Parse the body of a GET /api/v1/indexes/{ks}/{idx}/status reply. Any
+/// problem reading or parsing the body yields a status of `unknown`.
+auto parse_index_state(rjson::chunked_content&& content) -> index_state {
+    auto result = index_state{.status = index_status::unknown};
+    try {
+        auto json = rjson::parse(std::move(content));
+        const auto* status = rjson::find(json, "status");
+        if (status && status->IsString()) {
+            result.status = index_status_from_string(rjson::to_string_view(*status));
+        }
+        const auto* count = rjson::find(json, "count");
+        if (count && count->IsUint64()) {
+            result.count = count->GetUint64();
+        }
+        const auto* progress = rjson::find(json, "build_progress");
+        if (progress && progress->IsNumber()) {
+            result.build_progress = progress->GetDouble();
+        }
+    } catch (...) {
+        return index_state{.status = index_status::unknown};
+    }
+    return result;
+}
+
+auto parse_uris(std::string_view uris_csv) -> std::vector<uri> {
+    std::vector<uri> ret;
+    auto uris = utils::split_comma_separated_list(uris_csv);
+    if (should_vector_store_service_be_disabled(uris)) {
+        vslogger.info("Vector Store service URIs are empty, disabling Vector Store service");
+        return ret;
+    }
+
+    for (const auto& uri : uris) {
+        auto parsed = parse_service_uri(uri);
+        if (!parsed) {
+            throw configuration_exception(fmt::format("Invalid Vector Store service URI: {}", uri));
+        }
+        ret.push_back(*parsed);
+    }
+
+    vslogger.info("Vector Store service URIs set to: '{}'", uris_csv);
+    return ret;
+}
+
+auto parse_uris_no_throw(std::string_view uris_csv) -> std::vector<uri> {
+    try {
+        return parse_uris(uris_csv);
+    } catch (const configuration_exception& e) {
+        vslogger.error("Failed to parse Vector Store service URIs [{}]: {}", uris_csv, e.what());
+    }
+    return {};
+}
+
+std::vector<sstring> get_hosts(const std::vector<uri>& primary_uris, const std::vector<uri>& secondary_uris) {
+    std::vector<sstring> ret;
+    for (const auto& uri : primary_uris) {
+        ret.push_back(uri.host);
+    }
+    for (const auto& uri : secondary_uris) {
+        ret.push_back(uri.host);
+    }
+    return ret;
+}
+
+} // namespace
+
+namespace vector_search {
+
+struct vector_store_client::impl {
+    using invoke_on_others_func = std::function<future<>(std::function<future<>(impl&)>)>;
+
+    utils::observer<sstring> _primary_uri_observer;
+    utils::observer<sstring> _secondary_uri_observer;
+    std::vector<uri> _primary_uris;
+    std::vector<uri> _secondary_uris;
+    dns _dns;
+    uint64_t _dns_refreshes = 0;
+    seastar::metrics::metric_groups _metrics;
+    truststore _truststore;
+    clients _primary_clients;
+    clients _secondary_clients;
+
+    impl(utils::config_file::named_value<sstring> primary_uris, utils::config_file::named_value<sstring> secondary_uris,
+            utils::config_file::named_value<uint32_t> unreachable_node_detection_time_in_ms,
+            utils::config_file::named_value<utils::config_file::string_map> encryption_options, invoke_on_others_func invoke_on_others)
+        : _primary_uri_observer(primary_uris.observe([this](seastar::sstring uris_csv) {
+            handle_uris_changed(std::move(uris_csv), _primary_uris, _primary_clients);
+        }))
+        , _secondary_uri_observer(secondary_uris.observe([this](seastar::sstring uris_csv) {
+            handle_uris_changed(std::move(uris_csv), _secondary_uris, _secondary_clients);
+        }))
+        , _primary_uris(parse_uris(primary_uris()))
+        , _secondary_uris(parse_uris(secondary_uris()))
+        , _dns(
+                  vslogger, get_hosts(_primary_uris, _secondary_uris),
+                  [this](auto const& addrs) -> future<> {
+                      co_await handle_addresses_changed(addrs);
+                  },
+                  _dns_refreshes)
+        , _truststore(vslogger, encryption_options,
+                  [invoke_on_others = std::move(invoke_on_others)](auto func) {
+                      return invoke_on_others([func = std::move(func)](auto& self) {
+                          return func(self._truststore);
+                      });
+                  })
+        , _primary_clients(
+                  vslogger,
+                  [this]() {
+                      _dns.trigger_refresh();
+                  },
+                  unreachable_node_detection_time_in_ms, _truststore)
+
+        , _secondary_clients(
+                  vslogger,
+                  [this]() {
+                      _dns.trigger_refresh();
+                  },
+                  unreachable_node_detection_time_in_ms, _truststore) {
+        _metrics.add_group("vector_store", {seastar::metrics::make_gauge("dns_refreshes", seastar::metrics::description("Number of DNS refreshes"), [this] {
+            return _dns_refreshes;
+        }).aggregate({seastar::metrics::shard_label})});
+    }
+
+    void handle_uris_changed(seastar::sstring uris_csv, std::vector<uri>& uris, clients& clients) {
+        clients.clear();
+        uris = parse_uris_no_throw(uris_csv);
+        _dns.hosts(get_hosts(_primary_uris, _secondary_uris));
+    }
+
+    future<> handle_addresses_changed(const dns::host_address_map& addrs) {
+        co_await _primary_clients.handle_changed(_primary_uris, addrs);
+        co_await _secondary_clients.handle_changed(_secondary_uris, addrs);
+    }
+
+    auto is_disabled() const -> bool {
+        return _primary_uris.empty() && _secondary_uris.empty();
+    }
+
+    auto get_index_status(keyspace_name keyspace, index_name name, abort_source& as)
+            -> future<vector_store_client::index_status> {
+        using index_status = vector_store_client::index_status;
+        if (is_disabled()) {
+            co_return index_status::unknown;
+        }
+        auto path = format("/api/v1/indexes/{}/{}/status", keyspace, name);
+        auto resp = co_await request(operation_type::GET, std::move(path), std::nullopt, as);
+        if (!resp || resp->status != status_type::ok) {
+            co_return index_status::unknown;
+        }
+        co_return parse_index_state(std::move(resp->content)).status;
+    }
+
+    auto get_index_status_per_node(keyspace_name keyspace, index_name name, abort_source& as) -> future<std::vector<index_node_status>> {
+        using node_role = vector_store_client::node_role;
+        using node_connectivity = vector_store_client::node_connectivity;
+
+        std::vector<node_entry> nodes;
+        collect_nodes(nodes, node_role::primary, _primary_uris, _primary_clients);
+        collect_nodes(nodes, node_role::secondary, _secondary_uris, _secondary_clients);
+
+        // Query the reachable nodes concurrently, so that the overall latency
+        // is bound by the slowest node rather than by the sum of all of them.
+        auto path = format("/api/v1/indexes/{}/{}/status", keyspace, name);
+        co_await coroutine::parallel_for_each(nodes, [&](node_entry& n) -> future<> {
+            if (!n.status.endpoint || n.status.endpoint->connectivity != node_connectivity::up) {
+                co_return;
+            }
+            auto resp = co_await n.client->request(operation_type::GET, path, std::nullopt, as);
+            if (!resp || resp->status != status_type::ok) {
+                // A failed request may have marked the node unreachable.
+                n.status.endpoint->connectivity = n.client->is_up() ? node_connectivity::up : node_connectivity::down;
+                co_return;
+            }
+            n.status.state = parse_index_state(std::move(resp->content));
+        });
+
+        std::vector<index_node_status> ret;
+        ret.reserve(nodes.size());
+        for (auto& n : nodes) {
+            ret.push_back(std::move(n.status));
+        }
+        co_return ret;
+    }
+
+    auto post_to_index(std::string_view op, http_path path, json_content content, abort_source& as) -> future<std::expected<reply_content, ann_error>> {
+        if (is_disabled()) {
+            vslogger.error("Disabled Vector Store while calling {}", op);
+            co_return std::unexpected{disabled{}};
+        }
+
+        auto resp = co_await request(operation_type::POST, std::move(path), std::move(content), as);
+        if (!resp) {
+            co_return std::unexpected{std::visit(
+                    [](auto&& err) {
+                        return ann_error{err};
+                    },
+                    resp.error())};
+        }
+
+        if (resp->status != status_type::ok) {
+            auto error_content = decode_error_message(resp->content);
+            vslogger.error("Vector Store returned error: HTTP status {}: {}", resp->status, error_content);
+            co_return std::unexpected{service_error{resp->status, std::move(error_content)}};
+        }
+
+        co_return std::move(resp->content);
+    }
+
+    auto ann(keyspace_name keyspace, index_name name, schema_ptr schema, vs_vector vs_vector, limit limit, const rjson::value& filter, abort_source& as,
+            bool routing, std::vector<std::string> return_columns) -> future<std::expected<primary_keys, ann_error>> {
+        auto content = co_await post_to_index("ann", format("/api/v1/indexes/{}/{}/ann", keyspace, name),
+                write_ann_json(std::move(vs_vector), limit, filter, routing, return_columns), as);
+        if (!content) {
+            co_return std::unexpected{content.error()};
+        }
+
+        try {
+            co_return read_ann_json(rjson::parse(std::move(*content)), schema, return_columns);
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
+    auto bm25(keyspace_name keyspace, index_name name, schema_ptr schema, query_string fts_query, limit limit, abort_source& as)
+            -> future<std::expected<primary_keys, fts_error>> {
+        auto content = co_await post_to_index("bm25", format("/api/v1/indexes/{}/{}/bm25", keyspace, name), write_bm25_json(std::move(fts_query), limit), as);
+        if (!content) {
+            co_return std::unexpected{content.error()};
+        }
+
+        try {
+            co_return read_bm25_json(rjson::parse(std::move(*content)), schema);
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
+    auto like(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit, abort_source& as)
+            -> future<std::expected<primary_keys, like_error>> {
+        auto content = co_await post_to_index("like", format("/api/v1/indexes/{}/{}/like", keyspace, name),
+                write_like_json(std::move(pattern), limit), as);
+        if (!content) {
+            co_return std::unexpected{content.error()};
+        }
+
+        try {
+            co_return read_like_json(rjson::parse(std::move(*content)), schema);
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
+    auto highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents docs, abort_source& as)
+            -> future<std::expected<highlights, fts_error>> {
+        auto documents_sent = docs.size();
+        auto content = co_await post_to_index("highlight", format("/api/v1/indexes/{}/{}/highlight", keyspace, name),
+                write_highlight_json(std::move(fts_query), std::move(docs)), as);
+        if (!content) {
+            co_return std::unexpected{content.error()};
+        }
+
+        try {
+            co_return read_highlight_json(rjson::parse(std::move(*content)), documents_sent);
+        } catch (const rjson::error& e) {
+            vslogger.error("Vector Store returned invalid JSON: {}", e.what());
+            co_return std::unexpected{service_reply_format_error{}};
+        }
+    }
+
+    future<clients::request_result> request(
+            seastar::httpd::operation_type method, seastar::sstring path, std::optional<seastar::sstring> content, seastar::abort_source& as) {
+        auto success_or_aborted = [](const auto& result) {
+            return result || std::holds_alternative<vector_store_client::aborted>(result.error());
+        };
+        if (!_primary_uris.empty()) {
+            auto result = co_await _primary_clients.request(method, path, content, as);
+            if (success_or_aborted(result) || _secondary_uris.empty()) {
+                co_return result;
+            }
+        }
+
+        if (!_secondary_uris.empty()) {
+            co_return co_await _secondary_clients.request(method, path, content, as);
+        }
+
+        co_return std::unexpected{service_unavailable{}};
+    }
+
+    struct node_entry {
+        index_node_status status;
+        seastar::lw_shared_ptr<client> client;
+    };
+
+    /// Append one entry per known node of the given role. Each configured URI
+    /// contributes one entry per resolved address (up/down depending on the
+    /// client's reachability), or a single entry without an endpoint when no address has
+    /// been resolved for it yet.
+    ///
+    /// Reads only what the background DNS refresh has resolved so far, never
+    /// resolving on demand, so that a host which cannot be resolved does not
+    /// delay the caller. Such a host is reported as `unknown` until a later
+    /// refresh resolves it.
+    ///
+    /// Must not preempt: it iterates the live client vector, which the DNS
+    /// refresh replaces. The clients it keeps in `out` are reference counted,
+    /// so they stay alive (and unclosed) after the refresh drops them.
+    static void collect_nodes(std::vector<node_entry>& out, vector_store_client::node_role role, const std::vector<uri>& uris, const clients& cs) {
+        using node_connectivity = vector_store_client::node_connectivity;
+        for (const auto& uri : uris) {
+            bool found = false;
+            for (const auto& c : cs.current()) {
+                const auto& ep = c->endpoint();
+                if (ep.host != uri.host || ep.port != uri.port) {
+                    continue;
+                }
+                // The same endpoint may be configured both as a primary and as
+                // a secondary node; report it once, under the first role.
+                if (std::ranges::any_of(out, [&](const node_entry& n) {
+                        return n.status.endpoint && n.status.endpoint->ip == ep.ip && n.status.port == ep.port;
+                    })) {
+                    found = true;
+                    continue;
+                }
+                found = true;
+                out.push_back(node_entry{
+                        .status = index_node_status{
+                                .role = role,
+                                .host = uri.host,
+                                .port = uri.port,
+                                .endpoint = resolved_endpoint{
+                                        .ip = ep.ip,
+                                        .connectivity = c->is_up() ? node_connectivity::up : node_connectivity::down,
+                                },
+                                .state = index_state{.status = index_status::unknown},
+                        },
+                        .client = c,
+                });
+            }
+            // An unresolved host listed both as a primary and as a secondary
+            // node is likewise reported once, under the first role.
+            if (!found && std::ranges::none_of(out, [&](const node_entry& n) {
+                    return !n.status.endpoint && n.status.host == uri.host && n.status.port == uri.port;
+                })) {
+                out.push_back(node_entry{
+                        .status = index_node_status{
+                                .role = role,
+                                .host = uri.host,
+                                .port = uri.port,
+                                .endpoint = std::nullopt,
+                                .state = index_state{.status = index_status::unknown},
+                        },
+                });
+            }
+        }
+    }
+
+};
+
+vector_store_client::vector_store_client(config const& cfg)
+    : _impl(std::make_unique<impl>(cfg.vector_store_primary_uri, cfg.vector_store_secondary_uri, cfg.vector_store_unreachable_node_detection_time_in_ms,
+              cfg.vector_store_encryption_options, [this](auto func) {
+                  return container().invoke_on_others([func = std::move(func)](auto& self) {
+                      return func(*self._impl);
+                  });
+              })) {
+}
+
+vector_store_client::~vector_store_client() = default;
+
+void vector_store_client::start_background_tasks() {
+    _impl->_dns.start_background_tasks();
+}
+
+auto vector_store_client::stop() -> future<> {
+    co_await _impl->_dns.stop();
+    co_await _impl->_primary_clients.stop();
+    co_await _impl->_secondary_clients.stop();
+    co_await _impl->_truststore.stop();
+}
+
+auto vector_store_client::is_disabled() const -> bool {
+    return _impl->is_disabled();
+}
+
+auto vector_store_client::get_index_status(keyspace_name keyspace, index_name name, abort_source& as) -> future<index_status> {
+    return _impl->get_index_status(std::move(keyspace), std::move(name), as);
+}
+
+auto vector_store_client::get_index_status_per_node(keyspace_name keyspace, index_name name, abort_source& as)
+        -> future<std::vector<index_node_status>> {
+    return _impl->get_index_status_per_node(std::move(keyspace), std::move(name), as);
+}
+
+auto vector_store_client::ann(keyspace_name keyspace, index_name name, schema_ptr schema, vs_vector vs_vector, limit limit, const rjson::value& filter,
+        abort_source& as, bool routing, std::vector<std::string> return_columns) -> future<std::expected<primary_keys, ann_error>> {
+    return _impl->ann(std::move(keyspace), std::move(name), schema, std::move(vs_vector), limit, filter, as, routing, std::move(return_columns));
+}
+
+auto vector_store_client::bm25(keyspace_name keyspace, index_name name, schema_ptr schema, query_string fts_query, limit limit, abort_source& as)
+        -> future<std::expected<primary_keys, fts_error>> {
+    return _impl->bm25(std::move(keyspace), std::move(name), schema, std::move(fts_query), limit, as);
+}
+
+auto vector_store_client::like(keyspace_name keyspace, index_name name, schema_ptr schema, query_string pattern, limit limit, abort_source& as)
+        -> future<std::expected<primary_keys, like_error>> {
+    return _impl->like(std::move(keyspace), std::move(name), schema, std::move(pattern), limit, as);
+}
+
+auto vector_store_client::highlight(keyspace_name keyspace, index_name name, query_string fts_query, documents documents, abort_source& as)
+        -> future<std::expected<highlights, fts_error>> {
+    return _impl->highlight(std::move(keyspace), std::move(name), std::move(fts_query), std::move(documents), as);
+}
+
+void vector_store_client_tester::set_dns_refresh_interval(vector_store_client& vsc, std::chrono::milliseconds interval) {
+    vsc._impl->_dns.refresh_interval(interval);
+}
+
+void vector_store_client_tester::set_wait_for_client_timeout(vector_store_client& vsc, std::chrono::milliseconds timeout) {
+    vsc._impl->_primary_clients.timeout(timeout);
+    vsc._impl->_secondary_clients.timeout(timeout);
+}
+
+void vector_store_client_tester::set_dns_resolver(vector_store_client& vsc, std::function<future<std::vector<inet_address>>(sstring const&)> resolver) {
+    vsc._impl->_dns.resolver(std::move(resolver));
+}
+
+void vector_store_client_tester::trigger_dns_resolver(vector_store_client& vsc) {
+    vsc._impl->_dns.trigger_refresh();
+}
+
+auto vector_store_client_tester::resolve_hostname(vector_store_client& vsc, abort_source& as) -> future<std::vector<inet_address>> {
+    auto clients = co_await vsc._impl->_primary_clients.get_clients(as);
+    std::vector<inet_address> ret;
+    if (!clients) {
+        co_return ret;
+    }
+    for (auto const& c : *clients) {
+        ret.push_back(c->endpoint().ip);
+    }
+    co_return ret;
+}
+
+unsigned vector_store_client_tester::truststore_reload_count(vector_store_client& vsc) {
+    return vsc._impl->_truststore.reload_count();
+}
+
+} // namespace vector_search
+
+/// The names used by the vector store in its status replies, see
+/// index_status_from_string().
+auto fmt::formatter<vector_search::vector_store_client::index_status>::format(
+        vector_search::vector_store_client::index_status status, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    using index_status = vector_search::vector_store_client::index_status;
+    std::string_view name;
+    switch (status) {
+    case index_status::unknown:
+        name = "UNKNOWN";
+        break;
+    case index_status::initializing:
+        name = "INITIALIZING";
+        break;
+    case index_status::bootstrapping:
+        name = "BOOTSTRAPPING";
+        break;
+    case index_status::serving:
+        name = "SERVING";
+        break;
+    }
+    return formatter<string_view>::format(name, ctx);
+}
+
+auto fmt::formatter<vector_search::vector_store_client::node_role>::format(
+        vector_search::vector_store_client::node_role role, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    using node_role = vector_search::vector_store_client::node_role;
+    std::string_view name;
+    switch (role) {
+    case node_role::primary:
+        name = "primary";
+        break;
+    case node_role::secondary:
+        name = "secondary";
+        break;
+    }
+    return formatter<string_view>::format(name, ctx);
+}
+
+auto fmt::formatter<vector_search::vector_store_client::node_connectivity>::format(
+        vector_search::vector_store_client::node_connectivity c, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    using node_connectivity = vector_search::vector_store_client::node_connectivity;
+    std::string_view name;
+    switch (c) {
+    case node_connectivity::up:
+        name = "up";
+        break;
+    case node_connectivity::down:
+        name = "down";
+        break;
+    }
+    return formatter<string_view>::format(name, ctx);
+}

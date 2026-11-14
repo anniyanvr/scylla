@@ -53,6 +53,45 @@
          ]
       },
       {
+         "path":"/system/log",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Write a message to the Scylla log",
+               "type":"void",
+               "nickname":"write_log_message",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"message",
+                     "description":"The message to write to the log",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"level",
+                     "description":"The logging level to use",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "enum":[
+                        "error",
+                        "warn",
+                        "info",
+                        "debug",
+                        "trace"
+                     ],
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
          "path":"/system/drop_sstable_caches",
          "operations":[
             {
@@ -138,6 +177,69 @@
                      "paramType":"query"
                   }
                ]
+            }
+         ]
+      },
+      {
+         "path":"/system/dump_llvm_profile",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Dump llvm profile data (raw profile data) that can later be used for coverage reporting or PGO (no-op if the current binary is not instrumented)",
+               "type":"void",
+               "nickname":"dump_profile",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
+            }
+         ]
+      },
+      {
+         "path":"/system/highest_supported_sstable_version",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Get highest supported sstable version",
+               "type":"string",
+               "nickname":"get_highest_supported_sstable_version",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
+            }
+         ]
+      },
+      {
+         "path":"/system/chosen_sstable_version",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Get sstable version currently chosen for use in new sstables",
+               "type":"string",
+               "nickname":"get_chosen_sstable_version",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
+            }
+         ]
+      },
+      {
+         "path":"/system/shard_to_numa_node_mapping",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Get the shard-to-NUMA-node mapping. The nth element is the NUMA node ID of the nth shard.",
+               "type":"array",
+               "items":{
+                  "type":"long"
+               },
+               "nickname":"get_shard_to_numa_node_mapping",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
             }
          ]
       }

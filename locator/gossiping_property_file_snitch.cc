@@ -5,45 +5,44 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "locator/gossiping_property_file_snitch.hh"
+
+#include <seastar/core/file.hh>
+#include <seastar/core/seastar.hh>
 #include "gms/versioned_value.hh"
-#include "message/msg_addr.hh"
-#include "message/messaging_service.hh"
 #include "gms/gossiper.hh"
 
 namespace locator {
 future<bool> gossiping_property_file_snitch::property_file_was_modified() {
-    return open_file_dma(_prop_file_name, open_flags::ro)
-    .then([this](file f) {
-        return do_with(std::move(f), [] (file& f) {
-            return f.stat();
-        });
-    }).then_wrapped([this] (auto&& f) {
-        try {
-            auto st = f.get0();
-
-            if (!_last_file_mod ||
-                _last_file_mod->tv_sec != st.st_mtim.tv_sec) {
-                _last_file_mod = st.st_mtim;
-                return true;
-            } else {
-                return false;
-            }
-        } catch (...) {
-            logger().error("Failed to open {} for read or to get stats", _prop_file_name);
-            throw;
+    try {
+        auto f = co_await open_file_dma(_prop_file_name, open_flags::ro);
+        auto st = co_await f.stat();
+        if (!_last_file_mod ||
+            _last_file_mod->tv_sec != st.st_mtim.tv_sec) {
+            _last_file_mod = st.st_mtim;
+            co_return true;
+        } else {
+            co_return false;
         }
-    });
+    } catch (...) {
+        logger().error("Failed to open {} for read or to get stats", _prop_file_name);
+        throw;
+    }
 }
 
-gossiping_property_file_snitch::gossiping_property_file_snitch(
-    const sstring& fname, unsigned io_cpuid)
-: production_snitch_base(fname), _file_reader_cpu_id(io_cpuid) {
+gossiping_property_file_snitch::gossiping_property_file_snitch(const snitch_config& cfg)
+        : production_snitch_base(cfg)
+        , _file_reader_cpu_id(cfg.io_cpu_id)
+        , _listen_address(cfg.listen_address) {
     if (this_shard_id() == _file_reader_cpu_id) {
         io_cpu_id() = _file_reader_cpu_id;
+    }
+    if (_listen_address->addr().is_addr_any()) {
+        logger().warn("Not gossiping INADDR_ANY as internal IP");
+        _listen_address.reset();
     }
 }
 
@@ -61,93 +60,69 @@ future<> gossiping_property_file_snitch::start() {
         // minute and load its contents into the gossiper.endpoint_state_map
         //
         _file_reader.set_callback([this] {
-            periodic_reader_callback();
+            (void)periodic_reader_callback();
         });
 
-        return read_property_file().then([this] {
-            start_io();
-            set_snitch_ready();
-            return make_ready_future<>();
-        });
+        co_await read_property_file();
+        start_io();
     }
 
     set_snitch_ready();
-    return make_ready_future<>();
 }
 
-void gossiping_property_file_snitch::periodic_reader_callback() {
+future<> gossiping_property_file_snitch::periodic_reader_callback() {
     _file_reader_runs = true;
-    //FIXME: discarded future.
-    (void)property_file_was_modified().then([this] (bool was_modified) {
-
+    try {
+        bool was_modified = co_await property_file_was_modified();
         if (was_modified) {
-            return read_property_file();
+            co_await read_property_file();
         }
+    } catch (...) {
+        logger().error("Exception has been thrown when parsing the property file.");
+    }
 
-        return make_ready_future<>();
-    }).then_wrapped([this] (auto&& f) {
-        try {
-            f.get();
-        } catch (...) {
-            logger().error("Exception has been thrown when parsing the property file.");
-        }
+    if (_state == snitch_state::stopping || _state == snitch_state::io_pausing) {
+        this->set_stopped();
+    } else if (_state != snitch_state::stopped) {
+        _file_reader.arm(reload_property_file_period());
+    }
 
-        if (_state == snitch_state::stopping || _state == snitch_state::io_pausing) {
-            this->set_stopped();
-        } else if (_state != snitch_state::stopped) {
-            _file_reader.arm(reload_property_file_period());
-        }
-
-        _file_reader_runs = false;
-    });
+    _file_reader_runs = false;
 }
 
-future<> gossiping_property_file_snitch::gossiper_starting() {
-    using namespace gms;
-    using namespace service;
-    //
-    // Note: currently gossiper "main" instance always runs on CPU0 therefore
-    // this function will be executed on CPU0 only.
-    //
-    auto& g = get_local_gossiper();
-
-    auto local_internal_addr = g.get_local_messaging().listen_address();
-    std::ostringstream ostrm;
-
-    ostrm<<local_internal_addr<<std::flush;
-
-    return gossip_snitch_info({
-        { application_state::INTERNAL_IP, versioned_value::internal_ip(ostrm.str()) },
-    }).then([this] {
-        _gossip_started = true;
-        return reload_gossiper_state();
-    });
+gms::application_state_map gossiping_property_file_snitch::get_app_states() const {
+    gms::application_state_map ret = {
+        {gms::application_state::DC, gms::versioned_value::datacenter(_my_dc)},
+        {gms::application_state::RACK, gms::versioned_value::rack(_my_rack)},
+    };
+    if (_listen_address.has_value()) {
+        sstring ip = format("{}", *_listen_address);
+        ret.emplace(gms::application_state::INTERNAL_IP, gms::versioned_value::internal_ip(std::move(ip)));
+    }
+    return ret;
 }
 
 future<> gossiping_property_file_snitch::read_property_file() {
-    using namespace exceptions;
-
-    return load_property_file().then([this] {
-        return reload_configuration();
-    }).then_wrapped([this] (auto&& f) {
-        try {
-            f.get();
-            return make_ready_future<>();
-        } catch (...) {
-            //
-            // In case of an error:
-            //    - Halt if in the constructor.
-            //    - Print an error when reloading.
-            //
-            if (_state == snitch_state::initializing) {
-                logger().error("Failed to parse a properties file ({}). Halting...", _prop_file_name);
-                throw;
-            } else {
-                logger().warn("Failed to reload a properties file ({}). Using previous values.", _prop_file_name);
-                return make_ready_future<>();
-            }
+    std::exception_ptr ex;
+    try {
+        co_await load_property_file();
+        co_await reload_configuration();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    if (ex) {
+        //
+        // In case of an error:
+        //    - Halt if in the constructor.
+        //    - Print an error when reloading.
+        //
+        if (_state == snitch_state::initializing) {
+            logger().error("Failed to parse a properties file ({}). Halting...", _prop_file_name);
+            co_await coroutine::return_exception_ptr(std::move(ex));
+        } else {
+            logger().warn("Failed to reload a properties file ({}). Using previous values.", _prop_file_name);
         }
-    });
+    }
 }
 
 future<> gossiping_property_file_snitch::reload_configuration() {
@@ -174,48 +149,15 @@ future<> gossiping_property_file_snitch::reload_configuration() {
         }
     }
 
-    if (_state == snitch_state::initializing || _my_dc != new_dc ||
-        _my_rack != new_rack || _prefer_local != new_prefer_local) {
-
-        _my_dc = new_dc;
-        _my_rack = new_rack;
-        _prefer_local = new_prefer_local;
-
-        assert(_my_distributed);
-
-        return _my_distributed->invoke_on_all(
-            [this] (snitch_ptr& local_s) {
-
-            // Distribute the new values on all CPUs but the current one
-            if (this_shard_id() != _file_reader_cpu_id) {
-                local_s->set_my_dc(_my_dc);
-                local_s->set_my_rack(_my_rack);
-                local_s->set_prefer_local(_prefer_local);
-            }
-        }).then([this] {
-            return seastar::async([this] {
-                // reload Gossiper state (executed on CPU0 only)
-                smp::submit_to(0, [] {
-                    auto& local_snitch_ptr = get_local_snitch_ptr();
-                    return local_snitch_ptr->reload_gossiper_state();
-                }).get();
-
-                _reconfigured();
-
-                // spread the word...
-                smp::submit_to(0, [] {
-                    auto& local_snitch_ptr = get_local_snitch_ptr();
-                    if (local_snitch_ptr->local_gossiper_started()) {
-                        return local_snitch_ptr->gossip_snitch_info({});
-                    }
-
-                    return make_ready_future<>();
-                }).get();
-            });
+    if (_state == snitch_state::initializing || _my_dc != new_dc || _my_rack != new_rack || _prefer_local != new_prefer_local) {
+        co_await container().invoke_on_all([new_dc, new_rack, new_prefer_local] (snitch_ptr& local_s) {
+            local_s->set_my_dc_and_rack(new_dc, new_rack);
+            local_s->set_prefer_local(new_prefer_local);
+        });
+        co_await seastar::async([this] {
+            _reconfigured();
         });
     }
-
-    return make_ready_future<>();
 }
 
 void gossiping_property_file_snitch::set_stopped() {
@@ -258,57 +200,22 @@ void gossiping_property_file_snitch::start_io() {
 
 future<> gossiping_property_file_snitch::stop() {
     if (_state == snitch_state::stopped || _state == snitch_state::io_paused) {
-        return make_ready_future<>();
+        co_return;
     }
 
     _state = snitch_state::stopping;
 
-    return stop_io();
+    co_await stop_io();
 }
 
 future<> gossiping_property_file_snitch::pause_io() {
     if (_state == snitch_state::stopped || _state == snitch_state::io_paused) {
-        return make_ready_future<>();
+        co_return;
     }
 
     _state = snitch_state::io_pausing;
 
-    return stop_io();
+    co_await stop_io();
 }
 
-// should be invoked of CPU0 only
-future<> gossiping_property_file_snitch::reload_gossiper_state() {
-    if (!_gossip_started) {
-        return make_ready_future<>();
-    }
-
-    future<> ret = make_ready_future<>();
-    if (_reconnectable_helper) {
-        ret = gms::get_local_gossiper().unregister_(_reconnectable_helper);
-    }
-
-    if (!_prefer_local) {
-        return ret;
-    }
-
-    return ret.then([this] {
-        _reconnectable_helper = ::make_shared<reconnectable_snitch_helper>(_my_dc);
-        gms::get_local_gossiper().register_(_reconnectable_helper);
-    });
-}
-
-using registry_2_params = class_registrator<i_endpoint_snitch,
-                                   gossiping_property_file_snitch,
-                                   const sstring&, unsigned>;
-static registry_2_params registrator2("org.apache.cassandra.locator.GossipingPropertyFileSnitch");
-
-using registry_1_param = class_registrator<i_endpoint_snitch,
-                                   gossiping_property_file_snitch,
-                                   const sstring&>;
-static registry_1_param registrator1("org.apache.cassandra.locator.GossipingPropertyFileSnitch");
-
-using registry_default = class_registrator<i_endpoint_snitch,
-                                           gossiping_property_file_snitch>;
-static registry_default registrator_default("org.apache.cassandra.locator.GossipingPropertyFileSnitch");
-static registry_default registrator_default_short_name("GossipingPropertyFileSnitch");
 } // namespace locator

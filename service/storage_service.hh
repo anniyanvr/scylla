@@ -6,50 +6,60 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
+#include <variant>
+#include <seastar/core/shared_future.hh>
+#include "absl-flat_hash_map.hh"
+#include "gms/endpoint_state.hh"
 #include "gms/i_endpoint_state_change_subscriber.hh"
+#include "schema/schema_fwd.hh"
+#include "service/client_routes.hh"
+#include "service/raft/raft_group0_client.hh"
 #include "service/endpoint_lifecycle_subscriber.hh"
+#include "service/qos/service_level_controller.hh"
+#include "service/task_manager_module.hh"
+#include "service/topology_guard.hh"
 #include "locator/abstract_replication_strategy.hh"
+#include "locator/snitch_base.hh"
+#include "locator/tablets.hh"
+#include "locator/tablet_metadata_guard.hh"
 #include "inet_address_vectors.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/condition-variable.hh>
-#include "dht/i_partitioner.hh"
 #include "dht/token_range_endpoints.hh"
-#include <seastar/core/sleep.hh>
 #include "gms/application_state.hh"
+#include "gms/gossip_address_map.hh"
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/gate.hh>
-#include "utils/fb_utilities.hh"
 #include "replica/database_fwd.hh"
-#include "db/schema_features.hh"
-#include "streaming/stream_state.hh"
 #include "streaming/stream_reason.hh"
-#include <seastar/core/distributed.hh>
-#include "utils/disk-error-handler.hh"
 #include "service/migration_listener.hh"
-#include "protocol_server.hh"
-#include "gms/feature_service.hh"
 #include <seastar/core/metrics_registration.hh>
-#include <seastar/core/rwlock.hh>
-#include "sstables/version.hh"
-#include "sstables/shared_sstable.hh"
 #include <seastar/core/shared_ptr.hh>
-#include <seastar/core/lowres_clock.hh>
-#include "locator/snitch_base.hh"
 #include "cdc/generation_id.hh"
+#include "db/system_keyspace.hh"
+#include "raft/raft.hh"
+#include "node_ops/id.hh"
+#include "raft/server.hh"
+#include "db/view/view_building_state.hh"
+#include "service/tablet_allocator.hh"
+#include "service/tablet_operation.hh"
+#include "mutation/timestamp.hh"
+#include "utils/UUID.hh"
+#include "utils/user_provided_param.hh"
+#include "utils/sequenced_set.hh"
+#include "utils/serialized_action.hh"
+#include "service/topology_coordinator.hh"
 
 class node_ops_cmd_request;
 class node_ops_cmd_response;
 class node_ops_info;
-enum class node_ops_cmd : uint32_t;
 class repair_service;
-namespace service {
-class raft_group_registry;
-}
+class protocol_server;
 
 namespace cql3 { class query_processor; }
 
@@ -57,6 +67,7 @@ namespace cql_transport { class controller; }
 
 namespace cdc {
 class generation_service;
+class metadata;
 }
 
 namespace streaming {
@@ -64,8 +75,18 @@ class stream_manager;
 }
 
 namespace db {
+class cluster_config_manager;
 class system_distributed_keyspace;
+class system_keyspace;
 class batchlog_manager;
+class snapshot_ctl;
+namespace view {
+class view_builder;
+class view_building_worker;
+}
+namespace schema_tables {
+class schema_applier;
+}
 }
 
 namespace netw {
@@ -80,42 +101,80 @@ class range_streamer;
 namespace gms {
 class feature_service;
 class gossiper;
+class loaded_endpoint_state;
 };
+
+namespace node_ops {
+class node_ops_virtual_task;
+class task_manager_module;
+}
+
+namespace tasks {
+class task_manager;
+}
+
+namespace replica {
+class tablet_mutation_builder;
+}
+
+namespace auth { class cache; }
+
+namespace utils {
+class disk_space_monitor;
+}
 
 namespace service {
 
 class storage_service;
+class storage_proxy;
 class migration_manager;
 class raft_group0;
+class group0_guard;
+class group0_info;
+class raft_group0_client;
+class tablet_virtual_task;
+class task_manager_module;
+class topology_state_machine;
+namespace strong_consistency {
+    class groups_manager;
+}
 
-enum class disk_error { regular, commit };
+struct join_node_request_params;
+struct join_node_request_result;
+struct join_node_response_params;
+struct join_node_response_result;
 
-struct storage_service_config {
-    size_t available_memory;
+enum class disk_error { regular, commit, logstor };
+
+class node_ops_meta_data;
+
+using start_hint_manager = seastar::bool_class<class start_hint_manager_tag>;
+using loosen_constraints = seastar::bool_class<class loosen_constraints_tag>;
+using wait_balancer = seastar::bool_class<class wait_balancer_tag>;
+using reset_streaming_result = seastar::bool_class<class reset_streaming_result_tag>;
+using remove_unset = seastar::bool_class<class remove_unset_tag>;
+
+struct token_metadata_change {
+    std::vector<locator::mutable_token_metadata_ptr> pending_token_metadata_ptr{this_smp_shard_count()};
+    std::vector<std::unordered_map<sstring, locator::static_effective_replication_map_ptr>> pending_effective_replication_maps{this_smp_shard_count()};
+    std::vector<std::unordered_map<table_id, locator::effective_replication_map_ptr>> pending_table_erms{this_smp_shard_count()};
+    std::vector<std::unordered_map<table_id, locator::effective_replication_map_ptr>> pending_view_erms{this_smp_shard_count()};
+    std::unordered_set<session_id> open_sessions;
+
+    future<> destroy();
 };
 
-class node_ops_meta_data {
-    utils::UUID _ops_uuid;
-    gms::inet_address _coordinator;
-    std::function<future<> ()> _abort;
-    shared_ptr<abort_source> _abort_source;
-    std::function<void ()> _signal;
-    shared_ptr<node_ops_info> _ops;
-    seastar::timer<lowres_clock> _watchdog;
-    std::chrono::seconds _watchdog_interval{30};
-    bool _aborted = false;
+struct cluster_info {
+    sstring cluster_name;
+    sstring partitioner;
+    sstring snitch_name;
+};
+
+class schema_getter {
 public:
-    explicit node_ops_meta_data(
-            utils::UUID ops_uuid,
-            gms::inet_address coordinator,
-            shared_ptr<node_ops_info> ops,
-            std::function<future<> ()> abort_func,
-            std::function<void ()> signal_func);
-    shared_ptr<node_ops_info> get_ops_info();
-    shared_ptr<abort_source> get_abort_source();
-    future<> abort();
-    void update_watchdog();
-    void cancel_watchdog();
+    virtual flat_hash_map<sstring, locator::replication_strategy_ptr> get_keyspaces_replication() const = 0;
+    virtual future<> for_each_table_schema_gently(std::function<future<>(table_id, schema_ptr)> f) const = 0;
+    virtual ~schema_getter() {};
 };
 
 /**
@@ -129,7 +188,6 @@ class storage_service : public service::migration_listener, public gms::i_endpoi
 private:
     using token = dht::token;
     using token_range_endpoints = dht::token_range_endpoints;
-    using endpoint_details = dht::endpoint_details;
     using boot_strapper = dht::boot_strapper;
     using token_metadata = locator::token_metadata;
     using shared_token_metadata = locator::shared_token_metadata;
@@ -140,56 +198,159 @@ private:
     using inet_address = gms::inet_address;
     using versioned_value = gms::versioned_value;
 
+    struct tablet_operation {
+        sstring name;
+        shared_future<service::tablet_operation_result> done;
+    };
+
+    using tablet_op_registry = std::unordered_map<locator::global_tablet_id, tablet_operation>;
+
     abort_source& _abort_source;
     gms::feature_service& _feature_service;
-    distributed<replica::database>& _db;
+    sharded<replica::database>& _db;
     gms::gossiper& _gossiper;
-    // Container for all Raft instances running on this shard.
-    raft_group_registry& _raft_gr;
-    std::unique_ptr<service::raft_group0> _group0;
     sharded<netw::messaging_service>& _messaging;
     sharded<service::migration_manager>& _migration_manager;
+    cql3::query_processor& _qp;
     sharded<repair_service>& _repair;
     sharded<streaming::stream_manager>& _stream_manager;
+    sharded<locator::snitch_ptr>& _snitch;
+    sharded<qos::service_level_controller>& _sl_controller;
+    sharded<db::cluster_config_manager>& _cluster_config;
+    auth::cache& _auth_cache;
+    sharded<client_routes_service>& _client_routes;
+
+    // Engaged on shard 0 before `join_cluster`.
+    service::raft_group0* _group0;
+
     sstring _operation_in_progress;
-    bool _ms_stopped = false;
     seastar::metrics::metric_groups _metrics;
-    using client_shutdown_hook = noncopyable_function<void()>;
     std::vector<protocol_server*> _protocol_servers;
     std::vector<std::any> _listeners;
+    named_gate _async_gate;
 
-    std::unordered_map<utils::UUID, node_ops_meta_data> _node_ops;
-    std::list<std::optional<utils::UUID>> _node_ops_abort_queue;
-    seastar::condition_variable _node_ops_abort_cond;
-    named_semaphore _node_ops_abort_sem{1, named_semaphore_exception_factory{"node_ops_abort_sem"}};
-    future<> _node_ops_abort_thread;
-    void node_ops_update_heartbeat(utils::UUID ops_uuid);
-    void node_ops_done(utils::UUID ops_uuid);
-    void node_ops_abort(utils::UUID ops_uuid);
-    void node_ops_singal_abort(std::optional<utils::UUID> ops_uuid);
-    future<> node_ops_abort_thread();
+    condition_variable _tablet_split_monitor_event;
+    utils::sequenced_set<table_id> _tablet_split_candidates;
+    future<> _tablet_split_monitor = make_ready_future<>();
+
+    shared_ptr<node_ops::task_manager_module> _node_ops_module;
+    shared_ptr<service::task_manager_module> _tablets_module;
+    shared_ptr<service::topo::task_manager_module> _global_topology_requests_module;
+    shared_ptr<service::vnodes_to_tablets::task_manager_module> _vnodes_to_tablets_migration_module;
+    gms::gossip_address_map& _address_map;
+    future<service::tablet_operation_repair_result> repair_tablet(locator::global_tablet_id, service::session_id, std::optional<tablet_repair_flush_info> flush);
+    future<> stream_tablet(locator::global_tablet_id);
+    // Clones storage of leaving tablet into pending one. Done in the context of intra-node migration,
+    // when both of which sit on the same node. So all the movement is local.
+    future<> clone_locally_tablet_storage(locator::global_tablet_id, locator::tablet_replica leaving, locator::tablet_replica pending);
+    future<> cleanup_tablet(locator::global_tablet_id);
+    // Handler for table load stats RPC.
+    future<locator::load_stats> load_stats_for_tablet_based_tables();
+    future<> process_tablet_split_candidate(table_id) noexcept;
+    void register_tablet_split_candidate(table_id) noexcept;
+    future<> run_tablet_split_monitor();
+    void check_raft_rpc(raft::server_id dst);
 public:
-    storage_service(abort_source& as, distributed<replica::database>& db,
+    future<service::tablet_operation_result> do_tablet_operation(locator::global_tablet_id tablet,
+                                 sstring op_name,
+                                 std::function<future<service::tablet_operation_result>(locator::tablet_metadata_guard&)> op);
+
+    template <typename Func>
+    auto handle_raft_rpc(raft::server_id dst_id, Func&& handler) {
+        return container().invoke_on(0, [dst_id, handler = std::forward<Func>(handler)] (auto& ss) mutable {
+            ss.check_raft_rpc(dst_id);
+            return handler(ss);
+        });
+    };
+
+    storage_service(abort_source& as, sharded<replica::database>& db,
         gms::gossiper& gossiper,
+        sharded<db::system_keyspace>&,
         sharded<db::system_distributed_keyspace>&,
         gms::feature_service& feature_service,
-        storage_service_config config,
         sharded<service::migration_manager>& mm,
         locator::shared_token_metadata& stm,
         locator::effective_replication_map_factory& erm_factory,
         sharded<netw::messaging_service>& ms,
-        sharded<cdc::generation_service>&,
         sharded<repair_service>& repair,
         sharded<streaming::stream_manager>& stream_manager,
-        raft_group_registry& raft_gr,
         endpoint_lifecycle_notifier& elc_notif,
-        sharded<db::batchlog_manager>& bm);
+        sharded<db::batchlog_manager>& bm,
+        sharded<locator::snitch_ptr>& snitch,
+        sharded<service::tablet_allocator>& tablet_allocator,
+        sharded<cdc::generation_service>& cdc_gs,
+        sharded<db::view::view_builder>& view_builder,
+        sharded<db::view::view_building_worker>& view_building_worker,
+        cql3::query_processor& qp,
+        sharded<qos::service_level_controller>& sl_controller,
+        sharded<db::cluster_config_manager>& cluster_config,
+        auth::cache& auth_cache,
+        sharded<client_routes_service>& _client_routes,
+        topology_state_machine& topology_state_machine,
+        db::view::view_building_state_machine& view_building_state_machine,
+        tasks::task_manager& tm,
+        gms::gossip_address_map& address_map,
+        std::function<future<void>(std::string_view)> compression_dictionary_updated_callback,
+        utils::disk_space_monitor* disk_space_minitor,
+        strong_consistency::groups_manager& groups_manager);
+    ~storage_service();
 
-    // Needed by distributed<>
+    // Needed by sharded<>
     future<> stop();
     void init_messaging_service();
     future<> uninit_messaging_service();
 
+    // If a hint is provided, only the changed parts of the tablet metadata will be (re)loaded.
+    future<locator::mutable_token_metadata_ptr> prepare_tablet_metadata(const locator::tablet_metadata_change_hint& hint, mutable_token_metadata_ptr pending_token_metadata);
+    void wake_up_topology_state_machine() noexcept;
+    future<> update_tablet_metadata(const locator::tablet_metadata_change_hint& hint);
+
+    // Prepares a vnode-based keyspace for migration to tablets.
+    // Builds tablet maps from vnode token boundaries for all tables and
+    // persists them to group0.
+    future<> prepare_for_tablets_migration(const sstring& ks_name);
+
+    struct node_migration_status {
+        locator::host_id host_id;
+        // The node's IP address, or empty if it is not known to the address map.
+        // Reported so that `migrate-to-tablets upgrade/downgrade`, which are
+        // addressed by IP, can be driven straight off `migrate-to-tablets status`.
+        sstring endpoint;
+        sstring current_mode;  // "vnodes" or "tablets"
+        sstring intended_mode; // "vnodes" or "tablets"
+    };
+
+    enum class migration_status {
+        vnodes,
+        migrating_to_tablets,
+        tablets,
+    };
+
+    struct keyspace_migration_status {
+        sstring keyspace;
+        migration_status status;
+        std::vector<node_migration_status> nodes;
+    };
+
+    migration_status get_tablets_migration_status(const sstring& ks_name);
+    future<keyspace_migration_status> get_tablets_migration_status_with_node_details(const sstring& ks_name);
+    future<> set_node_intended_storage_mode(storage_mode mode);
+    future<> finalize_tablets_migration(const sstring& ks_name);
+
+    struct table_pow2_convergence_info {
+        sstring table_name;
+        bool converging;
+        size_t current_tablet_count;
+        size_t target_pow2_tablet_count; // 0 means not set
+    };
+    struct tablets_pow2_convergence_status {
+        size_t tables_converging;
+        size_t tables_total;
+        std::vector<table_pow2_convergence_info> tables;
+    };
+    tablets_pow2_convergence_status get_tablets_pow2_convergence_status(const sstring& ks_name) const;
+
+    void start_tablet_split_monitor();
 private:
     using acquire_merge_lock = bool_class<class acquire_merge_lock_tag>;
 
@@ -211,23 +372,40 @@ private:
     // Note: must be called on shard 0.
     future<> mutate_token_metadata(std::function<future<> (mutable_token_metadata_ptr)> func, acquire_merge_lock aml = acquire_merge_lock::yes) noexcept;
 
+    // Prepares token metadata change without making it visible. Combined with commit function
+    // and appropriate lock it does exactly the same as mutate_token_metadata.
+    // Note: prepare_token_metadata_change must be called on shard 0.
+    future<token_metadata_change> prepare_token_metadata_change(mutable_token_metadata_ptr tmptr,
+            const schema_getter& loader);
+
+    // Commits prepared token metadata changes. Must be called under token_metadata_lock
+    // and on all shards.
+    void commit_token_metadata_change(token_metadata_change& change) noexcept;
+
     // Update pending ranges locally and then replicate to all cores.
     // Should be serialized under token_metadata_lock.
     // Must be called on shard 0.
-    future<> update_pending_ranges(mutable_token_metadata_ptr tmptr, sstring reason);
-    future<> update_pending_ranges(sstring reason, acquire_merge_lock aml = acquire_merge_lock::yes);
+    future<> update_topology_change_info(mutable_token_metadata_ptr tmptr, sstring reason);
+    future<> update_topology_change_info(sstring reason, acquire_merge_lock aml = acquire_merge_lock::yes);
     future<> keyspace_changed(const sstring& ks_name);
     void register_metrics();
     future<> snitch_reconfigured();
-    future<> update_topology(inet_address endpoint);
 
+public:
+    future<std::unordered_map<table_id, uint64_t>> collect_table_sizes_for_migration(
+        const sstring& ks_name,
+        const locator::static_effective_replication_map_ptr& erm,
+        const locator::tablet_aware_replication_strategy* trs,
+        const std::vector<std::pair<table_id, sstring>>& tables_to_estimate);
+
+private:
     future<mutable_token_metadata_ptr> get_mutable_token_metadata_ptr() noexcept {
-        return get_token_metadata_ptr()->clone_async().then([] (token_metadata tm) {
+        return _shared_token_metadata.get()->clone_async().then([this] (token_metadata tm) {
             // bump the token_metadata ring_version
             // to invalidate cached token/replication mappings
             // when the modified token_metadata is committed.
             tm.invalidate_cached_rings();
-            return make_ready_future<mutable_token_metadata_ptr>(make_token_metadata_ptr(std::move(tm)));
+            return _shared_token_metadata.make_token_metadata_ptr(std::move(tm));
         });
     }
 
@@ -235,7 +413,17 @@ private:
         return _batchlog_manager;
     }
 
+    friend void check_raft_rpc_scheduling_group(storage_service&, std::string_view);
+    friend class db::schema_tables::schema_applier;
 public:
+
+    const gms::gossiper& gossiper() const noexcept {
+        return _gossiper;
+    };
+
+    gms::gossiper& gossiper() noexcept {
+        return _gossiper;
+    };
 
     locator::effective_replication_map_factory& get_erm_factory() noexcept {
         return _erm_factory;
@@ -253,60 +441,64 @@ public:
         return *_shared_token_metadata.get();
     }
 
-private:
-    inet_address get_broadcast_address() const {
-        return utils::fb_utilities::get_broadcast_address();
+    abort_source& get_abort_source() noexcept {
+        return _abort_source;
     }
+
+    gms::feature_service& get_feature_service() noexcept {
+        return _feature_service;
+    }
+
+    replica::database& get_database() noexcept {
+        return _db.local();
+    }
+
+    db::system_keyspace& get_system_keyspace() noexcept {
+        return _sys_ks.local();
+    }
+
+    bool is_raft_leader() const noexcept;
+
+    std::vector<table_id> get_tables_with_cdc_tablet_streams() const;
+
+    future<> query_cdc_timestamps(table_id table, bool ascending, noncopyable_function<future<>(db_clock::time_point)> f);
+    future<> query_cdc_streams(table_id table, noncopyable_function<future<>(db_clock::time_point, const utils::chunked_vector<cdc::stream_id>& current, cdc::cdc_stream_diff)> f);
+
+private:
+    inet_address get_broadcast_address() const noexcept {
+        return get_token_metadata_ptr()->get_topology().my_address();
+    }
+    locator::host_id my_host_id() const noexcept {
+        return get_token_metadata_ptr()->get_topology().my_host_id();
+    }
+    bool is_me(inet_address addr) const noexcept {
+        return addr == get_broadcast_address();
+    }
+    bool is_me(locator::host_id id) const noexcept {
+        return get_token_metadata_ptr()->get_topology().is_me(id);
+    }
+
+    // When we create a tablet mutation, usually we want to write it to the base table.
+    // In a group of co-located tables, the tablet info is stored on the base table partition only.
+    // Other tables which are co-located with the base table have only a static row that points to the base table.
+    // So if for example a tablet migration is requested for a co-located table, we need to write the
+    // tablet mutation with the transition stage to the base table, and then the entire co-location group
+    // will be migrated.
+    replica::tablet_mutation_builder tablet_mutation_builder_for_base_table(api::timestamp_type ts, table_id table);
+
     /* This abstraction maintains the token/endpoint metadata information */
     shared_token_metadata& _shared_token_metadata;
     locator::effective_replication_map_factory& _erm_factory;
 
-    /* CDC generation management service.
-     * It is sharded<>& and not simply a reference because the service will not yet be started
-     * when storage_service is constructed (but it will be when init_server is called)
-     */
-    sharded<cdc::generation_service>& _cdc_gen_service;
 public:
     std::chrono::milliseconds get_ring_delay();
+    enum class mode { NONE, STARTING, JOINING, BOOTSTRAP, NORMAL, LEAVING, DECOMMISSIONED, MOVING, DRAINING, DRAINED, MAINTENANCE };
 private:
-
-    std::unordered_set<inet_address> _replicating_nodes;
-
-    std::optional<inet_address> _removing_node;
-
-    /* Are we starting this node in bootstrap mode? */
-    bool _is_bootstrap_mode = false;
-
-    bool _initialized = false;
-
-    bool _joined = false;
-
-public:
-    enum class mode { STARTING, NORMAL, JOINING, LEAVING, DECOMMISSIONED, MOVING, DRAINING, DRAINED };
-private:
-    mode _operation_mode = mode::STARTING;
-    friend std::ostream& operator<<(std::ostream& os, const mode& mode);
+    mode _operation_mode = mode::NONE;
     /* Used for tracking drain progress */
 
     endpoint_lifecycle_notifier& _lifecycle_notifier;
     sharded<db::batchlog_manager>& _batchlog_manager;
-
-    std::unordered_set<token> _bootstrap_tokens;
-
-    /* The timestamp of the CDC streams generation that this node has proposed when joining.
-     * This value is nullopt only when:
-     * 1. this node is being upgraded from a non-CDC version,
-     * 2. this node is starting for the first time or restarting with CDC previously disabled,
-     *    in which case the value should become populated before we leave the join_token_ring procedure.
-     *
-     * Important: this variable is using only during the startup procedure. It is moved out from
-     * at the end of `join_token_ring`; the responsibility handling of CDC generations is passed
-     * to cdc::generation_service.
-     *
-     * DO NOT use this variable after `join_token_ring` (i.e. after we call `generation_service::after_join`
-     * and pass it the ownership of the timestamp.
-     */
-    std::optional<cdc::generation_id> _cdc_gen_id;
 
 public:
     // should only be called via JMX
@@ -318,122 +510,60 @@ public:
     // should only be called via JMX
     future<bool> is_gossip_running();
 
-    void register_protocol_server(protocol_server& server) {
-        _protocol_servers.push_back(&server);
-    }
+    future<> register_protocol_server(protocol_server& server, bool start_instantly = false);
 
     // All pointers are valid.
     const std::vector<protocol_server*>& protocol_servers() const {
         return _protocol_servers;
     }
 private:
-    future<> do_stop_ms();
     future<> shutdown_protocol_servers();
 
-    // Tokens and the CDC streams timestamp of the replaced node.
-    using replacement_info = std::unordered_set<token>;
-    future<replacement_info> prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes,
-            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
-
-    void run_replace_ops();
-    void run_bootstrap_ops();
-
-    std::list<gms::inet_address> get_ignore_dead_nodes_for_replace();
+    struct replacement_info {
+        locator::endpoint_dc_rack dc_rack;
+        locator::host_id host_id;
+    };
+    future<replacement_info> prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes);
 
 public:
-    future<bool> is_initialized();
 
-    future<> check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes,
-            const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features);
+    future<> join_cluster(sharded<service::storage_proxy>& proxy,
+            start_hint_manager start_hm, gms::generation_type new_generation);
 
-    /*!
-     * \brief Init the messaging service part of the service.
-     *
-     * This is the first part of the initialization, call this method
-     * first.
-     *
-     * After this method is completed, it is ok to start the storage_service
-     * API.
-     * \see init_server_without_the_messaging_service_part
-     */
-    future<> init_messaging_service_part();
-    /*!
-     * \brief Uninit the messaging service part of the service.
-     */
-    future<> uninit_messaging_service_part();
+    void set_group0(service::raft_group0&);
 
-    /*!
-     * \brief complete the server initialization
-     *
-     * The storage_service initialization is done in two parts.
-     *
-     * you first call init_messaging_service_part and then
-     * you call init_server_without_the_messaging_service_part.
-     *
-     * It is safe to start the API after init_messaging_service_part
-     * completed
-     *
-     * Must be called on shard 0.
-     *
-     * \see init_messaging_service_part
-     */
-    future<> init_server(cql3::query_processor& qp);
+    future<> init_address_map(gms::gossip_address_map& address_map);
 
-    future<> join_cluster();
+    future<> uninit_address_map();
 
     future<> drain_on_shutdown();
 
     future<> stop_transport();
 
+    future<> wait_for_group0_stop();
+
+    // The abort source that wait_for_group0_stop() fires. Services which hold
+    // the group 0 gate for their own operations can chain their abort sources
+    // onto this one, so that they are woken up before group 0 is drained.
+    abort_source& group0_abort_source() noexcept { return _group0_as; }
+
 private:
-    bool should_bootstrap();
-    bool is_first_node();
-    void prepare_to_join(
+    bool is_replacing();
+    future<> start_sys_dist_ks() const;
+    future<> join_topology(sharded<service::storage_proxy>& proxy,
             std::unordered_set<gms::inet_address> initial_contact_nodes,
-            std::unordered_set<gms::inet_address> loaded_endpoints,
-            std::unordered_map<gms::inet_address, sstring> loaded_peer_features);
-    void join_token_ring(int delay);
-    void maybe_start_sys_dist_ks();
+            std::unordered_map<locator::host_id, gms::loaded_endpoint_state> loaded_endpoints,
+            start_hint_manager start_hm,
+            gms::generation_type new_generation);
 public:
-    inline bool is_joined() const {
-        // Every time we set _joined, we do it on all shards, so we can read its
-        // value locally.
-        return _joined;
-    }
 
-    future<> rebuild(sstring source_dc);
+    future<> rebuild(utils::optional_param source_dc);
 
 private:
-    void set_mode(mode m, bool log);
-    void set_mode(mode m, sstring msg, bool log);
-    void mark_existing_views_as_built();
-
-    // Stream data for which we become a new replica.
-    // Before that, if we're not replacing another node, inform other nodes about our chosen tokens (_bootstrap_tokens)
-    // and wait for RING_DELAY ms so that we receive new writes from coordinators during streaming.
-    void bootstrap();
+    void set_mode(mode m);
 
 public:
-    bool is_bootstrap_mode() const {
-        return _is_bootstrap_mode;
-    }
-
-    /**
-     * Return the rpc address associated with an endpoint as a string.
-     * @param endpoint The endpoint to get rpc address for
-     * @return the rpc address
-     */
-    sstring get_rpc_address(const inet_address& endpoint) const;
-
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> get_range_to_address_map(const sstring& keyspace) const;
-
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> get_range_to_address_map_in_local_dc(
-            const sstring& keyspace) const;
-
-    std::vector<token> get_tokens_in_local_dc() const;
-
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> get_range_to_address_map(const sstring& keyspace,
-            const std::vector<token>& sorted_tokens) const;
+    future<std::unordered_map<dht::token_range, inet_address_vector_replica_set>> get_range_to_address_map(sstring keyspace, std::optional<table_id> tid) const;
 
     /**
      * The same as {@code describeRing(String)} but converts TokenRange to the String for JMX compatibility
@@ -450,7 +580,9 @@ public:
      */
     //std::vector<sstring> describeRingJMX(const sstring& keyspace) const {
 
-    future<std::vector<token_range_endpoints>> describe_ring(const sstring& keyspace, bool include_only_local_dc = false) const;
+    future<utils::chunked_vector<token_range_endpoints>> describe_ring(const sstring& keyspace, bool include_only_local_dc = false) const;
+
+    future<utils::chunked_vector<dht::token_range_endpoints>> describe_ring_for_table(table_id tid) const;
 
     /**
      * Retrieve a map of tokens to endpoints, including the bootstrapping ones.
@@ -460,17 +592,16 @@ public:
     std::map<token, inet_address> get_token_to_endpoint_map();
 
     /**
-     * Construct the range to endpoint mapping based on the true view
-     * of the world.
-     * @param ranges
-     * @return mapping of ranges to the replicas responsible for them.
-    */
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> construct_range_to_endpoint_map(
-            const sstring& keyspace,
-            const dht::token_range_vector& ranges) const;
+     * Retrieve a map of tablet tokens to endpoints.
+     *
+     * Tablet variant of get_token_to_endpoint_map().
+     *
+     * @return a map of tablet tokens to endpoints in ascending order
+     */
+    future<std::map<token, inet_address>> get_tablet_to_endpoint_map(table_id table);
+
 public:
-    virtual future<> on_join(gms::inet_address endpoint, gms::endpoint_state ep_state) override;
-    virtual future<> before_change(gms::inet_address endpoint, gms::endpoint_state current_state, gms::application_state new_state_key, const gms::versioned_value& new_value) override;
+    virtual future<> on_join(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr ep_state, gms::permit_id) override;
     /*
      * Handle the reception of a new particular ApplicationState for a particular endpoint. Note that the value of the
      * ApplicationState has not necessarily "changed" since the last known value, if we already received the same update
@@ -487,14 +618,10 @@ public:
      *   if bootstrapping. stays this way until all files are received.
      * STATUS_NORMAL,token
      *   ready to serve reads and writes.
-     * STATUS_LEAVING,token
-     *   get ready to leave the cluster as part of a decommission
      * STATUS_LEFT,token
      *   set after decommission is completed.
      *
      * Other STATUS values that may be seen (possibly anywhere in the normal progression):
-     * STATUS_MOVING,newtoken
-     *   set if node is currently moving to a new token in the ring
      * REMOVING_TOKEN,deadtoken
      *   set if the node is dead and is being removed by its REMOVAL_COORDINATOR
      * REMOVED_TOKEN,deadtoken
@@ -503,11 +630,11 @@ public:
      * Note: Any time a node state changes from STATUS_NORMAL, it will not be visible to new nodes. So it follows that
      * you should never bootstrap a new node during a removenode, decommission or move.
      */
-    virtual future<> on_change(inet_address endpoint, application_state state, const versioned_value& value) override;
-    virtual future<> on_alive(gms::inet_address endpoint, gms::endpoint_state state) override;
-    virtual future<> on_dead(gms::inet_address endpoint, gms::endpoint_state state) override;
-    virtual future<> on_remove(gms::inet_address endpoint) override;
-    virtual future<> on_restart(gms::inet_address endpoint, gms::endpoint_state state) override;
+    virtual future<> on_change(gms::inet_address endpoint, locator::host_id id, const gms::application_state_map& states, gms::permit_id) override;
+    virtual future<> on_alive(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr state, gms::permit_id) override;
+    virtual future<> on_dead(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr state, gms::permit_id) override;
+    virtual future<> on_remove(gms::inet_address endpoint, locator::host_id id, gms::permit_id) override;
+    virtual future<> on_restart(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr state, gms::permit_id) override;
 
 public:
     // For migration_listener
@@ -531,123 +658,47 @@ public:
     virtual void on_drop_function(const sstring& ks_name, const sstring& function_name) override {}
     virtual void on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name) override {}
     virtual void on_drop_view(const sstring& ks_name, const sstring& view_name) override {}
-private:
-    future<> update_peer_info(inet_address endpoint);
-    future<> do_update_system_peers_table(gms::inet_address endpoint, const application_state& state, const versioned_value& value);
 
-    std::unordered_set<token> get_tokens_for(inet_address endpoint);
+    future<> on_cleanup_for_drop_table(const table_id& id);
+private:
+    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(locator::host_id endpoint);
+    // return an engaged value iff app_state_map has changes to the peer info
+    std::optional<db::system_keyspace::peer_info> get_peer_info_for_update(locator::host_id endpoint, const gms::application_state_map& app_state_map);
+
+    std::optional<locator::endpoint_dc_rack> get_dc_rack_for(const gms::endpoint_state& ep_state);
+    std::optional<locator::endpoint_dc_rack> get_dc_rack_for(locator::host_id endpoint);
 private:
     // Should be serialized under token_metadata_lock.
     future<> replicate_to_all_cores(mutable_token_metadata_ptr tmptr) noexcept;
+    sharded<db::system_keyspace>& _sys_ks;
     sharded<db::system_distributed_keyspace>& _sys_dist_ks;
     locator::snitch_signal_slot_t _snitch_reconfigure;
-    std::unordered_set<gms::inet_address> _replacing_nodes_pending_ranges_updater;
+    sharded<service::tablet_allocator>& _tablet_allocator;
+    sharded<cdc::generation_service>& _cdc_gens;
+    sharded<db::view::view_builder>& _view_builder;
+    sharded<db::view::view_building_worker>& _view_building_worker;
+    bool _isolated = false;
 private:
-    /**
-     * Handle node bootstrap
-     *
-     * @param endpoint bootstrapping node
-     */
-    future<> handle_state_bootstrap(inet_address endpoint);
-
-    /**
-     * Handle node move to normal state. That is, node is entering token ring and participating
-     * in reads.
-     *
-     * @param endpoint node
-     */
-    future<> handle_state_normal(inet_address endpoint);
-
-    /**
-     * Handle node preparing to leave the ring
-     *
-     * @param endpoint node
-     */
-    future<> handle_state_leaving(inet_address endpoint);
-
-    /**
-     * Handle node leaving the ring. This will happen when a node is decommissioned
-     *
-     * @param endpoint If reason for leaving is decommission, endpoint is the leaving node.
-     * @param pieces STATE_LEFT,token
-     */
-    future<> handle_state_left(inet_address endpoint, std::vector<sstring> pieces);
-
-    /**
-     * Handle node moving inside the ring.
-     *
-     * @param endpoint moving endpoint address
-     * @param pieces STATE_MOVING, token
-     */
-    void handle_state_moving(inet_address endpoint, std::vector<sstring> pieces);
-
-    /**
-     * Handle notification that a node being actively removed from the ring via 'removenode'
-     *
-     * @param endpoint node
-     * @param pieces either REMOVED_TOKEN (node is gone) or REMOVING_TOKEN (replicas need to be restored)
-     */
-    future<> handle_state_removing(inet_address endpoint, std::vector<sstring> pieces);
-
-    /**
-     * Handle notification that a node is replacing another node.
-     *
-     * @param endpoint node
-     */
-    future<> handle_state_replacing(inet_address endpoint);
-
-    future<>
-    handle_state_replacing_update_pending_ranges(mutable_token_metadata_ptr tmptr, inet_address replacing_node);
-
-private:
-    future<> excise(std::unordered_set<token> tokens, inet_address endpoint);
-    future<> excise(std::unordered_set<token> tokens, inet_address endpoint, long expire_time);
 
     /** unlike excise we just need this endpoint gone without going through any notifications **/
-    future<> remove_endpoint(inet_address endpoint);
-
-    void add_expire_time_if_found(inet_address endpoint, int64_t expire_time);
-
-    int64_t extract_expire_time(const std::vector<sstring>& pieces) const {
-        return std::stoll(pieces[2]);
-    }
+    future<> remove_endpoint(inet_address endpoint, gms::permit_id pid);
 
     /**
      * Finds living endpoints responsible for the given ranges
      *
-     * @param keyspaceName the keyspace ranges belong to
+     * @param erm the keyspace effective_replication_map ranges belong to
      * @param ranges the ranges to find sources for
      * @return multimap of addresses to ranges the address is responsible for
      */
-    std::unordered_multimap<inet_address, dht::token_range> get_new_source_ranges(const sstring& keyspaceName, const dht::token_range_vector& ranges) const;
-public:
-    future<> confirm_replication(inet_address node);
+    future<std::unordered_multimap<locator::host_id, dht::token_range>> get_new_source_ranges(const locator::vnode_effective_replication_map* erm, const dht::token_range_vector& ranges) const;
 
-private:
-
-    /**
-     * Sends a notification to a node indicating we have finished replicating data.
-     *
-     * @param remote node to send notification to
-     */
-    future<> send_replication_notification(inet_address remote);
-
-    /**
-     * Called when an endpoint is removed from the ring. This function checks
-     * whether this node becomes responsible for new ranges as a
-     * consequence and streams data if needed.
-     *
-     * This is rather ineffective, but it does not matter so much
-     * since this is called very seldom
-     *
-     * @param endpoint the node that left
-     */
-    future<> restore_replica_count(inet_address endpoint, inet_address notify_endpoint);
-    future<> removenode_with_stream(gms::inet_address leaving_node, shared_ptr<abort_source> as_ptr);
-    void removenode_add_ranges(lw_shared_ptr<dht::range_streamer> streamer, gms::inet_address leaving_node);
+    future<> removenode_with_stream(locator::host_id leaving_node, frozen_topology_guard, shared_ptr<abort_source> as_ptr);
+    future<> removenode_add_ranges(lw_shared_ptr<dht::range_streamer> streamer, locator::host_id leaving_node);
 
     // needs to be modified to accept either a keyspace or ARS.
-    std::unordered_multimap<dht::token_range, inet_address> get_changed_ranges_for_leaving(sstring keyspace_name, inet_address endpoint);
+    future<std::unordered_multimap<dht::token_range, locator::host_id>> get_changed_ranges_for_leaving(const locator::vnode_effective_replication_map* erm, locator::host_id endpoint);
+
+    future<> maybe_reconnect_to_preferred_ip(inet_address ep, inet_address local_ip, locator::host_id host_id);
 
 public:
 
@@ -655,64 +706,48 @@ public:
 
     sstring get_schema_version();
 
+    cluster_info describe_cluster() const;
+
     future<std::unordered_map<sstring, std::vector<sstring>>> describe_schema_versions();
 
 
     /**
-     * Get all ranges an endpoint is responsible for (by keyspace)
+     * Get all ranges an endpoint is responsible for (by keyspace effective_replication_map)
      * Replication strategy's get_ranges() guarantees that no wrap-around range is returned.
      * @param ep endpoint we are interested in.
      * @return ranges for the specified endpoint.
      */
-    dht::token_range_vector get_ranges_for_endpoint(const sstring& name, const gms::inet_address& ep) const;
+    future<dht::token_range_vector> get_ranges_for_endpoint(const locator::effective_replication_map& erm, const locator::host_id& ep) const;
 
-    /**
-     * Get all ranges that span the ring given a set
-     * of tokens. All ranges are in sorted order of
-     * ranges.
-     * @return ranges in sorted order
-    */
-    dht::token_range_vector get_all_ranges(const std::vector<token>& sorted_tokens) const;
     /**
      * This method returns the N endpoints that are responsible for storing the
      * specified key i.e for replication.
      *
      * @param keyspaceName keyspace name also known as keyspace
      * @param cf Column family name
-     * @param key key for which we need to find the endpoint
+     * @param key Nodetool style key for which we need to find the endpoint
      * @return the endpoint responsible for this key
      */
-    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace,
-            const sstring& cf, const sstring& key) const;
-
+    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace, const sstring& cf, const sstring& key) const;
     /**
      * This method returns the N endpoints that are responsible for storing the
      * specified key i.e for replication.
      *
      * @param keyspaceName keyspace name also known as keyspace
-     * @param pos position for which we need to find the endpoint
-     * @return the endpoint responsible for this token
+     * @param cf Column family name
+     * @param key_components the components of the partition key for which we need to find the endpoint
+     * @return the endpoint responsible for this key
      */
-    inet_address_vector_replica_set  get_natural_endpoints(const sstring& keyspace, const token& pos) const;
-
-    /**
-     * @return Vector of Token ranges (_not_ keys!) together with estimated key count,
-     *      breaking up the data this node is responsible for into pieces of roughly keys_per_split
-     */
-    std::vector<std::pair<dht::token_range, uint64_t>> get_splits(const sstring& ks_name,
-            const sstring& cf_name,
-            range<dht::token> range,
-            uint32_t keys_per_split);
-public:
-    future<> decommission();
+    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace, const sstring& cf, const std::vector<sstring>& key_components) const;
 
 private:
-    /**
-     * Broadcast leaving status and update local _token_metadata accordingly
-     */
-    future<> start_leaving();
-    future<> leave_ring();
-    void unbootstrap();
+    inet_address_vector_replica_set get_natural_endpoints(const sstring& keyspace, const schema_ptr& schema, const replica::column_family& cf, const partition_key& pk) const;
+
+public:
+    future<> decommission(sharded<db::snapshot_ctl>&);
+
+private:
+    future<> unbootstrap();
 
 public:
     future<> move(sstring new_token) {
@@ -753,14 +788,11 @@ public:
      *
      * @param hostIdString token for the node
      */
-    future<> removenode(sstring host_id_string, std::list<gms::inet_address> ignore_nodes);
-    future<node_ops_cmd_response> node_ops_cmd_handler(gms::inet_address coordinator, node_ops_cmd_request req);
-    void node_ops_cmd_check(gms::inet_address coordinator, const node_ops_cmd_request& req);
-    future<> node_ops_cmd_heartbeat_updater(const node_ops_cmd& cmd, utils::UUID uuid, std::list<gms::inet_address> nodes, lw_shared_ptr<bool> heartbeat_updater_done);
+    future<> removenode(locator::host_id host_id, locator::host_id_or_endpoint_list ignore_nodes);
+    future<> mark_excluded(const std::vector<locator::host_id>&);
+    future<node_ops_cmd_response> node_ops_cmd_handler(gms::inet_address coordinator, std::optional<locator::host_id> coordinator_host_id, node_ops_cmd_request req);
 
-    future<sstring> get_operation_mode();
-
-    future<bool> is_starting();
+    future<mode> get_operation_mode();
 
     /**
      * Shuts node off to writes, empties memtables and the commit log.
@@ -772,11 +804,18 @@ public:
 
     future<std::map<gms::inet_address, float>> get_ownership();
 
-    future<std::map<gms::inet_address, float>> effective_ownership(sstring keyspace_name);
+    future<std::map<gms::inet_address, float>> effective_ownership(sstring keyspace_name, sstring table_name);
 
+    // Must run on shard 0.
+    future<> check_and_repair_cdc_streams();
+
+    // for testing
+    bool is_isolated() const {
+        return _isolated;
+    }
 private:
     promise<> _drain_finished;
-    std::optional<shared_promise<>> _transport_stopped;
+    std::optional<shared_future<>> _transport_stopped;
     future<> do_drain();
     /**
      * Seed data to the endpoints that will be responsible for it at the future
@@ -784,43 +823,377 @@ private:
      * @param rangesToStreamByKeyspace keyspaces and data ranges with endpoints included for each
      * @return async Future for whether stream was success
      */
-    future<> stream_ranges(std::unordered_map<sstring, std::unordered_multimap<dht::token_range, inet_address>> ranges_to_stream_by_keyspace);
+    future<> stream_ranges(std::unordered_map<sstring, std::unordered_multimap<dht::token_range, locator::host_id>> ranges_to_stream_by_keyspace);
+
+    // REST handlers are gated at the registration site (see gated() in
+    // api/storage_service.cc) so stop() drains in-flight requests before
+    // teardown.  run_with_api_lock_internal and run_with_no_api_lock hold
+    // _async_gate on shard 0 as well, because REST requests arriving on
+    // any shard are forwarded there for execution.
+    template <typename Func>
+    auto run_with_api_lock_internal(storage_service& ss, Func&& func, sstring& operation) {
+        auto holder = ss._async_gate.hold();
+        if (!ss._operation_in_progress.empty()) {
+            throw std::runtime_error(format("Operation {} is in progress, try again", ss._operation_in_progress));
+        }
+        ss._operation_in_progress = std::move(operation);
+        return func(ss).finally([&ss, holder = std::move(holder)] {
+            ss._operation_in_progress = sstring();
+        });
+    }
 
 public:
     int32_t get_exception_count();
+
+    auto hold_async_gate() {
+        return _async_gate.hold();
+    }
 
     template <typename Func>
     auto run_with_api_lock(sstring operation, Func&& func) {
         return container().invoke_on(0, [operation = std::move(operation),
                 func = std::forward<Func>(func)] (storage_service& ss) mutable {
-            if (!ss._operation_in_progress.empty()) {
-                throw std::runtime_error(format("Operation {} is in progress, try again", ss._operation_in_progress));
-            }
-            ss._operation_in_progress = std::move(operation);
-            return func(ss).finally([&ss] {
-                ss._operation_in_progress = sstring();
-            });
+            return ss.run_with_api_lock_internal(ss, std::forward<Func>(func), operation);
         });
     }
 
     template <typename Func>
     auto run_with_no_api_lock(Func&& func) {
-        return container().invoke_on(0, [func = std::forward<Func>(func)] (storage_service& ss) mutable {
-            return func(ss);
+        return container().invoke_on(0, [func = std::forward<Func>(func)] (storage_service& ss) mutable
+                -> futurize_t<std::invoke_result_t<Func, storage_service&>> {
+            auto holder = ss._async_gate.hold();
+            co_return co_await futurize_invoke(func, ss);
         });
     }
+
 private:
     void do_isolate_on_error(disk_error type);
     future<> isolate();
 
-    future<> notify_down(inet_address endpoint);
-    future<> notify_left(inet_address endpoint);
-    future<> notify_up(inet_address endpoint);
-    future<> notify_joined(inet_address endpoint);
-    future<> notify_cql_change(inet_address endpoint, bool ready);
+    future<> notify_down(inet_address endpoint, locator::host_id hid);
+    future<> notify_left(inet_address endpoint, locator::host_id hid);
+    future<> notify_released(locator::host_id hid);
+    future<> notify_up(inet_address endpoint, locator::host_id hid);
+    future<> notify_joined(inet_address endpoint, locator::host_id hid);
+    future<> notify_cql_change(inet_address endpoint, locator::host_id hid,bool ready);
+    future<> remove_rpc_client_with_ignored_topology(inet_address endpoint, locator::host_id id);
 public:
-    future<bool> is_cleanup_allowed(sstring keyspace);
     bool is_repair_based_node_ops_enabled(streaming::stream_reason reason);
+    future<> update_fence_version(token_metadata::version_t version);
+
+private:
+    friend class group0_state_machine;
+
+private:
+    future<> _raft_state_monitor = make_ready_future<>();
+    // This fibers monitors raft state and start/stops the topology change
+    // coordinator fiber
+    future<> raft_state_monitor_fiber(raft::server&, gate::holder);
+
+public:
+    bool topology_global_queue_empty() const;
+    future<bool> ongoing_rf_change(const group0_guard& guard, sstring ks) const;
+    // The prepare_migration request which is queued or executing, for `ks` or, without it,
+    // for any keyspace, if there is one.
+    future<std::optional<utils::UUID>> ongoing_prepare_migration(const group0_guard& guard, std::optional<sstring> ks) const;
+    future<> raft_initialize_discovery_leader(const join_node_request_params& params);
+    future<> initialize_done_topology_upgrade_state();
+    // Does the local part of global_token_metadata_barrier(), without a raft group0 barrier.
+    // In particular, waits for non-latest local erms to go die.
+    future<> local_topology_barrier();
+private:
+     // State machine that is responsible for topology change
+    topology_state_machine& _topology_state_machine;
+
+    // Batches concurrent await_topology_quiesced() callers so that they share one
+    // group0 request instead of submitting one each. Only shard 0's instance is used,
+    // since that is where the other shards forward to.
+    serialized_action _quiesce_topology{[this] { return do_await_topology_quiesced(); }};
+    db::view::view_building_state_machine& _view_building_state_machine;
+
+    future<> _topology_change_coordinator = make_ready_future<>();
+    future<> topology_change_coordinator_fiber(raft::server&, raft::term_t, cdc::generation_service&, sharded<db::system_distributed_keyspace>&, abort_source&);
+
+    // Those futures hold results of streaming for various operations
+    std::optional<shared_future<>> _bootstrap_result;
+    std::optional<shared_future<>> _decommission_result;
+    std::optional<shared_future<>> _rebuild_result;
+    std::unordered_map<raft::server_id, std::optional<shared_future<>>> _remove_result;
+
+    std::optional<shared_future<>> _decommission_hints_drain;
+
+    tablet_op_registry _tablet_ops;
+    // This tracks active topology cmd rpc. There can be only one active
+    // cmd running and by inspecting this structure it can be checked which
+    // cmd is current executing and which nodes are still did not reply.
+    // Needed for debugging.
+    topology_coordinator_cmd_rpc_tracker _topology_cmd_rpc_tracker;
+    struct {
+        raft::term_t term{0};
+        uint64_t last_index{0};
+    } _raft_topology_cmd_handler_state;
+    class ip_address_updater;
+    // Represents a subscription to gossiper on_change events,
+    // updating the raft data structures that depend on
+    // IP addresses (token_metadata.topology, erm-s),
+    // as well as the system.peers table.
+    shared_ptr<ip_address_updater> _ip_address_updater;
+
+    std::unordered_set<raft::server_id> find_raft_nodes_from_hoeps(const locator::host_id_or_endpoint_list& hoeps) const;
+
+    future<raft_topology_cmd_result> raft_topology_cmd_handler(raft::term_t term, uint64_t cmd_index, raft_topology_cmd cmd);
+
+    // The topology coordinator may resend the streaming request, in which case the operation
+    // tracked by result is joined instead of being started, and no new task is created.
+    // A previous attempt which failed is retried with a new task.
+    // With reset_streaming_result::yes, a successful result is forgotten, so that the
+    // operation is streamed again when it is requested once more.
+    future<> do_streaming_operation(std::optional<shared_future<>>& result,
+            streaming::stream_reason reason,
+            tasks::task_info parent_info,
+            noncopyable_function<future<>()> action,
+            reset_streaming_result reset_result = reset_streaming_result::no);
+
+    future<> raft_decommission();
+    future<> drain_hints_before_leaving();
+    future<> raft_removenode(locator::host_id host_id, locator::host_id_or_endpoint_list ignore_nodes_params);
+    future<> raft_rebuild(utils::optional_param source_dc);
+    future<> raft_check_and_repair_cdc_streams();
+    future<> update_topology_with_local_metadata(raft::server&);
+
+    struct state_change_hint {
+        // If engaged, describes all the changes to the tablet metadata, which is
+        // then updated incrementally. An empty hint means that nothing changed.
+        // Otherwise, the tablet metadata is rebuilt from system.tablets.
+        std::optional<locator::tablet_metadata_change_hint> tablets_hint;
+    };
+
+    // This is called on all nodes for each new command received through raft
+    // raft_group0_client::_read_apply_mutex must be held
+    // Precondition: the topology mutations were already written to disk; the function only transitions the in-memory state machine.
+    future<> topology_transition(state_change_hint hint = {});
+    
+    // This is called on all nodes for each new command related to tablet-view-building, received through raft
+    // raft_group0_client::_read_apply_mutex must be held
+    // Precondition: the mutations were already written to disk; the function only transitions the in-memory state machine.
+    future<> view_building_transition();
+public:
+    // Reloads in-memory topology state safely under group 0 read_apply mutex.
+    // Does not modify on-disk state.
+    //
+    // Must be called on shard 0.
+    future<> reload_raft_topology_state(service::raft_group0_client&);
+
+    // Service levels cache consists of two levels: service levels cache and effective service levels cache
+    // The second one is dependent on the first one.
+    // Must be called on shard 0.
+    //    
+    // update_both_cache_levels::yes - updates both levels of the cache
+    // update_both_cache_levels::no  - update only effective service levels cache
+    future<> update_service_levels_cache(qos::update_both_cache_levels update_only_effective_cache = qos::update_both_cache_levels::yes, qos::query_context ctx = qos::query_context::unspecified);
+
+    auth::cache& auth_cache() noexcept;
+
+    // Should be called whenever new compression dictionaries are published to system.dicts.
+    // This is an arbitrary callback passed through the constructor,
+    // but its intended usage is to set up the RPC connections to use the new dictionaries.
+    //
+    // Must be called on shard 0.
+    future<> compression_dictionary_updated_callback(std::string_view name);
+    future<> compression_dictionary_updated_callback_all();
+
+    future<> load_cdc_streams(std::optional<std::unordered_set<table_id>> changed_tables = std::nullopt);
+
+    future<> do_clusterwide_vnodes_cleanup();
+    future<> reset_cleanup_needed();
+
+    node_state get_node_state(locator::host_id id);
+
+    // Waits for topology state in which none of tablets has replaced_id as a replica.
+    // Must be called on shard 0.
+    future<> await_tablets_rebuilt(raft::server_id replaced_id);
+
+    topology_coordinator_cmd_rpc_tracker get_topology_cmd_status() {
+        return _topology_cmd_rpc_tracker;
+    }
+private:
+    // Tracks progress of the upgrade to topology coordinator.
+    future<> _upgrade_to_topology_coordinator_fiber = make_ready_future<>();
+
+    future<> transit_tablet(table_id, dht::token, noncopyable_function<sstring(group0_update_collector&, const locator::tablet_map& tmap, api::timestamp_type)> prepare_mutations);
+    future<bool> try_transit_tablet(table_id, dht::token, noncopyable_function<sstring(group0_update_collector&, const locator::tablet_map& tmap, api::timestamp_type)> prepare_mutations);
+    future<service::group0_guard> get_guard_for_tablet_update();
+    future<bool> exec_tablet_update(service::group0_guard guard, group0_update_collector updates, sstring reason);
+public:
+    struct all_tokens_tag {};
+    future<std::unordered_map<sstring, sstring>> add_repair_tablet_request(table_id table, std::variant<utils::chunked_vector<dht::token>, all_tokens_tag> tokens_variant, std::unordered_set<locator::host_id> hosts_filter, std::unordered_set<sstring> dcs_filter, bool await_completion, locator::tablet_repair_incremental_mode incremental_mode);
+    future<> del_repair_tablet_request(table_id table, locator::tablet_task_id);
+    future<> move_tablet(table_id, dht::token, locator::tablet_replica src, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
+    future<> add_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
+    future<> del_tablet_replica(table_id, dht::token, locator::tablet_replica dst, loosen_constraints force = loosen_constraints::no);
+    future<> restore_tablets(table_id, sstring snap_name);
+    future<> abort_restore_tablets(table_id);
+    // When disabling, waits for the in-flight tablet transitions. Those still in flight after
+    // grace_period are cancelled where possible; zero cancels nothing. Without grace_period, the
+    // tablet_transition_abort_grace_period_in_seconds option applies.
+    future<> set_tablet_balancing_enabled(bool enabled, std::optional<std::chrono::seconds> grace_period = std::nullopt);
+
+    // Cancels every tablet transition which can be cancelled, except those of a node drain.
+    future<> cancel_tablet_transitions();
+
+    // Cancels the tablet's migration with the given task id, even one draining a node. Throws
+    // task_not_found if the tablet is no longer in that migration.
+    future<> cancel_tablet_transition(locator::global_tablet_id tablet, locator::tablet_task_id task_id);
+
+    future<utils::UUID> submit_quiesce_topology_request();
+    // The body of await_topology_quiesced(), run through _quiesce_topology so that
+    // concurrent callers share a single request. Shard 0 only.
+    future<> do_await_topology_quiesced();
+    future<> await_topology_quiesced();
+    // Verifies topology is not busy, and also that topology version hasn't changed since the one provided
+    // by the caller.
+    future<bool> verify_topology_quiesced(token_metadata::version_t expected_version);
+
+    // In the maintenance mode, other nodes won't be available thus we disabled joining
+    // the token ring and the token metadata won't be populated with the local node's endpoint.
+    // When a CQL query is executed it checks the `token_metadata` structure and fails if it is empty.
+    //
+    // This method initialises `token_metadata` with the local node as the only node in the token ring.
+    // It is incompatible with the `join_cluster` method.
+    future<> start_maintenance_mode();
+
+    // Waits for a topology request with a given ID to complete and return non empty error string
+    // if request completes with an error
+    future<sstring> wait_for_topology_request_completion(utils::UUID id, bool require_entry = true,
+                                                        std::optional<lowres_clock::time_point> deadline = std::nullopt,
+                                                        abort_source* as = nullptr);
+
+    // Initiates abort of a topology request with a given ID.
+    // May have no effect if the request is not in an abortable state.
+    // Doesn't wait until request is done. Use wait_for_topology_request_completion().
+    // Must be called on shard 0.
+    future<> abort_topology_request(utils::UUID request_id);
+
+    future<> wait_for_topology_not_busy(abort_source* as = nullptr);
+
+    future<> abort_rf_change(utils::UUID request_id);
+
+private:
+    future<utils::chunked_vector<canonical_mutation>> get_system_mutations(schema_ptr schema);
+    future<utils::chunked_vector<canonical_mutation>> get_system_mutations(const sstring& ks_name, const sstring& cf_name);
+
+    struct nodes_to_notify_after_sync {
+        std::vector<std::pair<gms::inet_address, locator::host_id>> left;
+        std::vector<std::pair<gms::inet_address, locator::host_id>> joined;
+        std::vector<locator::host_id> released;
+    };
+
+    using host_id_to_ip_map_t = db::system_keyspace::host_id_to_ip_map_t;
+    future<> raft_topology_update_ip(locator::host_id id, gms::inet_address ip, const host_id_to_ip_map_t& map, nodes_to_notify_after_sync* nodes_to_notify);
+    // Synchronizes the local node state (token_metadata, system.peers/system.local tables,
+    // gossiper) to align it with the other raft topology nodes.
+    // Optional target_node can be provided to restrict the synchronization to the specified node.
+    // Returns a structure that describes which notifications to trigger after token metadata is updated.
+    future<nodes_to_notify_after_sync> sync_raft_topology_nodes(mutable_token_metadata_ptr tmptr, std::unordered_set<raft::server_id> prev_normal, std::optional<std::unordered_set<locator::host_id>> prev_released);
+    // Triggers notifications (on_joined, on_left) based on the recent changes to token metadata, as described by the passed in structure.
+    // This function should be called on the result of `sync_raft_topology_nodes`, after the global token metadata is updated.
+    future<> notify_nodes_after_sync(nodes_to_notify_after_sync&& nodes_to_notify);
+    // load topology state machine snapshot into memory
+    // raft_group0_client::_read_apply_mutex must be held
+    future<> topology_state_load(state_change_hint hint = {});
+    // Applies received raft snapshot to local state machine persistent storage
+    // raft_group0_client::_read_apply_mutex must be held
+    future<> merge_topology_snapshot(raft_snapshot snp);
+    // load view building state machine snapshot into memory
+    // raft_group0_client::_read_apply_mutex must be held
+    future<> view_building_state_load();
+    // Stores the views whose build is finished on every node in the tombstone GC state of every shard
+    future<> update_built_views(const db::system_keyspace::view_build_status_map& statuses);
+
+    utils::chunked_vector<canonical_mutation> build_mutation_from_join_params(const join_node_request_params& params, api::timestamp_type write_timestamp,
+        utils::UUID old_request_id = utils::UUID{});
+    std::unordered_set<raft::server_id> ignored_nodes_from_join_params(const join_node_request_params& params);
+
+    future<join_node_request_result> join_node_request_handler(join_node_request_params params);
+    future<join_node_response_result> join_node_response_handler(join_node_response_params params);
+    shared_promise<> _join_node_request_done;
+    shared_promise<> _join_node_group0_started;
+    shared_promise<> _join_node_response_done;
+    semaphore _join_node_response_handler_mutex{1};
+
+    future<> _sstable_vnodes_cleanup_fiber = make_ready_future<>();
+    future<> sstable_vnodes_cleanup_fiber(raft::server& raft, gate::holder, sharded<service::storage_proxy>& proxy) noexcept;
+
+    // We need to be able to abort all group0 operation during shutdown, so we need special abort source for that
+    abort_source _group0_as;
+
+    std::function<future<void>(std::string_view)> _compression_dictionary_updated_callback;
+
+    utils::disk_space_monitor* _disk_space_monitor; // != nullptr only on shard0.
+
+    strong_consistency::groups_manager& _groups_manager;
+
+public:
+    seastar::future<> notify_client_routes_change(const client_routes_service::client_route_keys& client_route_keys);
+
+    // Alters the given table's min/max tablet count hints. Only the engaged
+    // hints are applied; if both are disengaged the call is a no-op. When
+    // wait_balancer is set, waits for the load balancer to reach the requested
+    // tablet count (which requires both hints to be engaged and equal).
+    // When remove_unset is set, a disengaged hint removes that key from the table's
+    // tablet options instead of leaving it unchanged - needed to put back the schema
+    // of a table which had no hint of its own.
+    future<> alter_table_with_tablet_hints(table_id tid,
+                                           std::optional<size_t> min_tablet_count,
+                                           std::optional<size_t> max_tablet_count,
+                                           wait_balancer wait_for_balancer = wait_balancer::yes,
+                                           remove_unset erase_unset = remove_unset::no);
+
+    friend class join_node_rpc_handshaker;
+    friend class node_ops::node_ops_virtual_task;
+    friend class tasks::task_manager;
+    friend class tablet_virtual_task;
+    friend class topo::global_topology_request_virtual_task;
+    friend class vnodes_to_tablets::migration_virtual_task;
+    friend class vnodes_to_tablets::pow2_convergence_virtual_task;
 };
 
 }
+
+template <>
+struct fmt::formatter<service::storage_service::mode> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(service::storage_service::mode mode, FormatContext& ctx) const {
+        std::string_view name;
+        using enum service::storage_service::mode;
+        switch (mode) {
+        case NONE:           name = "STARTING"; break;
+        case STARTING:       name = "STARTING"; break;
+        case NORMAL:         name = "NORMAL"; break;
+        case JOINING:        name = "JOINING"; break;
+        case BOOTSTRAP:      name = "BOOTSTRAP"; break;
+        case LEAVING:        name = "LEAVING"; break;
+        case DECOMMISSIONED: name = "DECOMMISSIONED"; break;
+        case MOVING:         name = "MOVING"; break;
+        case DRAINING:       name = "DRAINING"; break;
+        case DRAINED:        name = "DRAINED"; break;
+        case MAINTENANCE:    name = "MAINTENANCE"; break;
+        }
+        return fmt::format_to(ctx.out(), "{}", name);
+    }
+};
+
+template <>
+struct fmt::formatter<service::storage_service::migration_status> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(service::storage_service::migration_status status, FormatContext& ctx) const {
+        std::string_view name;
+        using enum service::storage_service::migration_status;
+        switch (status) {
+        case vnodes:                name = "vnodes"; break;
+        case migrating_to_tablets:  name = "migrating_to_tablets"; break;
+        case tablets:               name = "tablets"; break;
+        }
+        return fmt::format_to(ctx.out(), "{}", name);
+    }
+};

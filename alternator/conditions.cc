@@ -3,23 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <list>
-#include <map>
 #include <string_view>
 #include "alternator/conditions.hh"
 #include "alternator/error.hh"
-#include "cql3/constants.hh"
 #include <unordered_map>
 #include "utils/rjson.hh"
 #include "serialization.hh"
 #include "utils/base64.hh"
 #include "utils/rjson.hh"
 #include <stdexcept>
-#include <boost/algorithm/cxx11/all_of.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
 #include "utils/overloaded_functor.hh"
 
 #include "expressions.hh"
@@ -45,12 +40,12 @@ comparison_operator_type get_comparison_operator(const rjson::value& comparison_
             {"NOT_CONTAINS", comparison_operator_type::NOT_CONTAINS},
     };
     if (!comparison_operator.IsString()) {
-        throw api_error::validation(format("Invalid comparison operator definition {}", rjson::print(comparison_operator)));
+        throw api_error::validation(fmt::format("Invalid comparison operator definition {}", rjson::print(comparison_operator)));
     }
-    std::string op = comparison_operator.GetString();
+    std::string op = rjson::to_string(comparison_operator);
     auto it = ops.find(op);
     if (it == ops.end()) {
-        throw api_error::validation(format("Unsupported comparison operator {}", op));
+        throw api_error::validation(fmt::format("Unsupported comparison operator {}", op));
     }
     return it->second;
 }
@@ -232,7 +227,14 @@ bool check_BEGINS_WITH(const rjson::value* v1, const rjson::value& v2,
     if (it2->name == "S") {
         return rjson::to_string_view(it1->value).starts_with(rjson::to_string_view(it2->value));
     } else /* it2->name == "B" */ {
-        return base64_begins_with(rjson::to_string_view(it1->value), rjson::to_string_view(it2->value));
+        try {
+            return base64_begins_with(rjson::to_string_view(it1->value), rjson::to_string_view(it2->value));
+        } catch(std::invalid_argument&) {
+            // determine if any of the malformed values is from query and raise an exception if so
+            unwrap_bytes(it1->value, v1_from_query);
+            unwrap_bytes(it2->value, v2_from_query);
+            return false;
+        }
     }
 }
 
@@ -241,8 +243,20 @@ static bool is_set_of(const rjson::value& type1, const rjson::value& type2) {
 }
 
 // Check if two JSON-encoded values match with the CONTAINS relation
-bool check_CONTAINS(const rjson::value* v1, const rjson::value& v2) {
+bool check_CONTAINS(const rjson::value* v1, const rjson::value& v2, bool v1_from_query, bool v2_from_query) {
     if (!v1) {
+        return false;
+    }
+    if (!v1->IsObject() || v1->MemberCount() != 1) {
+        if (v1_from_query) {
+            throw api_error::serialization("CONTAINS operator encountered malformed AttributeValue");
+        }
+        return false;
+    }
+    if (!v2.IsObject() || v2.MemberCount() != 1) {
+        if (v2_from_query) {
+            throw api_error::serialization("CONTAINS operator encountered malformed AttributeValue");
+        }
         return false;
     }
     const auto& kv1 = *v1->MemberBegin();
@@ -250,7 +264,12 @@ bool check_CONTAINS(const rjson::value* v1, const rjson::value& v2) {
     if (kv1.name == "S" && kv2.name == "S") {
         return rjson::to_string_view(kv1.value).find(rjson::to_string_view(kv2.value)) != std::string_view::npos;
     } else if (kv1.name == "B" && kv2.name == "B") {
-        return rjson::base64_decode(kv1.value).find(rjson::base64_decode(kv2.value)) != bytes::npos;
+        auto d_kv1 = unwrap_bytes(kv1.value, v1_from_query);
+        auto d_kv2 = unwrap_bytes(kv2.value, v2_from_query);
+        if (!d_kv1 || !d_kv2) {
+            return false;
+        }
+        return d_kv1->find(*d_kv2) != bytes::npos;
     } else if (is_set_of(kv1.name, kv2.name)) {
         for (auto i = kv1.value.Begin(); i != kv1.value.End(); ++i) {
             if (*i == kv2.value) {
@@ -258,9 +277,17 @@ bool check_CONTAINS(const rjson::value* v1, const rjson::value& v2) {
             }
         }
     } else if (kv1.name == "L") {
+        if (!kv1.value.IsArray()) {
+            if (v1_from_query) {
+                throw api_error::serialization("CONTAINS operator received a malformed list");
+            }
+            return false;
+        }
         for (auto i = kv1.value.Begin(); i != kv1.value.End(); ++i) {
             if (!i->IsObject() || i->MemberCount() != 1) {
-                clogger.error("check_CONTAINS received a list whose element is malformed");
+                if (v1_from_query) {
+                    throw api_error::serialization("CONTAINS operator received a list whose element is malformed");
+                }
                 return false;
             }
             const auto& el = *i->MemberBegin();
@@ -273,11 +300,11 @@ bool check_CONTAINS(const rjson::value* v1, const rjson::value& v2) {
 }
 
 // Check if two JSON-encoded values match with the NOT_CONTAINS relation
-static bool check_NOT_CONTAINS(const rjson::value* v1, const rjson::value& v2) {
+static bool check_NOT_CONTAINS(const rjson::value* v1, const rjson::value& v2, bool v1_from_query, bool v2_from_query) {
     if (!v1) {
         return false;
     }
-    return !check_CONTAINS(v1, v2);
+    return !check_CONTAINS(v1, v2, v1_from_query, v2_from_query);
 }
 
 // Check if a JSON-encoded value equals any element of an array, which must have at least one element.
@@ -330,7 +357,7 @@ static bool check_NOT_NULL(const rjson::value* val) {
 }
 
 // Only types S, N or B (string, number or bytes) may be compared by the
-// various comparion operators - lt, le, gt, ge, and between.
+// various comparison operators - lt, le, gt, ge, and between.
 // Note that in particular, if the value is missing (v->IsNull()), this
 // check returns false.
 static bool check_comparable_type(const rjson::value& v) {
@@ -370,11 +397,16 @@ bool check_compare(const rjson::value* v1, const rjson::value& v2, const Compara
         return cmp(unwrap_number(*v1, cmp.diagnostic), unwrap_number(v2, cmp.diagnostic));
     }
     if (kv1.name == "S") {
-        return cmp(std::string_view(kv1.value.GetString(), kv1.value.GetStringLength()),
-                   std::string_view(kv2.value.GetString(), kv2.value.GetStringLength()));
+        return cmp(rjson::to_string_view(kv1.value),
+                   rjson::to_string_view(kv2.value));
     }
     if (kv1.name == "B") {
-        return cmp(rjson::base64_decode(kv1.value), rjson::base64_decode(kv2.value));
+        auto d_kv1 = unwrap_bytes(kv1.value, v1_from_query);
+        auto d_kv2 = unwrap_bytes(kv2.value, v2_from_query);
+        if(!d_kv1 || !d_kv2) {
+            return false;
+        }
+        return cmp(*d_kv1, *d_kv2);
     }
     // cannot reach here, as check_comparable_type() verifies the type is one
     // of the above options.
@@ -415,7 +447,7 @@ static bool check_BETWEEN(const T& v, const T& lb, const T& ub, bool bounds_from
     if (cmp_lt()(ub, lb)) {
         if (bounds_from_query) {
             throw api_error::validation(
-                format("BETWEEN operator requires lower_bound <= upper_bound, but {} > {}", lb, ub));
+                fmt::format("BETWEEN operator requires lower_bound <= upper_bound, but {} > {}", lb, ub));
         } else {
             return false;
         }
@@ -458,13 +490,19 @@ static bool check_BETWEEN(const rjson::value* v, const rjson::value& lb, const r
         return check_BETWEEN(unwrap_number(*v, diag), unwrap_number(lb, diag), unwrap_number(ub, diag), bounds_from_query);
     }
     if (kv_v.name == "S") {
-        return check_BETWEEN(std::string_view(kv_v.value.GetString(), kv_v.value.GetStringLength()),
-                             std::string_view(kv_lb.value.GetString(), kv_lb.value.GetStringLength()),
-                             std::string_view(kv_ub.value.GetString(), kv_ub.value.GetStringLength()),
+        return check_BETWEEN(rjson::to_string_view(kv_v.value),
+                             rjson::to_string_view(kv_lb.value),
+                             rjson::to_string_view(kv_ub.value),
                              bounds_from_query);
     }
     if (kv_v.name == "B") {
-        return check_BETWEEN(rjson::base64_decode(kv_v.value), rjson::base64_decode(kv_lb.value), rjson::base64_decode(kv_ub.value), bounds_from_query);
+        auto d_kv_v = unwrap_bytes(kv_v.value, v_from_query);
+        auto d_kv_lb = unwrap_bytes(kv_lb.value, lb_from_query);
+        auto d_kv_ub = unwrap_bytes(kv_ub.value, ub_from_query);
+        if(!d_kv_v || !d_kv_lb || !d_kv_ub) {
+            return false;
+        }
+        return check_BETWEEN(*d_kv_v, *d_kv_lb, *d_kv_ub, bounds_from_query);
     }
     if (v_from_query) {
         throw api_error::validation(
@@ -557,7 +595,7 @@ static bool verify_expected_one(const rjson::value& condition, const rjson::valu
                             format("CONTAINS operator requires a single AttributeValue of type String, Number, or Binary, "
                                     "got {} instead", argtype));
                 }
-                return check_CONTAINS(got, arg);
+                return check_CONTAINS(got, arg, false, true);
             }
         case comparison_operator_type::NOT_CONTAINS:
             {
@@ -571,7 +609,7 @@ static bool verify_expected_one(const rjson::value& condition, const rjson::valu
                             format("CONTAINS operator requires a single AttributeValue of type String, Number, or Binary, "
                                     "got {} instead", argtype));
                 }
-                return check_NOT_CONTAINS(got, arg);
+                return check_NOT_CONTAINS(got, arg, false, true);
             }
         }
         throw std::logic_error(format("Internal error: corrupted operator enum: {}", int(op)));
@@ -593,14 +631,14 @@ conditional_operator_type get_conditional_operator(const rjson::value& req) {
         return conditional_operator_type::OR;
     } else {
         throw api_error::validation(
-                format("'ConditionalOperator' parameter must be AND, OR or missing. Found {}.", s));
+                fmt::format("'ConditionalOperator' parameter must be AND, OR or missing. Found {}.", s));
     }
 }
 
 // Check if the existing values of the item (previous_item) match the
 // conditions given by the Expected and ConditionalOperator parameters
 // (if they exist) in the request (an UpdateItem, PutItem or DeleteItem).
-// This function can throw an ValidationException API error if there
+// This function can throw a ValidationException API error if there
 // are errors in the format of the condition itself.
 bool verify_expected(const rjson::value& req, const rjson::value* previous_item) {
     const rjson::value* expected = rjson::find(req, "Expected");
@@ -663,7 +701,7 @@ static bool calculate_primitive_condition(const parsed::primitive_condition& con
     case parsed::primitive_condition::type::VALUE:
         if (calculated_values.size() != 1) {
             // Shouldn't happen unless we have a bug in the parser
-            throw std::logic_error(format("Unexpected values in primitive_condition", cond._values.size()));
+            throw std::logic_error(format("Unexpected values {} in primitive_condition", cond._values.size()));
         }
         // Unwrap the boolean wrapped as the value (if it is a boolean)
         if (calculated_values[0].IsObject() && calculated_values[0].MemberCount() == 1) {
@@ -723,9 +761,9 @@ bool verify_condition_expression(
             };
             switch (list.op) {
             case '&':
-                return boost::algorithm::all_of(list.conditions, verify_condition);
+                return std::ranges::all_of(list.conditions, verify_condition);
             case '|':
-                return boost::algorithm::any_of(list.conditions, verify_condition);
+                return std::ranges::any_of(list.conditions, verify_condition);
             default:
                 // Shouldn't happen unless we have a bug in the parser
                 throw std::logic_error("bad operator in condition_list");

@@ -3,37 +3,44 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <chrono>
-#include <unordered_map>
 #include <memory_resource>
+#include <optional>
+#include <ranges>
+#include <algorithm>
 
 #include <boost/intrusive/list.hpp>
-#include <boost/intrusive/unordered_set.hpp>
 #include <boost/intrusive/parent_from_member.hpp>
-#include <boost/range/adaptor/filtered.hpp>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/join.hpp>
 
-#include <seastar/core/seastar.hh>
-#include <seastar/core/future-util.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/core/gate.hh>
 
 #include "exceptions/exceptions.hh"
+#include "utils/assert.hh"
 #include "utils/loading_shared_values.hh"
 #include "utils/chunked_vector.hh"
-#include "log.hh"
+#include "utils/log.hh"
 
 namespace bi = boost::intrusive;
 
 namespace utils {
 
 enum class loading_cache_reload_enabled { no, yes };
+
+template <typename Clock>
+struct loading_cache_config_base final {
+    size_t max_size = 0;
+    Clock::duration expiry;
+    Clock::duration refresh;
+};
+
+using loading_cache_config = loading_cache_config_base<seastar::lowres_clock>;
 
 template <typename Tp>
 struct simple_entry_size {
@@ -46,6 +53,8 @@ struct do_nothing_loading_cache_stats {
     // Accounts events when entries are evicted from the unprivileged cache section due to size restriction.
     // These events are interesting because they are an indication of a cache pollution event.
     static void inc_unprivileged_on_cache_size_eviction() noexcept {};
+    // A metric complementary to the above one. Both combined allow to get the total number of cache evictions
+    static void inc_privileged_on_cache_size_eviction() noexcept {};
 };
 
 /// \brief Loading cache is a cache that loads the value into the cache using the given asynchronous callback.
@@ -56,8 +65,9 @@ struct do_nothing_loading_cache_stats {
 /// The values are going to be evicted from the cache if they are not accessed during the "expiration" period or haven't
 /// been reloaded even once during the same period.
 ///
-/// If "expiration" is set to zero - the caching is going to be disabled and get_XXX(...) is going to call the "loader" callback
-/// every time in order to get the requested value.
+/// If "expiration" is set to zero - the caching is going to be disabled and get(...) is going to call the "loader" callback
+/// every time in order to get the requested value. insert(...) is going to be a no-op in this mode. get_ptr(...) is not
+/// safe to call when caching is disabled (it asserts) since it returns a handle into the cache.
 ///
 /// \note In order to avoid the eviction of cached entries due to "aging" of the contained value the user has to choose
 /// the "expiration" to be at least ("refresh" + "max load latency"). This way the value is going to stay in the cache and is going to be
@@ -105,84 +115,91 @@ template<typename Key,
          typename EqualPred = std::equal_to<Key>,
          typename LoadingSharedValuesStats = utils::do_nothing_loading_shared_values_stats,
          typename LoadingCacheStats = utils::do_nothing_loading_cache_stats,
+         typename Clock = seastar::lowres_clock,
          typename Alloc = std::pmr::polymorphic_allocator<>>
 class loading_cache {
-
-using loading_cache_clock_type = seastar::lowres_clock;
-using safe_link_list_hook = bi::list_base_hook<bi::link_mode<bi::safe_link>>;
-
-class timestamped_val {
 public:
-    using value_type = Tp;
-    using loading_values_type = typename utils::loading_shared_values<Key, timestamped_val, Hash, EqualPred, LoadingSharedValuesStats, 256>;
-    class lru_entry;
-    class value_ptr;
+    using config = loading_cache_config;
 
 private:
-    value_type _value;
-    loading_cache_clock_type::time_point _loaded;
-    loading_cache_clock_type::time_point _last_read;
-    lru_entry* _lru_entry_ptr = nullptr; /// MRU item is at the front, LRU - at the back
-    size_t _size = 0;
+    using loading_cache_clock_type = Clock;
+    using time_point = loading_cache_clock_type::time_point;
+    using duration = loading_cache_clock_type::duration;
+    using safe_link_list_hook = bi::list_base_hook<bi::link_mode<bi::safe_link>>;
 
-public:
-    timestamped_val(value_type val)
-        : _value(std::move(val))
-        , _loaded(loading_cache_clock_type::now())
-        , _last_read(_loaded)
-        , _size(EntrySize()(_value))
-    {}
-    timestamped_val(timestamped_val&&) = default;
+    class timestamped_val {
+    public:
+        using value_type = Tp;
+        using loading_values_type = typename utils::loading_shared_values<Key, timestamped_val, Hash, EqualPred, LoadingSharedValuesStats, 256>;
+        class lru_entry;
+        class value_ptr;
 
-    timestamped_val& operator=(value_type new_val) {
-        assert(_lru_entry_ptr);
+    private:
+        value_type _value;
+        loading_cache_clock_type::time_point _loaded;
+        loading_cache_clock_type::time_point _last_read;
+        lru_entry* _lru_entry_ptr = nullptr; /// MRU item is at the front, LRU - at the back
+        size_t _size = 0;
 
-        _value = std::move(new_val);
-        _loaded = loading_cache_clock_type::now();
-        _lru_entry_ptr->cache_size() -= _size;
-        _size = EntrySize()(_value);
-        _lru_entry_ptr->cache_size() += _size;
-        return *this;
-    }
+    public:
+        timestamped_val(value_type val)
+            : _value(std::move(val))
+            , _loaded(loading_cache_clock_type::now())
+            , _last_read(_loaded)
+            , _size(EntrySize()(_value))
+        {}
+        timestamped_val(timestamped_val&&) = default;
 
-    value_type& value() noexcept { return _value; }
-    const value_type& value() const noexcept { return _value; }
+        timestamped_val& operator=(value_type new_val) {
+            SCYLLA_ASSERT(_lru_entry_ptr);
 
-    static const timestamped_val& container_of(const value_type& value) {
-        return *bi::get_parent_from_member(&value, &timestamped_val::_value);
-    }
+            _value = std::move(new_val);
+            _loaded = loading_cache_clock_type::now();
+            _lru_entry_ptr->owning_section_size() -= _size;
+            _size = EntrySize()(_value);
+            _lru_entry_ptr->owning_section_size() += _size;
+            return *this;
+        }
 
-    loading_cache_clock_type::time_point last_read() const noexcept {
-        return _last_read;
-    }
+        value_type& value() noexcept { return _value; }
+        const value_type& value() const noexcept { return _value; }
 
-    loading_cache_clock_type::time_point loaded() const noexcept {
-        return _loaded;
-    }
+        static const timestamped_val& container_of(const value_type& value) {
+            return *bi::get_parent_from_member(&value, &timestamped_val::_value);
+        }
 
-    size_t size() const {
-        return _size;
-    }
+        loading_cache_clock_type::time_point last_read() const noexcept {
+            return _last_read;
+        }
 
-    bool ready() const noexcept {
-        return _lru_entry_ptr;
-    }
+        loading_cache_clock_type::time_point loaded() const noexcept {
+            return _loaded;
+        }
 
-    lru_entry* lru_entry_ptr() const noexcept {
-        return _lru_entry_ptr;
-    }
+        size_t size() const noexcept {
+            return _size;
+        }
 
-private:
-    void touch() noexcept {
-        assert(_lru_entry_ptr);
-        _last_read = loading_cache_clock_type::now();
-        _lru_entry_ptr->touch();
-    }
+        bool ready() const noexcept {
+            return _lru_entry_ptr;
+        }
 
-    void set_anchor_back_reference(lru_entry* lru_entry_ptr) noexcept {
-        _lru_entry_ptr = lru_entry_ptr;
-    }
-};
+        lru_entry* lru_entry_ptr() const noexcept {
+            return _lru_entry_ptr;
+        }
+
+    private:
+        void touch() noexcept {
+            _last_read = loading_cache_clock_type::now();
+            if (_lru_entry_ptr) {
+                _lru_entry_ptr->touch();
+            }
+        }
+
+        void set_anchor_back_reference(lru_entry* lru_entry_ptr) noexcept {
+            _lru_entry_ptr = lru_entry_ptr;
+        }
+    };
 
 private:
     using loading_values_type = typename timestamped_val::loading_values_type;
@@ -199,28 +216,40 @@ public:
     class entry_is_too_big : public std::exception {};
 
 private:
-    loading_cache(size_t max_size, lowres_clock::duration expiry, lowres_clock::duration refresh, logging::logger& logger)
-        : _max_size(max_size)
-        , _expiry(expiry)
-        , _refresh(refresh)
+    loading_cache(config cfg, logging::logger& logger)
+        : _cfg(std::move(cfg))
         , _logger(logger)
         , _timer([this] { on_timer(); })
+        , _timer_reads_gate("loading_cache::timer_reads")
     {
         static_assert(noexcept(LoadingCacheStats::inc_unprivileged_on_cache_size_eviction()), "LoadingCacheStats::inc_unprivileged_on_cache_size_eviction must be non-throwing");
+        static_assert(noexcept(LoadingCacheStats::inc_privileged_on_cache_size_eviction()), "LoadingCacheStats::inc_privileged_on_cache_size_eviction must be non-throwing");
 
-        // Sanity check: if expiration period is given then non-zero refresh period and maximal size are required
-        if (caching_enabled() && (_refresh == lowres_clock::duration(0) || _max_size == 0)) {
+        _logger.debug("Loading cache; max_size: {}, expiry: {}ms, refresh: {}ms", _cfg.max_size,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(_cfg.expiry).count(),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(_cfg.refresh).count());
+
+        if (!validate_config(_cfg)) {
             throw exceptions::configuration_exception("loading_cache: caching is enabled but refresh period and/or max_size are zero");
         }
     }
 
+    bool validate_config(const config& cfg) const noexcept {
+        // Sanity check: if expiration period is given then non-zero refresh period and maximal size are required
+        if (cfg.expiry != duration(0) && (cfg.max_size == 0 || cfg.refresh == duration(0))) {
+            return false;
+        }
+
+        return true;
+    }
+
 public:
     template<typename Func>
-    loading_cache(size_t max_size, lowres_clock::duration expiry, lowres_clock::duration refresh, logging::logger& logger, Func&& load)
-        : loading_cache(max_size, expiry, refresh, logger)
+    requires std::is_invocable_r_v<future<value_type>, Func, const key_type&>
+    loading_cache(config cfg, logging::logger& logger, Func&& load)
+        : loading_cache(std::move(cfg), logger)
     {
         static_assert(ReloadEnabled == loading_cache_reload_enabled::yes, "This constructor should only be invoked when ReloadEnabled == loading_cache_reload_enabled::yes");
-        static_assert(std::is_same<future<value_type>, std::result_of_t<Func(const key_type&)>>::value, "Bad Func signature");
 
         _load = std::forward<Func>(load);
 
@@ -229,12 +258,12 @@ public:
             return;
         }
 
-        _timer_period = std::min(_expiry, _refresh);
+        _timer_period = std::min(_cfg.expiry, _cfg.refresh);
         _timer.arm(_timer_period);
     }
 
-    loading_cache(size_t max_size, lowres_clock::duration expiry, logging::logger& logger)
-        : loading_cache(max_size, expiry, loading_cache_clock_type::time_point::max().time_since_epoch(), logger)
+    loading_cache(size_t max_size, duration expiry, logging::logger& logger)
+        : loading_cache({max_size, expiry, time_point::max().time_since_epoch()}, logger)
     {
         static_assert(ReloadEnabled == loading_cache_reload_enabled::no, "This constructor should only be invoked when ReloadEnabled == loading_cache_reload_enabled::no");
 
@@ -243,7 +272,7 @@ public:
             return;
         }
 
-        _timer_period = _expiry;
+        _timer_period = _cfg.expiry;
         _timer.arm(_timer_period);
     }
 
@@ -253,22 +282,53 @@ public:
         _lru_list.erase_and_dispose(_lru_list.begin(), _lru_list.end(), value_destroyer);
     }
 
-    template <typename LoadFunc>
-    future<value_ptr> get_ptr(const Key& k, LoadFunc&& load) {
-        static_assert(std::is_same<future<value_type>, std::result_of_t<LoadFunc(const key_type&)>>::value, "Bad LoadFunc signature");
-        // We shouldn't be here if caching is disabled
-        assert(caching_enabled());
+    void reset() noexcept {
+        _logger.info("Resetting cache");
 
-        return _loading_values.get_or_load(k, [this, load = std::forward<LoadFunc>(load)] (const Key& k) mutable {
-            return load(k).then([this] (value_type val) {
+        remove_if([](const value_type&){ return true; });
+    }
+
+    bool update_config(config cfg) {
+        _logger.info("Updating loading cache; max_size: {}, expiry: {}ms, refresh: {}ms", cfg.max_size,
+                     std::chrono::duration_cast<std::chrono::milliseconds>(cfg.expiry).count(),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(cfg.refresh).count());
+
+        if (!validate_config(cfg)) {
+            _logger.debug("loading_cache: caching is enabled but refresh period and/or max_size are zero");
+            return false;
+        }
+
+        _updated_cfg.emplace(std::move(cfg));
+
+        // * If the timer is already armed we need to rearm it so that the changes on config can take place.
+        // * If timer is not armed and caching is enabled, it means that on_timer was executed but its continuation hasn't finished yet,
+        //   so we don't need to rearm it here, since on_timer's continuation will take care of that
+        // * If caching is disabled and it's being enabled here on update_config, we also need to arm the timer, so that the changes on config
+        //   can take place
+        if (_timer.armed() ||
+            (!caching_enabled() && _updated_cfg->expiry != duration(0))) {
+            _timer.rearm(loading_cache_clock_type::now() + duration(std::chrono::milliseconds(1)));
+        }
+
+        return true;
+    }
+
+    template <typename LoadFunc>
+    requires std::is_invocable_r_v<future<value_type>, LoadFunc, const key_type&>
+    future<value_ptr> get_ptr(const Key& k, LoadFunc&& load) {
+        // We shouldn't be here if caching is disabled
+        SCYLLA_ASSERT(caching_enabled());
+
+        return _loading_values.get_or_load(k, [load = std::forward<LoadFunc>(load)] (const Key& k) mutable {
+            return load(k).then([] (value_type val) {
                 return timestamped_val(std::move(val));
             });
         }).then([this, k] (timestamped_val_ptr ts_val_ptr) {
             // check again since it could have already been inserted and initialized
-            if (!ts_val_ptr->ready()) {
+            if (!ts_val_ptr->ready() && !ts_val_ptr.orphaned()) {
                 _logger.trace("{}: storing the value for the first time", k);
 
-                if (ts_val_ptr->size() > _max_size) {
+                if (ts_val_ptr->size() > _cfg.max_size) {
                     return make_exception_future<value_ptr>(entry_is_too_big());
                 }
 
@@ -292,6 +352,24 @@ public:
     future<value_ptr> get_ptr(const Key& k) {
         static_assert(ReloadEnabled == loading_cache_reload_enabled::yes, "");
         return get_ptr(k, _load);
+    }
+
+    /// \brief Insert a value into the cache, loading it via \p load if not already present.
+    ///
+    /// Equivalent to get_ptr(k, load).discard_result() when caching is enabled,
+    /// but is a no-op when caching is disabled (i.e. the cache was constructed
+    /// with expiry == 0). Use this when you only want the side effect of
+    /// populating the cache and don't need a handle to the cached value.
+    ///
+    /// Unlike get_ptr(), it is safe to call this on a cache configured with
+    /// caching disabled.
+    template <typename LoadFunc>
+    requires std::is_invocable_r_v<future<value_type>, LoadFunc, const key_type&>
+    future<> insert(const Key& k, LoadFunc&& load) {
+        if (!caching_enabled()) {
+            return make_ready_future<>();
+        }
+        return get_ptr(k, std::forward<LoadFunc>(load)).discard_result();
     }
 
     future<Tp> get(const Key& k) {
@@ -331,28 +409,46 @@ public:
         return set_find(k);
     }
 
+    // Removes all values matching a given predicate and values which are currently loading.
+    // Guarantees that no values which match the predicate and whose loading was initiated
+    // before this call will be present after this call (or appear at any time later).
+    // The predicate may be invoked multiple times on the same value.
+    // It must return the same result for a given value (it must be a pure function).
     template <typename Pred>
+    requires std::is_invocable_r_v<bool, Pred, const value_type&>
     void remove_if(Pred&& pred) {
-        static_assert(std::is_same<bool, std::result_of_t<Pred(const value_type&)>>::value, "Bad Pred signature");
-
-        auto cond_pred = [this, &pred] (const ts_value_lru_entry& v) {
+        auto cond_pred = [&pred] (const ts_value_lru_entry& v) {
             return pred(v.timestamped_value().value());
         };
-        auto value_destroyer = [this] (ts_value_lru_entry* p) {
+        auto value_destroyer = [] (ts_value_lru_entry* p) {
             loading_cache::destroy_ts_value(p);
         };
 
         _unprivileged_lru_list.remove_and_dispose_if(cond_pred, value_destroyer);
         _lru_list.remove_and_dispose_if(cond_pred, value_destroyer);
+        _loading_values.remove_if([&pred] (const timestamped_val& v) {
+            return pred(v.value());
+        });
     }
 
+    // Removes a given key from the cache.
+    // The key is removed immediately.
+    // After this, get_ptr() is guaranteed to reload the value before returning it.
+    // As a consequence of the above, if there is a concurrent get_ptr() in progress with this,
+    // its value will not populate the cache. It will still succeed.
     void remove(const Key& k) {
         remove_ts_value(set_find(k));
+        // set_find() returns nullptr for a key which is currently loading, which we want to remove too.
+        _loading_values.remove(k);
     }
 
+    // Removes a given key from the cache.
+    // Same guarantees as with remove(key).
     template<typename KeyType, typename KeyHasher, typename KeyEqual>
     void remove(const KeyType& key, KeyHasher key_hasher_func, KeyEqual key_equal_func) noexcept {
-        remove_ts_value(set_find(key, std::move(key_hasher_func), std::move(key_equal_func)));
+        remove_ts_value(set_find(key, key_hasher_func, key_equal_func));
+        // set_find() returns nullptr for a key which is currently loading, which we want to remove too.
+        _loading_values.remove(key, key_hasher_func, key_equal_func);
     }
 
     size_t size() const {
@@ -360,10 +456,19 @@ public:
     }
 
     /// \brief returns the memory size the currently cached entries occupy according to the EntrySize predicate.
-    size_t memory_footprint() const {
-        return _current_size;
+    size_t memory_footprint() const noexcept {
+        return _unprivileged_section_size + _privileged_section_size;
     }
 
+    /// \brief returns the memory size the currently cached entries occupy in the privileged section according to the EntrySize predicate.
+    size_t privileged_section_memory_footprint() const noexcept {
+        return _privileged_section_size;
+    }
+
+    /// \brief returns the memory size the currently cached entries occupy in the unprivileged section according to the EntrySize predicate.
+    size_t unprivileged_section_memory_footprint() const noexcept {
+        return _unprivileged_section_size;
+    }
 private:
     void remove_ts_value(timestamped_val_ptr ts_ptr) {
         if (!ts_ptr) {
@@ -371,7 +476,7 @@ private:
         }
         ts_value_lru_entry* lru_entry_ptr = ts_ptr->lru_entry_ptr();
         lru_list_type& entry_list = container_list(*lru_entry_ptr);
-        entry_list.erase_and_dispose(entry_list.iterator_to(*lru_entry_ptr), [this] (ts_value_lru_entry* p) { loading_cache::destroy_ts_value(p); });
+        entry_list.erase_and_dispose(entry_list.iterator_to(*lru_entry_ptr), [] (ts_value_lru_entry* p) { loading_cache::destroy_ts_value(p); });
     }
 
     timestamped_val_ptr ready_entry_ptr(timestamped_val_ptr tv_ptr) {
@@ -397,10 +502,10 @@ private:
     }
 
     bool caching_enabled() const {
-        return _expiry != lowres_clock::duration(0);
+        return _cfg.expiry != duration(0);
     }
 
-    static void destroy_ts_value(ts_value_lru_entry* val) {
+    static void destroy_ts_value(ts_value_lru_entry* val) noexcept {
         Alloc().delete_object(val);
     }
 
@@ -419,16 +524,22 @@ private:
         }
 
         if (lru_entry.touch_count() < SectionHitThreshold) {
-            _logger.trace("Putting key {} into the unpriviledged section", lru_entry.key());
+            _logger.trace("Putting key {} into the unprivileged section", lru_entry.key());
             _unprivileged_lru_list.push_front(lru_entry);
             lru_entry.inc_touch_count();
         } else {
-            _logger.trace("Putting key {} into the priviledged section", lru_entry.key());
+            _logger.trace("Putting key {} into the privileged section", lru_entry.key());
             _lru_list.push_front(lru_entry);
 
             // Bump it up only once to avoid a wrap around
             if (lru_entry.touch_count() == SectionHitThreshold) {
+                // This code will run only once, when a promotion
+                // from unprivileged to privileged section happens.
+                // Update section size bookkeeping.
+                
+                lru_entry.owning_section_size() -= lru_entry.timestamped_value().size();
                 lru_entry.inc_touch_count();
+                lru_entry.owning_section_size() += lru_entry.timestamped_value().size();
             }
         }
     }
@@ -453,11 +564,11 @@ private:
             // The exceptions are related to the load operation itself.
             // We should ignore them for the background reads - if
             // they persist the value will age and will be reloaded in
-            // the forground. If the foreground READ fails the error
+            // the foreground. If the foreground READ fails the error
             // will be propagated up to the user and will fail the
             // corresponding query.
             try {
-                *ts_value_ptr = f.get0();
+                *ts_value_ptr = f.get();
             } catch (std::exception& e) {
                 _logger.debug("{}: reload failed: {}", key, e.what());
             } catch (...) {
@@ -476,13 +587,13 @@ private:
             const timestamped_val& v = lru_entry.timestamped_value();
             auto since_last_read = now - v.last_read();
             auto since_loaded = now - v.loaded();
-            if (_expiry < since_last_read || (ReloadEnabled == loading_cache_reload_enabled::yes && _expiry < since_loaded)) {
-                _logger.trace("drop_expired(): {}: dropping the entry: _expiry {},  ms passed since: loaded {} last_read {}", lru_entry.key(), _expiry.count(), duration_cast<milliseconds>(since_loaded).count(), duration_cast<milliseconds>(since_last_read).count());
+            if (_cfg.expiry < since_last_read || (ReloadEnabled == loading_cache_reload_enabled::yes && _cfg.expiry < since_loaded)) {
+                _logger.trace("drop_expired(): {}: dropping the entry: expiry {},  ms passed since: loaded {} last_read {}", lru_entry.key(), _cfg.expiry.count(), duration_cast<milliseconds>(since_loaded).count(), duration_cast<milliseconds>(since_last_read).count());
                 return true;
             }
             return false;
         };
-        auto value_destroyer = [this] (ts_value_lru_entry* p) {
+        auto value_destroyer = [] (ts_value_lru_entry* p) {
             loading_cache::destroy_ts_value(p);
         };
 
@@ -490,22 +601,50 @@ private:
         _lru_list.remove_and_dispose_if(expiration_cond, value_destroyer);
     }
 
-    // Shrink the cache to the _max_size discarding the least recently used items.
+    // Shrink the cache to the max_size discarding the least recently used items.
     // Get rid from the entries that were used exactly once first.
-    void shrink() {
+    void shrink() noexcept {
         using namespace std::chrono;
 
-        while (_current_size >= _max_size && !_unprivileged_lru_list.empty()) {
-            ts_value_lru_entry& lru_entry = *_unprivileged_lru_list.rbegin();
-            _logger.trace("shrink(): {}: dropping the unpriviledged entry: ms since last_read {}", lru_entry.key(), duration_cast<milliseconds>(loading_cache_clock_type::now() - lru_entry.timestamped_value().last_read()).count());
-            loading_cache::destroy_ts_value(&lru_entry);
-            LoadingCacheStats::inc_unprivileged_on_cache_size_eviction();
-        }
-
-        while (_current_size >= _max_size) {
+        auto drop_privileged_entry = [&] {
             ts_value_lru_entry& lru_entry = *_lru_list.rbegin();
             _logger.trace("shrink(): {}: dropping the entry: ms since last_read {}", lru_entry.key(), duration_cast<milliseconds>(loading_cache_clock_type::now() - lru_entry.timestamped_value().last_read()).count());
             loading_cache::destroy_ts_value(&lru_entry);
+            LoadingCacheStats::inc_privileged_on_cache_size_eviction();
+        };
+
+        auto drop_unprivileged_entry = [&] {
+            ts_value_lru_entry& lru_entry = *_unprivileged_lru_list.rbegin();
+            _logger.trace("shrink(): {}: dropping the unprivileged entry: ms since last_read {}", lru_entry.key(), duration_cast<milliseconds>(loading_cache_clock_type::now() - lru_entry.timestamped_value().last_read()).count());
+            loading_cache::destroy_ts_value(&lru_entry);
+            LoadingCacheStats::inc_unprivileged_on_cache_size_eviction();
+        };
+
+        // When cache entries need to be evicted due to a size restriction,
+        // unprivileged section entries are evicted first.
+        //
+        // However, we make sure that the unprivileged section does not get
+        // too small, because this could lead to starving the unprivileged section.
+        // For example if the cache could store at most 50 entries and there are 49 entries in
+        // privileged section, after adding 5 entries (that would go to unprivileged
+        // section) 4 of them would get evicted and only the 5th one would stay.
+        // This caused problems with BATCH statements where all prepared statements
+        // in the batch have to stay in cache at the same time for the batch to correctly
+        // execute.
+        auto minimum_unprivileged_section_size = _cfg.max_size / 2;
+        while (memory_footprint() >= _cfg.max_size && _unprivileged_section_size > minimum_unprivileged_section_size) {
+            drop_unprivileged_entry();
+        }
+
+        while (memory_footprint() >= _cfg.max_size && !_lru_list.empty()) {
+            drop_privileged_entry();
+        }
+
+        // If dropping entries from privileged section did not help,
+        // we have to drop entries from unprivileged section,
+        // going below minimum_unprivileged_section_size.
+        while (memory_footprint() >= _cfg.max_size) {
+            drop_unprivileged_entry();
         }
     }
 
@@ -519,9 +658,27 @@ private:
     }
 
     void on_timer() {
+        auto holder = _timer_reads_gate.try_hold();
+        if (!holder) {
+            // stop() was called
+            return;
+        }
+
         _logger.trace("on_timer(): start");
 
-        // Clean up items that were not touched for the whole _expiry period.
+        if (_updated_cfg) {
+            _cfg = *_updated_cfg;
+            _updated_cfg.reset();
+            _timer_period = std::min(_cfg.expiry, _cfg.refresh);
+        }
+
+        // Caching might have been disabled during a config update
+        if (!caching_enabled()) {
+            reset();
+            return;
+        }
+
+        // Clean up items that were not touched for the whole expiry period.
         drop_expired();
 
         // check if rehashing is needed and do it if it is.
@@ -536,21 +693,32 @@ private:
         // Reload all those which value needs to be reloaded.
         // Future is waited on indirectly in `stop()` (via `_timer_reads_gate`).
         // FIXME: error handling
-        (void)with_gate(_timer_reads_gate, [this] {
-            auto to_reload = boost::copy_range<utils::chunked_vector<timestamped_val_ptr>>(boost::range::join(_unprivileged_lru_list, _lru_list)
-                    | boost::adaptors::filtered([this] (ts_value_lru_entry& lru_entry) {
-                        return lru_entry.timestamped_value().loaded() + _refresh < loading_cache_clock_type::now();
+        (void)do_with(std::move(*holder), [this] (seastar::gate::holder& h) {
+            auto now = loading_cache_clock_type::now();
+            auto to_reload = std::array<lru_list_type*, 2>({&_unprivileged_lru_list, &_lru_list})
+                    | std::views::transform([] (auto* list_ptr) -> decltype(auto) { return *list_ptr; })
+                    | std::views::join
+                    | std::views::filter([this, now] (ts_value_lru_entry& lru_entry) {
+                        return lru_entry.timestamped_value().loaded() + _cfg.refresh < now;
                     })
-                    | boost::adaptors::transformed([] (ts_value_lru_entry& lru_entry) {
+                    | std::views::transform([] (ts_value_lru_entry& lru_entry) {
                         return lru_entry.timestamped_value_ptr();
-                    }));
+                    })
+                    | std::ranges::to<utils::chunked_vector<timestamped_val_ptr>>();
 
             return parallel_for_each(std::move(to_reload), [this] (timestamped_val_ptr ts_value_ptr) {
                 _logger.trace("on_timer(): {}: reloading the value", loading_values_type::to_key(ts_value_ptr));
                 return this->reload(std::move(ts_value_ptr));
             }).finally([this] {
                 _logger.trace("on_timer(): rearming");
-                _timer.arm(loading_cache_clock_type::now() + _timer_period);
+
+                // If the config was updated after on_timer and before this continuation finished
+                // it's necessary to run on_timer again to make sure that everything will be reloaded correctly
+                if (_updated_cfg) {
+                    _timer.arm(loading_cache_clock_type::now() + duration(std::chrono::milliseconds(1)));
+                } else {
+                    _timer.arm(loading_cache_clock_type::now() + _timer_period);
+                }
             });
         });
     }
@@ -558,19 +726,19 @@ private:
     loading_values_type _loading_values;
     lru_list_type _lru_list;              // list containing "privileged" section entries
     lru_list_type _unprivileged_lru_list; // list containing "unprivileged" section entries
-    size_t _current_size = 0;
-    size_t _max_size = 0;
-    loading_cache_clock_type::duration _expiry;
-    loading_cache_clock_type::duration _refresh;
+    size_t _privileged_section_size = 0;
+    size_t _unprivileged_section_size = 0;
     loading_cache_clock_type::duration _timer_period;
+    config _cfg;
+    std::optional<config> _updated_cfg;
     logging::logger& _logger;
     std::function<future<Tp>(const Key&)> _load;
     timer<loading_cache_clock_type> _timer;
-    seastar::gate _timer_reads_gate;
+    seastar::named_gate _timer_reads_gate;
 };
 
-template<typename Key, typename Tp, int SectionHitThreshold, loading_cache_reload_enabled ReloadEnabled, typename EntrySize, typename Hash, typename EqualPred, typename LoadingSharedValuesStats, typename LoadingCacheStats, typename Alloc>
-class loading_cache<Key, Tp, SectionHitThreshold, ReloadEnabled, EntrySize, Hash, EqualPred, LoadingSharedValuesStats, LoadingCacheStats, Alloc>::timestamped_val::value_ptr {
+template<typename Key, typename Tp, int SectionHitThreshold, loading_cache_reload_enabled ReloadEnabled, typename EntrySize, typename Hash, typename EqualPred, typename LoadingSharedValuesStats, typename LoadingCacheStats, typename Clock, typename Alloc>
+class loading_cache<Key, Tp, SectionHitThreshold, ReloadEnabled, EntrySize, Hash, EqualPred, LoadingSharedValuesStats, LoadingCacheStats, Clock, Alloc>::timestamped_val::value_ptr {
 private:
     using loading_values_type = typename timestamped_val::loading_values_type;
 
@@ -588,8 +756,7 @@ public:
         }
     }
     value_ptr(std::nullptr_t) noexcept : _ts_val_ptr() {}
-    bool operator==(const value_ptr& x) const { return _ts_val_ptr == x._ts_val_ptr; }
-    bool operator!=(const value_ptr& x) const { return !operator==(x); }
+    bool operator==(const value_ptr&) const = default;
     explicit operator bool() const noexcept { return bool(_ts_val_ptr); }
     value_type& operator*() const noexcept { return _ts_val_ptr->value(); }
     value_type* operator->() const noexcept { return &_ts_val_ptr->value(); }
@@ -600,8 +767,8 @@ public:
 };
 
 /// \brief This is and LRU list entry which is also an anchor for a loading_cache value.
-template<typename Key, typename Tp, int SectionHitThreshold, loading_cache_reload_enabled ReloadEnabled, typename EntrySize, typename Hash, typename EqualPred, typename LoadingSharedValuesStats, typename  LoadingCacheStats, typename Alloc>
-class loading_cache<Key, Tp, SectionHitThreshold, ReloadEnabled, EntrySize, Hash, EqualPred, LoadingSharedValuesStats, LoadingCacheStats, Alloc>::timestamped_val::lru_entry : public safe_link_list_hook {
+template<typename Key, typename Tp, int SectionHitThreshold, loading_cache_reload_enabled ReloadEnabled, typename EntrySize, typename Hash, typename EqualPred, typename LoadingSharedValuesStats, typename  LoadingCacheStats, typename Clock, typename Alloc>
+class loading_cache<Key, Tp, SectionHitThreshold, ReloadEnabled, EntrySize, Hash, EqualPred, LoadingSharedValuesStats, LoadingCacheStats, Clock, Alloc>::timestamped_val::lru_entry : public safe_link_list_hook {
 private:
     using loading_values_type = typename timestamped_val::loading_values_type;
 
@@ -621,10 +788,10 @@ public:
         , _touch_count(0)
     {
         // We don't want to allow SectionHitThreshold to be greater than half the max value of _touch_count to avoid a wrap around
-        static_assert(SectionHitThreshold <= std::numeric_limits<typeof(_touch_count)>::max() / 2, "SectionHitThreshold value is too big");
+        static_assert(SectionHitThreshold <= std::numeric_limits<decltype(_touch_count)>::max() / 2, "SectionHitThreshold value is too big");
 
         _ts_val_ptr->set_anchor_back_reference(this);
-        cache_size() += _ts_val_ptr->size();
+        owning_section_size() += _ts_val_ptr->size();
     }
 
     void inc_touch_count() noexcept {
@@ -640,12 +807,12 @@ public:
             lru_list_type& lru_list = _parent.container_list(*this);
             lru_list.erase(lru_list.iterator_to(*this));
         }
-        cache_size() -= _ts_val_ptr->size();
+        owning_section_size() -= _ts_val_ptr->size();
         _ts_val_ptr->set_anchor_back_reference(nullptr);
     }
 
-    size_t& cache_size() noexcept {
-        return _parent._current_size;
+    size_t& owning_section_size() noexcept {
+        return _touch_count <= SectionHitThreshold ? _parent._unprivileged_section_size : _parent._privileged_section_size;
     }
 
     void touch() noexcept {

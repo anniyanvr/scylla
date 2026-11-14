@@ -1,21 +1,17 @@
 /*
- */
-
-/*
  * Copyright (C) 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include <string_view>
 #include <functional>
-#include <iosfwd>
 #include <optional>
 
 #include <seastar/core/sstring.hh>
@@ -39,28 +35,36 @@ public:
     ///
     authenticated_user() = default;
     explicit authenticated_user(std::string_view name);
+    friend bool operator==(const authenticated_user&, const authenticated_user&) noexcept = default;
 };
 
-///
-/// The user name, or "anonymous".
-///
-std::ostream& operator<<(std::ostream&, const authenticated_user&);
-
-inline bool operator==(const authenticated_user& u1, const authenticated_user& u2) noexcept {
-    return u1.name == u2.name;
-}
-
-inline bool operator!=(const authenticated_user& u1, const authenticated_user& u2) noexcept {
-    return !(u1 == u2);
-}
-
 const authenticated_user& anonymous_user() noexcept;
+
+///
+/// The name reported for the anonymous user, which has none of its own.
+///
+inline const sstring anonymous_username = "anonymous";
 
 inline bool is_anonymous(const authenticated_user& u) noexcept {
     return u == anonymous_user();
 }
 
 }
+
+///
+/// The user name, or "anonymous".
+///
+template <>
+struct fmt::formatter<auth::authenticated_user> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const auth::authenticated_user& u, FormatContext& ctx) const {
+        if (u.name) {
+            return fmt::format_to(ctx.out(), "{}", *u.name);
+        } else {
+            return fmt::format_to(ctx.out(), "{}", auth::anonymous_username);
+        }
+    }
+};
 
 namespace std {
 

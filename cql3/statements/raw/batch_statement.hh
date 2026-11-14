@@ -1,12 +1,10 @@
 /*
- */
-/*
  * Modified by ScyllaDB
  * Copyright (C) 2015-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #pragma once
 
@@ -48,7 +46,13 @@ public:
         }
     }
 
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
+protected:
+    virtual audit::statement_category category() const override;
+    virtual audit::audit_info_ptr audit_info() const override {
+        constexpr bool batch = true;
+        return audit::audit::create_audit_info(category(), sstring(), sstring(), batch);
+    }
 };
 
 }

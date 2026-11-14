@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -12,6 +12,8 @@
 #include <seastar/core/sstring.hh>
 
 #include "seastarx.hh"
+
+enum class mutable_view { no, yes, };
 
 template<typename CharT>
 class basic_mutable_view {
@@ -48,8 +50,7 @@ public:
     CharT* data() const { return _begin; }
     size_t size() const { return _end - _begin; }
     bool empty() const { return _begin == _end; }
-    CharT& front() { return *_begin; }
-    const CharT& front() const { return *_begin; }
+    CharT& front() const { return *_begin; }
 
     void remove_prefix(size_t n) {
         _begin += n;
@@ -61,5 +62,9 @@ public:
     basic_mutable_view substr(size_t pos, size_t count) {
         size_t n = std::min(count, (_end - _begin) - pos);
         return basic_mutable_view{_begin + pos, n};
+    }
+
+    explicit operator std::span<CharT>() const noexcept {
+        return std::span<CharT>(_begin, _end);
     }
 };

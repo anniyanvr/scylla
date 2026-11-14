@@ -1,27 +1,33 @@
 # Getting Started With ScyllaDB Alternator
 
-## Installing Scylla
+## Installing ScyllaDB
 Before you can start using ScyllaDB Alternator, you will have to have an up
-and running scylla cluster configured to expose the alternator port.
+and running a ScyllaDB cluster configured to expose the Alternator port.
 This section will guide you through the steps for setting up the cluster:
-### Get Scylla with alternator support from a docker:
-1. Because Alternator is still improving quickly, it is recommended to run
-   the latest nightly build. Make sure you have the latest nightly image by
-   running: `docker pull scylladb/scylla-nightly:latest`
-2. Follow the steps in the [Scylla official download web page](https://www.scylladb.com/download/open-source/#docker)
-   add to every "docker run" command: `-p 8000:8000` before the image name
-   and `--alternator-port=8000 --alternator-write-isolation=always` at the end.
-   The "alternator-port" option specifies on which port Scylla will listen for
+### Get ScyllaDB with Alternator support from a docker:
+1. Download the latest stable ScyllaDB image for Docker, by running
+   `docker pull scylladb/scylla:latest`
+2. To run this Docker image, follow the instructions in
+   <https://hub.docker.com/r/scylladb/scylla/>, but add to every `docker run`
+   command a `-p 8000:8000` before the image name and
+   `--alternator-port=8000 --alternator-write-isolation=always` at the end.
+   The "alternator-port" option specifies on which port ScyllaDB will listen for
    the (unencrypted) DynamoDB API, and the "alternator-write-isolation" chooses
    whether or not Alternator will use LWT for every write.
    For example,
-   `docker run --name scylla -d -p 8000:8000 scylladb/scylla-nightly:latest --alternator-port=8000 --alternator-write-isolation=always`.
+   `docker run --name scylla -d -p 8000:8000 scylladb/scylla:latest --alternator-port=8000 --alternator-write-isolation=always`.
    The `--alternator-https-port=...` option can also be used to enable
    Alternator on an encrypted (HTTPS) port. Note that in this case, the files
    `/etc/scylla/scylla.crt` and `/etc/scylla/scylla.key` must be inserted into
    the image, containing the SSL certificate and key to use.
 
-## Testing Scylla's DynamoDB API support:
+By default, ScyllaDB run in this way will not have authentication or
+authorization enabled, and any DynamoDB API request will be honored without
+requiring them to be signed appropriately. See the
+[ScyllaDB Alternator for DynamoDB users](compatibility.md#authentication-and-authorization)
+document on how to configure authentication and authorization.
+
+## Testing ScyllaDB's DynamoDB API support:
 ### Running AWS Tic Tac Toe demo app to test the cluster:
 1. Follow the instructions on the [AWS github page](https://github.com/awsdocs/amazon-dynamodb-developer-guide/blob/master/doc_source/TicTacToe.Phase1.md)
 2. Enjoy your tic-tac-toe game :-)

@@ -90,7 +90,7 @@
          "operations":[
             {
                "method":"GET",
-               "summary":"Returns a list of the tokens endpoint mapping",
+               "summary":"Returns the token to endpoint mapping: the vnode ring by default, or the per-table (tablet) mapping when keyspace and cf are given",
                "type":"array",
                "items":{
                   "type":"mapper"
@@ -100,6 +100,22 @@
                   "application/json"
                ],
                "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"The keyspace. Alone, it must be a vnode keyspace and the vnode ring is returned; tablet keyspaces also require cf",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"The table to provide the per-table mapping for; requires keyspace",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
                ]
             }
          ]
@@ -196,6 +212,25 @@
                   "type":"string"
                },
                "nickname":"get_moving_nodes",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/nodes/excluded",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Retrieve host ids of nodes which are marked as excluded",
+               "type":"array",
+               "items":{
+                  "type":"string"
+               },
+               "nickname":"get_excluded_nodes",
                "produces":[
                   "application/json"
                ],
@@ -336,6 +371,14 @@
                      "allowMultiple":false,
                      "type":"boolean",
                      "paramType":"query"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"Column family name",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
                   }
                ]
             }
@@ -369,25 +412,6 @@
          ]
       },
       {
-         "path":"/storage_service/describe_ring/",
-         "operations":[
-            {
-               "method":"GET",
-               "summary":"The TokenRange for a any keyspace",
-               "type":"array",
-               "items":{
-                  "type":"token_range"
-               },
-               "nickname":"describe_any_ring",
-               "produces":[
-                  "application/json"
-               ],
-               "parameters":[
-               ]
-            }
-         ]
-      },
-      {
          "path":"/storage_service/describe_ring/{keyspace}",
          "operations":[
             {
@@ -409,6 +433,14 @@
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"path"
+                  },
+                  {
+                     "name":"table",
+                     "description":"The name of table to fetch information about",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
                   }
                ]
             }
@@ -436,6 +468,14 @@
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"path"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"Column family name",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
                   }
                ]
             }
@@ -465,7 +505,7 @@
          "operations":[
             {
                "method":"GET",
-               "summary":"Retrieve the mapping of endpoint to host ID",
+               "summary":"Retrieve the mapping of endpoint to host ID of all nodes that own tokens",
                "type":"array",
                "items":{
                   "type":"mapper"
@@ -574,6 +614,50 @@
          ]
       },
       {
+         "path": "/storage_service/natural_endpoints/v2/{keyspace}",
+         "operations": [
+            {
+               "method": "GET",
+               "summary":"This method returns the N endpoints that are responsible for storing the specified key i.e for replication. the endpoint responsible for this key",
+               "type": "array",
+               "items": {
+                  "type": "string"
+               },
+               "nickname": "get_natural_endpoints_v2",
+               "produces": [
+                  "application/json"
+               ],
+               "parameters": [
+                  {
+                     "name": "keyspace",
+                     "description": "The keyspace to query about.",
+                     "required": true,
+                     "allowMultiple": false,
+                     "type": "string",
+                     "paramType": "path"
+                  },
+                  {
+                     "name": "cf",
+                     "description": "Column family name.",
+                     "required": true,
+                     "allowMultiple": false,
+                     "type": "string",
+                     "paramType": "query"
+                  },
+                  {
+                     "name": "key_component",
+                     "description": "Each component of the key for which we need to find the endpoint (e.g. ?key_component=part1&key_component=part2).",
+                     "required": true,
+                     "allowMultiple": true,
+                     "type": "string",
+                     "paramType": "query"
+                  }
+               ]
+            }
+         ]
+      },
+
+      {
          "path":"/storage_service/cdc_streams_check_and_repair",
          "operations":[
             {
@@ -624,7 +708,7 @@
                   },
                   {
                      "name":"kn",
-                     "description":"Comma seperated keyspaces name to snapshot",
+                     "description":"Keyspace(s) to snapshot. Multiple keyspaces can be provided using a comma-separated list. If omitted, snapshot all keyspaces.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -632,7 +716,7 @@
                   },
                   {
                      "name":"cf",
-                     "description":"the column family to snapshot",
+                     "description":"Table(s) to snapshot. Multiple tables (in a single keyspace) can be provided using a comma-separated list. If omitted, snapshot all tables in the given keyspace(s).",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -659,7 +743,7 @@
                "parameters":[
                   {
                      "name":"tag",
-                     "description":"the tag given to the snapshot",
+                     "description":"The snapshot tag to delete. If omitted, all snapshots are removed.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -667,7 +751,7 @@
                   },
                   {
                      "name":"kn",
-                     "description":"Comma seperated keyspaces name that their snapshot will be deleted",
+                     "description":"Comma-separated list of keyspace names to delete snapshots from. If omitted, snapshots are deleted from all keyspaces.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -675,7 +759,7 @@
                   },
                   {
                      "name":"cf",
-                     "description":"an optional table name that its snapshot will be deleted",
+                     "description":"A table name used to filter which table's snapshots are deleted. If omitted or empty, snapshots for all tables are eligible. When provided together with 'kn', the table is looked up in each listed keyspace independently. For secondary indexes, the logical index name (e.g. 'myindex') can be used and is resolved automatically.",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -702,6 +786,246 @@
          ]
       },
       {
+         "path":"/storage_service/compact",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Forces major compaction in all keyspaces",
+               "type":"void",
+               "nickname":"force_compaction",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"flush_memtables",
+                     "description":"Controls flushing of memtables before compaction (true by default). Set to \"false\" to skip automatic flushing of memtables before compaction, e.g. when tables were flushed explicitly before invoking the compaction api.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"consider_only_existing_data",
+                     "description":"Set to \"true\" to flush all memtables and force tombstone garbage collection to check only the sstables being compacted (false by default). The memtable, commitlog and other uncompacted sstables will not be checked during tombstone garbage collection.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+          "path":"/storage_service/backup",
+          "operations":[
+              {
+                  "method":"POST",
+                  "summary":"Starts copying SSTables from a specified keyspace to a designated bucket in object storage",
+                  "type":"string",
+                  "nickname":"start_backup",
+                  "produces":[
+                      "application/json"
+                  ],
+                  "parameters":[
+                      {
+                          "name":"endpoint",
+                          "description":"ID of the configured object storage endpoint to copy sstables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"bucket",
+                          "description":"Name of the bucket to backup sstables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                           "name":"prefix",
+                           "description":"The prefix of the objects for the backuped sstables",
+                           "required":true,
+                           "allowMultiple":false,
+                           "type":"string",
+                           "paramType":"query"
+                      },
+                      {
+                          "name":"keyspace",
+                          "description":"Name of a keyspace to copy sstables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"table",
+                          "description":"Name of a table to copy sstables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"snapshot",
+                          "description":"Name of a snapshot to copy sstables from",
+                          "required":false,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"move_files",
+                          "description":"Move component files instead of copying them",
+                          "required":false,
+                          "allowMultiple":false,
+                          "type":"boolean",
+                          "paramType":"query"
+                      }
+                  ]
+              }
+          ]
+      },
+      {
+          "path":"/storage_service/restore",
+          "operations":[
+              {
+                  "method":"POST",
+                  "summary":"Starts copying SSTables from a designated bucket in object storage to a specified keyspace",
+                  "type":"string",
+                  "nickname":"start_restore",
+                  "produces":[
+                      "application/json"
+                  ],
+                  "parameters":[
+                      {
+                          "name":"endpoint",
+                          "description":"ID of the configured object storage endpoint to copy SSTables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"bucket",
+                          "description":"Name of the bucket to read SSTables from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"prefix",
+                          "description":"The prefix of the object keys for the backuped SSTables",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "in": "body",
+                          "name": "sstables",
+                          "description": "The list of the object keys of the TOC component of the SSTables to be restored",
+                          "required":true,
+                          "schema" :{
+                              "type": "array",
+                              "items": {
+                                  "type": "string"
+                              }
+                          }
+                      },
+                      {
+                          "name":"keyspace",
+                          "description":"Name of a keyspace to copy SSTables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"table",
+                          "description":"Name of a table to copy SSTables to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"scope",
+                          "description":"Defines the set of nodes to which mutations can be streamed",
+                          "required":false,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query",
+                          "enum": ["all", "dc", "rack", "node"]
+                      },
+                      {
+                         "name":"primary_replica_only",
+                         "description":"Load the sstables and stream to the primary replica node within the scope, if one is specified. If not, stream to the global primary replica.",
+                         "required":false,
+                         "allowMultiple":false,
+                         "type":"boolean",
+                         "paramType":"query"
+                      }
+                  ]
+              }
+          ]
+      },
+      {
+         "path":"/storage_service/tablets/restore",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Starts copying SSTables from a designated bucket in object storage to a specified keyspace",
+               "type":"string",
+               "nickname":"tablet_aware_restore",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"Name of a keyspace to copy SSTables to",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Name of a table to copy SSTables to",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"snapshot",
+                     "description":"Name of the snapshot to restore from",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"backup_source_location",
+                     "description":"Array of backup location objects, exactly one entry per datacenter the keyspace replicates to.",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"array",
+                     "items":{
+                        "$ref":"backup_location"
+                     },
+                     "paramType":"body"
+                  }
+               ]
+            }
+         ]
+      },
+      {
          "path":"/storage_service/keyspace_compaction/{keyspace}",
          "operations":[
             {
@@ -715,7 +1039,7 @@
                "parameters":[
                   {
                      "name":"keyspace",
-                     "description":"The keyspace to query about",
+                     "description":"The keyspace to compact",
                      "required":true,
                      "allowMultiple":false,
                      "type":"string",
@@ -723,10 +1047,26 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma seperated column family names",
+                     "description":"Comma-separated column family names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"flush_memtables",
+                     "description":"Controls flushing of memtables before compaction (true by default). Set to \"false\" to skip automatic flushing of memtables before compaction, e.g. when tables were flushed explicitly before invoking the compaction api.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"consider_only_existing_data",
+                     "description":"Set to \"true\" to flush all memtables and force tombstone garbage collection to check only the sstables being compacted (false by default). The memtable, commitlog and other uncompacted sstables will not be checked during tombstone garbage collection.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
                      "paramType":"query"
                   }
                ]
@@ -747,7 +1087,7 @@
                "parameters":[
                   {
                      "name":"keyspace",
-                     "description":"The keyspace to query about",
+                     "description":"The keyspace to cleanup",
                      "required":true,
                      "allowMultiple":false,
                      "type":"string",
@@ -755,13 +1095,52 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma seperated column family names",
+                     "description":"Comma-separated column family names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
                   }
                ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/cleanup_all/",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Trigger a global cleanup",
+               "type":"long",
+               "nickname":"cleanup_all",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                    {
+                     "name":"global",
+                     "description":"true if cleanup of entire cluster is requested",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/mark_node_as_clean",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Mark the node as clean. After that the node will not be considered as needing cleanup during automatic cleanup which is triggered by some topology operations",
+               "type":"void",
+               "nickname":"reset_cleanup_needed",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
             }
          ]
       },
@@ -787,7 +1166,7 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma-seperated table names",
+                     "description":"Comma-separated table names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -802,7 +1181,7 @@
          "operations":[
             {
                "method":"GET",
-               "summary":"Scrub (deserialize + reserialize at the latest version, resolving corruptions if any) the given keyspace. If columnFamilies array is empty, all CFs are scrubbed. Scrubbed CFs will be snapshotted first, if disableSnapshot is false. Scrub has the following modes: Abort (default) - abort scrub if corruption is detected; Skip (same as `skip_corrupted=true`) skip over corrupt data, omitting them from the output; Segregate - segregate data into multiple sstables if needed, such that each sstable contains data with valid order; Validate - read (no rewrite) and validate data, logging any problems found.",
+               "summary":"Scrub (deserialize + reserialize at the latest version, resolving corruptions if any) the given keyspace. If columnFamilies array is empty, all CFs are scrubbed. Scrubbed CFs will be snapshotted first, if disableSnapshot is false. Scrub has the following modes: Abort - abort scrub if corruption is detected; Skip (same as `skip_corrupted=true`) skip over corrupt data, omitting them from the output; Segregate - segregate data into multiple sstables if needed, such that each sstable contains data with valid order; Validate (default) - read (no rewrite) and validate data, logging any problems found.",
                "type": "long",
                "nickname":"scrub",
                "produces":[
@@ -853,6 +1232,14 @@
                      "paramType":"query"
                   },
                   {
+                     "name":"quarantine_invalid_sstables",
+                     "description":"Controls whether invalid sstable identified by scrub (validate-mode) should be quarantined (default true)",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
                      "name":"keyspace",
                      "description":"The keyspace to query about",
                      "required":true,
@@ -862,10 +1249,18 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma seperated column family names",
+                     "description":"Comma-separated column family names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name": "drop_unfixable_sstables",
+                     "description": "When set to true, drop unfixable sstables. Applies only to scrub mode SEGREGATE.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
                      "paramType":"query"
                   }
                ]
@@ -902,13 +1297,28 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma seperated column family names",
+                     "description":"Comma-separated column family names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
                   }
                ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/flush",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Flush all memtables in all keyspaces.",
+               "type":"void",
+               "nickname":"force_flush",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
             }
          ]
       },
@@ -934,13 +1344,52 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma seperated column family names",
+                     "description":"Comma-separated column family names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
                   }
                ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/logstor_compaction",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Trigger compaction of the key-value storage",
+               "type":"void",
+               "nickname":"logstor_compaction",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"major",
+                     "description":"When true, perform a major compaction",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/logstor_flush",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Trigger flush of logstor storage",
+               "type":"void",
+               "nickname":"logstor_flush",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[]
             }
          ]
       },
@@ -1114,6 +1563,22 @@
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
+                  },
+                  {
+                     "name":"ranges_parallelism",
+                     "description":"An integer specifying the number of ranges to repair in parallel by user request. If this number is bigger than the max_repair_ranges_in_parallel calculated by Scylla core, the smaller one will be used.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"small_table_optimization",
+                     "description":"If the value is the string 'true' with any capitalization, perform small table optimization. When this option is enabled, user can send the repair request to any of the nodes in the cluster. There is no need to send repair requests to multiple nodes. All token ranges for the table will be repaired automatically.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
                   }
                ]
             },
@@ -1228,7 +1693,7 @@
          "operations":[
             {
                "method":"POST",
-               "summary":"Removes token (and all data associated with enpoint that had it) from the ring",
+               "summary":"Removes a node from the cluster. Replicated data that logically belonged to this node is redistributed among the remaining nodes.",
                "type":"void",
                "nickname":"remove_node",
                "produces":[
@@ -1245,8 +1710,32 @@
                   },
                   {
                      "name":"ignore_nodes",
-                     "description":"List of dead nodes to ingore in removenode operation",
+                     "description":"Comma-separated list of dead nodes to ignore in removenode operation. Use the same method for all nodes to ignore: either Host IDs or ip addresses.",
                      "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/exclude_node",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Marks the node as permanently down (excluded).",
+               "type":"void",
+               "nickname":"exclude_node",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"hosts",
+                     "description":"Comma-separated list of host ids to exclude",
+                     "required":true,
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
@@ -1393,38 +1882,6 @@
          ]
       },
       {
-         "path":"/storage_service/truncate/{keyspace}",
-         "operations":[
-            {
-               "method":"POST",
-               "summary":"Truncates (deletes) the given columnFamily from the provided keyspace. Calling truncate results in actual deletion of all data in the cluster under the given columnFamily and it will fail unless all hosts are up. All data in the given column family will be deleted, but its definition will not be affected.",
-               "type":"void",
-               "nickname":"truncate",
-               "produces":[
-                  "application/json"
-               ],
-               "parameters":[
-                  {
-                     "name":"keyspace",
-                     "description":"The keyspace",
-                     "required":true,
-                     "allowMultiple":false,
-                     "type":"string",
-                     "paramType":"path"
-                  },
-                  {
-                     "name":"cf",
-                     "description":"Column family name",
-                     "required":false,
-                     "allowMultiple":false,
-                     "type":"string",
-                     "paramType":"query"
-                  }
-               ]
-            }
-         ]
-      },
-      {
          "path":"/storage_service/keyspaces",
          "operations":[
             {
@@ -1446,6 +1903,15 @@
                      "allowMultiple":false,
                      "type":"string",
                      "enum": [ "all", "user", "non_local_strategy" ],
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"replication",
+                     "description":"Filter keyspaces for the replication used: vnodes or tablets (default: all)",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "enum": [ "all", "vnodes", "tablets" ],
                      "paramType":"query"
                   }
                ]
@@ -1582,32 +2048,10 @@
          "path":"/storage_service/rpc_server",
          "operations":[
             {
-               "method":"DELETE",
-               "summary":"Allows a user to disable thrift",
-               "type":"void",
-               "nickname":"stop_rpc_server",
-               "produces":[
-                  "application/json"
-               ],
-               "parameters":[
-               ]
-            },
-            {
-               "method":"POST",
-               "summary":"allows a user to reenable thrift",
-               "type":"void",
-               "nickname":"start_rpc_server",
-               "produces":[
-                  "application/json"
-               ],
-               "parameters":[
-               ]
-            },
-            {
                "method":"GET",
                "summary":"Determine if thrift is running",
                "type":"boolean",
-               "nickname":"is_rpc_server_running",
+               "nickname":"is_thrift_server_running",
                "produces":[
                   "application/json"
                ],
@@ -1756,7 +2200,7 @@
          "operations":[
             {
                "method":"GET",
-               "summary":"Check if incremental backup is enabled",
+               "summary":"Check if incremental backup is enabled (deprecated: support for incremental backup may be removed in a future release)",
                "type":"boolean",
                "nickname":"is_incremental_backups_enabled",
                "produces":[
@@ -1767,7 +2211,7 @@
             },
             {
                "method":"POST",
-               "summary":"",
+               "summary":"Enable or disable incremental backup (deprecated: support for incremental backup may be removed in a future release)",
                "type":"void",
                "nickname":"set_incremental_backups_enabled",
                "produces":[
@@ -1804,6 +2248,14 @@
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"force",
+                     "description":"Enforce the source_dc option, even if it unsafe to use for rebuild",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
                      "paramType":"query"
                   }
                ]
@@ -1917,6 +2369,31 @@
                      "allowMultiple":false,
                      "type":"string",
                      "paramType":"query"
+                  },
+                  {
+                     "name":"skip_cleanup",
+                     "description":"Don't cleanup keys from loaded sstables. Invalid if load_and_stream is true",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"skip_reshape",
+                     "description":"Don't reshape the loaded sstables. Invalid if load_and_stream is true",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"scope",
+                     "description":"Defines the set of nodes to which mutations can be streamed",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query",
+                     "enum": ["all", "dc", "rack", "node"]
                   }
                ]
             }
@@ -1946,7 +2423,7 @@
          "operations":[
             {
                "method":"POST",
-               "summary":"Reset local schema",
+               "summary":"Forces this node to recalculate versions of schema objects.",
                "type":"void",
                "nickname":"reset_local_schema",
                "produces":[
@@ -1962,7 +2439,7 @@
          "operations":[
             {
                "method":"POST",
-               "summary":"Enables/Disables tracing for the whole system. Only thrift requests can start tracing currently",
+               "summary":"Enables/Disables tracing for the whole system.",
                "type":"void",
                "nickname":"set_trace_probability",
                "produces":[
@@ -2073,7 +2550,7 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma seperated column family names",
+                     "description":"Comma-separated column family names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -2100,7 +2577,66 @@
                   },
                   {
                      "name":"cf",
-                     "description":"Comma seperated column family names",
+                     "description":"Comma-separated column family names",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/tombstone_gc/{keyspace}",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Enable tombstone GC",
+               "type":"void",
+               "nickname":"enable_tombstone_gc",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"The keyspace",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"Comma-separated column family names",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            },
+            {
+               "method":"DELETE",
+               "summary":"Disable tombstone GC",
+               "type":"void",
+               "nickname":"disable_tombstone_gc",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"The keyspace",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"Comma-separated column family names",
                      "required":false,
                      "allowMultiple":false,
                      "type":"string",
@@ -2344,6 +2880,521 @@
          ]
       },
       {
+         "path":"/storage_service/tablets/move",
+         "operations":[
+            {
+               "nickname":"move_tablet",
+               "method":"POST",
+               "summary":"Moves a tablet replica",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"ks",
+                     "description":"Keyspace name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Table name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"token",
+                     "description":"Token owned by the tablet to move",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"integer",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"src_host",
+                     "description":"Source host id",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"dst_host",
+                     "description":"Destination host id",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"src_shard",
+                     "description":"Source shard number",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"integer",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"dst_shard",
+                     "description":"Destination shard number",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"integer",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"force",
+                     "description":"When set to true, replication strategy constraints can be broken (false by default)",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/tablets/add_replica",
+         "operations":[
+            {
+               "nickname":"add_tablet_replica",
+               "method":"POST",
+               "summary":"Adds replica to tablet",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"ks",
+                     "description":"Keyspace name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Table name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"token",
+                     "description":"Token owned by the tablet to add replica to",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"integer",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"dst_host",
+                     "description":"Destination host id",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"dst_shard",
+                     "description":"Destination shard number",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"integer",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"force",
+                     "description":"When set to true, replication strategy constraints can be broken (false by default)",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/tablets/del_replica",
+         "operations":[
+            {
+               "nickname":"del_tablet_replica",
+               "method":"POST",
+               "summary":"Deletes replica from tablet",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"ks",
+                     "description":"Keyspace name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Table name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"token",
+                     "description":"Token owned by the tablet to delete replica from",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"integer",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"host",
+                     "description":"Host id to remove replica from",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"shard",
+                     "description":"Shard number to remove replica from",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"integer",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"force",
+                     "description":"When set to true, replication strategy constraints can be broken (false by default)",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/tablets/repair",
+         "operations":[
+            {
+               "nickname":"repair_tablet",
+               "method":"POST",
+               "summary":"Repair a tablet",
+               "type":"tablet_repair_result",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"ks",
+                     "description":"Keyspace name to repair",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Table name to repair",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"tokens",
+                     "description":"Tokens owned by the tablets to repair. Multiple tokens can be provided using a comma-separated list. When set to the special word 'all', all tablets will be repaired",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"hosts_filter",
+                     "description":"Repair replicas listed in the comma-separated host_id list.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"dcs_filter",
+                     "description":"Repair replicas listed in the comma-separated DC list",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"await_completion",
+                     "description":"Set true to wait for the repair to complete. Set false to skip waiting for the repair to complete. When the option is not provided, it defaults to false.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"incremental_mode",
+                     "description":"Set the incremental repair mode. Can be 'disabled', 'incremental', or 'full'. 'incremental': The incremental repair logic is enabled. Unrepaired sstables will be included for repair. Repaired sstables will be skipped. The incremental repair states will be updated after repair. 'full': The incremental repair logic is enabled. Both repaired and unrepaired sstables will be included for repair. The incremental repair states will be updated after repair. 'disabled': The incremental repair logic is disabled completely. The incremental repair states, e.g., repaired_at in sstables and sstables_repaired_at in the system.tablets table, will not be updated after repair. When the option is not provided, it defaults to incremental mode.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/tablets/balancing",
+         "operations":[
+            {
+               "nickname":"tablet_balancing_enable",
+               "method":"POST",
+               "summary":"Controls tablet load-balancing",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"enabled",
+                     "description":"When set to false, tablet load balancing is disabled",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"grace_period_in_seconds",
+                     "description":"When disabling balancing, how long in-flight tablet transitions are given before those which can still be cancelled, tablet repairs included, are cancelled. A cancelled repair drops its tablets from the repair request without reporting them as failed. Cancelling a transition which was adding a replica leaves that tablet below its replication factor until balancing is enabled again. Transitions which cannot be cancelled, or which drain a node, are waited for. 0 cancels nothing. Defaults to the tablet_transition_abort_grace_period_in_seconds configuration option.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"long",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+
+      {
+         "path":"/storage_service/tablets/snapshots",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Takes the snapshot for the given keyspaces/tables. A snapshot name must be specified.",
+               "type":"void",
+               "nickname":"take_cluster_snapshot",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"tag",
+                     "description":"the tag given to the snapshot",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"keyspace",
+                     "description":"Keyspace(s) to snapshot. Multiple keyspaces can be provided using a comma-separated list. If omitted, snapshot all keyspaces.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"table",
+                     "description":"Table(s) to snapshot. Multiple tables (in a single keyspace) can be provided using a comma-separated list. If omitted, snapshot all tables in the given keyspace(s).",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+
+      {
+         "path":"/storage_service/vnode_tablet_migrations/keyspaces/{keyspace}",
+         "operations":[{
+             "method":"POST",
+             "summary":"Start vnodes-to-tablets migration for all tables in a keyspace",
+             "type":"void",
+             "nickname":"create_vnode_tablet_migration",
+             "produces":["application/json"],
+             "parameters":[
+                 {
+                     "name":"keyspace",
+                     "description":"Keyspace name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                 }
+             ]
+         },
+         {
+             "method":"GET",
+             "summary":"Get a keyspace's vnodes-to-tablets migration status",
+             "type":"vnode_tablet_migration_status",
+             "nickname":"get_vnode_tablet_migration",
+             "produces":["application/json"],
+             "parameters":[
+                 {
+                     "name":"keyspace",
+                     "description":"Keyspace name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                 },
+                 {
+                     "name":"include",
+                     "description":"Optional status details to include in the response. Supported values: 'tablet_status' (include per-table pow2 convergence information when migration status is 'tablets')",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                 }
+             ]
+         }]
+      },
+      {
+         "path":"/storage_service/vnode_tablet_migrations/node/storage_mode",
+         "operations":[{
+             "method":"PUT",
+             "summary":"Set the intended storage mode for this node during vnodes-to-tablets migration",
+             "type":"void",
+             "nickname":"set_vnode_tablet_migration_node_storage_mode",
+             "produces":["application/json"],
+             "parameters":[
+                 {
+                     "name":"intended_mode",
+                     "description":"Intended storage mode (tablets or vnodes)",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                 }
+             ]
+         }]
+      },
+      {
+         "path":"/storage_service/vnode_tablet_migrations/keyspaces/{keyspace}/finalization",
+         "operations":[{
+             "method":"POST",
+             "summary":"Finalize vnodes-to-tablets migration for all tables in a keyspace",
+             "type":"void",
+             "nickname":"finalize_vnode_tablet_migration",
+             "produces":["application/json"],
+             "parameters":[
+                 {
+                     "name":"keyspace",
+                     "description":"Keyspace name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"path"
+                 }
+             ]
+         }]
+      },
+      {
+          "path":"/storage_service/tablets/backup",
+          "operations":[
+              {
+                  "method":"POST",
+                  "summary":"Starts copying SSTables from a specified keyspace across all nodes to a designated bucket in object storage",
+                  "type":"string",
+                  "nickname":"start_global_backup",
+                  "produces":[
+                      "application/json"
+                  ],
+                  "parameters":[
+                      {
+                         "name":"keyspace",
+                         "description":"Keyspace(s) in snapshot to backup. Multiple keyspaces can be provided using a comma-separated list. If omitted, snapshot all keyspaces.",
+                         "required":false,
+                         "allowMultiple":false,
+                         "type":"string",
+                         "paramType":"query"
+                      },
+                      {
+                         "name":"table",
+                         "description":"Table(s) in snapshot to backup. Multiple tables (in a single keyspace) can be provided using a comma-separated list. If omitted, snapshot all tables in the given keyspace(s).",
+                         "required":false,
+                         "allowMultiple":false,
+                         "type":"string",
+                         "paramType":"query"
+                      },
+                      {
+                          "name":"snapshot",
+                          "description":"Name of a snapshot to copy sstables from. If not existing, a new snapshot will be made",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"move_files",
+                          "description":"Move component files instead of copying them",
+                          "required":false,
+                          "allowMultiple":false,
+                          "type":"boolean",
+                          "paramType":"query"
+                      },
+                      {
+                         "name":"backup_location",
+                         "description":"JSON array of backup location objects. Each object must contain: 'datacenter' (string), 'endpoint' (string), 'bucket' (string), and 'prefix' (string). 'manifests' must not be set.",
+                         "required":true,
+                         "allowMultiple":false,
+                         "type":"array",
+                         "items":{
+                            "$ref":"backup_location"
+                         },
+                         "paramType":"body"
+                      }
+                  ]
+              }
+          ]
+      },
+
+      {
+         "path":"/storage_service/quiesce_topology",
+         "operations":[
+            {
+               "nickname":"quiesce_topology",
+               "method":"POST",
+               "summary":"Waits until there are no ongoing topology operations. Guarantees that topology operations which started before the call are finished after the call. This doesn't consider requested but not started operations. Such operations may start after the call succeeds.",
+               "type":"void",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            }
+         ]
+      },
+      {
          "path":"/storage_service/metrics/total_hints",
          "operations":[
             {
@@ -2395,6 +3446,41 @@
          ]
       },
       {
+         "path":"/storage_service/object_storage/sstables",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"List object-storage SSTables and references in a bucket",
+               "type":"array",
+               "items":{
+                  "type":"object_storage_sstable"
+               },
+               "nickname":"object_storage_sstables",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"endpoint",
+                     "description":"ID of the configured object storage endpoint",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"bucket",
+                     "description":"Object storage bucket name",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
          "path":"/storage_service/sstable_info",
          "operations":[
             {
@@ -2428,7 +3514,173 @@
                ]
             }
          ]
-      }      
+      },
+      {
+         "path":"/storage_service/retrain_dict",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Retrain the SSTable compression dictionary for the target table.",
+               "type":"void",
+               "nickname":"retrain_dict",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"Name of the keyspace containing the target table.",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"Name of the target table.",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/estimate_compression_ratios",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Compute an estimated compression ratio for SSTables of the given table, for various compression configurations.",
+               "type":"array",
+               "items":{
+                  "type":"compression_config_result"
+               },
+               "nickname":"estimate_compression_ratios",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"Name of the keyspace containing the target table.",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"cf",
+                     "description":"Name of the target table.",
+                     "required":true,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/raft_topology/reload",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Reload Raft topology state from disk.",
+               "type":"void",
+               "nickname":"reload_raft_topology_state",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/raft_topology/upgrade",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Trigger the upgrade to topology on raft.",
+               "type":"void",
+               "nickname":"upgrade_to_raft_topology",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            },
+            {
+               "method":"GET",
+               "summary":"Get information about the current upgrade status of topology on raft.",
+               "type":"string",
+               "nickname":"raft_topology_upgrade_status",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/raft_topology/cmd_rpc_status",
+         "operations":[
+            {
+               "method":"GET",
+               "summary":"Get information about currently running topology cmd rpc",
+               "type":"string",
+               "nickname":"raft_topology_get_cmd_status",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+               ]
+            }
+         ]
+      },
+      {
+         "path":"/storage_service/drop_quarantined_sstables",
+         "operations":[
+            {
+               "method":"POST",
+               "summary":"Drops all quarantined sstables in all keyspaces or specified keyspace and tables",
+               "type":"void",
+               "nickname":"drop_quarantined_sstables",
+               "produces":[
+                  "application/json"
+               ],
+               "parameters":[
+                  {
+                     "name":"keyspace",
+                     "description":"The keyspace name to drop quarantined sstables from.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"tables",
+                     "description":"Comma-separated table names to drop quarantined sstables from.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"string",
+                     "paramType":"query"
+                  },
+                  {
+                     "name":"accept_data_resurrection_risk",
+                     "description":"The drop quarantined SSTables operation is unsafe. Accept the risk of data resurrection. Required for the operation to execute.",
+                     "required":false,
+                     "allowMultiple":false,
+                     "type":"boolean",
+                     "paramType":"query"
+                  }
+               ]
+            }
+         ]
+      }
    ],
    "models":{
       "mapper":{
@@ -2456,6 +3708,35 @@
             "value":{
                "type":"double",
                "description":"The value"
+            }
+         }
+      },
+      "object_storage_sstable":{
+         "id":"object_storage_sstable",
+         "description":"Object-storage SSTable namespace entry",
+         "properties":{
+            "sstable_id":{
+               "type":"string",
+               "description":"The SSTable ID path component"
+            },
+            "num_references":{
+               "type":"long",
+               "description":"Number of reference objects under this SSTable ID"
+            },
+            "references":{
+               "type":"array",
+               "items":{
+                  "type":"string"
+               },
+               "description":"Reference object paths relative to the refs prefix"
+            },
+            "version":{
+               "type":"string",
+               "description":"SSTable version, from the TOC object attributes. Absent if the TOC object carries no version attribute"
+            },
+            "format":{
+               "type":"string",
+               "description":"SSTable format, from the TOC object attributes. Absent if the TOC object carries no format attribute"
             }
          }
       },
@@ -2510,7 +3791,7 @@
                "description":"The snapshot key"
             },
             "value":{
-               "type":"array",
+               "type":"chunked_array",
                "items":{
                   "type":"snapshot"
                },
@@ -2564,11 +3845,11 @@
          "properties":{
             "start_token":{
                "type":"string",
-               "description":"The range start token"
+               "description":"The range start token (exclusive)"
             },
             "end_token":{
                "type":"string",
-               "description":"The range start token"
+               "description":"The range end token (inclusive)"
             },
             "endpoints":{
                "type":"array",
@@ -2631,7 +3912,7 @@
                 "description":"File creation time"
             },
             "generation":{
-                "type":"long",
+                "type":"string",
                 "description":"SSTable generation"
             },
             "level":{
@@ -2641,7 +3922,7 @@
             "version":{
                "type":"string",
                "enum":[
-                  "ka", "la", "mc", "md"
+                  "ka", "la", "mc", "md", "me", "ms", "mt"
                ],
                "description":"SSTable version"
             },
@@ -2678,6 +3959,174 @@
                 }
             }
         }
+      },
+      "tablet_repair_result":{
+        "id":"tablet_repair_result",
+        "description":"Tablet repair result",
+        "properties":{
+            "tablet_task_id":{
+                "type":"string"
+            }
+        }
+      },
+      "compression_config_result":{
+         "id":"compression_config_result",
+         "description":"Compression ratio estimation result for one config",
+         "properties":{
+            "level":{
+               "type":"long",
+               "description":"The used value of `compression_level`"
+            },
+            "chunk_length_in_kb":{
+               "type":"long",
+               "description":"The used value of `chunk_length_in_kb`"
+            },
+            "dict":{
+               "type":"string",
+               "description":"The used dictionary: `none`, `past` (== current), or `future`"
+            },
+            "sstable_compression":{
+               "type":"string",
+               "description":"The used compressor name (aka `sstable_compression`)"
+            },
+            "ratio":{
+               "type":"float",
+               "description":"The resulting compression ratio (estimated on a random sample of files)"
+            }
+         }
+      },
+      "vnode_tablet_migration_node_status":{
+         "id":"vnode_tablet_migration_node_status",
+         "description":"Node storage mode info during vnodes-to-tablets migration",
+         "properties":{
+            "host_id":{
+               "type":"string",
+               "description":"The host ID"
+            },
+            "endpoint":{
+               "type":"string",
+               "description":"The node IP address. Empty if the address is not known."
+            },
+            "current_mode":{
+               "type":"string",
+               "description":"The current storage mode: `vnodes` or `tablets`"
+            },
+            "intended_mode":{
+               "type":"string",
+               "description":"The intended storage mode: `vnodes` or `tablets`"
+            }
+         }
+      },
+      "vnode_tablet_migration_status":{
+         "id":"vnode_tablet_migration_status",
+         "description":"Vnodes-to-tablets migration status for a keyspace",
+         "properties":{
+            "keyspace":{
+               "type":"string",
+               "description":"The keyspace name"
+            },
+            "status":{
+               "type":"string",
+               "description":"The migration status: `vnodes` (not started), `migrating_to_tablets` (in progress), or `tablets` (complete)"
+            },
+            "nodes":{
+               "type":"array",
+               "items":{
+                  "$ref":"vnode_tablet_migration_node_status"
+               },
+               "description":"Per-node storage mode information. Empty if the keyspace is not being migrated."
+            },
+            "tablets":{
+               "type":"tablet_status",
+               "description":"Tablet status. Only present when ?include=tablet_status and migration status is 'tablets'."
+            }
+         }
+      },
+      "tablet_status":{
+         "id":"tablet_status",
+         "description":"Tablet status for a keyspace",
+         "properties":{
+            "pow2_convergence":{
+               "type":"tablets_pow2_convergence_status",
+               "description":"Pow2 convergence status"
+            }
+         }
+      },
+      "tablets_pow2_convergence_status":{
+         "id":"tablets_pow2_convergence_status",
+         "description":"Pow2 convergence status for all tables in a keyspace",
+         "properties":{
+            "status":{
+               "type":"string",
+               "description":"Overall convergence status: `in_progress` or `complete`"
+            },
+            "tables_converging":{
+               "type":"long",
+               "description":"Number of tables still converging to pow2 tablet layout"
+            },
+            "tables_total":{
+               "type":"long",
+               "description":"Total number of tables in the keyspace"
+            },
+            "tables":{
+               "type":"array",
+               "items":{
+                  "$ref":"table_pow2_convergence_info"
+               },
+               "description":"Per-table convergence information"
+            }
+         }
+      },
+      "table_pow2_convergence_info":{
+         "id":"table_pow2_convergence_info",
+         "description":"Pow2 convergence info for a single table",
+         "properties":{
+            "table":{
+               "type":"string",
+               "description":"The table name"
+            },
+            "converging":{
+               "type":"boolean",
+               "description":"Whether the table is currently converging to a pow2 tablet layout"
+            },
+            "current_tablet_count":{
+               "type":"long",
+               "description":"The current number of tablets"
+            },
+            "target_pow2_tablet_count":{
+               "type":"long",
+               "description":"The target pow2 tablet count (0 if not converging)"
+            }
+         }
+      },
+      "backup_location":{
+         "id":"backup_location",
+         "description":"A backup location entry describing where to find or place SSTables",
+         "properties":{
+            "datacenter":{
+               "type":"string",
+               "description":"The datacenter name"
+            },
+            "endpoint":{
+               "type":"string",
+               "description":"The object store endpoint URL"
+            },
+            "bucket":{
+               "type":"string",
+               "description":"The object store bucket name"
+            },
+            "prefix":{
+               "type":"string",
+               "description":"The object store bucket prefix"
+            },
+            "manifests":{
+               "type":"array",
+               "items":{
+                  "type":"string"
+               },
+               "description":"List of manifest file paths, relative to 'prefix'. Only used by tablet-aware restore; must not be set for backup."
+            }
+         }
       }
    }
 }

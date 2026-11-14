@@ -3,23 +3,31 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include "cdc/cdc_options.hh"
+#include "cdc/log.hh"
 #include "seastarx.hh"
 #include "service/paxos/cas_request.hh"
+#include "service/cas_shard.hh"
 #include "utils/rjson.hh"
+#include "consumed_capacity.hh"
 #include "executor.hh"
+#include "tracing/trace_state.hh"
+#include "keys/keys.hh"
 
 namespace alternator {
+
+class consumed_capacity;
 
 // An rmw_operation encapsulates the common logic of all the item update
 // operations which may involve a read of the item before the write
 // (so-called Read-Modify-Write operations). These operations include PutItem,
 // UpdateItem and DeleteItem: All of these may be conditional operations (the
-// "Expected" parameter) which requir a read before the write, and UpdateItem
+// "Expected" parameter) which require a read before the write, and UpdateItem
 // may also have an update expression which refers to the item's old value.
 //
 // The code below supports running the read and the write together as one
@@ -50,7 +58,7 @@ public:
     static write_isolation get_write_isolation_for_schema(schema_ptr schema);
 
     static write_isolation default_write_isolation;
-public:
+
     static void set_default_write_isolation(std::string_view mode);
 
 protected:
@@ -63,13 +71,17 @@ protected:
     partition_key _pk = partition_key::make_empty();
     clustering_key _ck = clustering_key::make_empty();
     write_isolation _write_isolation;
-
+    mutable wcu_consumed_capacity_counter _consumed_capacity;
     // All RMW operations can have a ReturnValues parameter from the following
     // choices. But note that only UpdateItem actually supports all of them:
     enum class returnvalues {
         NONE, ALL_OLD, UPDATED_OLD, ALL_NEW, UPDATED_NEW
     } _returnvalues;
+    enum class returnvalues_on_condition_check_failure {
+        NONE, ALL_OLD
+    } _returnvalues_on_condition_check_failure;
     static returnvalues parse_returnvalues(const rjson::value& request);
+    static returnvalues_on_condition_check_failure parse_returnvalues_on_condition_check_failure(const rjson::value& request);
     // When _returnvalues != NONE, apply() should store here, in JSON form,
     // the values which are to be returned in the "Attributes" field.
     // The default null JSON means do not return an Attributes field at all.
@@ -77,6 +89,8 @@ protected:
     // it (see explanation below), but note that because apply() may be
     // called more than once, if apply() will sometimes set this field it
     // must set it (even if just to the default empty value) every time.
+    // Additionally when _returnvalues_on_condition_check_failure is ALL_OLD
+    // then condition check failure will also result in storing values here.
     mutable rjson::value _return_attributes;
 public:
     // The constructor of a rmw_operation subclass should parse the request
@@ -95,20 +109,27 @@ public:
     // violating this). We mark apply() "const" to let the compiler validate
     // this for us. The output-only field _return_attributes is marked
     // "mutable" above so that apply() can still write to it.
-    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts) const = 0;
+    virtual std::optional<mutation> apply(std::unique_ptr<rjson::value> previous_item, api::timestamp_type ts, cdc::per_request_options& cdc_opts) const = 0;
     // Convert the above apply() into the signature needed by cas_request:
-    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts) override;
+    virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr, const query::partition_slice& slice, api::timestamp_type ts, cdc::per_request_options& cdc_opts) override;
     virtual ~rmw_operation() = default;
+    const wcu_consumed_capacity_counter& consumed_capacity() const noexcept { return _consumed_capacity; }
     schema_ptr schema() const { return _schema; }
     const rjson::value& request() const { return _request; }
     rjson::value&& move_request() && { return std::move(_request); }
     future<executor::request_return_type> execute(service::storage_proxy& proxy,
+            std::optional<service::cas_shard> cas_shard,
             service::client_state& client_state,
             tracing::trace_state_ptr trace_state,
             service_permit permit,
             bool needs_read_before_write,
-            stats& stats);
-    std::optional<shard_id> shard_for_execute(bool needs_read_before_write);
+            stats& global_stats,
+            stats& per_table_stats,
+            uint64_t& wcu_total);
+    std::optional<service::cas_shard> shard_for_execute(bool needs_read_before_write);
+
+private:
+    inline bool should_fill_preimage() const { return _schema->cdc_options().enabled(); }
 };
 
 } // namespace alternator

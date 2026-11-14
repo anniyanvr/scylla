@@ -1,43 +1,35 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "bytes.hh"
-#include "keys.hh"
+#include "keys/keys.hh"
 #include "paging_state.hh"
 #include <seastar/core/simple-stream.hh>
-#include "idl/keys.dist.hh"
-#include "idl/uuid.dist.hh"
 #include "idl/paging_state.dist.hh"
-#include "idl/token.dist.hh"
-#include "idl/range.dist.hh"
-#include "serializer_impl.hh"
-#include "idl/keys.dist.impl.hh"
-#include "idl/uuid.dist.impl.hh"
 #include "idl/paging_state.dist.impl.hh"
-#include "idl/token.dist.impl.hh"
-#include "idl/range.dist.impl.hh"
+#include "exceptions/exceptions.hh"
 #include "message/messaging_service.hh"
 #include "utils/bit_cast.hh"
 
 service::pager::paging_state::paging_state(partition_key pk,
         std::optional<clustering_key> ck,
         uint32_t rem_low_bits,
-        utils::UUID query_uuid,
+        query_id query_uuid,
         replicas_per_token_range last_replicas,
         std::optional<db::read_repair_decision> query_read_repair_decision,
         uint32_t rows_fetched_for_last_partition_low_bits,
         uint32_t rem_high_bits,
-        uint32_t rows_fetched_for_last_partition_high_bits)
+        uint32_t rows_fetched_for_last_partition_high_bits,
+        bound_weight ck_weight,
+        partition_region region,
+        std::optional<query_plan> plan)
     : _partition_key(std::move(pk))
     , _clustering_key(std::move(ck))
     , _remaining_low_bits(rem_low_bits)
@@ -46,22 +38,29 @@ service::pager::paging_state::paging_state(partition_key pk,
     , _query_read_repair_decision(query_read_repair_decision)
     , _rows_fetched_for_last_partition_low_bits(rows_fetched_for_last_partition_low_bits)
     , _remaining_high_bits(rem_high_bits)
-    , _rows_fetched_for_last_partition_high_bits(rows_fetched_for_last_partition_high_bits) {
-}
+    , _rows_fetched_for_last_partition_high_bits(rows_fetched_for_last_partition_high_bits)
+    , _ck_weight(ck_weight)
+    , _region(region)
+    , _query_plan(std::move(plan))
+{ }
 
 service::pager::paging_state::paging_state(partition_key pk,
-        std::optional<clustering_key> ck,
+        position_in_partition_view pos,
         uint64_t rem,
-        utils::UUID query_uuid,
+        query_id query_uuid,
         replicas_per_token_range last_replicas,
         std::optional<db::read_repair_decision> query_read_repair_decision,
-        uint64_t rows_fetched_for_last_partition)
-    : paging_state(std::move(pk), std::move(ck), static_cast<uint32_t>(rem), query_uuid, std::move(last_replicas), query_read_repair_decision,
+        uint64_t rows_fetched_for_last_partition,
+        std::optional<query_plan> plan)
+    : paging_state(std::move(pk), pos.has_key() ? std::optional(pos.key()) : std::nullopt, static_cast<uint32_t>(rem), query_uuid, std::move(last_replicas), query_read_repair_decision,
             static_cast<uint32_t>(rows_fetched_for_last_partition), static_cast<uint32_t>(rem >> 32),
-            static_cast<uint32_t>(rows_fetched_for_last_partition >> 32)) {
-}
+            static_cast<uint32_t>(rows_fetched_for_last_partition >> 32),
+            pos.get_bound_weight(),
+            pos.region(),
+            std::move(plan))
+{ }
 
-lw_shared_ptr<service::pager::paging_state> service::pager::paging_state::deserialize(
+lw_shared_ptr<const service::pager::paging_state> service::pager::paging_state::deserialize(
         bytes_opt data) {
     if (!data) {
         return nullptr;
@@ -76,7 +75,7 @@ lw_shared_ptr<service::pager::paging_state> service::pager::paging_state::deseri
     seastar::simple_input_stream in(reinterpret_cast<char*>(data.value().begin() + sizeof(uint32_t)), data.value().size() - sizeof(uint32_t));
 
     try {
-        return make_lw_shared<paging_state>(ser::deserialize(in, boost::type<paging_state>()));
+        return make_lw_shared<paging_state>(ser::deserialize(in, std::type_identity<paging_state>()));
     } catch (...) {
         std::throw_with_nested(
                 exceptions::protocol_exception(

@@ -1,6 +1,6 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the DescribeTable operation.
 # Some attributes used only by a specific major feature will be tested
@@ -18,7 +18,9 @@ import pytest
 from botocore.exceptions import ClientError
 import re
 import time
-from util import multiset
+from test.alternator.util import multiset, new_test_table, random_string, scylla_config_temporary
+
+import requests
 
 # Test that DescribeTable correctly returns the table's name and state
 def test_describe_table_basic(test_table):
@@ -55,22 +57,60 @@ def test_describe_table_billing(test_table):
     # mode, so the table creation date should be the same as the billing
     # mode setting date.
     assert 'LastUpdateToPayPerRequestDateTime' in got['BillingModeSummary']
-    assert got['BillingModeSummary']['LastUpdateToPayPerRequestDateTime'] == got['CreationDateTime']
+    # boto3 returns these times as datetimes in the local time zone, each
+    # with its own tzlocal() object. Python considers comparing such
+    # datetimes an inter-zone comparison, and if the time is in the hour
+    # repeated when daylight saving time ends, == always returns False for
+    # it. So compare the timestamps instead.
+    assert got['BillingModeSummary']['LastUpdateToPayPerRequestDateTime'].timestamp() == got['CreationDateTime'].timestamp()
 
-# Test that DescribeTable correctly returns the table's creation time.
-# We don't know what this creation time is supposed to be, so this test
-# cannot be very thorough... We currently just tests against something we
-# know to be wrong - returning the *current* time, which changes on every
-# call.
-@pytest.mark.xfail(reason="DescribeTable does not return table creation time")
-def test_describe_table_creation_time(test_table):
-    got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
-    assert 'CreationDateTime' in got
-    time1 = got['CreationDateTime']
-    time.sleep(1) 
-    got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
-    time2 = got['CreationDateTime']
-    assert time1 == time2
+# Test that DescribeTable correctly returns the table's creation time - 
+# timestamp in seconds as double with as much precision as the operating system will provide
+# Reproduces issue #5013
+def test_describe_table_creation_time(dynamodb):
+    before_time = time.time()
+
+    schema = {
+        'KeySchema': [ { 'AttributeName': 'p', 'KeyType': 'HASH' },
+                    { 'AttributeName': 'c', 'KeyType': 'RANGE' }
+        ],
+        'AttributeDefinitions': [
+                    { 'AttributeName': 'p', 'AttributeType': 'S' },
+                    { 'AttributeName': 'c', 'AttributeType': 'S' },
+        ],
+    }
+
+    with new_test_table(dynamodb, **schema) as table1:
+        # let's sleep few ms, so table2 creation time was always bigger, as we now return CreationDateTime in ms precision
+        time.sleep(0.002)
+        with new_test_table(dynamodb, **schema) as table2:
+            got1 = table1.meta.client.describe_table(TableName=table1.name)['Table']
+            got2 = table2.meta.client.describe_table(TableName=table2.name)['Table']
+            assert 'CreationDateTime' in got1
+            assert 'CreationDateTime' in got2
+            
+            time1 = got1['CreationDateTime']
+            time2 = got2['CreationDateTime']
+            
+            after_time = time.time()
+            # we add some wiggle room, as the test might be run with on aws and time synchronization might be bit off
+            assert before_time - 1  < time1.timestamp() < time2.timestamp() < after_time + 1
+
+            got4 = table2.meta.client.describe_table(TableName=table2.name)['Table']
+            got3 = table1.meta.client.describe_table(TableName=table1.name)['Table']
+            assert 'CreationDateTime' in got3
+            assert 'CreationDateTime' in got4
+
+            time3 = got3['CreationDateTime']
+            time4 = got4['CreationDateTime']
+
+            # boto3 returns these times as datetimes in the local time zone,
+            # each with its own tzlocal() object. Python considers comparing
+            # such datetimes an inter-zone comparison, and if the time is in
+            # the hour repeated when daylight saving time ends, == always
+            # returns False for it. So compare the timestamps instead.
+            assert time1.timestamp() == time3.timestamp(), (time1, time1.timestamp(), time3, time3.timestamp())
+            assert time2.timestamp() == time4.timestamp(), (time2, time2.timestamp(), time4, time4.timestamp())
 
 # Test that DescribeTable returns the table's estimated item count
 # in the ItemCount attribute. Unfortunately, there's not much we can
@@ -86,26 +126,85 @@ def test_describe_table_item_count(test_table):
 
 # Similar test for estimated size in bytes - TableSizeBytes - which again,
 # may reflect the size as long as six hours ago.
-@pytest.mark.xfail(reason="DescribeTable does not return table size")
 def test_describe_table_size(test_table):
     got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
     assert 'TableSizeBytes' in got
+    assert got['TableSizeBytes'] >= 0
+
+# this is scylla-only test - it uses scylla's configuration option to stabilize test
+# we also don't have any guarantees about sizes returned by dynamodb
+@pytest.mark.parametrize("cache_validity_in_seconds", [0, 3600])
+def test_describe_table_size_with_N_timeout(scylla_only, dynamodb, rest_api, cache_validity_in_seconds):
+    '''
+    This tests side effect of how describe table works in ScyllaDB - it caches calculated
+    values. The cache validity is set to 1 hour (long enough to cover whole test duration).
+    We call DescribeTable twice, expecting second value to be the same as first one due to the cache.
+    '''
+    schema = {
+        'KeySchema': [ { 'AttributeName': 'p', 'KeyType': 'HASH' },
+                    { 'AttributeName': 'c', 'KeyType': 'RANGE' }
+        ],
+        'AttributeDefinitions': [
+                    { 'AttributeName': 'p', 'AttributeType': 'S' },
+                    { 'AttributeName': 'c', 'AttributeType': 'S' },
+        ],
+    }
+
+    with scylla_config_temporary(dynamodb, 'alternator_describe_table_info_cache_validity_in_seconds', str(cache_validity_in_seconds)):
+        with new_test_table(dynamodb, **schema) as test_table:
+            got1 = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
+            assert 'TableSizeBytes' in got1
+            assert got1['TableSizeBytes'] >= 0
+
+            p = random_string()
+            c = random_string()
+            v = random_string()
+            test_table.put_item(Item={'p': p, 'c': c, 'v': v})
+
+            ks = 'alternator_' + test_table.name
+            cf = test_table.name
+            # We need to flush memtables to make sure size is updated, as current implementation
+            # calculates size based on sstables only
+            response = requests.post(rest_api+f'/storage_service/keyspace_flush/{ks}', params={'cf' : cf})
+            assert response.ok
+
+            got2 = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
+            assert 'TableSizeBytes' in got2
+            if cache_validity_in_seconds == 0:
+                assert got2['TableSizeBytes'] > got1['TableSizeBytes']
+            else:
+                assert got2['TableSizeBytes'] == got1['TableSizeBytes']
 
 # Test the ProvisionedThroughput attribute returned by DescribeTable.
 # This is a very partial test: Our test table is configured without
 # provisioned throughput, so obviously it will not have interesting settings
-# for it. DynamoDB returns zeros for some of the attributes, even though
-# the documentation suggests missing values should have been fine too.
-@pytest.mark.xfail(reason="DescribeTable does not return provisioned throughput")
+# for it. But DynamoDB documents that zeros be returned for WriteCapacityUnits
+# and ReadCapacityUnits, and does this in practice as well - and some
+# applications assume these numbers are always there (even if 0).
 def test_describe_table_provisioned_throughput(test_table):
     got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
     assert got['ProvisionedThroughput']['NumberOfDecreasesToday'] == 0
     assert got['ProvisionedThroughput']['WriteCapacityUnits'] == 0
     assert got['ProvisionedThroughput']['ReadCapacityUnits'] == 0
 
+# Test the WarmThroughput attribute returned by DescribeTable. Alternator has
+# no throughput caps and does not implement pre-warming (issue #21853), but
+# DynamoDB returns this structure even for a table created without configuring
+# it, and clients rely on it being there: the Terraform AWS Provider polls it
+# after CreateTable and reads its absence as the table not existing, which
+# broke every "terraform apply" against Alternator (CUSTOMER-705). The numbers
+# differ - DynamoDB reports a 12000/4000 baseline, Alternator zeros - so only
+# the structure is checked here.
+def test_describe_table_warm_throughput(test_table):
+    got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']
+    assert 'WarmThroughput' in got
+    assert isinstance(got['WarmThroughput']['ReadUnitsPerSecond'], int)
+    assert isinstance(got['WarmThroughput']['WriteUnitsPerSecond'], int)
+    assert got['WarmThroughput']['Status'] == 'ACTIVE'
+
 # This is a silly test for the RestoreSummary attribute in DescribeTable -
 # it should not exist in a table not created by a restore. When testing
-# the backup/restore feature, we will have more meaninful tests for the
+# the backup/restore feature, we will have more meaningful tests for the
 # value of this attribute in that case.
 def test_describe_table_restore_summary(test_table):
     got = test_table.meta.client.describe_table(TableName=test_table.name)['Table']

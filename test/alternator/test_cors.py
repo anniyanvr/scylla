@@ -1,6 +1,6 @@
 # Copyright 2021-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for CORS (Cross-origin resource sharing) protocol support.
 # If the request has the "Origin" header specifying where the script which
@@ -12,6 +12,8 @@
 # respond by "allowing" them in the response headers.
 
 import requests
+
+from .util import get_cert
 
 # If the request does not have a "Origin" header, the reply should not
 # have any of the CORS headers. We test this for the GET, POST and
@@ -25,8 +27,9 @@ def test_cors_not_used(dynamodb):
         'Access-Control-Allow-Methods',
         'Access-Control-Allow-Headers']
     url = dynamodb.meta.client._endpoint.host
+    cert = get_cert(dynamodb)
     for f in [requests.options, requests.get, requests.post]:
-        response = f(url, verify=False)
+        response = f(url, verify=False, cert=cert)
         for h in cors_headers:
             assert not h in response.headers
 
@@ -36,8 +39,9 @@ def test_cors_not_used(dynamodb):
 def test_cors_allow_origin(dynamodb):
     headers = {'Origin': 'http://example.com/'}
     url = dynamodb.meta.client._endpoint.host
+    cert = get_cert(dynamodb)
     for f in [requests.options, requests.get, requests.post]:
-        response = f(url, headers=headers, verify=False)
+        response = f(url, headers=headers, verify=False, cert=cert)
         assert 'Access-Control-Allow-Origin' in response.headers
         assert response.headers['Access-Control-Allow-Origin'] == '*'
         assert 'Access-Control-Expose-Headers' in response.headers
@@ -59,8 +63,9 @@ def test_cors_allow_requested(dynamodb):
         'Access-Control-Request-Headers': 'cat, meerkat, mouse'
     }
     url = dynamodb.meta.client._endpoint.host
+    cert = get_cert(dynamodb)
     for f in [requests.options, requests.get, requests.post]:
-        response = f(url, headers=headers, verify=False)
+        response = f(url, headers=headers, verify=False, cert=cert)
         assert 'Access-Control-Allow-Origin' in response.headers
         assert response.headers['Access-Control-Allow-Origin'] == '*'
         assert 'Access-Control-Expose-Headers' in response.headers

@@ -5,12 +5,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include "cql3/statements/statement_type.hh"
+#include "db/consistency_level_type.hh"
+
+#include <cstdint>
 
 namespace cql3 {
 
@@ -76,13 +79,27 @@ struct cql_stats {
     int64_t select_allow_filtering = 0;
     int64_t select_partition_range_scan = 0;
     int64_t select_partition_range_scan_no_bypass_cache = 0;
+    int64_t select_parallelized = 0;
+    int64_t select_paging_plan_rederivations = 0;
 
+    uint64_t minimum_replication_factor_fail_violations = 0;
+    uint64_t minimum_replication_factor_warn_violations = 0;
+    uint64_t maximum_replication_factor_warn_violations = 0;
+    uint64_t maximum_replication_factor_fail_violations = 0;
+
+    uint64_t replication_strategy_warn_list_violations = 0;
+    uint64_t replication_strategy_fail_list_violations = 0;
+    uint64_t writes_per_consistency_level[size_t(db::consistency_level::MAX_VALUE) + 1] = {};
+    uint64_t write_consistency_levels_disallowed_violations = 0;
+    uint64_t write_consistency_levels_warned_violations = 0;
+
+    uint64_t forwarded_requests = 0;
 private:
     uint64_t _unpaged_select_queries[(size_t)ks_selector::SIZE] = {0ul};
     uint64_t _query_cnt[(size_t)source_selector::SIZE]
             [(size_t)ks_selector::SIZE]
             [(size_t)cond_selector::SIZE]
-            [statements::statement_type::MAX_VALUE + 1] = {0ul};
+            [statements::statement_type::MAX_VALUE + 1] = {};
 };
 
 }

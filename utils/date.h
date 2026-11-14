@@ -25,7 +25,7 @@
 // SOFTWARE.
 //
 // Our apologies.  When the previous paragraph was written, lowercase had not yet
-// been invented (that woud involve another several millennia of evolution).
+// been invented (that would involve another several millennia of evolution).
 // We did not mean to shout.
 
 #include <algorithm>
@@ -705,7 +705,6 @@ class year_month_weekday
     date::weekday_indexed wdi_;
 
 public:
-    year_month_weekday() = default;
     CONSTCD11 year_month_weekday(const date::year& y, const date::month& m,
                                    const date::weekday_indexed& wdi) NOEXCEPT;
     CONSTCD14 year_month_weekday(const sys_days& dp) NOEXCEPT;
@@ -834,8 +833,8 @@ operator<<(std::basic_ostream<CharT, Traits>& os, const year_month_weekday_last&
 inline namespace literals
 {
 
-CONSTCD11 date::day  operator "" _d(unsigned long long d) NOEXCEPT;
-CONSTCD11 date::year operator "" _y(unsigned long long y) NOEXCEPT;
+CONSTCD11 date::day  operator ""_d(unsigned long long d) NOEXCEPT;
+CONSTCD11 date::year operator ""_y(unsigned long long y) NOEXCEPT;
 
 // CONSTDATA date::month jan{1};
 // CONSTDATA date::month feb{2};
@@ -1660,7 +1659,7 @@ inline namespace literals
 CONSTCD11
 inline
 date::day
-operator "" _d(unsigned long long d) NOEXCEPT
+operator ""_d(unsigned long long d) NOEXCEPT
 {
     return date::day{static_cast<unsigned>(d)};
 }
@@ -1668,7 +1667,7 @@ operator "" _d(unsigned long long d) NOEXCEPT
 CONSTCD11
 inline
 date::year
-operator "" _y(unsigned long long y) NOEXCEPT
+operator ""_y(unsigned long long y) NOEXCEPT
 {
     return date::year(static_cast<int64_t>(y));
 }
@@ -5962,8 +5961,7 @@ parse(std::basic_istream<CharT, Traits>& is,
             }
             if (Y != not_a_year)
             {
-                if (!(static_cast<int64_t>(year::min()) <= Y &&
-                      Y <= static_cast<int64_t>(year::max())))
+                if (!std::in_range<int64_t>(Y))
                     goto broken;
                 if (j != 0)
                 {

@@ -3,31 +3,41 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #define BOOST_TEST_MODULE core
 
 #include "enum_set.hh"
 
-#include <iostream>
 #include <iterator>
 #include <unordered_set>
 
 #include <boost/test/unit_test.hpp>
+#include <fmt/ostream.h>
+#include <fmt/ranges.h>
 
-#include "to_string.hh"
 
 enum class fruit { apple = 3, pear = 7, banana = 8 };
 
-static std::ostream& operator<<(std::ostream& os, fruit f) {
-    switch (f) {
-        case fruit::apple: os << "apple"; break;
-        case fruit::pear: os << "pear"; break;
-        case fruit::banana: os << "banana"; break;
+template <> struct fmt::formatter<fruit> : fmt::formatter<string_view> {
+    auto format(fruit f, fmt::format_context& ctx) const {
+        std::string_view name;
+        using enum fruit;
+        switch (f) {
+            case apple: name = "apple"; break;
+            case pear: name = "pear"; break;
+            case banana: name = "banana"; break;
+        }
+        return formatter<string_view>::format(name, ctx);
     }
+};
 
+namespace std {
+std::ostream& boost_test_print_type(std::ostream& os, const std::unordered_set<fruit>& fruits) {
+    fmt::print(os, "{}", fruits);
     return os;
+}
 }
 
 using fruit_enum = super_enum<fruit, fruit::apple, fruit::pear, fruit::banana>;
@@ -59,6 +69,10 @@ BOOST_AUTO_TEST_CASE(enum_valid_sequence) {
 //
 
 using fruit_set = enum_set<fruit_enum>;
+
+static_assert(std::ranges::forward_range<fruit_set>);
+static_assert(std::ranges::view<fruit_set>);
+static_assert(std::ranges::borrowed_range<fruit_set>);
 
 BOOST_AUTO_TEST_CASE(set_contains) {
     const auto fs = fruit_set::of<fruit::apple, fruit::banana>();

@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -20,6 +17,7 @@
 #include <vector>
 #include <stddef.h>
 #include "cql3/expr/expression.hh"
+#include "cql3/dialect.hh"
 
 class schema;
 
@@ -36,12 +34,21 @@ namespace functions { class function_call; }
  */
 class prepare_context final {
 private:
+    // Keeps names of all the bind variables. For bind variables without a name ('?'), the name is nullptr.
+    // Maps bind_index -> name.
     std::vector<shared_ptr<column_identifier>> _variable_names;
-    std::vector<lw_shared_ptr<column_specification>> _specs;
-    std::vector<lw_shared_ptr<column_specification>> _target_columns;
-    // A list of pointers to prepared `function_call` cache ids, that
-    // participate in partition key ranges computation within an LWT statement.
-    std::vector<::shared_ptr<std::optional<uint8_t>>> _pk_function_calls_cache_ids;
+
+    // Keeps column_specification for every bind_index. column_specification describes the name and type of this variable.
+    std::vector<lw_shared_ptr<column_specification>> _variable_specs;
+
+    // For every expression like (<target> = <bind variable>), there's a pair of (bind_index, target column_specification) in _targets.
+    // Collecting all equalities of bind variables allows to determine which of the variables set the value of partition key columns.
+    // The driver needs this information in order to compute the partition token and send the request to the right node.
+    std::vector<std::pair<std::size_t, lw_shared_ptr<column_specification>>> _targets;
+
+    // How many `function_call`s that take part in partition key computation
+    // have been given a cache id so far.
+    uint8_t _pk_function_calls_count = 0;
 
     // The flag denoting whether the context is currently in partition key
     // processing mode (inside query restrictions AST nodes). If set to true,
@@ -49,6 +56,13 @@ private:
     // will be assigned an identifier, which will then be used for caching
     // the function call results.
     bool _processing_pk_restrictions = false;
+
+    // The dialect the statement is parsed and prepared under. Captured when the
+    // request starts being processed, so that everything the prepare step decides
+    // is decided under a single value, even if the node configuration changes
+    // while the statement is being prepared. There is no default: preparing under
+    // a dialect nobody chose is worse than not preparing at all.
+    std::optional<dialect> _dialect;
 
 public:
 
@@ -64,9 +78,12 @@ public:
 
     void add_variable_specification(int32_t bind_index, lw_shared_ptr<column_specification> spec);
 
-    void set_bound_variables(const std::vector<shared_ptr<column_identifier>>& prepare_meta);
+    // Hands over what the parser knows and the prepare step needs. The dialect is
+    // part of it, so that a statement built rather than parsed cannot reach the
+    // prepare step without having said which dialect it is prepared under.
+    void set_bound_variables(const std::vector<shared_ptr<column_identifier>>& bind_variable_names, dialect d);
 
-    void clear_pk_function_calls_cache();
+    const dialect& get_dialect() const;
 
     // Record a new function call, which evaluates a partition key constraint.
     // Also automatically assigns an id to the AST node for caching purposes.

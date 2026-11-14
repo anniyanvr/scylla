@@ -1,18 +1,25 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Various utility functions which are useful for multiple tests
 
 import string
 import random
 import collections
-import time
 import re
+import ssl
+import time
 import requests
+import json
 import pytest
+from cassandra import InvalidRequest
 from contextlib import contextmanager
+from botocore import UNSIGNED
 from botocore.hooks import HierarchicalEmitter
+import boto3
+
+from test.pylib.skip_types import skip_env
 
 # The "pytest-randomly" pytest plugins modifies the default "random" to repeat
 # the same pseudo-random sequence (with the same seed) in each separate test.
@@ -117,6 +124,10 @@ def freeze(item):
         return frozenset((key, freeze(value)) for key, value in item.items())
     elif isinstance(item, list):
         return tuple(freeze(value) for value in item)
+    elif isinstance(item, (set, frozenset)):
+        return frozenset(freeze(value) for value in item)
+    elif isinstance(item, bytearray):
+        return bytes(item)
     return item
 
 def multiset(items):
@@ -134,11 +145,17 @@ def unique_table_name():
     return test_table_prefix + str(current_ms)
 unique_table_name.last_ms = 0
 
-def create_test_table(dynamodb, **kwargs):
-    name = unique_table_name()
+def create_test_table(dynamodb, name=None, **kwargs):
+    if name is None:
+        name = unique_table_name()
+    BillingMode = 'PAY_PER_REQUEST'
+    if 'BillingMode' in kwargs:
+        BillingMode = kwargs['BillingMode']
+        del kwargs['BillingMode']
+
     print("fixture creating new table {}".format(name))
     table = dynamodb.create_table(TableName=name,
-        BillingMode='PAY_PER_REQUEST', **kwargs)
+        BillingMode=BillingMode, **kwargs)
     waiter = table.meta.client.get_waiter('table_exists')
     # recheck every second instead of the default, lower, frequency. This can
     # save a few seconds on AWS with its very slow table creation, but can
@@ -180,7 +197,11 @@ def list_tables(dynamodb, limit=100):
         else:
             page = dynamodb.meta.client.list_tables(Limit=limit);
         results = page.get('TableNames', None)
-        assert(results)
+        if not results:
+            # DynamoDB may return a last empty page, without TableNames at
+            # all. It seems it doesn't happen on us-east-1, but does happen
+            # on eu-north-1 when limit=1.
+            break;
         ret = ret + results
         newpos = page.get('LastEvaluatedTableName', None)
         if not newpos:
@@ -201,7 +222,7 @@ def list_tables(dynamodb, limit=100):
 # While these transformations are very convenient, they prevent us from
 # checking various *errors* in the format of API parameters, because boto3
 # verifies and/or modifies these parameters for us.
-# So the following contextmanager presents a boto3 client which is modifed
+# So the following contextmanager presents a boto3 client which is modified
 # to *not* do these transformations or validations at all.
 @contextmanager
 def client_no_transform(client):
@@ -210,30 +231,418 @@ def client_no_transform(client):
     # override it with an empty emitter:
     old_events = client.meta.events
     client.meta.events = HierarchicalEmitter()
-    yield client
-    client.meta.events = old_events
+    try:
+        yield client
+    finally:
+        client.meta.events = old_events
 
 def is_aws(dynamodb):
-    return dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com')
+    try:
+        # Let's try first if dynamodb represents a client object
+        # `Client` object has `_endpoint.host` attribute, which we check for amazon domain
+        return dynamodb._endpoint.host.endswith('.amazonaws.com')
+    except AttributeError:
+        # If not, it must be a resource (table for example), which has meta.client object, which has the _endpoint.host attribute.
+        return dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com')
+
+# The ARN of a table.
+def get_table_arn(table):
+    desc = table.meta.client.describe_table(TableName=table.name)
+    return desc['Table']['TableArn']
+
+# Return the AWS region name, or the Scylla data center name.
+def get_region(dynamodb):
+    if is_aws(dynamodb):
+        dc_name = dynamodb.meta.client.meta.region_name
+        # Make sure we got a non-empty region name.
+        assert len(dc_name) > 0
+        return dc_name
+    system_local = dynamodb.Table('.scylla.alternator.system.local')
+    return system_local.scan(AttributesToGet=['data_center'])['Items'][0]['data_center']
 
 # Tries to inject an error via Scylla REST API. It only works on Scylla,
 # and only in specific build modes (dev, debug, sanitize), so this function
 # will trigger a test to be skipped if it cannot be executed.
 @contextmanager
-def scylla_inject_error(dynamodb, err, one_shot=False):
-    if dynamodb.meta.client._endpoint.host.endswith('.amazonaws.com'):
-        pytest.skip("Error injection not enabled on AWS")
-    url = dynamodb.meta.client._endpoint.host
-    # The REST API is on port 10000, and always http, not https.
-    url = re.sub(r':[0-9]+(/|$)', ':10000', url)
-    url = re.sub(r'^https:', 'http:', url)
-    response = requests.post(f'{url}/v2/error_injection/injection/{err}?one_shot={one_shot}')
-    response = requests.get(f'{url}/v2/error_injection/injection')
+def scylla_inject_error(rest_api, err, one_shot=False, parameters={}):
+    requests.post(f'{rest_api}/v2/error_injection/injection/{err}?one_shot={one_shot}', json=parameters)
+    response = requests.get(f'{rest_api}/v2/error_injection/injection')
     print("Enabled error injections:", response.content.decode('utf-8'))
     if response.content.decode('utf-8') == "[]":
-        pytest.skip("Error injection not enabled in Scylla - try compiling in dev/debug/sanitize mode")
+        skip_env("Error injection not enabled in Scylla - try compiling in dev/debug/sanitize mode")
     try:
         yield
     finally:
         print("Disabling error injection", err)
-        response = requests.delete(f'{url}/v2/error_injection/injection/{err}')
+        requests.delete(f'{rest_api}/v2/error_injection/injection/{err}')
+
+# Send a message to the Scylla log. E.g., we can write a message to the log
+# indicating that a test has started, which will make it easier to see which
+# test caused which errors in the log.
+def scylla_log(optional_rest_api, message, level):
+    if optional_rest_api:
+        requests.post(f'{optional_rest_api}/system/log?message={requests.utils.quote(message)}&level={level}')
+
+# UpdateTable for creating a GSI is an asynchronous operation. The table's
+# TableStatus changes from ACTIVE to UPDATING for a short while, and then
+# goes back to ACTIVE, but the new GSI's IndexStatus appears as CREATING,
+# until eventually (in Amazon DynamoDB - it takes a *long* time...) it
+# becomes ACTIVE. During the CREATING phase, at some point the Backfilling
+# attribute also appears, until it eventually disappears. We need to wait
+# until all three markers indicate completion.
+# Unfortunately, while boto3 has a client.get_waiter('table_exists') to
+# wait for a table to exists, there is no such function to wait for an
+# index to come up, so we need to code it ourselves.
+def wait_for_gsi(table, gsi_name):
+    start_time = time.time()
+    # On Amazon DynamoDB, adding a GSI, even to a tiny table, seems to take
+    # as much as 20 minutes. So we need to use an absurdly long "timeout" when
+    # running the test on AWS. We also shouldn't retry very often, so we pick
+    # a longer "delay"
+    if is_aws(table):
+        timeout = 1800
+        delay = 3
+    else:
+        timeout = 60
+        delay = 0.1
+    while time.time() < start_time + timeout:
+        desc = table.meta.client.describe_table(TableName=table.name)
+        table_status = desc['Table']['TableStatus']
+        if table_status != 'ACTIVE':
+            time.sleep(delay)
+            continue
+        index_desc = [x for x in desc['Table']['GlobalSecondaryIndexes'] if x['IndexName'] == gsi_name]
+        assert len(index_desc) == 1
+        index_status = index_desc[0]['IndexStatus']
+        if index_status != 'ACTIVE':
+            time.sleep(delay)
+            continue
+        # When the index is ACTIVE, this must be after backfilling completed
+        assert not 'Backfilling' in index_desc[0]
+        return
+    raise AssertionError("wait_for_gsi did not complete")
+
+# Similarly to how wait_for_gsi() waits for a GSI to finish adding,
+# this function waits for a GSI to be finally deleted.
+def wait_for_gsi_gone(table, gsi_name):
+    start_time = time.time()
+    while time.time() < start_time + 600:
+        desc = table.meta.client.describe_table(TableName=table.name)
+        table_status = desc['Table']['TableStatus']
+        if table_status != 'ACTIVE':
+            time.sleep(0.1)
+            continue
+        if 'GlobalSecondaryIndexes' in desc['Table']:
+            index_desc = [x for x in desc['Table']['GlobalSecondaryIndexes'] if x['IndexName'] == gsi_name]
+            if len(index_desc) != 0:
+                time.sleep(0.1)
+                continue
+        return
+    raise AssertionError("wait_for_gsi_gone did not complete")
+
+# Read a parameter from Scylla's configuration, stored in the system table
+# which is also visible to Alternator. This function will only work on Scylla,
+# and fail otherwise, so should only be used in Scylla-only tests.
+# If this is Scylla, but the specific parameter name is not present in the
+# configuration, this function returns None. If the parameter is present,
+# it is returned (as a string).
+def scylla_config_read(dynamodb, name):
+    config_table = dynamodb.Table('.scylla.alternator.system.config')
+    # We use query() here instead of the simpler get_item(), because
+    # commit 44a1daf only added support for system tables in Query and
+    # Scan, not in GetItem...
+    r = config_table.query(
+            KeyConditionExpression='#key=:val',
+            ExpressionAttributeNames={'#key': 'name'},
+            ExpressionAttributeValues={':val': name}
+        )
+    if not 'Items' in r or not r['Items']:
+        return None
+    return r['Items'][0]['value']
+
+# Write a parameter in Scylla's configuration, using in the system table
+# which is also visible to Alternator. This function will only work on Scylla,
+# and fail otherwise, so should only be used in Scylla-only tests.
+# Also on Scylla, this function may fail with an exception if the
+# configuration parameter alternator_allow_system_table_write is not turned
+# on, so callers might want to catch such an exception and skip the test.
+def scylla_config_write(dynamodb, name, value):
+    config_table = dynamodb.Table('.scylla.alternator.system.config')
+    config_table.update_item(
+            Key={'name': name},
+            UpdateExpression='SET #val = :val',
+            ExpressionAttributeNames={'#val': 'value'},
+            ExpressionAttributeValues={':val': value}
+        )
+
+# A context manager that can be used in a "with" to temporarily set a
+# configuration parameter to a desired value, and restore its original
+# value when the context ends.
+# The configuration parameter has to be live-updatable.
+# Note that using this mechanism is only a good idea if you're sure that
+# no other workload or test is using the same Alternator cluster in parallel,
+# because the changed configuration will affect the other workload too.
+@contextmanager
+def scylla_config_temporary(dynamodb, name, value, nop = False):
+    if nop:
+        yield
+        return
+    original_value = scylla_config_read(dynamodb, name)
+    scylla_config_write(dynamodb, name, value)
+    try:
+        yield
+    finally:
+        scylla_config_write(dynamodb, name, original_value)
+
+# get_cert() returns the (cert_file, key_file) tuple that should be passed
+# as the "cert" parameter of requests.get()/post() to authenticate to the
+# given dynamodb connection's endpoint, or None if that connection does not
+# use a client certificate. Tests which send raw HTTP requests (i.e., not
+# through boto3) to the same endpoint as "dynamodb" - instead of through
+# get_signed_request()/manual_request() below - need to pass this "cert" too,
+# because under mTLS (--mtls) the TLS handshake itself will fail without it,
+# regardless of the request's content.
+def get_cert(dynamodb):
+    session = dynamodb.meta.client._endpoint.http_session
+    cert_file = getattr(session, '_cert_file', None)
+    return (cert_file, session._key_file) if cert_file else None
+
+# An ssl.SSLContext for connecting to the given server as a client, for
+# tests which bypass boto3 and establish TLS connections themselves.
+def client_ssl_context(dynamodb):
+    context = ssl.create_default_context()
+    # check_hostname and verify_mode is needed when we use self-signed
+    # certificates in tests.
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    # Under mTLS, the server requires a client certificate at the TLS
+    # handshake level - so load it if there is one.
+    cert = get_cert(dynamodb)
+    if cert:
+        context.load_cert_chain(certfile=cert[0], keyfile=cert[1])
+    return context
+
+# manual_request() can be used to send a DynamoDB API request without any
+# boto3 involvement in preparing the request - the operation name and
+# operation payload (a JSON string) are created by the caller. Use this
+# function sparingly - most tests should use boto3's resource API or when
+# needed, client_no_transform(). Although manual_request() does give the test
+# more control, not using it allows the test to check the natural requests
+# sent by a real-life SDK.
+def manual_request(dynamodb, op, payload):
+    req = get_signed_request(dynamodb, op, payload)
+    res = requests.post(req.url, headers=req.headers, data=req.body, verify=False, cert=req.cert)
+    if res.status_code == 200:
+        return json.loads(res.text)
+    else:
+        err = json.loads(res.text)
+        error_code = res.status_code
+        error_type = err['__type'].split('#')[1]
+        # Normally, DynamoDB uses lowercase 'message', but in some cases
+        # it uses 'Message', and for some types of error it may be missing
+        # entirely (we'll return an empty string for that).
+        message = err.get('message', err.get('Message', ''))
+        raise ManualRequestError(error_code, error_type, message)
+
+class ManualRequestError(Exception):
+    def __init__(self, error_code, error_type, message):
+        super().__init__(message) # message is the main exception text
+        self.code = error_code
+        self.type = error_type
+        self.message = message
+    def __str__(self):
+        return f'{self.code} {self.type} {self.message}'
+    __repr__ = __str__
+
+def get_signed_request(dynamodb, op, payload, extra_headers=None):
+    # Usually "payload" will be a Python string and we'll write it as UTF-8.
+    # but in some tests we may want to write bytes directly - potentially
+    # bytes which include invalid UTF-8.
+    payload_bytes = payload if isinstance(payload, bytes) else payload.encode(encoding='UTF-8')
+    # NOTE: Signing routines use boto3 implementation details and may be prone
+    # to unexpected changes
+    class Request:
+        url=dynamodb.meta.client._endpoint.host
+        headers={'X-Amz-Target': 'DynamoDB_20120810.' + op, 'Content-Type': 'application/x-amz-json-1.0'} | (extra_headers or {})
+        body=payload_bytes
+        cert=get_cert(dynamodb)
+        method='POST'
+        context={}
+        params={}
+    req = Request()
+    signer = dynamodb.meta.client._request_signer
+    # Under mTLS, "dynamodb" is configured with signature_version=UNSIGNED
+    # (the client certificate is the sole authentication, and any SigV4
+    # signature is ignored) - so there is no signer to use, and trying to
+    # sign anyway raises UnknownSignatureVersionError. Leave the request
+    # unsigned in that case; it authenticates via req.cert instead.
+    if signer._signature_version != UNSIGNED:
+        signer.get_auth(signer.signing_name, signer.region_name).add_auth(request=req)
+    return req
+
+# Fixture for checking if we are able to test Scylla metrics. Scylla metrics
+# are not available on AWS (of course), but may also not be available for
+# Scylla if for some reason we have only access to the Alternator protocol
+# port but no access to the metrics port (9180).
+# If metrics are *not* available, tests using this fixture will be skipped.
+# Tests using this fixture may call get_metrics(metrics).
+@pytest.fixture(scope="module")
+def metrics(dynamodb):
+    if is_aws(dynamodb):
+        skip_env('Scylla-only feature not supported by AWS')
+    url = dynamodb.meta.client._endpoint.host
+    # The Prometheus API is on port 9180, and always http, not https.
+    url = re.sub(r':[0-9]+(/|$)', ':9180', url)
+    url = re.sub(r'^https:', 'http:', url)
+    url = url + '/metrics'
+    resp = requests.get(url)
+    if resp.status_code != 200:
+        skip_env('Metrics port 9180 is not available')
+    yield url
+
+# Utility function for fetching all metrics from Scylla, using an HTTP request
+# to port 9180. The response format is defined by the Prometheus protocol.
+# get_metrics() needs the test to use the "metrics" fixture.
+def get_metrics(metrics):
+    response = requests.get(metrics)
+    assert response.status_code == 200
+    return response.text
+
+# Utility function for fetching a metric with a given name and optionally a
+# given sub-metric label (which should be a name-value map). If multiple
+# matches are found, they are summed - this is useful for summing up the
+# counts from multiple shards.
+def get_metric(metrics, name, requested_labels=None, the_metrics=None):
+    if not the_metrics:
+        the_metrics = get_metrics(metrics)
+    total = 0.0
+    lines = re.compile('^'+name+'{.*$', re.MULTILINE)
+    for match in re.findall(lines, the_metrics):
+        a = match.split()
+        metric = a[0]
+        val = float(a[1])
+        # Check if match also matches the requested labels
+        if requested_labels:
+            # we know metric begins with name{ and ends with } - the labels
+            # are what we have between those
+            got_labels = metric[len(name)+1:-1].split(',')
+            # Check that every one of the requested labels is in got_labels:
+            for k, v in requested_labels.items():
+                if not f'{k}="{v}"' in got_labels:
+                    # No match for requested label, skip this metric (python
+                    # doesn't have "continue 2" so let's just set val to 0...
+                    val = 0
+                    break
+        total += float(val)
+    return total
+
+# context manager for checking that a certain piece of code increases each
+# of the specified metrics. Helps reduce the amount of code duplication
+# below.
+@contextmanager
+def check_increases_metric(metrics, metric_names, requested_labels=None):
+    the_metrics = get_metrics(metrics)
+    saved_metrics = { x: get_metric(metrics, x, requested_labels, the_metrics) for x in metric_names }
+    yield
+    the_metrics = get_metrics(metrics)
+    for n in metric_names:
+        assert saved_metrics[n] < get_metric(metrics, n, requested_labels, the_metrics), f"Metric '{n}' with labels {requested_labels} did not increase"
+
+@contextmanager
+def check_increases_metric_exact(metrics, metric_name, value_and_labels):
+    the_metrics = get_metrics(metrics)
+    saved_metric = [get_metric(metrics, metric_name, vl[1], the_metrics) for vl in value_and_labels]
+    yield
+    the_metrics = get_metrics(metrics)
+    for (expected_increase, labels), base_value in zip(value_and_labels, saved_metric):
+        actual_increase = get_metric(metrics, metric_name, labels, the_metrics) - base_value
+        assert actual_increase == expected_increase, (
+            f"Metric '{metric_name}' with labels {labels} did not increase by an exact value. "
+            f"Initial value: {base_value}. "
+            f"Expected increase: {expected_increase}. "
+            f"Actual increase: {actual_increase}."
+        )
+
+@contextmanager
+def check_increases_operation(metrics, operation_names, metric_name = 'scylla_alternator_operation', expected_value=None):
+    the_metrics = get_metrics(metrics)
+    saved_metrics = { x: get_metric(metrics, metric_name, {'op': x}, the_metrics) for x in operation_names }
+    yield
+    the_metrics = get_metrics(metrics)
+    for op in operation_names:
+        if expected_value is not None:
+            assert expected_value == get_metric(metrics, metric_name, {'op': op}, the_metrics) - saved_metrics[op]
+        else:
+            assert saved_metrics[op] < get_metric(metrics, metric_name, {'op': op}, the_metrics)
+
+@contextmanager
+def check_table_increases_operation(metrics, operation_names, table, metric_name = 'scylla_alternator_table_operation', expected_value=None):
+    the_metrics = get_metrics(metrics)
+    saved_metrics = { x: get_metric(metrics, metric_name, {'op': x, 'cf': table}, the_metrics) for x in operation_names }
+    yield
+    the_metrics = get_metrics(metrics)
+    for op in operation_names:
+        if expected_value is not None:
+            assert expected_value == get_metric(metrics, metric_name, {'op': op, 'cf': table}, the_metrics) - saved_metrics[op]
+        else:
+            assert saved_metrics[op] < get_metric(metrics, metric_name, {'op': op, 'cf': table}, the_metrics)
+
+# new_role() is a context manager for temporarily creating a new role with
+# a unique name and returning its name and the secret key needed to connect
+# to it with the DynamoDB API.
+# The "login" and "superuser" flags are passed to the CREATE ROLE statement.
+# This is a ScyllaDB-only feature, and currently uses CQL to create the role.
+@contextmanager
+def new_role(cql, login=True, superuser=False):
+    # The role name is not a table's name but it doesn't matter. Because our
+    # unique_table_name() uses (deliberately) a non-lower-case character, the
+    # role name has to be quoted in double quotes when used in CQL below.
+    role = unique_table_name()
+    # The password set for the new role is identical to the user name (not
+    # very secure ;-)) - but we later need to retrieve the "salted hash" of
+    # this password, which serves in Alternator as the secret key of the role.
+    cql.execute(f"CREATE ROLE \"{role}\" WITH PASSWORD = '{role}' AND SUPERUSER = {superuser} AND LOGIN = {login}")
+    try:
+        # Newer Scylla places the "roles" table in the "system" keyspace, but
+        # older versions used "system_auth_v2" or "system_auth"
+        key = None
+        for ks in ['system', 'system_auth_v2', 'system_auth']:
+            try:
+                e = list(cql.execute(f"SELECT salted_hash FROM {ks}.roles WHERE role = '{role}'"))
+                if e != []:
+                    key = e[0].salted_hash
+                    if key is not None:
+                        break
+            except InvalidRequest:
+                # This keyspace doesn't have a "roles" table on this Scylla
+                # version - try the next candidate.
+                pass
+        assert key is not None
+        yield (role, key)
+    finally:
+        cql.execute(f'DROP ROLE "{role}"')
+
+# Create a new DynamoDB API resource (connection object) similar to the
+# existing "dynamodb" resource - but authenticating with the given role
+# and key.
+# This is a ScyllaDB-only feature.
+@contextmanager
+def new_dynamodb(dynamodb, role, key):
+    # Under mTLS, identity is determined solely by the client certificate
+    # presented on the connection (and SigV4 signatures, if any, are
+    # ignored) - so there is no way to authenticate as a different role
+    # using a role/key pair. Skip such tests instead of silently
+    # reconnecting as whatever identity the certificate maps to.
+    if get_cert(dynamodb):
+        skip_env("new_dynamodb() authenticates using SigV4 role/key pairs, which are not supported under mTLS")
+    url = dynamodb.meta.client._endpoint.host
+    config = dynamodb.meta.client._client_config
+    region_name = dynamodb.meta.client.meta.region_name
+    verify = not url.startswith('https')
+    ret = boto3.resource('dynamodb', endpoint_url=url, verify=verify,
+        aws_access_key_id=role, aws_secret_access_key=key,
+        region_name=region_name, config=config)
+    try:
+        yield ret
+    finally:
+        ret.meta.client.close()

@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2017-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -19,7 +16,7 @@
 #include <optional>
 #include <memory>
 
-#include "schema_fwd.hh"
+#include "schema/schema_fwd.hh"
 
 namespace cql3 {
 
@@ -47,9 +44,9 @@ public:
 
     virtual void validate(query_processor&, const service::client_state& state) const override;
 
-    future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
 private:
     schema_ptr lookup_indexed_table(query_processor& qp) const;
     schema_ptr make_drop_idex_schema(query_processor& qp) const;

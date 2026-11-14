@@ -1,23 +1,28 @@
 /*
- */
-/*
  * Modified by ScyllaDB
  * Copyright (C) 2015-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #pragma once
 
 #include "cql3/cql_statement.hh"
 #include "raw/batch_statement.hh"
-#include "timestamp.hh"
-#include "log.hh"
+#include "mutation/timestamp.hh"
+#include "utils/log.hh"
 #include "service_permit.hh"
+#include "exceptions/coordinator_result.hh"
+#include "tracing/trace_state.hh"
+#include "cql3/statements/batch_executor.hh"
 
 namespace cql_transport::messages {
     class result_message;
+}
+
+namespace db {
+enum class large_data_violation_type : uint8_t;
 }
 
 namespace cql3 {
@@ -32,7 +37,7 @@ class modification_statement;
  * A <code>BATCH</code> statement parsed from a CQL query.
  *
  */
-class batch_statement : public cql_statement_opt_metadata {
+class batch_statement : public cql_statement {
     static logging::logger _logger;
 public:
     using type = raw::batch_statement::type;
@@ -69,10 +74,10 @@ private:
     // all columns of the table, including the primary key.
     column_set _columns_of_cas_result_set;
     cql_stats& _stats;
+    const batch_executor* _executor;
 public:
     /**
-     * Creates a new BatchStatement from a list of statements and a
-     * Thrift consistency level.
+     * Creates a new BatchStatement from a list of statements
      *
      * @param type type of the batch
      * @param statements a list of UpdateStatements
@@ -88,16 +93,18 @@ public:
                     std::unique_ptr<attributes> attrs,
                     cql_stats& stats);
 
-    virtual bool depends_on_keyspace(const sstring& ks_name) const override;
+    virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const override;
 
-    virtual bool depends_on_column_family(const sstring& cf_name) const override;
+    // A control connection never has a legitimate reason to run a batch, so any
+    // batch arriving on one means it is being used for user load.
+    bool should_reclassify_control_connection() const override {
+        return true;
+    }
 
     virtual uint32_t get_bound_terms() const override;
 
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
-    // Validates a prepared batch statement without validating its nested statements.
-    void validate();
 
     bool has_conditions() const { return _has_conditions; }
 
@@ -107,20 +114,38 @@ public:
     //   or in QueryProcessor.processBatch() - for native protocol batches.
     virtual void validate(query_processor& qp, const service::client_state& state) const override;
 
-    const std::vector<single_statement>& get_statements();
-private:
-    future<std::vector<mutation>> get_mutations(query_processor& qp, const query_options& options, db::timeout_clock::time_point timeout,
-            bool local, api::timestamp_type now, service::query_state& query_state) const;
+    const std::vector<single_statement>& get_statements() const;
+
+    // What a batch_executor needs to commit this batch. Everything else about
+    // the batch stays private.
+    type batch_type() const { return _type; }
+    // Only the const predicates a batch_executor validates against. The one
+    // attribute that is evaluated rather than inspected is forwarded below,
+    // because evaluating it is not a const operation on attributes.
+    const attributes& get_attrs() const { return *_attrs; }
+    int64_t get_timestamp(int64_t now, const query_options& options) const;
+    cql_stats& stats() const { return _stats; }
+    const column_set& columns_of_cas_result_set() const { return _columns_of_cas_result_set; }
+    const seastar::shared_ptr<metadata>& cas_result_metadata() const { return _metadata; }
+
+    // How this batch reaches storage. Set when the batch is built and never null
+    // afterwards; see cql3::statements::batch_executor.
+    const batch_executor& executor() const { return *_executor; }
 
 public:
     /**
      * Checks batch size to ensure threshold is met. If not, a warning is logged.
      * @param cfs ColumnFamilies that will store the batch's mutations.
      */
-    static void verify_batch_size(query_processor& qp, const std::vector<mutation>& mutations);
+    void verify_batch_size(query_processor& qp, const utils::chunked_vector<mutation>& mutations) const;
 
     virtual future<shared_ptr<cql_transport::messages::result_message>> execute(
-            query_processor& qp, service::query_state& state, const query_options& options) const override;
+            query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
+
+    virtual future<shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message(
+            query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
+
+    db::timeout_clock::duration get_timeout(const service::client_state& state, const query_options& options) const;
 private:
     friend class batch_statement_executor;
     future<shared_ptr<cql_transport::messages::result_message>> do_execute(
@@ -128,20 +153,6 @@ private:
             service::query_state& query_state, const query_options& options,
             bool local, api::timestamp_type now) const;
 
-    future<> execute_without_conditions(
-            query_processor& qp,
-            std::vector<mutation> mutations,
-            db::consistency_level cl,
-            db::timeout_clock::time_point timeout,
-            tracing::trace_state_ptr tr_state,
-            service_permit permit) const;
-
-    future<shared_ptr<cql_transport::messages::result_message>> execute_with_conditions(
-            query_processor& qp,
-            const query_options& options,
-            service::query_state& state) const;
-
-    db::timeout_clock::duration get_timeout(const service::client_state& state, const query_options& options) const;
 public:
     // FIXME: no cql_statement::to_string() yet
 #if 0

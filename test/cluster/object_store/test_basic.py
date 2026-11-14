@@ -1,0 +1,1473 @@
+#!/usr/bin/env python3
+
+import asyncio
+import os
+import time
+import pytest
+import shutil
+import logging
+import json
+import time
+import uuid
+
+from test.pylib.s3mock_server import create_conf
+from botocore.exceptions import ClientError
+from cassandra.protocol import ConfigurationException, InvalidRequest
+from cassandra.query import SimpleStatement, ConsistencyLevel
+from test.pylib.rest_client import ScyllaMetricsClient
+from test.pylib.scylla_cluster_manager import ScyllaClusterManager
+from test.pylib.util import wait_for, wait_for_cql_and_get_hosts
+from test.pylib.object_storage import format_tuples, keyspace_options
+from test.cqlpy.rest_api import scylla_inject_error
+from test.cluster.test_alternator import alternator_config, get_alternator, unique_table_name
+from test.cluster.test_config import wait_for_config
+from test.cluster.util import new_test_keyspace, wait_for_token_ring_and_group0_consistency
+from test.pylib.tablets import get_all_tablet_replicas
+from test.pylib.util import wait_for, unique_name
+
+logger = logging.getLogger(__name__)
+
+
+async def assert_registry_entries_on_all_nodes(cql, hosts, table_id, action):
+    """Verify that the sstables registry has entries for the given table_id on all nodes passed as arg."""
+    for h in hosts:
+        res = await cql.run_async(
+            SimpleStatement(f"SELECT * FROM system.sstables WHERE table_id = {table_id} ALLOW FILTERING",
+                            consistency_level=ConsistencyLevel.ONE), host=h)
+        assert res, f'Expected registry entries on {h.address} before {action}'
+
+
+async def assert_registry_empty_on_all_nodes(cql, hosts, table_id, action):
+    """Verify that the sstables registry has no entries for the given table_id on all nodes passed as arg.
+
+    system.sstables is a node-local table, so each node only stores entries for
+    the tablets it owns. Querying every node verifies each one cleaned up its own
+    registry after the operation.
+
+    Object-storage SSTables are deleted in two phases: unlink() (awaited by
+    TRUNCATE/DROP) only transitions the registry entry to the 'removing' state via
+    wipe(), while the row itself is deleted later by destroy(), which runs
+    fire-and-forget when the last SSTable reference is dropped. The operation can
+    therefore return before the entries are gone, so poll each node until its
+    registry is empty instead of asserting immediately.
+    """
+    async def registry_empty_on(h):
+        res = await cql.run_async(
+            SimpleStatement(f"SELECT * FROM system.sstables WHERE table_id = {table_id} ALLOW FILTERING",
+                            consistency_level=ConsistencyLevel.ONE), host=h)
+        return True if not res else None
+
+    for h in hosts:
+        try:
+            await wait_for(lambda h=h: registry_empty_on(h), time.time() + 30)
+        except AssertionError:
+            raise AssertionError(f'Unexpected entries in registry on {h.address} after {action}')
+
+
+async def get_table_id(cql, ks, table_name):
+    """Get the table UUID from system_schema."""
+    rows = await cql.run_async(
+        f"SELECT id FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name = '{table_name}'")
+    return rows[0].id
+
+
+async def get_registry_entries(cql, table_id, node_owner, host):
+    """Get sstables registry entries for a specific (table_id, node_owner) partition.
+
+    system.sstables is a node-local table: entries with node_owner=N only exist in
+    node N's own system.sstables. The query must therefore be routed to that node
+    via the `host` parameter, otherwise it hits the coordinator's local table and
+    returns nothing.
+    """
+    if isinstance(node_owner, str):
+        node_owner = uuid.UUID(node_owner)
+    rows = await cql.run_async(
+        SimpleStatement(
+            "SELECT generation, status FROM system.sstables"
+            " WHERE table_id = %s AND node_owner = %s",
+            consistency_level=ConsistencyLevel.ONE),
+        parameters=[table_id, node_owner], host=host)
+    return rows
+
+
+@pytest.mark.parametrize('replication_factor', [1, 3])
+@pytest.mark.parametrize('mode', ['normal', 'encrypted'])
+async def test_basic(manager: ScyllaClusterManager, object_storage, tmp_path, mode, replication_factor):
+    '''verify ownership table is updated, and tables written to object storage can be read after scylla restarts.
+    Parametrized over replication_factor to also verify RF=3 with multiple servers.'''
+
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    if mode == 'encrypted':
+        d = tmp_path / "system_keys"
+        d.mkdir()
+        cfg = cfg | {
+            'system_key_directory': str(d),
+            'user_info_encryption': { 'enabled': True, 'key_provider': 'LocalFileSystemKeyProviderFactory' }
+        }
+
+    servers = []
+    for rack_num in range(replication_factor):
+        property_file = {"dc": "dc1", "rack": f"r{rack_num}"}
+        server = await manager.server_add(config=cfg, property_file=property_file)
+        servers.append(server)
+
+    cql = manager.get_cql()
+    workdir = await manager.server_get_workdir(servers[0].server_id)
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    async with new_test_keyspace(manager, keyspace_options(object_storage, rf=replication_factor)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int);")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{k}', {k});") for k in range(4)])
+
+        assert not os.path.exists(os.path.join(workdir, f'data/{ks}')), "object storage backed keyspace has local directory created"
+        # Sanity check that the path is constructed correctly
+        assert os.path.exists(os.path.join(workdir, 'data/system')), "Datadir is elsewhere"
+
+        desc = cql.execute(f"DESCRIBE KEYSPACE {ks}").one().create_statement
+        # The storage_opts wraps options with '{ <options> }' while the DESCRIBE
+        # does it like '{<options>}' so strip the corner branches and spaces for check
+        assert f"{{'type': '{object_storage.type}', 'bucket': '{object_storage.bucket_name}', 'endpoint': '{object_storage.address}'}}" in desc, "DESCRIBE generates unexpected storage options"
+
+        res = cql.execute(f"SELECT * FROM {ks}.test;")
+        rows = {x.name: x.value for x in res}
+        assert len(rows) > 0, 'Test table is empty'
+
+        print('Flush keyspace on all servers')
+        for server in servers:
+            await manager.api.flush_keyspace(server.ip_addr, ks)
+
+        # Check that the ownership table is populated properly
+        tid = cql.execute(f"SELECT id FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name = 'test'").one()
+        res = cql.execute("SELECT * FROM system.sstables;")
+        for row in res:
+            assert row.table_id == tid.id, \
+                f'Unexpected entry table_id in registry: {row.table_id}'
+            assert row.status == 'sealed', f'Unexpected entry status in registry: {row.status}'
+
+        if replication_factor > 1:
+            tablet_replicas = await get_all_tablet_replicas(manager, servers[0], ks, 'test')
+            print(f'Found {len(tablet_replicas)} tablets')
+            hosts = {await manager.get_host_id(s.server_id): s.ip_addr for s in servers}
+            for idx, tablet in enumerate(tablet_replicas):
+                replica_ips = [hosts[r[0]] for r in tablet.replicas]
+                print(f'Tablet {idx}: last_token={tablet.last_token}, replicas={replica_ips}')
+                assert len(replica_ips) == replication_factor, f'Expected RF={replication_factor} replicas, got {len(replica_ips)}'
+
+        print('Restart scylla')
+        for server in servers:
+            await manager.server_restart(server.server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        # Shouldn't be recreated by populator code
+        assert not os.path.exists(os.path.join(workdir, f'data/{ks}')), "object storage backed keyspace has local directory resurrected"
+
+        stmt = SimpleStatement(f"SELECT * FROM {ks}.test;", consistency_level=ConsistencyLevel.ALL)
+        res = cql.execute(stmt)
+        have_res = {x.name: x.value for x in res}
+        assert have_res == rows, f'Unexpected table content: {have_res}'
+
+async def test_garbage_collect(manager: ScyllaClusterManager, object_storage):
+    '''verify ownership table is garbage-collected on boot'''
+
+    sstable_entries = []
+
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    cmd = ['--logger-log-level', 's3=trace:http=debug:gcp_storage=trace']
+    server = await manager.server_add(config=cfg, cmdline=cmd)
+
+    cql = manager.get_cql()
+
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    async with new_test_keyspace(manager, keyspace_options(object_storage)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int);")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{k}', {k});") for k in range(4)])
+
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+        # Mark the sstables as "removing" to simulate the problem
+        res = cql.execute("SELECT * FROM system.sstables;")
+        for row in res:
+            sstable_entries.append((row.table_id, row.node_owner, row.generation))
+        print(f'Found entries: {[ str(ent[2]) for ent in sstable_entries ]}')
+        for table_id, node_owner, gen in sstable_entries:
+            cql.execute("UPDATE system.sstables SET status = 'removing'"
+                         f" WHERE table_id = {table_id} AND node_owner = {node_owner} AND generation = {gen};")
+
+        print('Restart scylla')
+        await manager.server_restart(server.server_id)
+        cql, _ = await manager.get_ready_cql([server])
+
+        res = cql.execute(f"SELECT * FROM {ks}.test;")
+        have_res = {x.name: x.value for x in res}
+        # Must be empty as no sstables should have been picked up
+        assert not have_res, f'Sstables not cleaned, got {have_res}'
+        # Make sure objects also disappeared
+        objects = object_storage.get_resource().Bucket(object_storage.bucket_name).objects.all()
+        print(f'Found objects: {[ objects ]}')
+        for o in objects:
+            for ent in sstable_entries:
+                assert not o.key.startswith(str(ent[2])), f'Sstable object not cleaned, found {o.key}'
+
+
+async def test_populate_from_quarantine(manager: ScyllaClusterManager, object_storage):
+    '''verify sstables are populated from quarantine state'''
+
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    server = await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    async with new_test_keyspace(manager, keyspace_options(object_storage)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int);")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{k}', {k});") for k in range(4)])
+
+        res = cql.execute(f"SELECT * FROM {ks}.test;")
+        rows = {x.name: x.value for x in res}
+        assert len(rows) > 0, 'Test table is empty'
+
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+        # Move the sstables into "quarantine"
+        res = cql.execute("SELECT * FROM system.sstables;")
+        assert len(list(res)) > 0, 'No entries in registry'
+        for row in res:
+            cql.execute("UPDATE system.sstables SET state = 'quarantine'"
+                         f" WHERE table_id = {row.table_id} AND node_owner = {row.node_owner} AND generation = {row.generation};")
+
+        print('Restart scylla')
+        await manager.server_restart(server.server_id)
+        cql, _ = await manager.get_ready_cql([server])
+
+        res = cql.execute(f"SELECT * FROM {ks}.test;")
+        have_res = {x.name: x.value for x in res}
+        # Quarantine entries must have been processed normally
+        assert have_res == rows, f'Unexpected table content: {have_res}'
+
+
+async def test_misconfigured_storage(manager: ScyllaClusterManager, object_storage):
+    '''creating keyspace with unknown endpoint is not allowed'''
+    # scylladb/scylladb#15074
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    server = await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    storage_opts = format_tuples(type=f'{object_storage.type}',
+                                 endpoint='unknown_endpoint',
+                                 bucket=object_storage.bucket_name)
+
+    with pytest.raises(ConfigurationException):
+        cql.execute((f"CREATE KEYSPACE test_ks WITH"
+                      f" REPLICATION = {replication_opts} AND STORAGE = {storage_opts};"))
+
+
+async def test_storage_type_endpoint_mismatch(manager: ScyllaClusterManager, s3_storage, gs_storage):
+    '''creating a keyspace whose STORAGE type doesn't match the configured type of the
+    given endpoint (S3 endpoint used with type GS, or vice versa) must not be allowed,
+    even though the endpoint name itself is known.'''
+    objconf = s3_storage.create_endpoint_conf() + gs_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'experimental_features': ['keyspace-storage-options']}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+
+    print('S3 storage type must not be able to pick a GS-configured endpoint')
+    storage_opts = format_tuples(type='S3', endpoint=gs_storage.address, bucket=s3_storage.bucket_name)
+    with pytest.raises(ConfigurationException):
+        cql.execute((f"CREATE KEYSPACE test_ks_s3_on_gs WITH"
+                      f" REPLICATION = {replication_opts} AND STORAGE = {storage_opts};"))
+
+    print('GS storage type must not be able to pick an S3-configured endpoint')
+    storage_opts = format_tuples(type='GS', endpoint=s3_storage.address, bucket=gs_storage.bucket_name)
+    with pytest.raises(ConfigurationException):
+        cql.execute((f"CREATE KEYSPACE test_ks_gs_on_s3 WITH"
+                      f" REPLICATION = {replication_opts} AND STORAGE = {storage_opts};"))
+
+
+async def test_memtable_flush_retries(manager: ScyllaClusterManager, tmpdir, object_storage):
+    '''verify that memtable flush doesn't crash in case storage access keys are incorrect'''
+
+    print('Spoof the object-store config')
+    objconf = object_storage.create_endpoint_conf()
+
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    server = await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int);")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{k}', {k});") for k in range(4)])
+
+        res = cql.execute(f"SELECT * FROM {ks}.test;")
+        rows = {x.name: x.value for x in res}
+
+        with scylla_inject_error(cql, "s3_client_fail_authorization"):
+            print(f'Flush keyspace')
+            flush = asyncio.create_task(manager.api.flush_keyspace(server.ip_addr, ks))
+            print(f'Wait few seconds')
+            await asyncio.sleep(8)
+
+        print(f'Wait for flush to finish')
+        await flush
+
+        print(f'Check the sstables table')
+        res = cql.execute("SELECT * FROM system.sstables;")
+        ssts = "\n".join(f"{row.table_id} {row.generation} {row.status}" for row in res)
+        print(f'sstables:\n{ssts}')
+
+        print('Restart scylla')
+        await manager.server_restart(server.server_id)
+        cql, _ = await manager.get_ready_cql([server])
+
+        res = cql.execute(f"SELECT * FROM {ks}.test;")
+        have_res = { x.name: x.value for x in res }
+        assert have_res == dict(rows), f'Unexpected table content: {have_res}'
+
+@pytest.mark.parametrize('config_with_full_url', [True, False])
+async def test_get_object_store_endpoints(manager: ScyllaClusterManager, config_with_full_url):
+    if config_with_full_url:
+        objconf = create_conf('http://a:123', 'region')
+    else:
+        objconf = create_conf('a', 'region')
+        objconf[0]["port"] = 123
+        objconf[0]["use_https"] = False
+        del objconf[0]["type"]
+
+    cfg = {'object_storage_endpoints': objconf}
+
+    print('Scylla returns the object storage endpoints')
+    server = await manager.server_add(config=cfg)
+    endpoints = await manager.api.get_config(server.ip_addr, 'object_storage_endpoints')
+
+    name = objconf[0]['name']
+    del objconf[0]['name']
+
+    print('Also check the returned string is valid JSON')
+    assert name in endpoints
+    assert json.loads(endpoints[name]) == objconf[0]
+
+    print('Check that system.config contains the object storage endpoints')
+    cql = manager.get_cql()
+    res = json.loads(cql.execute("SELECT value FROM system.config WHERE name = 'object_storage_endpoints';").one().value)
+    assert name in res
+    assert json.loads(res[name]) == objconf[0]
+
+
+async def get_object_storage_put_requests(server_ip, storage_type: str) -> float:
+    # Reported by the backend client itself, under labels its owner supplies, so
+    # this stops moving if the owner fails to name a client it has replaced.
+    label = storage_type.lower()
+    metrics = await ScyllaMetricsClient().query(server_ip)
+    puts = metrics.get('scylla_object_storage_total_put_requests', {'type': label})
+    assert puts is not None, f'No scylla_object_storage_total_put_requests for type={label}'
+    return puts
+
+
+async def get_object_storage_written_bytes(server_ip, storage_type: str) -> float:
+    # The fixture spells the type in upper case, the metric label in lower.
+    label = storage_type.lower()
+    metrics = await ScyllaMetricsClient().query(server_ip)
+    written = metrics.get('scylla_object_storage_total_write_bytes', {'type': label})
+    assert written is not None, f'No scylla_object_storage_total_write_bytes for type={label}'
+    return written
+
+
+async def test_create_keyspace_after_config_update(manager: ScyllaClusterManager, object_storage):
+    print('Trying to create a keyspace with an endpoint not configured in object_storage_endpoints should trip storage_manager::is_known_endpoint()')
+    server = await manager.server_add()
+    cql = manager.get_cql()
+    endpoint = object_storage.address  
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    storage_opts = format_tuples(type=f'{object_storage.type}',
+                                 endpoint=endpoint,
+                                 bucket=object_storage.bucket_name)
+
+    with pytest.raises(ConfigurationException):
+        cql.execute((f'CREATE KEYSPACE random_ks WITH'
+                      f' REPLICATION = {replication_opts} AND STORAGE = {storage_opts};'))
+
+    print('Update config with a new endpoint and SIGHUP Scylla to reload configuration')
+    objconf = object_storage.create_endpoint_conf()
+    await manager.server_update_config(server.server_id, 'object_storage_endpoints', objconf)
+    ep = objconf[0]
+    if ep['type'] == 's3':
+        expected_conf = f'{{ "type": "s3", "aws_region": "{ep["aws_region"]}", "iam_role_arn": "{ep["iam_role_arn"]}" }}'
+    else:
+        expected_conf = f'{{ "type": "gs", "credentials_file": "{ep["credentials_file"]}" }}'
+    await wait_for_config(manager, server, 'object_storage_endpoints', {ep['name']: expected_conf})
+
+    print('Passing a known endpoint will make the CREATE KEYSPACE stmt to succeed')
+    cql.execute((f'CREATE KEYSPACE random_ks WITH'
+                    f' REPLICATION = {replication_opts} AND STORAGE = {storage_opts};'))
+
+    print('Create a table, insert data and flush the keyspace to force object_storage_client creation')
+    cql.execute(f'CREATE TABLE random_ks.test (name text PRIMARY KEY, value int);')
+    await cql.run_async(f"INSERT INTO random_ks.test (name, value) VALUES ('test_key', 123);")
+    await manager.api.flush_keyspace(server.ip_addr, 'random_ks')
+    res = cql.execute(f"SELECT value FROM random_ks.test WHERE name = 'test_key';")
+    assert res.one().value == 123, f'Unexpected value after flush: {res.one().value}'
+
+    print('The flush wrote objects, so the object storage metrics report the bytes')
+    written = await get_object_storage_written_bytes(server.ip_addr, object_storage.type)
+    assert written > 0, f'No bytes counted for {object_storage.type} after the flush'
+
+    # Now that a live object_storage_client exists for this endpoint, push a
+    # config update that modifies the endpoint parameters.  This exercises the
+    # update_config_sync path on an already-instantiated client
+    print('Push a config update to reconfigure the live object_storage_client')
+    updated_objconf = object_storage.create_endpoint_conf()
+    updated_ep = updated_objconf[0]
+    if updated_ep['type'] == 's3':
+        updated_ep['aws_region'] = 'updated-region'
+        updated_expected_conf = f'{{ "type": "s3", "aws_region": "{updated_ep["aws_region"]}", "iam_role_arn": "{updated_ep["iam_role_arn"]}" }}'
+    else:
+        updated_ep['credentials_file'] = ''
+        updated_expected_conf = f'{{ "type": "gs", "credentials_file": "{updated_ep["credentials_file"]}" }}'
+
+    await manager.server_update_config(server.server_id, 'object_storage_endpoints', updated_objconf)
+    await wait_for_config(manager, server, 'object_storage_endpoints', {updated_ep['name']: updated_expected_conf})
+
+    # versitygw signs the region into every request, so a flush through the S3
+    # configuration above would fail and abort the node; put the original one
+    # back first.  (Runs for GCS too, where the restore is merely harmless.)
+    print('Restore the configuration, which reconfigures the live client once more')
+    await manager.server_update_config(server.server_id, 'object_storage_endpoints', objconf)
+    await wait_for_config(manager, server, 'object_storage_endpoints', {ep['name']: expected_conf})
+
+    print('Verify the reconfigured client still works: insert more data and flush')
+    await cql.run_async(f"INSERT INTO random_ks.test (name, value) VALUES ('after_reconfig', 456);")
+    await manager.api.flush_keyspace(server.ip_addr, 'random_ks')
+    res = cql.execute(f"SELECT value FROM random_ks.test WHERE name = 'after_reconfig';")
+    assert res.one().value == 456, f'Unexpected value after reconfiguration flush: {res.one().value}'
+
+    # A config update replaces the GCS client, so its request metrics have to be
+    # registered again for the replacement, while the bytes are reported a layer
+    # up by the wrapper the update keeps. Sample both after the flush above, by
+    # when every shard has picked up the new configuration, and require both to
+    # advance across the writes that follow: the requests show the replacement is
+    # named, the bytes show its traffic reaches the reported total.
+    written_before = await get_object_storage_written_bytes(server.ip_addr, object_storage.type)
+    puts_before = await get_object_storage_put_requests(server.ip_addr, object_storage.type)
+
+    print('The reconfigured client reports the writes that follow it')
+    await cql.run_async(f"INSERT INTO random_ks.test (name, value) VALUES ('after_metrics', 789);")
+    await manager.api.flush_keyspace(server.ip_addr, 'random_ks')
+
+    written_after = await get_object_storage_written_bytes(server.ip_addr, object_storage.type)
+    assert written_after > written_before, \
+        f'{object_storage.type} bytes did not advance after the reconfiguration: {written_before} -> {written_after}'
+    puts_after = await get_object_storage_put_requests(server.ip_addr, object_storage.type)
+    assert puts_after > puts_before, \
+        f'{object_storage.type} PUT requests did not advance after the reconfiguration: {puts_before} -> {puts_after}'
+
+    print('Verify all data is intact')
+    rows = {r.name: r.value for r in cql.execute(f'SELECT * FROM random_ks.test;')}
+    assert rows == {'test_key': 123, 'after_reconfig': 456, 'after_metrics': 789}, f'Unexpected table content: {rows}'
+
+
+async def test_tablet_move_updates_registry(manager: ScyllaClusterManager, s3_storage):
+    """
+    Verify that moving a tablet from one node to another correctly
+    updates the (node-local) sstables registry: the destination node
+    creates new entries (status=sealed) in its own system.sstables and
+    the source node's entries are cleaned up.
+
+    Uses a 2-node cluster with RF=1 and a single tablet to ensure
+    deterministic placement and movement.
+
+    S3-only: the fake-gcs-server mock breaks tablet
+    streaming over object storage (ifGenerationMatch ignored, SCYLLADB-2044).
+    """
+    cfg = {
+        'object_storage_endpoints': s3_storage.create_endpoint_conf(),
+    }
+    servers = await manager.servers_add(2, config=cfg)
+    await manager.disable_tablet_balancing()
+    cql = manager.get_cql()
+    hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 30)
+    host_by_ip = {h.address: h for h in hosts}
+
+    host_ids = {}
+    driver_host = {}
+    for s in servers:
+        host_ids[s] = await manager.get_host_id(s.server_id)
+        driver_host[s] = host_by_ip[str(s.rpc_address)]
+
+    ks_opts = keyspace_options(s3_storage, rf=1)
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.t1 (pk int PRIMARY KEY, v int) WITH tablets = {{'max_tablet_count': 1}}")
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.t1 (pk, v) VALUES ({i}, {i})")
+
+        for srv in servers:
+            await manager.api.flush_keyspace(srv.ip_addr, ks)
+
+        table_id = await get_table_id(cql, ks, 't1')
+
+        # Find which node owns the tablet
+        replicas = await get_all_tablet_replicas(manager, servers[0], ks, 't1')
+        assert len(replicas) == 1, f"Expected 1 tablet, got {len(replicas)}"
+        assert len(replicas[0].replicas) == 1, f"Expected RF=1, got {len(replicas[0].replicas)}"
+        src_host_id, src_shard = replicas[0].replicas[0]
+        token = replicas[0].last_token
+
+        # Determine source and destination servers
+        src_server = None
+        dst_server = None
+        for s in servers:
+            if host_ids[s] == src_host_id:
+                src_server = s
+            else:
+                dst_server = s
+        assert src_server and dst_server, f"Could not match host_ids: tablet src={src_host_id}, servers={host_ids}"
+
+        dst_host_id = host_ids[dst_server]
+
+        # Verify source has registry entries before move
+        src_entries = await get_registry_entries(cql, table_id, src_host_id, host=driver_host[src_server])
+        assert len(src_entries) > 0, "Source should have registry entries before move"
+        logger.info(f"Source {src_host_id} has {len(src_entries)} registry entries before move")
+
+        # Move the tablet
+        logger.info(f"Moving tablet from {src_host_id} (shard {src_shard}) to {dst_host_id} (shard 0)")
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "t1",
+                                      src_host_id, src_shard,
+                                      dst_host_id, 0, token)
+
+        # Verify data is still readable
+        rows = await cql.run_async(f"SELECT * FROM {ks}.t1")
+        assert len(rows) == 10, f"Expected 10 rows after move, got {len(rows)}"
+
+        # Verify destination's local registry has entries (status=sealed)
+        dst_entries = await get_registry_entries(cql, table_id, dst_host_id, host=driver_host[dst_server])
+        assert len(dst_entries) > 0, \
+            f"Destination {dst_host_id} should have registry entries after move"
+        for entry in dst_entries:
+            assert entry.status == 'sealed', \
+                f"Destination entry {entry.generation} has status '{entry.status}', expected 'sealed'"
+        logger.info(f"Destination {dst_host_id} has {len(dst_entries)} sealed registry entries")
+
+        # Verify source entries are cleaned up
+        src_entries_after = await get_registry_entries(cql, table_id, src_host_id, host=driver_host[src_server])
+        assert len(src_entries_after) == 0, \
+            f"Source {src_host_id} should have no registry entries after move, got {len(src_entries_after)}"
+        logger.info("Source registry entries cleaned up successfully")
+
+
+async def test_decommission_migrates_registry(manager: ScyllaClusterManager, s3_storage):
+    """
+    Verify registry behavior around decommission.
+    This test checks that the tablet owned by the decommissioned node is migrated to the surviving node,
+    which then builds its own local registry entries (status=sealed).
+
+    Uses a 2-node cluster with RF=1 and a single tablet so the owner is unambiguous; the
+    owner is decommissioned to force a migration.
+
+    S3-only: the fake-gcs-server mock breaks tablet
+    streaming over object storage (ifGenerationMatch ignored, SCYLLADB-2044).
+    """
+    cfg = {
+        'object_storage_endpoints': s3_storage.create_endpoint_conf(),
+    }
+    servers = await manager.servers_add(2, config=cfg)
+    # Avoid racing with the pre-decommission registry check below.
+    # Decommission still drains the tablet to the survivor regardless.
+    await manager.disable_tablet_balancing()
+
+    cql = manager.get_cql()
+    hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 30)
+    host_by_ip = {h.address: h for h in hosts}
+
+    host_ids = {}
+    for s in servers:
+        host_ids[s] = await manager.get_host_id(s.server_id)
+
+    ks_opts = keyspace_options(s3_storage, rf=1)
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.t1 (pk int PRIMARY KEY, v int) WITH tablets = {{'max_tablet_count': 1}}")
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.t1 (pk, v) VALUES ({i}, {i})")
+
+        for srv in servers:
+            await manager.api.flush_keyspace(srv.ip_addr, ks)
+
+        table_id = await get_table_id(cql, ks, 't1')
+
+        # Identify the tablet owner and decommission it, forcing the tablet to migrate
+        # to the surviving node.
+        replicas = await get_all_tablet_replicas(manager, servers[0], ks, 't1')
+        assert len(replicas) == 1, f"Expected 1 tablet, got {len(replicas)}"
+        assert len(replicas[0].replicas) == 1, f"Expected RF=1, got {len(replicas[0].replicas)}"
+        owner_host_id = replicas[0].replicas[0][0]
+        decom_server = next(s for s in servers if host_ids[s] == owner_host_id)
+        remaining_server = next(s for s in servers if s is not decom_server)
+        remaining_host_id = host_ids[remaining_server]
+
+        # The owner has local registry entries before decommission.
+        owner_entries = await get_registry_entries(cql, table_id, owner_host_id,
+                                                    host=host_by_ip[str(decom_server.rpc_address)])
+        assert len(owner_entries) > 0, "Owner should have registry entries before decommission"
+        logger.info(f"Owner {owner_host_id} has {len(owner_entries)} registry entries before decommission")
+
+        # Decommission the owner node
+        logger.info(f"Decommissioning owner {decom_server} (host_id={owner_host_id})")
+        await manager.decommission_node(decom_server.server_id)
+        await wait_for_token_ring_and_group0_consistency(manager, time.time() + 30)
+
+        # Re-resolve the surviving node's CQL host after the topology change.
+        remaining_hosts = await wait_for_cql_and_get_hosts(cql, [remaining_server], time.time() + 30)
+        remaining_host = remaining_hosts[0]
+
+        # The tablet migrated to the surviving node, which must have built its own
+        # local registry entries (status=sealed).
+        entries = await get_registry_entries(cql, table_id, remaining_host_id, host=remaining_host)
+        assert len(entries) > 0, \
+            f"Surviving node {remaining_host_id} should have registry entries after migration"
+        for e in entries:
+            assert e.status == 'sealed', \
+                f"Entry {e.generation} has status '{e.status}', expected 'sealed'"
+        logger.info(f"Surviving node {remaining_host_id} has {len(entries)} sealed registry entries")
+
+        # Data remains readable from the surviving node.
+        rows = await cql.run_async(
+            SimpleStatement(f"SELECT * FROM {ks}.t1", consistency_level=ConsistencyLevel.ONE),
+            host=remaining_host)
+        assert len(rows) == 10, f"Expected 10 rows, got {len(rows)}"
+
+
+async def test_repair_creates_registry_entries(manager: ScyllaClusterManager, s3_storage):
+    """
+    Verify that non-incremental (tablet) repair on an object-storage keyspace
+    creates sstables registry entries on the repaired node via streaming.
+
+    To attribute the new entries to repair -- and not to a memtable flush of
+    data the node already had -- the destination must genuinely lack the data
+    before repair:
+
+      * dst is stopped while the rows are written (at CL=ONE to src) and src
+        is flushed, so the data lives only in src's SSTables;
+      * hinted handoff is disabled so dst is not silently repopulated when it
+        restarts;
+      * after dst restarts, its local system.sstables is empty.
+
+    Repair on dst then streams the data from src, writing a new sealed SSTable
+    on dst, which must appear in dst's registry *without any flush*. If repair
+    were a no-op, dst's registry would stay empty.
+
+    FIXME: incremental repair is not supported on object-storage keyspaces
+    because object_storage_base does not implement link_with_excluded_components().
+    Regular tablet repair uses streaming which works correctly.
+
+    S3-only: the fake-gcs-server mock breaks tablet
+    streaming over object storage (ifGenerationMatch ignored, SCYLLADB-2044).
+    """
+    cfg = {
+        'object_storage_endpoints': s3_storage.create_endpoint_conf(),
+        'rf_rack_valid_keyspaces': False,
+        'hinted_handoff_enabled': False,
+    }
+
+    servers = await manager.servers_add(2, config=cfg)
+    # Keep tablet placement deterministic so dst's missing replica is only
+    # filled in by the explicit repair below, not by background balancing.
+    await manager.disable_tablet_balancing()
+
+    cql = manager.get_cql()
+    hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 30)
+    host_by_ip = {h.address: h for h in hosts}
+
+    src_node = servers[0]
+    dst_node = servers[1]
+    src_host_id = await manager.get_host_id(src_node.server_id)
+    dst_host_id = await manager.get_host_id(dst_node.server_id)
+    src_host = host_by_ip[str(src_node.rpc_address)]
+
+    ks_opts = keyspace_options(s3_storage, rf=2)
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.t1 (pk int PRIMARY KEY, v int)")
+        table_id = await get_table_id(cql, ks, 't1')
+
+        # Stop dst so the writes land only on src. With hinted handoff disabled,
+        # dst will not be repopulated on restart, so the only way it can later
+        # obtain the data (and a registry entry) is through repair streaming.
+        await manager.server_stop_gracefully(dst_node.server_id)
+
+        for i in range(10):
+            await cql.run_async(
+                SimpleStatement(f"INSERT INTO {ks}.t1 (pk, v) VALUES ({i}, {i})",
+                                consistency_level=ConsistencyLevel.ONE),
+                host=src_host)
+        await manager.api.flush_keyspace(src_node.ip_addr, ks)
+
+        # Bring dst back and refresh its CQL host handle.
+        await manager.server_start(dst_node.server_id, wait_others=1)
+        hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+        host_by_ip = {h.address: h for h in hosts}
+        dst_host = host_by_ip[str(dst_node.rpc_address)]
+
+        src_entries = await get_registry_entries(cql, table_id, src_host_id, host=src_host)
+        assert len(src_entries) > 0, "Source should have registry entries after flush"
+        logger.info(f"Source {src_host_id} has {len(src_entries)} registry entries")
+
+        # dst was down during the writes (hints disabled), so it has no SSTables
+        # and therefore no local registry entries.
+        dst_entries_before = await get_registry_entries(cql, table_id, dst_host_id, host=dst_host)
+        assert len(dst_entries_before) == 0, \
+            f"Destination should have no registry entries before repair, got {len(dst_entries_before)}"
+
+        # Run non-incremental tablet repair on dst. This streams the missing data
+        # from src and writes a new sealed SSTable on dst.
+        logger.info(f"Running repair on {dst_host_id} ({dst_node.ip_addr})")
+        params = {
+            "ks": ks,
+            "table": "t1",
+            "tokens": "all",
+            "await_completion": "true",
+            "incremental_mode": "disabled",
+        }
+        await manager.api.client.post_json(
+            "/storage_service/tablets/repair", host=dst_node.ip_addr, params=params)
+
+        # Repair streams a complete sealed SSTable, so the registry entry must
+        # appear on dst.
+        dst_entries = await get_registry_entries(cql, table_id, dst_host_id, host=dst_host)
+        assert len(dst_entries) > 0, \
+            f"Destination {dst_host_id} should have registry entries created by repair"
+        for e in dst_entries:
+            assert e.status == 'sealed', \
+                f"Entry {e.generation} has status '{e.status}', expected 'sealed'"
+        logger.info(f"Destination {dst_host_id} has {len(dst_entries)} sealed entries after repair")
+
+        # Verify data consistency
+        rows = await cql.run_async(f"SELECT * FROM {ks}.t1")
+        assert len(rows) == 10, f"Expected 10 rows, got {len(rows)}"
+
+
+@pytest.mark.parametrize('operation', ['truncate', 'drop_table', 'drop_keyspace'])
+async def test_registry_cleanup_on_all_nodes(manager: ScyllaClusterManager, object_storage, operation):
+    """
+    Verify that TRUNCATE, DROP TABLE and DROP KEYSPACE on an object-storage
+    backed table clean up the sstables registry entries on all nodes.
+
+    Uses a 2-node RF=2 cluster so both nodes own the data
+    and therefore both have local system.sstables entries that the operation
+    must remove.
+    """
+    cfg = {
+        'object_storage_endpoints': object_storage.create_endpoint_conf(),
+    }
+    servers = await manager.servers_add(2, config=cfg,
+                                        property_file=[{"dc": "dc1", "rack": "r0"},
+                                                       {"dc": "dc1", "rack": "r1"}])
+
+    cql = manager.get_cql()
+    hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage, rf=2)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int)")
+        for k in range(4):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({k}, {k})")
+        for server in servers:
+            await manager.api.flush_keyspace(server.ip_addr, ks)
+
+        table_id = await get_table_id(cql, ks, 'test')
+
+        await assert_registry_entries_on_all_nodes(cql, hosts, table_id, operation)
+
+        if operation == 'truncate':
+            await cql.run_async(f"TRUNCATE {ks}.test")
+        elif operation == 'drop_table':
+            await cql.run_async(f"DROP TABLE {ks}.test")
+        else:
+            await cql.run_async(f"DROP KEYSPACE {ks}")
+
+        await assert_registry_empty_on_all_nodes(cql, hosts, table_id, operation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_stream_sink_abort_on_object_storage(manager: ScyllaClusterManager, object_storage):
+    """Verify that aborting a blob stream on object storage cleans up
+    partial SSTable components instead of leaving orphaned S3 objects.
+
+    When tablet migration streaming fails mid-transfer, the receiving side
+    calls sstable_stream_sink_impl::abort() to clean up the partial SSTable
+    component. Before the fix, abort() used remove_file() with a local
+    filesystem path. On object storage this silently fails (the exception
+    is caught and logged), leaving the partially-uploaded S3 object
+    orphaned. The fix uses unlink_component() which delegates to the
+    correct storage backend (e.g., S3 delete_object).
+
+    This test triggers a streaming failure via error injection and verifies
+    the migration retries successfully, data remains intact, and the bucket
+    is left with no orphaned objects from the aborted attempt.
+    """
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': object_storage.create_endpoint_conf()}
+
+    # Two servers are enough to migrate a tablet from one to the other.
+    servers = []
+    for _ in range(2):
+        servers.append(await manager.server_add(config=cfg))
+
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage, rf=1)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int)")
+        for i in range(20):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, {i})")
+        await asyncio.gather(*[manager.api.flush_keyspace(s.ip_addr, ks)
+                                for s in servers])
+
+        # Find which server holds the tablet and which doesn't
+        tablets = await get_all_tablet_replicas(manager, servers[0], ks, "test")
+        tablet = tablets[0]
+        src_host, src_shard = tablet.replicas[0]
+
+        host_ids = {await manager.get_host_id(s.server_id): s for s in servers}
+        dst_server = [s for hid, s in host_ids.items() if hid != src_host][0]
+        dst_host = await manager.get_host_id(dst_server.server_id)
+
+        # Arm error injection on the destination to fail streaming on
+        # the first data write. This triggers abort() on the partial SSTable.
+        await manager.api.enable_injection(dst_server.ip_addr,
+                                           "stream_blob_rx_data_error", True)
+
+        logger.info("Moving tablet from %s to %s with abort injection armed",
+                     src_host, dst_host)
+
+        # The migration should eventually succeed: the first streaming
+        # attempt will fail (triggering abort()), and tablet migration
+        # will retry.
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "test",
+                                      src_host, src_shard,
+                                      dst_host, 0, tablet.last_token)
+
+        # Verify tablet moved to the destination
+        tablets_after = await get_all_tablet_replicas(manager, servers[0],
+                                                     ks, "test")
+        moved = [t for t in tablets_after
+                 if t.last_token == tablet.last_token]
+        assert len(moved) == 1
+        new_host = moved[0].replicas[0][0]
+        assert new_host == dst_host, \
+            f"Tablet not on expected host: {new_host} != {dst_host}"
+
+        # Verify data
+        rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+        result = {r.pk: r.v for r in rows}
+        expected = {i: i for i in range(20)}
+        assert result == expected, f"Data mismatch: {result}"
+
+        def get_components_and_refs():
+            objects = object_storage.get_resource().Bucket(
+                object_storage.bucket_name).objects.all()
+            components = {}
+            refs = {}
+            for o in objects:
+                if o.key.endswith("/"):
+                    # the "sstables/" folder object
+                    continue
+                generation, has_refs, ref = o.key.rpartition("/refs/")
+                if has_refs:
+                    refs.setdefault(generation, set()).add(ref)
+                else:
+                    generation, _, component = o.key.rpartition("/")
+                    components.setdefault(generation, set()).add(component)
+            return components, refs
+
+        # The aborted streaming attempt failed while writing the TOC,
+        # so on object storage it left behind only
+        # a partial TOC.txt.tmp object and never wrote a Data.db.
+        # A fully streamed sstable always has a
+        # Data.db, so any generation in the bucket lacking one is an orphan.
+        #
+        # Poll until the bucket settles: the migrated-away source sstable may
+        # still be mid-wipe, but soon disappears entirely.
+        # With the fix the leaked TOC.txt.tmp is gone so the condition converges;
+        # without it the orphan persists and wait_for times out.
+        async def no_orphaned_objects():
+            components, refs = get_components_and_refs()
+            for gen, refset in refs.items():
+                if not gen in components:
+                    raise RuntimeError(f"Orphaned refs with no components: {gen=} refs={refset}")
+                if len(refset) > 1: 
+                    raise RuntimeError(f"Too many refs: {gen=} refs={refset} comps={components[gen]}")
+            orphans = {gen for gen, comps in components.items()
+                       if "Data.db" not in comps}
+            return None if orphans else True
+
+        try:
+            await wait_for(no_orphaned_objects, time.time() + 30,
+                    label="object storage bucket has no orphaned sstable components")
+        except Exception as e:
+            components, refs = get_components_and_refs()
+            logger.error(f"Orphaned components: {components=} {refs=}: {e}")
+            raise
+
+
+async def test_reject_object_storage_keyspace_when_local_exists(manager: ScyllaClusterManager, object_storage):
+    '''a cluster keeps its user data either locally or in object storage, so an
+    object-storage keyspace must be refused once a local user keyspace exists'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    cql.execute(f'CREATE KEYSPACE local_ks WITH REPLICATION = {replication_opts};')
+
+    with pytest.raises(InvalidRequest, match='in object storage: this cluster keeps its user data in local'):
+        cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+
+async def test_dropping_the_last_local_keyspace_allows_object_storage(manager: ScyllaClusterManager, object_storage):
+    '''the check reads the keyspaces the cluster has now, so dropping the local
+    keyspace which refused an object-storage one lets the retry through'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    cql.execute(f'CREATE KEYSPACE local_ks WITH REPLICATION = {replication_opts};')
+    with pytest.raises(InvalidRequest, match='in object storage: this cluster keeps its user data in local'):
+        cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+    cql.execute('DROP KEYSPACE local_ks;')
+    cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+
+async def test_reject_local_keyspace_when_object_storage_exists(manager: ScyllaClusterManager, object_storage):
+    '''the other direction: a local keyspace must be refused once an
+    object-storage keyspace exists'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+    with pytest.raises(InvalidRequest, match='in local storage: this cluster keeps its user data in object'):
+        cql.execute(f'CREATE KEYSPACE local_ks WITH REPLICATION = {replication_opts};')
+
+
+async def test_if_not_exists_on_an_existing_keyspace_is_not_refused(manager: ScyllaClusterManager, object_storage):
+    '''the refusal skips a keyspace which already exists, so CREATE KEYSPACE IF
+    NOT EXISTS naming one stays the no-op it is without the guardrail, even when
+    it asks for the storage the cluster does not use'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+    # no STORAGE clause, so this asks for local storage on a cluster which keeps
+    # its user data in object storage -- refused for a new keyspace, a no-op here
+    cql.execute(f'CREATE KEYSPACE IF NOT EXISTS object_storage_ks WITH REPLICATION = {replication_opts};')
+
+
+@pytest.mark.parametrize('restriction', ['warn', 'false'])
+async def test_relaxed_restriction_allows_a_mixed_storage_cluster(manager: ScyllaClusterManager, object_storage, restriction):
+    '''restrict_mixed_storage_clusters relaxes the refusal to a warning or
+    removes it, which is what mixed-storage development needs'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'restrict_mixed_storage_clusters': restriction}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    cql.execute(f'CREATE KEYSPACE local_ks WITH REPLICATION = {replication_opts};')
+    cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+    keyspaces = [row.keyspace_name for row in cql.execute('SELECT keyspace_name FROM system_schema.keyspaces;')]
+    assert 'local_ks' in keyspaces and 'object_storage_ks' in keyspaces, \
+        f'both keyspaces should have been created: {keyspaces}'
+
+
+async def test_restriction_is_live_updateable(manager: ScyllaClusterManager, object_storage):
+    '''the option is LiveUpdate, so both turning the guardrail on and turning it
+    off must take effect without a restart'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'restrict_mixed_storage_clusters': 'false'}
+    server = await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    cql.execute(f'CREATE KEYSPACE local_ks WITH REPLICATION = {replication_opts};')
+
+    # the cluster stays local while the refusal holds, so neither direction
+    # below leans on the already-mixed case, which only ever warns
+    # the reload is asynchronous, so wait for the node to report the new value
+    await manager.server_update_config(server.server_id, 'restrict_mixed_storage_clusters', 'true')
+    await wait_for_config(manager, server, 'restrict_mixed_storage_clusters', 'true')
+    with pytest.raises(InvalidRequest, match='in object storage: this cluster keeps its user data in local'):
+        cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+    await manager.server_update_config(server.server_id, 'restrict_mixed_storage_clusters', 'false')
+    await wait_for_config(manager, server, 'restrict_mixed_storage_clusters', 'false')
+    cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+
+async def test_audit_keyspace_does_not_count_as_local(manager: ScyllaClusterManager, object_storage):
+    '''the table-based audit backend creates the local "audit" keyspace on
+    startup. It belongs to Scylla, not to the user, so it must not make the
+    cluster look like a local one and block object-storage keyspaces'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf,
+           'audit': 'table'}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    assert list(cql.execute("SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name = 'audit';")), \
+        'the audit keyspace was not created, the test would pass for the wrong reason'
+
+    # Were the audit keyspace counted as a user keyspace, the cluster would look
+    # local and this would be refused.
+    cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+
+async def test_user_keyspace_named_audit_counts_as_local(manager: ScyllaClusterManager, object_storage):
+    '''the audit keyspace only belongs to Scylla while the table sink is
+    configured. Without it the name is free, and such a keyspace is a user
+    keyspace like any other'''
+    # "audit" defaults to "table", which would have Scylla create the keyspace
+    # first and take the name.
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': object_storage.create_endpoint_conf(),
+           'audit': 'none'}
+    await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    replication_opts = format_tuples({'class': 'NetworkTopologyStrategy',
+                                      'replication_factor': '1'})
+    cql.execute(f'CREATE KEYSPACE audit WITH REPLICATION = {replication_opts};')
+
+    with pytest.raises(InvalidRequest, match='this cluster keeps its user data in local'):
+        cql.execute(f'CREATE KEYSPACE {unique_name()} {keyspace_options(object_storage)};')
+
+
+async def test_alternator_create_table_rejected_on_object_storage_cluster(manager: ScyllaClusterManager, object_storage):
+    '''Alternator creates its keyspace with the default local storage, so a
+    CreateTable must be refused on a cluster which keeps its user data in
+    object storage'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    cfg.update(alternator_config)
+    server = await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    cql.execute(f'CREATE KEYSPACE object_storage_ks {keyspace_options(object_storage)};')
+
+    alternator = get_alternator(server.ip_addr)
+    with pytest.raises(ClientError, match='keeps its user data in object storage') as excinfo:
+        alternator.create_table(TableName=unique_table_name(),
+                                BillingMode='PAY_PER_REQUEST',
+                                KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+                                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'N'}])
+    # An InternalServerError carries the same message but asks the SDK to retry
+    # a request which can never succeed.
+    assert excinfo.value.response['Error']['Code'] == 'ValidationException', \
+        f"expected a ValidationException, got {excinfo.value.response['Error']}"
+
+    # The refusal must come before the keyspace is created, not after.
+    keyspaces = [row.keyspace_name for row in cql.execute('SELECT keyspace_name FROM system_schema.keyspaces;')]
+    assert not [ks for ks in keyspaces if ks.startswith('alternator_')], \
+        f'a local Alternator keyspace was left behind: {keyspaces}'
+
+
+async def test_alternator_create_table_rejected_on_object_storage_keyspace(manager: ScyllaClusterManager, object_storage):
+    '''nothing stops CREATE KEYSPACE from naming an Alternator keyspace and
+    asking for object storage; the table is then built from that keyspace's
+    metadata, so the CreateTable must be refused too'''
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    cfg.update(alternator_config)
+    server = await manager.server_add(config=cfg)
+
+    cql = manager.get_cql()
+    table_name = unique_table_name()
+    # quoted: an Alternator table name is case-sensitive, and CQL would fold it
+    cql.execute(f'CREATE KEYSPACE "alternator_{table_name}" {keyspace_options(object_storage)};')
+
+    alternator = get_alternator(server.ip_addr)
+    with pytest.raises(ClientError, match='keeps its data in object storage') as excinfo:
+        alternator.create_table(TableName=table_name,
+                                BillingMode='PAY_PER_REQUEST',
+                                KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+                                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'N'}])
+    assert excinfo.value.response['Error']['Code'] == 'ValidationException', \
+        f"expected a ValidationException, got {excinfo.value.response['Error']}"
+
+    tables = [row.table_name for row in cql.execute(
+        f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = 'alternator_{table_name}';")]
+    assert not tables, f'a table was created in the object-storage keyspace: {tables}'
+
+
+async def run_scylla_sstable(args, timeout=300):
+    """Run a scylla sstable command without blocking the event loop, and without
+    letting a stalled object-storage request hang the run."""
+    proc = await asyncio.create_subprocess_exec(*args,
+                                               stdout=asyncio.subprocess.PIPE,
+                                               stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        pytest.fail(f"scylla sstable did not finish within {timeout}s: {args}")
+    finally:
+        # Reap the process on timeout, on cancellation, and on any error out of
+        # communicate(), so that a stray scylla does not outlive the test.
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    return proc.returncode, stdout.decode(), stderr.decode()
+
+
+async def test_scylla_sstable_layout_of_object_storage_table(manager: ScyllaClusterManager, object_storage):
+    """`scylla sstable layout ks table` describes a table living in object storage.
+
+    Its sstables cannot be listed: the bucket is shared by the whole cluster and
+    its objects are named after an sstable id alone, so which of them make up
+    the table on this node is only recorded in system.sstables. The tool has no
+    CQL to ask, and reads the registry from the sstables of the data dir."""
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    server = await manager.server_add(config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, keyspace_options(object_storage)) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int)")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{k}', {k});")
+                               for k in range(4)])
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+        # the tool reads the registry and the schema off the disk of a node it
+        # assumes is down, so both have to be flushed, and the node must not
+        # compact them away while it reads them
+        await manager.api.flush_keyspace(server.ip_addr, "system")
+        await manager.api.flush_keyspace(server.ip_addr, "system_schema")
+        await manager.api.disable_autocompaction(server.ip_addr, "system_schema")
+        await manager.api.disable_autocompaction(server.ip_addr, "system", "sstables")
+
+        table_id = await get_table_id(cql, ks, 'test')
+        res = await cql.run_async(
+            SimpleStatement(f"SELECT sstable_id, status FROM system.sstables WHERE table_id = {table_id} ALLOW FILTERING",
+                            consistency_level=ConsistencyLevel.ONE))
+        sealed = [row for row in res if row.status == 'sealed']
+        assert sealed, f'No sealed sstables registered for {ks}.test'
+
+        # the boto3 client only speaks to the s3 server, the gs one rejects its
+        # ListObjects, so the objects are compared where they can be listed and
+        # the registry -- the only metadata a write would go through -- always
+        def bucket_contents():
+            if object_storage.type != 's3':
+                return []
+            return sorted((o.key, o.size, o.e_tag) for o in
+                          object_storage.get_resource().Bucket(object_storage.bucket_name).objects.all())
+
+        before = bucket_contents()
+
+        scylla_path = await manager.server_get_exe(server.server_id)
+        workdir = await manager.server_get_workdir(server.server_id)
+        # the node is running, it can delete sstables while they are loaded
+        args = [scylla_path, "sstable", "layout", "--ignore-incomplete-sstables",
+                "--scylla-yaml-file", os.path.join(workdir, "conf", "scylla.yaml"),
+                "--output-format", "json", "--keyspace", ks, "--table", "test"]
+        returncode, out, err = await run_scylla_sstable(args)
+        assert returncode == 0, f"scylla sstable failed: {out} {err}"
+
+        # describing a table must not write to the bucket holding it, nor to
+        # the registry which says what the bucket holds
+        assert bucket_contents() == before, "the bucket changed"
+        after_registry = await cql.run_async(
+            SimpleStatement(f"SELECT sstable_id, status FROM system.sstables WHERE table_id = {table_id} ALLOW FILTERING",
+                            consistency_level=ConsistencyLevel.ONE))
+        assert sorted((r.sstable_id, r.status) for r in after_registry) == \
+               sorted((r.sstable_id, r.status) for r in res), "the sstables registry changed"
+
+        laid_out = [sst for group in json.loads(out)["compaction_groups"]
+                    for bucket in group["buckets"] for sst in bucket["sstables"]]
+        # every sstable the registry knows of was described, and it was read
+        assert len(laid_out) == len(sealed), f"{laid_out} != {sealed}"
+        assert all(sst["size"] > 0 for sst in laid_out), laid_out
+
+        # the table keeps nothing in the data dir, so the sstables it described
+        # can only have been the ones the registry named
+        local = [f for _, _, files in os.walk(os.path.join(workdir, "data", ks))
+                 for f in files if f.endswith("-Data.db")]
+        assert not local, f"{ks} has sstables in the data dir: {local}"
+
+
+async def test_scylla_sstable_dump_scylla_metadata(manager: ScyllaClusterManager, object_storage, tmp_path):
+    objconf = object_storage.create_endpoint_conf()
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': objconf}
+    cmd = ['--logger-log-level', 's3=trace:http=debug:gcp_storage=trace']
+    server = await manager.server_add(config=cfg, cmdline=cmd)
+
+    cql = manager.get_cql()
+
+    print(f'Create keyspace (storage server listening at {object_storage.address})')
+    async with new_test_keyspace(manager, keyspace_options(object_storage)) as ks:
+        schema = f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int)"
+        schema_file = os.path.join(tmp_path, f"{unique_name()}-schema.cql")
+        with open(schema_file, "w") as f:
+            f.write(schema)
+        await cql.run_async(schema)
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{k}', {k});") for k in range(4)])
+
+        await manager.api.flush_keyspace(server.ip_addr, ks)
+        # Scope the lookup to this table: system.sstables holds an entry for
+        # every object-storage sstable on the node, not just ours.
+        table_id = await get_table_id(cql, ks, 'test')
+        res = await cql.run_async(
+            SimpleStatement(f"SELECT sstable_id FROM system.sstables WHERE table_id = {table_id} ALLOW FILTERING",
+                            consistency_level=ConsistencyLevel.ONE))
+        sstables = [row.sstable_id for row in res]
+        assert sstables, f'No sstables registered for {ks}.test'
+        logger.debug(f'Found entries: {sstables}')
+
+        scylla_path = await manager.server_get_exe(server.server_id)
+        workdir = await manager.server_get_workdir(server.server_id)
+        args = [scylla_path, "sstable", "dump-scylla-metadata",
+                "--scylla-yaml-file", os.path.join(workdir, "conf", "scylla.yaml"),
+                "--schema-file", schema_file,
+                f"{object_storage.type}://{object_storage.bucket_name}/sstables/{sstables[0]}/TOC.txt"]
+        returncode, out, err = await run_scylla_sstable(args)
+        assert returncode == 0, f"scylla sstable failed: {out} {err}"
+        # The dump is keyed by component name and carries the scylla metadata of
+        # each sstable.  Checking the identifier, rather than just that some JSON
+        # came back, is what pins down that the tool recovered the descriptor from
+        # the TOC attributes and opened the sstable we asked for.
+        dumped = json.loads(out)["sstables"]
+        assert len(dumped) == 1, f"expected a single sstable in the dump, got {list(dumped)}"
+        metadata = next(iter(dumped.values()))
+        assert metadata.get("sstable_identifier") == str(sstables[0]), \
+            f"unexpected sstable_identifier: {metadata}"
+
+        # A path that does not name an sstable id is not a live-layout path, and
+        # must be reported as such rather than as a standard-layout parse error.
+        bad_args = args[:-1] + [f"{object_storage.type}://{object_storage.bucket_name}/sstables/not-a-uuid/TOC.txt"]
+        returncode, out, err = await run_scylla_sstable(bad_args)
+        assert returncode != 0
+        assert "is not one" in out + err, f"unexpected diagnosis: {out} {err}"
+
+
+@pytest.mark.parametrize('stop', ['graceful', 'kill'])
+async def test_registry_survives_restart(manager: ScyllaClusterManager, s3_storage, stop):
+    """SSTables that compaction deleted must not come back as live registry entries.
+
+    The registry lives in system.sstables, which distributed_loader reads while
+    loading non-system keyspaces - before the commitlog carrying its updates is
+    replayed. A SIGKILL therefore rolls the registry back to its last flushed
+    state, while the objects the rolled-back entries point at are already gone
+    from the bucket, so populating the keyspace aborts with a 404 and the node
+    never starts again.
+
+    Refs: https://scylladb.atlassian.net/browse/SCYLLADB-4603
+    """
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': s3_storage.create_endpoint_conf()}
+    server = await manager.server_add(config=cfg)
+    cql = manager.get_cql()
+
+    # A single tablet keeps the whole table in one compaction group, and with
+    # autocompaction off nothing merges the flushed sstables behind the test's
+    # back, so the two flushes below leave exactly the two the major compaction
+    # is meant to consume. compaction_manager::submit() honours the flag while
+    # perform_major_compaction() does not, so the explicit compaction still runs.
+    ks_opts = keyspace_options(s3_storage) + " AND tablets = {'initial': 1}"
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int);")
+        await manager.api.disable_autocompaction(server.ip_addr, ks, 'test')
+
+        # Two sstables, so the major compaction below has inputs to delete.
+        rows = {}
+        for batch in range(2):
+            for k in range(4):
+                name = f'{batch}-{k}'
+                rows[name] = k
+                await cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{name}', {k});")
+            await manager.api.keyspace_flush(server.ip_addr, ks)
+
+        table_id = await get_table_id(cql, ks, 'test')
+        host = (await wait_for_cql_and_get_hosts(cql, [server], time.time() + 60))[0]
+        node_owner = uuid.UUID(await manager.get_host_id(server.server_id))
+        entries = await cql.run_async(
+            SimpleStatement("SELECT generation, sstable_id, status FROM system.sstables"
+                            " WHERE table_id = %s AND node_owner = %s",
+                            consistency_level=ConsistencyLevel.ONE),
+            parameters=[table_id, node_owner], host=host)
+        assert len(entries) == 2 and all(e.status == 'sealed' for e in entries), \
+            f'Expected two sealed entries, got {entries}'
+        doomed = [e.sstable_id for e in entries]
+
+        # Flush system.sstables so those two sealed entries reach an sstable of
+        # their own. That is the state the registry reverts to when the node is
+        # killed; everything written from here on lives only in its memtable.
+        await manager.api.keyspace_flush(server.ip_addr, 'system', 'sstables')
+
+        # Compaction replaces both inputs and deletes their component objects,
+        # recording that in the registry - which is to say, in the memtable.
+        await manager.api.keyspace_compaction(server.ip_addr, ks)
+
+        bucket = s3_storage.get_resource().Bucket(s3_storage.bucket_name)
+
+        async def objects_deleted():
+            left = [o.key for sid in doomed
+                    for o in bucket.objects.filter(Prefix=f'sstables/{sid}/')]
+            return True if not left else None
+
+        await wait_for(objects_deleted, time.time() + 60)
+
+        # The kill loses the memtable, so the registry goes back to claiming the
+        # two compacted-away sstables are sealed and live.
+        # The graceful arm flushes the memtable on the way out and must always
+        # pass; it is the control that tells a registry rollback apart from
+        # object storage simply being unable to reload its sstables.
+        if stop == 'graceful':
+            await manager.server_stop_gracefully(server.server_id)
+        else:
+            await manager.server_stop(server.server_id, convict=False)
+        await manager.server_start(server.server_id)
+        cql = manager.get_cql()
+        # The session the test held was torn down with the node, so wait for the
+        # driver to reconnect rather than querying over the closed connection.
+        host = (await wait_for_cql_and_get_hosts(cql, [server], time.time() + 60))[0]
+
+        res = await cql.run_async(
+            SimpleStatement(f"SELECT * FROM {ks}.test;", consistency_level=ConsistencyLevel.ONE), host=host)
+        assert {r.name: r.value for r in res} == rows, 'Unexpected table content after restart'
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+@pytest.mark.parametrize('stop', ['graceful', 'kill'])
+async def test_registry_sealed_state_survives_ungraceful_restart(manager: ScyllaClusterManager, s3_storage, stop):
+    """A complete sstable must not lose its objects to the startup garbage collector.
+
+    The registry entry is created before the sstable's objects are written and
+    marked sealed after. If the entry reaches disk but the seal does not, an
+    ungraceful restart reads the entry as still 'creating' and garbage_collect()
+    deletes the objects of a complete, live sstable - with nothing in the log
+    beyond 'Removing dangling ... creating entry'.
+
+    Refs: https://scylladb.atlassian.net/browse/SCYLLADB-4603
+    """
+    cfg = {'enable_user_defined_functions': False,
+           'object_storage_endpoints': s3_storage.create_endpoint_conf()}
+    server = await manager.server_add(config=cfg)
+    cql = manager.get_cql()
+
+    # One tablet, and no compaction to add an sstable the test did not ask for
+    # while it is counting registry entries, or to replace the checked sstable
+    # after the restart. Disabling autocompaction through the REST API is not
+    # enough: the restarted node does not remember it, and compacts the checked
+    # sstable with the one flushed after the commitlog replay.
+    ks_opts = keyspace_options(s3_storage) + " AND tablets = {'initial': 1}"
+    async with new_test_keyspace(manager, ks_opts) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (name text PRIMARY KEY, value int)"
+                            " WITH compaction = {'class': 'NullCompactionStrategy'};")
+        rows = {}
+        for k in range(4):
+            rows[str(k)] = k
+            await cql.run_async(f"INSERT INTO {ks}.test (name, value) VALUES ('{k}', {k});")
+
+        table_id = await get_table_id(cql, ks, 'test')
+        host = (await wait_for_cql_and_get_hosts(cql, [server], time.time() + 60))[0]
+        node_owner = uuid.UUID(await manager.get_host_id(server.server_id))
+
+        async def entries():
+            return await cql.run_async(
+                SimpleStatement("SELECT generation, sstable_id, status FROM system.sstables"
+                                " WHERE table_id = %s AND node_owner = %s",
+                                consistency_level=ConsistencyLevel.ONE),
+                parameters=[table_id, node_owner], host=host)
+
+        # Hold the flush with the sstable written but its entry not yet sealed.
+        injection = 'object_storage_seal_before_sealed_status'
+        await manager.api.enable_injection(server.ip_addr, injection, one_shot=True)
+        flush = asyncio.create_task(manager.api.keyspace_flush(server.ip_addr, ks))
+
+        async def creating_entry():
+            es = await entries()
+            return True if es and all(e.status == 'creating' for e in es) else None
+        await wait_for(creating_entry, time.time() + 60)
+
+        # Persist the entry in that state. The seal below lands only in the
+        # memtable, which is what the kill throws away.
+        await manager.api.keyspace_flush(server.ip_addr, 'system', 'sstables')
+
+        await manager.api.message_injection(server.ip_addr, injection)
+        await flush
+
+        sealed = await entries()
+        assert len(sealed) == 1 and sealed[0].status == 'sealed', \
+            f'Expected one sealed entry after the flush, got {sealed}'
+        sid = sealed[0].sstable_id
+        bucket = s3_storage.get_resource().Bucket(s3_storage.bucket_name)
+        assert list(bucket.objects.filter(Prefix=f'sstables/{sid}/')), \
+            f'Sealed sstable {sid} has no objects'
+
+        if stop == 'graceful':
+            await manager.server_stop_gracefully(server.server_id)
+        else:
+            await manager.server_stop(server.server_id, convict=False)
+        await manager.server_start(server.server_id)
+        cql = manager.get_cql()
+        host = (await wait_for_cql_and_get_hosts(cql, [server], time.time() + 60))[0]
+
+        # The sstable was complete and sealed before the kill, so the collector
+        # had no business reaping it. Its objects are not checked directly: the
+        # loader may legitimately relocate the sstable across shards, which on
+        # object storage writes a fresh sstable id and drops the old objects.
+        log = await manager.server_open_log(server.server_id)
+        reaped = await log.grep('Removing dangling')
+        assert not reaped, f'Garbage collector reaped a sealed sstable: {reaped}'
+
+        # Only the entry the node was killed on is checked. The commitlog still
+        # held the inserts, so the replay re-applies them and the flush that
+        # follows it writes sstables of their own - entries this test did not
+        # create are normal here, and one of them can still be creating.
+        after = await entries()
+        assert not [e for e in after if e.sstable_id == sid and e.status != 'sealed'], \
+            f'The entry for {sid} lost its sealed status across the restart, got {after}'
+
+        res = await cql.run_async(
+            SimpleStatement(f"SELECT * FROM {ks}.test;", consistency_level=ConsistencyLevel.ONE), host=host)
+        assert {r.name: r.value for r in res} == rows, 'Unexpected table content after restart'

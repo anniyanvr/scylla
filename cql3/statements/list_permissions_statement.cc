@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include <vector>
@@ -18,8 +15,18 @@
 #include "auth/authorizer.hh"
 #include "auth/common.hh"
 #include "cql3/result_set.hh"
-#include "cql3/column_identifier.hh"
+#include "db/system_keyspace.hh"
 #include "transport/messages/result_message.hh"
+#include "service/raft/raft_group0_client.hh"
+
+shared_ptr<const cql3::metadata> cql3::statements::list_permissions_statement::get_result_metadata() const {
+    return ::make_shared<cql3::metadata>(
+            std::vector<lw_shared_ptr<cql3::column_specification>>{
+                    make_column_spec(db::system_keyspace::NAME, "permissions", "role", utf8_type),
+                    make_column_spec(db::system_keyspace::NAME, "permissions", "username", utf8_type),
+                    make_column_spec(db::system_keyspace::NAME, "permissions", "resource", utf8_type),
+                    make_column_spec(db::system_keyspace::NAME, "permissions", "permission", utf8_type)});
+}
 
 cql3::statements::list_permissions_statement::list_permissions_statement(
         auth::permission_set permissions,
@@ -32,8 +39,8 @@ cql3::statements::list_permissions_statement::list_permissions_statement(
 }
 
 std::unique_ptr<cql3::statements::prepared_statement> cql3::statements::list_permissions_statement::prepare(
-                data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(::make_shared<list_permissions_statement>(*this));
+                data_dictionary::database db, cql_stats& stats, const cql_config& cfg) {
+    return std::make_unique<prepared_statement>(audit_info(), ::make_shared<list_permissions_statement>(*this));
 }
 
 void cql3::statements::list_permissions_statement::validate(
@@ -45,14 +52,14 @@ void cql3::statements::list_permissions_statement::validate(
 
 future<> cql3::statements::list_permissions_statement::check_access(query_processor& qp, const service::client_state& state) const {
     if (_resource) {
-        maybe_correct_resource(*_resource, state);
+        maybe_correct_resource(*_resource, state, qp);
         return state.ensure_exists(*_resource);
     }
 
     const auto& as = *state.get_auth_service();
     const auto user = state.user();
 
-    return auth::has_superuser(as, *user).then([this, &state, &as, user](bool has_super) {
+    return state.has_superuser().then([this, &as, user](bool has_super) {
         if (has_super) {
             return make_ready_future<>();
         }
@@ -81,19 +88,8 @@ future<::shared_ptr<cql_transport::messages::result_message>>
 cql3::statements::list_permissions_statement::execute(
         query_processor& qp,
         service::query_state& state,
-        const query_options& options) const {
-    static auto make_column = [](sstring name) {
-        return make_lw_shared<column_specification>(
-                auth::meta::AUTH_KS,
-                "permissions",
-                ::make_shared<column_identifier>(std::move(name), true),
-                utf8_type);
-    };
-
-    static thread_local const std::vector<lw_shared_ptr<column_specification>> metadata({
-        make_column("role"), make_column("username"), make_column("resource"), make_column("permission")
-    });
-
+        const query_options& options,
+        std::optional<service::group0_guard> guard) const {
     const auto make_resource_filter = [this]()
             -> std::optional<std::pair<auth::resource, auth::recursive_permissions>> {
         if (!_resource) {
@@ -106,16 +102,17 @@ cql3::statements::list_permissions_statement::execute(
     };
 
     const auto& as = *state.get_client_state().get_auth_service();
+    auto metadata = ::make_shared<cql3::metadata>(*get_result_metadata());
 
-    return do_with(make_resource_filter(), [this, &as](const auto& resource_filter) {
+    return do_with(make_resource_filter(), [this, &as, metadata = std::move(metadata)](const auto& resource_filter) mutable {
         return auth::list_filtered_permissions(
                 as,
                 _permissions,
                 _role_name,
-                resource_filter).then([this](std::vector<auth::permission_details> all_details) {
+                resource_filter).then([metadata = std::move(metadata)](std::vector<auth::permission_details> all_details) mutable {
             std::sort(all_details.begin(), all_details.end());
 
-            auto rs = std::make_unique<result_set>(metadata);
+            auto rs = std::make_unique<result_set>(std::move(metadata));
 
             for (const auto& pd : all_details) {
                 const std::vector<sstring> sorted_permission_names = [&pd] {

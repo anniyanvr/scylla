@@ -1,0 +1,206 @@
+/*
+ * Copyright (C) 2024-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#pragma once
+
+#include <concepts>
+#include <cstdint>
+#include <set>
+#include <unordered_set>
+
+#include <seastar/core/sstring.hh>
+
+#include "dht/token.hh"
+#include "mutation/canonical_mutation.hh"
+#include "mutation/mutation.hh"
+#include "schema/schema.hh"
+#include "service/topology_state_machine.hh"
+#include "mutation/timestamp.hh"
+#include "utils/UUID.hh"
+
+namespace service {
+
+template<typename Builder>
+class topology_mutation_builder_base {
+private:
+    Builder& self() {
+        return *static_cast<Builder*>(this);
+    }
+
+protected:
+    enum class collection_apply_mode {
+        overwrite,
+        update,
+    };
+
+    using builder_base = topology_mutation_builder_base<Builder>;
+
+    Builder& apply_atomic(const char* cell, const data_value& value);
+    template<std::ranges::range C>
+    requires std::convertible_to<std::ranges::range_value_t<C>, data_value>
+    Builder& apply_set(const char* cell, collection_apply_mode apply_mode, const C& c);
+    Builder& set(const char* cell, node_state value);
+    Builder& set(const char* cell, topology_request value);
+    Builder& set(const char* cell, global_topology_request value);
+    Builder& set(const char* cell, const sstring& value);
+    Builder& set(const char* cell, const raft::server_id& value);
+    Builder& set(const char* cell, const uint32_t& value);
+    Builder& set(const char* cell, cleanup_status value);
+    Builder& set(const char* cell, storage_mode value);
+    Builder& set(const char* cell, const utils::UUID& value);
+    Builder& set(const char* cell, bool value);
+    Builder& set(const char* cell, const char* value);
+    Builder& set(const char* cell, const db_clock::time_point& value);
+
+    Builder& del(const char* cell);
+};
+
+class topology_mutation_builder;
+
+class topology_node_mutation_builder
+        : public topology_mutation_builder_base<topology_node_mutation_builder> {
+
+    friend builder_base;
+
+    topology_mutation_builder& _builder;
+    deletable_row& _r;
+
+private:
+    row& row();
+    api::timestamp_type timestamp() const;
+    const schema& schema() const;
+    ttl_opt ttl() const { return std::nullopt; }
+
+public:
+    topology_node_mutation_builder(topology_mutation_builder&, raft::server_id);
+
+    using builder_base::set;
+    using builder_base::del;
+    topology_node_mutation_builder& set(const char* cell, const std::unordered_set<raft::server_id>& nodes_ids);
+    topology_node_mutation_builder& set(const char* cell, const std::unordered_set<dht::token>& value);
+    topology_node_mutation_builder& set(const char* cell, const std::set<sstring>& value);
+
+    // Moves the node to the left state. The row stays - left_nodes is a
+    // permanent ban list - but the columns nobody reads for a left node go,
+    // because every reader of system.topology pays for them forever.
+    topology_node_mutation_builder& mark_left();
+
+    canonical_mutation build();
+};
+
+class topology_mutation_builder
+        : public topology_mutation_builder_base<topology_mutation_builder> {
+
+    friend builder_base;
+    friend class topology_node_mutation_builder;
+
+    schema_ptr _s;
+    mutation _m;
+    api::timestamp_type _ts;
+
+    std::optional<topology_node_mutation_builder> _node_builder;
+
+private:
+    row& row();
+    api::timestamp_type timestamp() const;
+    const schema& schema() const;
+    ttl_opt ttl() const { return std::nullopt; }
+
+public:
+    topology_mutation_builder(api::timestamp_type ts);
+    topology_mutation_builder& set_transition_state(topology::transition_state);
+    topology_mutation_builder& set_version(topology::version_t);
+    topology_mutation_builder& set_fence_version(topology::version_t);
+    topology_mutation_builder& set_session(session_id);
+    topology_mutation_builder& set_tablet_balancing_enabled(bool);
+    topology_mutation_builder& set_new_cdc_generation_data_uuid(const utils::UUID& value);
+    topology_mutation_builder& set_committed_cdc_generations(const std::vector<cdc::generation_id>& values);
+    topology_mutation_builder& set_new_keyspace_rf_change_data(const sstring &ks_name, const std::map<sstring, sstring> &rf_per_dc);
+    topology_mutation_builder& set_unpublished_cdc_generations(const std::vector<cdc::generation_id>& values);
+    topology_mutation_builder& set_global_topology_request(global_topology_request);
+    topology_mutation_builder& set_global_topology_request_id(const utils::UUID&);
+    topology_mutation_builder& set_upgrade_state_done();
+    topology_mutation_builder& add_enabled_features(const std::set<sstring>& value);
+    topology_mutation_builder& add_ignored_nodes(const std::unordered_set<raft::server_id>& value);
+    topology_mutation_builder& set_ignored_nodes(const std::unordered_set<raft::server_id>& value);
+    topology_mutation_builder& add_new_committed_cdc_generation(const cdc::generation_id& value);
+    topology_mutation_builder& del_transition_state();
+    topology_mutation_builder& del_session();
+    topology_mutation_builder& del_global_topology_request();
+    topology_mutation_builder& del_global_topology_request_id();
+    topology_mutation_builder& queue_global_topology_request_id(const utils::UUID& value);
+    topology_mutation_builder& drop_first_global_topology_request_id(const std::vector<utils::UUID>&, const utils::UUID&);
+    // Drops `ids` from the front of the queue. The plural counterpart of the above, for
+    // when several queued requests are handled together, see handle_global_request().
+    //
+    // `queue` must start with `ids`, otherwise this is an internal error. Callers take the
+    // ids from the head of the queue under the same guard the mutation is written with,
+    // and that guard also excludes group0 command application, so the queue cannot move
+    // underneath them. Dropping the wrong entries would either lose a request nobody
+    // answered, or leave an answered one to be popped and answered again on every
+    // subsequent round, wedging the coordinator on it forever.
+    topology_mutation_builder& drop_first_global_topology_request_ids(const std::vector<utils::UUID>& queue,
+            const std::vector<utils::UUID>& ids);
+    topology_mutation_builder& pause_rf_change_request(const utils::UUID&);
+    // Removes every id in `ids` from paused_rf_change_requests in a single overwrite.
+    // Several overwrites of one set at the same write timestamp merge into their union,
+    // so a pass which un-pauses more than one request must do it in one call.
+    topology_mutation_builder& resume_rf_change_requests(const std::unordered_set<utils::UUID>& current, const std::unordered_set<utils::UUID>& ids);
+    topology_mutation_builder& start_rf_change_migrations(const utils::UUID&);
+    topology_mutation_builder& finish_rf_change_migrations(const std::unordered_set<utils::UUID>&, const utils::UUID&);
+    topology_mutation_builder& start_restore_request(const utils::UUID& req_id);
+    // Removes every id in `req_ids` from ongoing_restore_requests in a single overwrite.
+    // Several overwrites of one set at the same write timestamp merge into their union,
+    // so callers finishing more than one request in a pass must use this.
+    topology_mutation_builder& finish_restore_requests(const std::unordered_set<utils::UUID>& current, const std::unordered_set<utils::UUID>& req_ids);
+    topology_node_mutation_builder& with_node(raft::server_id);
+    canonical_mutation build() { return canonical_mutation{std::move(_m)}; }
+};
+
+class topology_request_tracking_mutation_builder :
+            public topology_mutation_builder_base<topology_request_tracking_mutation_builder> {
+
+    schema_ptr _s;
+    mutation _m;
+    api::timestamp_type _ts;
+    deletable_row& _r;
+    bool _set_type;
+
+public:
+    row& row();
+    const schema& schema() const;
+    api::timestamp_type timestamp() const;
+    ttl_opt ttl() const;
+
+    topology_request_tracking_mutation_builder(utils::UUID id, bool set_type = false);
+    using builder_base::set;
+    using builder_base::del;
+    topology_request_tracking_mutation_builder& set(const char* cell, topology_request value);
+    topology_request_tracking_mutation_builder& set(const char* cell, global_topology_request value);
+    topology_request_tracking_mutation_builder& abort(sstring error);
+    // `end_time` defaults to now. Pass it explicitly when several requests are completed
+    // together, so that they are all stamped with the same time.
+    topology_request_tracking_mutation_builder& done(std::optional<sstring> error = std::nullopt,
+            std::optional<db_clock::time_point> end_time = std::nullopt);
+    topology_request_tracking_mutation_builder& set_truncate_table_data(const table_id& table_id);
+    topology_request_tracking_mutation_builder& set_new_keyspace_rf_change_data(const sstring& ks_name, const std::map<sstring, sstring>& rf_per_dc);
+    topology_request_tracking_mutation_builder& set_snapshot_tables_data(const std::unordered_set<table_id>&, const sstring& tag, bool);
+    topology_request_tracking_mutation_builder& set_finalize_migration_data(const sstring& ks_name);
+    // `tables` maps each table which has no tablet map yet to its tablet count target, 0 for none.
+    topology_request_tracking_mutation_builder& set_prepare_migration_data(const sstring& ks_name,
+            const std::unordered_map<table_id, size_t>& tables);
+    topology_request_tracking_mutation_builder& set_restore_tablets_data(const table_id& tid, const sstring& snapshot_name);
+
+    canonical_mutation build() { return canonical_mutation{std::move(_m)}; }
+};
+
+extern template class topology_mutation_builder_base<topology_mutation_builder>;
+extern template class topology_mutation_builder_base<topology_node_mutation_builder>;
+extern template class topology_mutation_builder_base<topology_request_tracking_mutation_builder>;
+
+} // namespace service

@@ -5,225 +5,280 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include <map>
+#include <functional>
 #include <unordered_set>
 #include <unordered_map>
 #include "gms/inet_address.hh"
-#include "dht/i_partitioner.hh"
-#include "inet_address_vectors.hh"
-#include "utils/UUID.hh"
+#include "dht/ring_position.hh"
 #include <optional>
 #include <memory>
-#include <boost/range/iterator_range.hpp>
 #include <boost/icl/interval.hpp>
-#include "range.hh"
+#include "utils/interval.hh"
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/sharded.hh>
+#include "utils/chunked_vector.hh"
+#include "utils/phased_barrier.hh"
+#include "service/topology_state_machine_fwd.hh"
+
+#include "locator/types.hh"
+#include "locator/topology.hh"
+#include "locator/token_metadata_fwd.hh"
+
+struct sort_by_proximity_topology;
 
 // forward declaration since replica/database.hh includes this file
 namespace replica {
 class keyspace;
 }
 
+namespace gms {
+class gossiper;
+}
+
 namespace locator {
+
+using topology_version_t = service::topology_version_t;
 
 class abstract_replication_strategy;
 
-using inet_address = gms::inet_address;
 using token = dht::token;
 
-// Endpoint Data Center and Rack names
-struct endpoint_dc_rack {
-    sstring dc;
-    sstring rack;
+class shared_token_metadata;
+class tablet_metadata;
+
+struct host_id_or_endpoint {
+    std::variant<host_id, gms::inet_address> _value;
+
+    enum class param_type {
+        host_id,
+        endpoint,
+        auto_detect
+    };
+
+    host_id_or_endpoint(const sstring& s, param_type restrict = param_type::auto_detect);
+
+    bool has_host_id() const noexcept {
+        return _value.index() == 0;
+    }
+
+    bool has_endpoint() const noexcept {
+        return _value.index() == 1;
+    }
+
+    host_id id() const {
+        return std::get<host_id>(_value);
+    };
+
+    gms::inet_address endpoint() const {
+        return std::get<gms::inet_address>(_value);
+    };
+
+    // Map the host_id to endpoint or vice verse, using the token_metadata.
+    // Throws runtime error if failed to resolve.
+    host_id resolve_id(const gms::gossiper&) const;
+    gms::inet_address resolve_endpoint(const gms::gossiper&) const;
 };
 
-class topology {
-public:
-    topology() {}
-    topology(const topology& other);
+using host_id_or_endpoint_list = std::vector<host_id_or_endpoint>;
 
-    future<> clear_gently() noexcept;
-
-    /**
-     * Stores current DC/rack assignment for ep
-     */
-    void add_endpoint(const inet_address& ep);
-
-    /**
-     * Removes current DC/rack assignment for ep
-     */
-    void remove_endpoint(inet_address ep);
-
-    /**
-     * Re-reads the DC/rack info for the given endpoint
-     * @param ep endpoint in question
-     */
-    void update_endpoint(inet_address ep);
-
-    /**
-     * Returns true iff contains given endpoint
-     */
-    bool has_endpoint(inet_address) const;
-
-    std::unordered_map<sstring,
-                       std::unordered_set<inet_address>>&
-    get_datacenter_endpoints() {
-        return _dc_endpoints;
-    }
-
-    const std::unordered_map<sstring,
-                           std::unordered_set<inet_address>>&
-    get_datacenter_endpoints() const {
-        return _dc_endpoints;
-    }
-
-    std::unordered_map<sstring,
-                       std::unordered_map<sstring,
-                                          std::unordered_set<inet_address>>>&
-    get_datacenter_racks() {
-        return _dc_racks;
-    }
-
-    const std::unordered_map<sstring,
-                       std::unordered_map<sstring,
-                                          std::unordered_set<inet_address>>>&
-    get_datacenter_racks() const {
-        return _dc_racks;
-    }
-
-    const endpoint_dc_rack& get_location(const inet_address& ep) const;
-private:
-    /** multi-map: DC -> endpoints in that DC */
-    std::unordered_map<sstring,
-                       std::unordered_set<inet_address>>
-        _dc_endpoints;
-
-    /** map: DC -> (multi-map: rack -> endpoints in that rack) */
-    std::unordered_map<sstring,
-                       std::unordered_map<sstring,
-                                          std::unordered_set<inet_address>>>
-        _dc_racks;
-
-    /** reverse-lookup map: endpoint -> current known dc/rack assignment */
-    std::unordered_map<inet_address, endpoint_dc_rack> _current_locations;
-};
+[[nodiscard]] inline bool check_host_ids_contain_only_uuid(const auto& host_ids) {
+    return std::ranges::none_of(host_ids, [](const auto& node_str) { return locator::host_id_or_endpoint{node_str}.has_endpoint(); });
+}
 
 class token_metadata_impl;
+struct topology_change_info;
 
-class token_metadata final {
-    std::unique_ptr<token_metadata_impl> _impl;
+struct version_tracker {
 public:
-    using UUID = utils::UUID;
-    using inet_address = gms::inet_address;
-private:
-    class tokens_iterator {
-    public:
-        using iterator_category = std::input_iterator_tag;
-        using value_type = token;
-        using difference_type = std::ptrdiff_t;
-        using pointer = token*;
-        using reference = token&;
-    public:
-        tokens_iterator() = default;
-        tokens_iterator(const token& start, const token_metadata_impl* token_metadata);
-        bool operator==(const tokens_iterator& it) const;
-        const token& operator*() const;
-        tokens_iterator& operator++();
-    private:
-        std::vector<token>::const_iterator _cur_it;
-        size_t _remaining = 0;
-        const token_metadata_impl* _token_metadata = nullptr;
+    friend class shared_token_metadata;
 
-        friend class token_metadata_impl;
+    using link_base = boost::intrusive::list_member_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>>;
+    struct link_type : link_base {
+        link_type() noexcept = default;
+        link_type(link_type&& o) noexcept { swap_nodes(o); }
+        link_type& operator=(link_type&& o) noexcept {
+            if (this != &o) {
+                unlink();
+                swap_nodes(o);
+            }
+            return *this;
+        }
     };
+private:
+    utils::phased_barrier::operation _op;
+    topology_version_t _version;
+    const token_metadata* _tm = nullptr;
+    link_type _link;
+
+    // When engaged it means the version is no longer latest and should be released soon as to
+    // not block barriers. If this version dies past _log_threshold, it should self-report.
+    std::optional<std::chrono::steady_clock::time_point> _expired_at;
+    std::chrono::steady_clock::duration _log_threshold;
 public:
-    token_metadata();
+    version_tracker() = default;
+    version_tracker(utils::phased_barrier::operation op, const token_metadata& tm);
+    version_tracker(version_tracker&&) noexcept = default;
+    version_tracker& operator=(version_tracker&& o) noexcept {
+        if (this != &o) {
+            std::destroy_at(this);
+            new (this) version_tracker(std::move(o));
+        }
+        return *this;
+    };
+    version_tracker(const version_tracker&) = delete;
+    ~version_tracker();
+
+    topology_version_t version() const {
+        return _version;
+    }
+
+    long version_use_count() const;
+
+    void mark_expired(std::chrono::steady_clock::duration log_threshold) {
+        if (!_expired_at) {
+            _expired_at = std::chrono::steady_clock::now();
+            _log_threshold = log_threshold;
+        }
+    }
+};
+
+class tokens_iterator {
+public:
+    using iterator_category = std::input_iterator_tag;
+    using iterator_concept = std::input_iterator_tag;
+    using value_type = token;
+    using difference_type = std::ptrdiff_t;
+    using pointer = token*;
+    using reference = token&;
+public:
+    tokens_iterator() = default;
+    tokens_iterator(const token& start, const token_metadata_impl* token_metadata);
+    bool operator==(const tokens_iterator& it) const;
+    const token& operator*() const;
+    tokens_iterator& operator++();
+    tokens_iterator operator++(int) {
+        auto tmp = *this;
+        ++*this;
+        return tmp;
+    }
+private:
+    utils::chunked_vector<token>::const_iterator _cur_it;
+    size_t _remaining = 0;
+    const token_metadata_impl* _token_metadata = nullptr;
+
+    friend class token_metadata_impl;
+};
+
+class token_metadata final: public enable_lw_shared_from_this<token_metadata> {
+    shared_token_metadata* _shared_token_metadata = nullptr;
+    std::unique_ptr<token_metadata_impl> _impl;
+private:
+    friend class token_metadata_ring_splitter;
+    using tokens_iterator = locator::tokens_iterator;
+public:
+    struct config {
+        topology::config topo_cfg;
+    };
+    using inet_address = gms::inet_address;
+    using version_t = topology_version_t;
+    using version_tracker_t = version_tracker;
+
+    token_metadata(shared_token_metadata& stm, config cfg);
     explicit token_metadata(std::unique_ptr<token_metadata_impl> impl);
     token_metadata(token_metadata&&) noexcept; // Can't use "= default;" - hits some static_assert in unique_ptr
     token_metadata& operator=(token_metadata&&) noexcept;
     ~token_metadata();
-    const std::vector<token>& sorted_tokens() const;
+    const utils::chunked_vector<token>& sorted_tokens() const;
+    const tablet_metadata& tablets() const;
+    tablet_metadata& tablets();
+    void set_tablets(tablet_metadata);
     // Update token->endpoint mappings for a given \c endpoint.
     // \c tokens are all the tokens that are now owned by \c endpoint.
-    future<> update_normal_tokens(std::unordered_set<token> tokens, inet_address endpoint);
-    // Batch update token->endpoint mappings for the given endpoints.
-    // The \c endpoint_tokens map contains the set of tokens currently owned by each respective endpoint.
-    future<> update_normal_tokens(const std::unordered_map<inet_address, std::unordered_set<token>>& endpoint_tokens);
+    //
+    // Note: the function is not exception safe!
+    // It must be called only on a temporary copy of the token_metadata
+    future<> update_normal_tokens(std::unordered_set<token> tokens, host_id endpoint);
     const token& first_token(const token& start) const;
     size_t first_token_index(const token& start) const;
-    std::optional<inet_address> get_endpoint(const token& token) const;
-    std::vector<token> get_tokens(const inet_address& addr) const;
-    const std::unordered_map<token, inet_address>& get_token_to_endpoint() const;
-    const std::unordered_set<inet_address>& get_leaving_endpoints() const;
-    const std::unordered_map<token, inet_address>& get_bootstrap_tokens() const;
-    void update_topology(inet_address ep);
+    std::optional<host_id> get_endpoint(const token& token) const;
+    std::vector<token> get_tokens(const host_id& addr) const;
+    const std::unordered_map<token, host_id>& get_token_to_endpoint() const;
+    const std::unordered_set<host_id>& get_leaving_endpoints() const;
+    const std::unordered_map<token, host_id>& get_bootstrap_tokens() const;
+
     /**
-     * Creates an iterable range of the sorted tokens starting at the token next
-     * after the given one.
+     * Update or add a node for a given host_id.
+     * The other arguments (dc, state, shard_count) are optional, i.e. the corresponding node
+     * fields won't be updated if std::nullopt is passed.
+     */
+    void update_topology(host_id ep, std::optional<endpoint_dc_rack> opt_dr, std::optional<node::state> opt_st = std::nullopt,
+                         std::optional<shard_id> shard_count = std::nullopt);
+    /**
+     * Set a flag of the node with the given host_id, see node::set_flag().
+     * No-op if there is no such node.
+     */
+    void set_node_flag(host_id id, node::flag f, bool value);
+    /**
+     * Records the local host_id in the topology config, see topology::set_host_id_cfg().
+     */
+    void set_host_id_cfg(host_id this_host_id);
+    /**
+     * Creates an iterable range of the sorted tokens starting at the token t
+     * such that t >= start.
      *
      * @param start A token that will define the beginning of the range
      *
      * @return The requested range (see the description above)
      */
-    boost::iterator_range<tokens_iterator> ring_range(const token& start) const;
-    boost::iterator_range<tokens_iterator> ring_range(
-        const std::optional<dht::partition_range::bound>& start) const;
+    std::ranges::subrange<tokens_iterator> ring_range(const token& start) const;
 
-    topology& get_topology();
+    /**
+     * Returns a range of tokens such that the first token t satisfies dht::ring_position_view::ending_at(t) >= start.
+     */
+    std::ranges::subrange<tokens_iterator> ring_range(dht::ring_position_view start) const;
+
     const topology& get_topology() const;
     void debug_show() const;
 
-    /**
-     * Store an end-point to host ID mapping.  Each ID must be unique, and
-     * cannot be changed after the fact.
-     *
-     * @param hostId
-     * @param endpoint
-     */
-    void update_host_id(const UUID& host_id, inet_address endpoint);
-
-    /** Return the unique host ID for an end-point. */
-    UUID get_host_id(inet_address endpoint) const;
-
-    /// Return the unique host ID for an end-point or nullopt if not found.
-    std::optional<UUID> get_host_id_if_known(inet_address endpoint) const;
-
-    /** Return the end-point for a unique host ID */
-    std::optional<inet_address> get_endpoint_for_host_id(UUID host_id) const;
-
     /** @return a copy of the endpoint-to-id map for read-only operations */
-    const std::unordered_map<inet_address, utils::UUID>& get_endpoint_to_host_id_map_for_reading() const;
+    std::unordered_set<host_id> get_host_ids() const;
 
-    void add_bootstrap_token(token t, inet_address endpoint);
+    /// Returns host_id of the local node.
+    host_id get_my_id() const;
 
-    void add_bootstrap_tokens(std::unordered_set<token> tokens, inet_address endpoint);
+    void add_bootstrap_token(token t, host_id endpoint);
+
+    void add_bootstrap_tokens(std::unordered_set<token> tokens, host_id endpoint);
 
     void remove_bootstrap_tokens(std::unordered_set<token> tokens);
 
-    void add_leaving_endpoint(inet_address endpoint);
-    void del_leaving_endpoint(inet_address endpoint);
+    void add_leaving_endpoint(host_id endpoint);
+    void del_leaving_endpoint(host_id endpoint);
 
-    void remove_endpoint(inet_address endpoint);
+    void remove_endpoint(host_id endpoint);
 
-    bool is_member(inet_address endpoint) const;
+    // Checks if the node is part of the token ring. If yes, the node is one of
+    // the nodes that owns the tokens and inside the set _normal_token_owners.
+    bool is_normal_token_owner(host_id endpoint) const;
 
-    bool is_leaving(inet_address endpoint) const;
+    bool is_leaving(host_id endpoint) const;
 
     // Is this node being replaced by another node
-    bool is_being_replaced(inet_address endpoint) const;
+    bool is_being_replaced(host_id endpoint) const;
 
     // Is any node being replaced by another node
     bool is_any_node_being_replaced() const;
 
-    void add_replacing_endpoint(inet_address existing_node, inet_address replacing_node);
+    void add_replacing_endpoint(host_id existing_node, host_id replacing_node);
 
-    void del_replacing_endpoint(inet_address existing_node);
+    void del_replacing_endpoint(host_id existing_node);
 
     /**
      * Create a full copy of token_metadata using asynchronous continuations.
@@ -264,84 +319,136 @@ public:
      * Number of returned ranges = O(1)
      */
     dht::token_range_vector get_primary_ranges_for(token right) const;
-    static boost::icl::interval<token>::interval_type range_to_interval(range<dht::token> r);
-    static range<dht::token> interval_to_range(boost::icl::interval<token>::interval_type i);
+    static boost::icl::interval<token>::interval_type range_to_interval(wrapping_interval<dht::token> r);
+    static wrapping_interval<dht::token> interval_to_range(boost::icl::interval<token>::interval_type i);
 
-    bool has_pending_ranges(sstring keyspace_name, inet_address endpoint) const;
-     /**
-     * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
-     *
-     * (1) When in doubt, it is better to write too much to a node than too little. That is, if
-     * there are multiple nodes moving, calculate the biggest ranges a node could have. Cleaning
-     * up unneeded data afterwards is better than missing writes during movement.
-     * (2) When a node leaves, ranges for other nodes can only grow (a node might get additional
-     * ranges, but it will not lose any of its current ranges as a result of a leave). Therefore
-     * we will first remove _all_ leaving tokens for the sake of calculation and then check what
-     * ranges would go where if all nodes are to leave. This way we get the biggest possible
-     * ranges with regard current leave operations, covering all subsets of possible final range
-     * values.
-     * (3) When a node bootstraps, ranges of other nodes can only get smaller. Without doing
-     * complex calculations to see if multiple bootstraps overlap, we simply base calculations
-     * on the same token ring used before (reflecting situation after all leave operations have
-     * completed). Bootstrapping nodes will be added and removed one by one to that metadata and
-     * checked what their ranges would be. This will give us the biggest possible ranges the
-     * node could have. It might be that other bootstraps make our actual final ranges smaller,
-     * but it does not matter as we can clean up the data afterwards.
-     *
-     * NOTE: This is heavy and ineffective operation. This will be done only once when a node
-     * changes state in the cluster, so it should be manageable.
-     */
-    future<> update_pending_ranges(const abstract_replication_strategy& strategy, const sstring& keyspace_name);
+    future<> update_topology_change_info(dc_rack_fn& get_dc_rack);
+
+    const std::optional<topology_change_info>& get_topology_change_info() const;
 
     token get_predecessor(token t) const;
 
-    std::vector<inet_address> get_all_endpoints() const;
+    const std::unordered_set<host_id>& get_normal_token_owners() const;
+
+    void for_each_token_owner(std::function<void(const node&)> func) const;
 
     /* Returns the number of different endpoints that own tokens in the ring.
      * Bootstrapping tokens are not taken into account. */
     size_t count_normal_token_owners() const;
 
-    // returns empty vector if keyspace_name not found.
-    inet_address_vector_topology_change pending_endpoints_for(const token& token, const sstring& keyspace_name) const;
+    // Returns the map: DC -> host_id of token owners in that DC.
+    // If there are no token owners in a DC, it is not present in the result.
+    // The result is cached and remains valid until this token_metadata is mutated.
+    const std::unordered_map<sstring, std::unordered_set<host_id>>& get_datacenter_token_owners() const;
 
-    /** @return an endpoint to token multimap representation of tokenToEndpointMap (a copy) */
-    std::multimap<inet_address, token> get_endpoint_to_token_map_for_reading() const;
-    /**
-     * @return a (stable copy, won't be modified) Token to Endpoint map for all the normal and bootstrapping nodes
-     *         in the cluster.
-     */
-    std::map<token, inet_address> get_normal_and_bootstrapping_token_to_endpoint_map() const;
+    // Returns the map: DC -> (map: rack -> host_id of token owners in that rack).
+    // If there are no token owners in a DC/rack, it is not present in the result.
+    // The result is cached and remains valid until this token_metadata is mutated.
+    const std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<host_id>>>&
+    get_datacenter_racks_token_owners() const;
+
+    // Returns the map: DC -> token owners in that DC.
+    // If there are no token owners in a DC, it is not present in the result.
+    std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>> get_datacenter_token_owners_nodes() const;
+
+    // Returns the map: DC -> (map: rack -> token owners in that rack).
+    // If there are no token owners in a DC/rack, it is not present in the result.
+    std::unordered_map<sstring, std::unordered_map<sstring, std::unordered_set<std::reference_wrapper<const node>>>>
+    get_datacenter_racks_token_owners_nodes() const;
+
+    // Updates the read_new flag, switching read requests from
+    // the old endpoints to the new ones during topology changes:
+    // read_new_t::no - no read_endpoints will be stored on update_pending_ranges, all reads goes to normal endpoints;
+    // read_new_t::yes - triggers update_pending_ranges to compute and store new ranges for read requests.
+    // The value is preserved in all clone functions, the default is read_new_t::no.
+    using read_new_t = bool_class<class read_new_tag>;
+    void set_read_new(read_new_t value);
 
     long get_ring_version() const;
     void invalidate_cached_rings();
 
+    version_t get_version() const;
+    void set_version(version_t version);
+
+    shared_token_metadata& get_shared_token_metadata();
+
     friend class token_metadata_impl;
+    friend class shared_token_metadata;
+private:
+    void set_version_tracker(version_tracker_t tracker);
+
+    void set_shared_token_metadata(shared_token_metadata& stm);
+
+    // Clears and disposes the token metadata impl in the background, if present.
+    void clear_and_dispose_impl() noexcept;
 };
 
-using token_metadata_ptr = lw_shared_ptr<const token_metadata>;
-using mutable_token_metadata_ptr = lw_shared_ptr<token_metadata>;
+struct topology_change_info {
+    lw_shared_ptr<token_metadata> target_token_metadata;
+    utils::chunked_vector<dht::token> all_tokens;
+    token_metadata::read_new_t read_new;
+
+    topology_change_info(lw_shared_ptr<token_metadata> target_token_metadata_,
+        utils::chunked_vector<dht::token> all_tokens_,
+        token_metadata::read_new_t read_new_);
+    future<> clear_gently();
+};
+
 using token_metadata_lock = semaphore_units<>;
 using token_metadata_lock_func = noncopyable_function<future<token_metadata_lock>() noexcept>;
 
-template <typename... Args>
-mutable_token_metadata_ptr make_token_metadata_ptr(Args... args) {
-    return make_lw_shared<token_metadata>(std::forward<Args>(args)...);
-}
-
-class shared_token_metadata {
+class shared_token_metadata : public peering_sharded_service<shared_token_metadata> {
+    named_gate _background_dispose_gate{"shared_token_metadata::background_dispose_gate"};
     mutable_token_metadata_ptr _shared;
     token_metadata_lock_func _lock_func;
+    std::chrono::steady_clock::duration _stall_detector_threshold = std::chrono::seconds(2);
 
+    // We use this barrier during the transition to a new token_metadata version to ensure that the
+    // system stops using previous versions. Here are the key points:
+    //   * A new phase begins when a mutable_token_metadata_ptr passed to shared_token_metadata::set has
+    //   a higher version than the current one.
+    //   * Each shared_token_metadata::set call initiates an operation on the barrier. If multiple calls
+    //   have the same version, multiple operations may be initiated with the same phase.
+    //   * The operation is stored within the new token_metadata instance (token_metadata::set_version_tracker),
+    //   and it completes when the instance is destroyed.
+    //   * The method shared_token_metadata::stale_versions_in_use can be used to wait for the phase
+    //   transition to complete. Once this future resolves, there will be no token_metadata instances
+    //   with versions lower than the current one.
+    //   * Multiple new phases (version upgrades) can be started before accessing stale_versions_in_use.
+    //   However, stale_versions_in_use waits for all previous phases to finish, as advance_and_await
+    //   includes its own invocation as an operation in the new phase.
+    utils::phased_barrier _versions_barrier;
+    shared_future<> _stale_versions_in_use{make_ready_future<>()};
+    using version_tracker_list_type = boost::intrusive::list<version_tracker,
+            boost::intrusive::member_hook<version_tracker, version_tracker::link_type, &version_tracker::_link>,
+            boost::intrusive::constant_time_size<false>>;
+    version_tracker_list_type _trackers;
+private:
+    version_tracker new_tracker(const token_metadata& tm);
 public:
     // used to construct the shared object as a sharded<> instance
     // lock_func returns semaphore_units<>
-    explicit shared_token_metadata(token_metadata_lock_func lock_func)
-        : _shared(make_token_metadata_ptr())
+    explicit shared_token_metadata(token_metadata_lock_func lock_func, token_metadata::config cfg)
+        : _shared(make_lw_shared<token_metadata>(*this, cfg))
         , _lock_func(std::move(lock_func))
-    { }
+        , _versions_barrier("shared_token_metadata::versions_barrier")
+    {
+        _shared->set_version_tracker(new_tracker(*_shared));
+    }
 
     shared_token_metadata(const shared_token_metadata& x) = delete;
     shared_token_metadata(shared_token_metadata&& x) = default;
+
+    future<> stop() noexcept;
+
+    mutable_token_metadata_ptr make_token_metadata_ptr() {
+        return make_lw_shared<token_metadata>(*this, token_metadata::config{_shared->get_topology().get_config()});
+    }
+
+    mutable_token_metadata_ptr make_token_metadata_ptr(token_metadata&& tm) {
+        tm.set_shared_token_metadata(*this);
+        return make_lw_shared<token_metadata>(std::move(tm));
+    }
 
     token_metadata_ptr get() const noexcept {
         return _shared;
@@ -349,15 +456,26 @@ public:
 
     void set(mutable_token_metadata_ptr tmptr) noexcept;
 
+    void set_stall_detector_threshold(std::chrono::steady_clock::duration threshold) {
+        _stall_detector_threshold = threshold;
+    }
+
+    // Returns a map version -> use_count
+    std::unordered_map<topology_version_t, int> describe_stale_versions();
+
+    future<> stale_versions_in_use() const {
+        return _stale_versions_in_use.get_future();
+    }
+
     // Token metadata changes are serialized
     // using the schema_tables merge_lock.
     //
     // Must be called on shard 0.
-    future<token_metadata_lock> get_lock() noexcept {
+    future<token_metadata_lock> get_lock() const noexcept {
         return _lock_func();
     }
 
-    // mutate_token_metadata acquires the shared_token_metadata lock,
+    // mutate_token_metadata_on_all_shards acquires the shared_token_metadata lock,
     // clones the token_metadata (using clone_async)
     // and calls an asynchronous functor on
     // the cloned copy of the token_metadata to mutate it.
@@ -366,6 +484,35 @@ public:
     // is set back to to the shared_token_metadata,
     // otherwise, the clone is destroyed.
     future<> mutate_token_metadata(seastar::noncopyable_function<future<> (token_metadata&)> func);
+
+    // mutate_token_metadata_on_all_shards acquires the shared_token_metadata lock,
+    // clones the token_metadata (using clone_async)
+    // and calls an asynchronous functor on
+    // the cloned copy of the token_metadata to mutate it.
+    //
+    // If the functor is successful, the mutated clone
+    // is set back to to the shared_token_metadata on all shards,
+    // otherwise, the clone is destroyed.
+    //
+    // Must be called on shard 0.
+    static future<> mutate_on_all_shards(sharded<shared_token_metadata>& stm, seastar::noncopyable_function<future<> (token_metadata&)> func);
+
+    void clear_and_dispose(std::unique_ptr<token_metadata_impl> impl) noexcept;
+
+private:
+    // for testing only, unsafe to be called without awaiting get_lock() first
+    void mutate_token_metadata_for_test(seastar::noncopyable_function<void (token_metadata&)> func);
+
+    friend struct ::sort_by_proximity_topology;
+};
+
+class pending_token_metadata {
+    std::vector<locator::mutable_token_metadata_ptr> _shards{this_smp_shard_count()};
+public:
+    future<> assign(locator::mutable_token_metadata_ptr new_token_metadata);
+    locator::mutable_token_metadata_ptr& local();
+    locator::token_metadata_ptr local() const;
+    future<> destroy();
 };
 
 }

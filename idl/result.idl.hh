@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 namespace query {
@@ -20,6 +20,7 @@ class result {
     std::optional<uint32_t> row_count_low_bits() [[version 2.1]];
     std::optional<uint32_t> partition_count() [[version 2.1]];
     std::optional<uint32_t> row_count_high_bits() [[version 4.3]];
+    std::optional<full_position> last_position() [[version 5.1]];
 };
 
 }

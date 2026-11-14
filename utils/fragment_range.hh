@@ -3,23 +3,21 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <concepts>
 #include <compare>
-#include <boost/range/algorithm/copy.hpp>
+#include <algorithm>
 #include <seastar/net/byteorder.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/util/backtrace.hh>
 
 #include "marshal_exception.hh"
 #include "bytes.hh"
 #include "utils/bit_cast.hh"
-
-enum class mutable_view { no, yes, };
 
 /// Fragmented buffer
 ///
@@ -123,7 +121,7 @@ bytes linearized(const FragmentedBuffer& buffer)
     bytes b(bytes::initialized_later(), buffer.size_bytes());
     auto dst = b.begin();
     for (bytes_view fragment : buffer) {
-        dst = boost::copy(fragment, dst);
+        dst = std::ranges::copy(fragment, dst).out;
     }
     return b;
 }
@@ -136,7 +134,7 @@ decltype(auto) with_linearized(const FragmentedBuffer& buffer, Function&& fn)
 {
     bytes b;
     bytes_view bv;
-    if (__builtin_expect(!buffer.empty() && std::next(buffer.begin()) == buffer.end(), true)) {
+    if (!buffer.empty() && std::next(buffer.begin()) == buffer.end()) [[likely]] {
         bv = *buffer.begin();
     } else if (!buffer.empty()) {
         b = linearized(buffer);
@@ -208,6 +206,11 @@ struct fragment_range {
     size_t size_bytes() const { return view.size_bytes(); }
     bool empty() const { return view.empty(); }
 };
+
+template <FragmentedView View>
+inline bool is_single_fragment(View v) {
+    return v.empty() || v.size_bytes() == v.current_fragment().size();
+}
 
 template<FragmentedView View>
 requires (!FragmentRange<View>)
@@ -388,7 +391,7 @@ T read_simple_exactly(View v) {
 }
 
 template<typename T, FragmentedMutableView Out>
-static inline
+inline
 void write(Out& out, std::type_identity_t<T> val) {
     auto v = net::ntoh(val);
     auto p = reinterpret_cast<const bytes_view::value_type*>(&v);
@@ -401,7 +404,7 @@ void write(Out& out, std::type_identity_t<T> val) {
 }
 
 template<typename T, FragmentedMutableView Out>
-static inline
+inline
 void write_native(Out& out, std::type_identity_t<T> v) {
     auto p = reinterpret_cast<const bytes_view::value_type*>(&v);
     if (out.current_fragment().size() >= sizeof(v)) [[likely]] {
@@ -412,22 +415,14 @@ void write_native(Out& out, std::type_identity_t<T> v) {
     }
 }
 
-inline sstring::iterator fragment_to_hex(sstring::iterator out, bytes_view frag) {
-    static constexpr char digits[] = "0123456789abcdef";
-    for (auto byte : frag) {
-        uint8_t x = static_cast<uint8_t>(byte);
-        *out++ = digits[x >> 4];
-        *out++ = digits[x & 0xf];
+template <FragmentedView View>
+struct fmt::formatter<View> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const View& b, FormatContext& ctx) const {
+        auto out = ctx.out();
+        for (auto frag : fragment_range(b)) {
+            fmt::format_to(out, "{}", fmt_hex(frag));
+        }
+        return out;
     }
-    return out;
-}
-
-template<FragmentedView View>
-sstring to_hex(const View& b) {
-    sstring out = uninitialized_string(b.size_bytes() * 2);
-    auto it = out.begin();
-    for (auto frag : fragment_range(b)) {
-        it = fragment_to_hex(it, frag);
-    }
-    return out;
-}
+};

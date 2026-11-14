@@ -1,27 +1,35 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/statements/raw/select_statement.hh"
+#include "cql3/expr/unset.hh"
 #include "cql3/cql_statement.hh"
 #include "cql3/stats.hh"
 #include <seastar/core/shared_ptr.hh>
+#include <string_view>
 #include "transport/messages/result_message.hh"
 #include "index/secondary_index_manager.hh"
+#include "exceptions/coordinator_result.hh"
+#include "locator/host_id.hh"
+#include "service/cas_shard.hh"
 
 namespace service {
     class client_state;
+    class storage_proxy;
+    class storage_proxy_coordinator_query_options;
+    class storage_proxy_coordinator_query_result;
+    namespace pager {
+        class query_pager;
+    }
 } // namespace service
 
 namespace cql3 {
@@ -30,14 +38,22 @@ class query_processor;
 
 namespace selection {
     class selection;
+    class external_values_provider;
 } // namespace selection
 
 namespace restrictions {
     class restrictions;
-    class statement_restrictions;
+    class select_restrictions;
 } // namespace restrictions
 
 namespace statements {
+
+
+/// Encapsulates a partition key and clustering key prefix as a primary key.
+struct primary_key {
+    dht::decorated_key partition;
+    clustering_key_prefix clustering;
+};
 
 /**
  * Encapsulates a completely parsed SELECT query, including the target
@@ -46,20 +62,27 @@ namespace statements {
  */
 class select_statement : public cql_statement {
 public:
+    template<typename T>
+    using coordinator_result = exceptions::coordinator_result<T>;
     using parameters = raw::select_statement::parameters;
     using ordering_comparator_type = raw::select_statement::ordering_comparator_type;
-    static constexpr int DEFAULT_COUNT_PAGE_SIZE = 10000;
+    using prepared_ann_ordering_type = raw::select_statement::prepared_ann_ordering_type;
 protected:
     static thread_local const lw_shared_ptr<const parameters> _default_parameters;
     schema_ptr _schema;
+    schema_ptr _query_schema;
     uint32_t _bound_terms;
     lw_shared_ptr<const parameters> _parameters;
     ::shared_ptr<selection::selection> _selection;
-    ::shared_ptr<restrictions::statement_restrictions> _restrictions;
-    const bool _restrictions_need_filtering;
+    const ::shared_ptr<const restrictions::select_restrictions> _restrictions;
+private:
+    const bool _restrictions_need_filtering; // Access via needs_post_filtering()
+protected:
     ::shared_ptr<std::vector<size_t>> _group_by_cell_indices; ///< Indices in result row of cells holding GROUP BY values.
     bool _is_reversed;
+    expr::unset_bind_variable_guard _limit_unset_guard;
     std::optional<expr::expression> _limit;
+    expr::unset_bind_variable_guard _per_partition_limit_unset_guard;
     std::optional<expr::expression> _per_partition_limit;
 
     template<typename T>
@@ -78,6 +101,11 @@ protected:
     bool _range_scan = false;
     bool _range_scan_no_bypass_cache = false;
     std::unique_ptr<cql3::attributes> _attrs;
+private:
+    future<shared_ptr<cql_transport::messages::result_message>> process_results_complex(foreign_ptr<lw_shared_ptr<query::result>> results,
+        lw_shared_ptr<query::read_command> cmd, const query_options& options, gc_clock::time_point now,
+        const cql3::selection::external_values_provider* external_values_provider = nullptr) const;
+    void detect_range_scan();
 protected :
     virtual future<::shared_ptr<cql_transport::messages::result_message>> do_execute(query_processor& qp,
         service::query_state& state, const query_options& options) const;
@@ -87,7 +115,7 @@ public:
             uint32_t bound_terms,
             lw_shared_ptr<const parameters> parameters,
             ::shared_ptr<selection::selection> selection,
-            ::shared_ptr<restrictions::statement_restrictions> restrictions,
+            ::shared_ptr<const restrictions::select_restrictions> restrictions,
             ::shared_ptr<std::vector<size_t>> group_by_cell_indices,
             bool is_reversed,
             ordering_comparator_type ordering_comparator,
@@ -99,24 +127,41 @@ public:
     virtual ::shared_ptr<const cql3::metadata> get_result_metadata() const override;
     virtual uint32_t get_bound_terms() const override;
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
-    virtual void validate(query_processor&, const service::client_state& state) const override;
-    virtual bool depends_on_keyspace(const sstring& ks_name) const override;
-    virtual bool depends_on_column_family(const sstring& cf_name) const override;
+    virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const override;
+
+    virtual std::optional<service::pager::query_plan> query_plan_for_paging() const override {
+        return scanned_plan();
+    }
+
+    virtual std::optional<std::string_view> keyspace_for_reparse() const override {
+        return keyspace();
+    }
+
+    virtual bool should_reclassify_control_connection() const override;
 
     virtual future<::shared_ptr<cql_transport::messages::result_message>> execute(query_processor& qp,
-        service::query_state& state, const query_options& options) const override;
+        service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
-    future<::shared_ptr<cql_transport::messages::result_message>> execute(query_processor& qp,
+    virtual future<::shared_ptr<cql_transport::messages::result_message>>
+        execute_without_checking_exception_message(query_processor& qp, service::query_state& qs, const query_options& options, std::optional<service::group0_guard> guard) const override;
+
+    future<::shared_ptr<cql_transport::messages::result_message>> execute_non_aggregate_unpaged(query_processor& qp,
         lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
          const query_options& options, gc_clock::time_point now) const;
 
-    struct primary_key {
-        dht::decorated_key partition;
-        clustering_key_prefix clustering;
-    };
+    future<::shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message_non_aggregate_unpaged(query_processor& qp,
+        lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
+        const query_options& options, gc_clock::time_point now,
+        std::optional<service::cas_shard> cas_shard) const;
+
+    future<::shared_ptr<cql_transport::messages::result_message>> execute_without_checking_exception_message_aggregate_or_paged(query_processor& qp,
+        lw_shared_ptr<query::read_command> cmd, dht::partition_range_vector&& partition_ranges, service::query_state& state,
+         const query_options& options, gc_clock::time_point now, int32_t page_size, bool aggregate, bool nonpaged_filtering, uint64_t limit,
+        std::optional<service::cas_shard> cas_shard) const;
 
     future<shared_ptr<cql_transport::messages::result_message>> process_results(foreign_ptr<lw_shared_ptr<query::result>> results,
-        lw_shared_ptr<query::read_command> cmd, const query_options& options, gc_clock::time_point now) const;
+        lw_shared_ptr<query::read_command> cmd, const query_options& options, gc_clock::time_point now,
+        const cql3::selection::external_values_provider* external_values_provider = nullptr) const;
 
     const sstring& keyspace() const;
 
@@ -124,20 +169,31 @@ public:
 
     query::partition_slice make_partition_slice(const query_options& options) const;
 
-    ::shared_ptr<restrictions::statement_restrictions> get_restrictions() const;
+    const ::shared_ptr<const restrictions::select_restrictions> get_restrictions() const;
 
     bool has_group_by() const { return _group_by_cell_indices && !_group_by_cell_indices->empty(); }
 
     db::timeout_clock::duration get_timeout(const service::client_state& state, const query_options& options) const;
 
 protected:
-    uint64_t do_get_limit(const query_options& options, const std::optional<expr::expression>& limit, uint64_t default_limit) const;
-    uint64_t get_limit(const query_options& options) const {
-        return do_get_limit(options, _limit, query::max_rows);
+    // The plan this statement scans, recorded in the paging state it hands out
+    // so that a later page keeps reading the same thing. See #18992.
+    virtual service::pager::query_plan scanned_plan() const;
+
+    uint64_t get_limit(const query_options& options, const std::optional<expr::expression>& limit, bool is_per_partition_limit = false) const;
+    static uint64_t get_inner_loop_limit(uint64_t limit, bool is_aggregate);
+
+    // Drains the pager into one result set, grouped by _group_by_cell_indices.
+    // For the cases where the client must get the whole result at once:
+    // aggregates, GROUP BY included, and filtering without paging.
+    future<::shared_ptr<cql_transport::messages::result_message>> execute_aggregate_or_nonpaged_filtering(
+        std::unique_ptr<service::pager::query_pager> pager, const query_options& options, gc_clock::time_point now,
+        int32_t page_size, db::timeout_clock::time_point timeout, uint64_t limit) const;
+
+    virtual bool needs_post_filtering() const {
+        return _restrictions_need_filtering;
     }
-    uint64_t get_per_partition_limit(const query_options& options) const {
-        return do_get_limit(options, _per_partition_limit, query::partition_max_rows);
-    }
+
     bool needs_post_query_ordering() const;
     virtual void update_stats_rows_read(int64_t rows_read) const {
         _stats.rows_read += rows_read;
@@ -150,7 +206,7 @@ public:
                      uint32_t bound_terms,
                      lw_shared_ptr<const parameters> parameters,
                      ::shared_ptr<selection::selection> selection,
-                     ::shared_ptr<restrictions::statement_restrictions> restrictions,
+                     ::shared_ptr<const restrictions::select_restrictions> restrictions,
                      ::shared_ptr<std::vector<size_t>> group_by_cell_indices,
                      bool is_reversed,
                      ordering_comparator_type ordering_comparator,
@@ -160,9 +216,8 @@ public:
                      std::unique_ptr<cql3::attributes> attrs);
 };
 
-class indexed_table_select_statement : public select_statement {
+class view_indexed_table_select_statement : public select_statement {
     secondary_index::index _index;
-    ::shared_ptr<restrictions::restrictions> _used_index_restrictions;
     schema_ptr _view_schema;
     noncopyable_function<dht::partition_range_vector(const query_options&)> _get_partition_ranges_for_posting_list;
     noncopyable_function<query::partition_slice(const query_options&)> _get_partition_slice_for_posting_list;
@@ -174,7 +229,7 @@ public:
                                                                     uint32_t bound_terms,
                                                                     lw_shared_ptr<const parameters> parameters,
                                                                     ::shared_ptr<selection::selection> selection,
-                                                                    ::shared_ptr<restrictions::statement_restrictions> restrictions,
+                                                                    ::shared_ptr<const restrictions::select_restrictions> restrictions,
                                                                     ::shared_ptr<std::vector<size_t>> group_by_cell_indices,
                                                                     bool is_reversed,
                                                                     ordering_comparator_type ordering_comparator,
@@ -183,11 +238,11 @@ public:
                                                                     cql_stats &stats,
                                                                     std::unique_ptr<cql3::attributes> attrs);
 
-    indexed_table_select_statement(schema_ptr schema,
+    view_indexed_table_select_statement(schema_ptr schema,
                                    uint32_t bound_terms,
                                    lw_shared_ptr<const parameters> parameters,
                                    ::shared_ptr<selection::selection> selection,
-                                   ::shared_ptr<restrictions::statement_restrictions> restrictions,
+                                   ::shared_ptr<const restrictions::select_restrictions> restrictions,
                                    ::shared_ptr<std::vector<size_t>> group_by_cell_indices,
                                    bool is_reversed,
                                    ordering_comparator_type ordering_comparator,
@@ -195,22 +250,29 @@ public:
                                    std::optional<expr::expression> per_partition_limit,
                                    cql_stats &stats,
                                    const secondary_index::index& index,
-                                   ::shared_ptr<restrictions::restrictions> used_index_restrictions,
                                    schema_ptr view_schema,
                                    std::unique_ptr<cql3::attributes> attrs);
+
+protected:
+    virtual service::pager::query_plan scanned_plan() const override;
 
 private:
     virtual future<::shared_ptr<cql_transport::messages::result_message>> do_execute(query_processor& qp,
             service::query_state& state, const query_options& options) const override;
 
-    lw_shared_ptr<const service::pager::paging_state> generate_view_paging_state_from_base_query_results(lw_shared_ptr<const service::pager::paging_state> paging_state,
-            const foreign_ptr<lw_shared_ptr<query::result>>& results, service::query_state& state, const query_options& options) const;
+    bool needs_post_filtering() const override;
 
-    future<std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>>> find_index_partition_ranges(query_processor& qp,
+    future<::shared_ptr<cql_transport::messages::result_message>> actually_do_execute(query_processor& qp,
+            service::query_state& state, const query_options& options) const;
+
+    lw_shared_ptr<const service::pager::paging_state> generate_view_paging_state_from_base_query_results(lw_shared_ptr<const service::pager::paging_state> paging_state,
+            const foreign_ptr<lw_shared_ptr<query::result>>& results, service::query_state& state, const query_options& options, uint32_t internal_page_size) const;
+
+    future<coordinator_result<std::tuple<dht::partition_range_vector, lw_shared_ptr<const service::pager::paging_state>>>> find_index_partition_ranges(query_processor& qp,
                                                                     service::query_state& state,
                                                                     const query_options& options) const;
 
-    future<std::tuple<std::vector<primary_key>, lw_shared_ptr<const service::pager::paging_state>>> find_index_clustering_rows(query_processor& qp,
+    future<coordinator_result<std::tuple<std::vector<primary_key>, lw_shared_ptr<const service::pager::paging_state>>>> find_index_clustering_rows(query_processor& qp,
                                                                 service::query_state& state,
                                                                 const query_options& options) const;
 
@@ -221,13 +283,14 @@ private:
             service::query_state& state,
             const query_options& options,
             gc_clock::time_point now,
-            lw_shared_ptr<const service::pager::paging_state> paging_state) const;
+            lw_shared_ptr<const service::pager::paging_state> paging_state,
+            uint32_t internal_page_size) const;
 
     lw_shared_ptr<query::read_command>
     prepare_command_for_base_query(query_processor& qp, const query_options& options, service::query_state& state, gc_clock::time_point now,
             bool use_paging) const;
 
-    future<std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>>
+    future<coordinator_result<std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>>>
     do_execute_base_query(
             query_processor& qp,
             dht::partition_range_vector&& partition_ranges,
@@ -253,7 +316,7 @@ private:
     // but to implement the general case (multiple rows from multiple partitions)
     // efficiently, we will need more support from other layers.
     // Keys are ordered in token order (see #3423)
-    future<std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>>
+    future<coordinator_result<std::tuple<foreign_ptr<lw_shared_ptr<query::result>>, lw_shared_ptr<query::read_command>>>>
     do_execute_base_query(
             query_processor& qp,
             std::vector<primary_key>&& primary_keys,
@@ -275,7 +338,7 @@ private:
         _stats.secondary_index_rows_read += rows_read;
     }
 
-    future<::shared_ptr<cql_transport::messages::result_message::rows>>read_posting_list(
+    future<coordinator_result<::shared_ptr<cql_transport::messages::result_message::rows>>> read_posting_list(
             query_processor& qp,
             const query_options& options,
             uint64_t limit,
@@ -293,6 +356,43 @@ private:
     bytes compute_idx_token(const partition_key& key) const;
 };
 
-}
+class mutation_fragments_select_statement : public select_statement {
+    schema_ptr _underlying_schema;
+public:
+    mutation_fragments_select_statement(
+            schema_ptr output_schema,
+            schema_ptr underlying_schema,
+            uint32_t bound_terms,
+            lw_shared_ptr<const parameters> parameters,
+            ::shared_ptr<selection::selection> selection,
+            ::shared_ptr<const restrictions::select_restrictions> restrictions,
+            ::shared_ptr<std::vector<size_t>> group_by_cell_indices,
+            bool is_reversed,
+            ordering_comparator_type ordering_comparator,
+            std::optional<expr::expression> limit,
+            std::optional<expr::expression> per_partition_limit,
+            cql_stats &stats,
+            std::unique_ptr<cql3::attributes> attrs);
 
+    // This statement has a schema that is different from that of the underlying table.
+    static schema_ptr generate_output_schema(schema_ptr underlying_schema);
+
+private:
+    future<exceptions::coordinator_result<service::storage_proxy_coordinator_query_result>>
+    do_query(
+            locator::effective_replication_map_ptr erm_keepalive,
+            locator::host_id this_node,
+            service::storage_proxy& sp,
+            schema_ptr schema,
+            lw_shared_ptr<query::read_command> cmd,
+            dht::partition_range_vector partition_ranges,
+            db::consistency_level cl,
+            service::storage_proxy_coordinator_query_options optional_params) const;
+
+    virtual future<::shared_ptr<cql_transport::messages::result_message>> do_execute(query_processor& qp,
+            service::query_state& state, const query_options& options) const override;
+};
+
+
+}
 }

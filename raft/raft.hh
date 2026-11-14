@@ -3,22 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #pragma once
 
+#include "utils/assert.hh"
 #include <vector>
 #include <unordered_set>
 #include <functional>
 #include <boost/container/deque.hpp>
-#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/abort_source.hh>
 #include "bytes_ostream.hh"
-#include "utils/UUID.hh"
 #include "internal.hh"
+#include "raft/raft_fwd.hh"
 #include "logical_clock.hh"
+#include "bounded_clock.hh"
 
 namespace raft {
 // Keeps user defined command. A user is responsible to serialize
@@ -29,25 +30,11 @@ using command_cref = std::reference_wrapper<const command>;
 
 extern seastar::logger logger;
 
-// This is user provided id for a snapshot
-using snapshot_id = internal::tagged_id<struct snapshot_id_tag>;
-// Unique identifier of a server in a Raft group
-using server_id = internal::tagged_id<struct server_id_tag>;
-// Unique identifier of a Raft group
-using group_id = raft::internal::tagged_id<struct group_id_tag>;
-
-// This type represents the raft term
-using term_t = internal::tagged_uint64<struct term_tag>;
-// This type represensts the index into the raft log
-using index_t = internal::tagged_uint64<struct index_tag>;
-// Identifier for a read barrier request
-using read_id = internal::tagged_uint64<struct read_id_tag>;
-
 // Opaque connection properties. May contain ip:port pair for instance.
 // This value is disseminated between cluster member
 // through regular log replication as part of a configuration
 // log entry. Upon receiving it a server passes it down to
-// RPC module through add_server() call where it is deserialized
+// RPC module through on_configuration_change() call where it is deserialized
 // and used to obtain connection info for the node `id`. After a server
 // is added to the RPC module RPC's send functions can be used to communicate
 // with it using its `id`.
@@ -55,61 +42,96 @@ using server_info = bytes;
 
 struct server_address {
     server_id id;
-    bool can_vote = true;
     server_info info;
+
+    server_address(server_id id, server_info info)
+        : id(std::move(id)), info(std::move(info)) {
+    }
+
     bool operator==(const server_address& rhs) const {
         return id == rhs.id;
     }
+
+    bool operator==(const raft::server_id& rhs) const {
+        return id == rhs;
+    }
+
     bool operator<(const server_address& rhs) const {
         return id < rhs.id;
     }
-
-    friend std::ostream& operator<<(std::ostream&, const server_address&);
 };
 
-} // end of namespace raft
+using is_voter = bool_class<struct is_voter_tag>;
 
-namespace std {
+struct config_member {
+    server_address addr;
+    is_voter can_vote;
 
-template <> struct hash<raft::server_address> {
-    size_t operator()(const raft::server_address& address) const {
-        return std::hash<raft::server_id>{}(address.id);
+    config_member(server_address addr, is_voter can_vote)
+        : addr{std::move(addr)}, can_vote{can_vote} {
+    }
+
+    bool operator==(const config_member& rhs) const {
+        return addr == rhs.addr;
+    }
+
+    bool operator==(const raft::server_id& rhs) const {
+        return addr.id == rhs;
+    }
+
+    bool operator<(const config_member& rhs) const {
+        return addr < rhs.addr;
     }
 };
 
-} // end of namespace std
+struct server_address_hash {
+    using is_transparent = void;
 
-namespace raft {
+    size_t operator()(const raft::server_id& id) const {
+        return std::hash<raft::server_id>{}(id);
+    }
 
-using server_address_set = std::unordered_set<server_address>;
+    size_t operator()(const raft::server_address& address) const {
+        return operator()(address.id);
+    }
+};
+
+struct config_member_hash {
+    using is_transparent = void;
+
+    size_t operator()(const raft::server_id& id) const {
+        return std::hash<raft::server_id>{}(id);
+    }
+
+    size_t operator()(const raft::server_address& address) const {
+        return operator()(address.id);
+    }
+
+    size_t operator()(const raft::config_member& s) const {
+        return operator()(s.addr);
+    }
+};
+
+using server_address_set = std::unordered_set<server_address, server_address_hash, std::equal_to<>>;
+using config_member_set = std::unordered_set<config_member, config_member_hash, std::equal_to<>>;
 
 // A configuration change decomposed to joining and leaving
 // servers. Helps validate the configuration and update RPC.
 struct configuration_diff {
-    server_address_set joining, leaving;
+    config_member_set joining, leaving;
 };
 
 struct configuration {
     // Contains the current configuration. When configuration
     // change is in progress, contains the new configuration.
-    server_address_set current;
+    config_member_set current;
     // Used during the transitioning period of configuration
     // changes.
-    server_address_set previous;
+    config_member_set previous;
 
-    configuration(std::initializer_list<server_id> ids) {
-        current.reserve(ids.size());
-        for (auto&& id : ids) {
-            if (id == server_id{}) {
-                throw std::invalid_argument("raft::configuration: id zero is not supported");
-            }
-            current.emplace(server_address{std::move(id)});
-        }
-    }
-
-    explicit configuration(server_address_set current_arg = {}, server_address_set previous_arg = {})
+    explicit configuration(config_member_set current_arg = {}, config_member_set previous_arg = {})
         : current(std::move(current_arg)), previous(std::move(previous_arg)) {
-            if (current.count(server_address{server_id()}) || previous.count(server_address{server_id()})) {
+            if (current.count(server_id{}) || previous.count(server_id{})) {
                 throw std::invalid_argument("raft::configuration: id zero is not supported");
             }
         }
@@ -121,12 +143,13 @@ struct configuration {
     }
 
     // Count the number of voters in a configuration
-    static size_t voter_count(const server_address_set& c_new) {
-        return std::count_if(c_new.begin(), c_new.end(), [] (const server_address& s) { return s.can_vote; });
+    static size_t voter_count(const config_member_set& c_new) {
+        return std::count_if(c_new.begin(), c_new.end(), [] (const config_member& s) { 
+            return s.can_vote == is_voter::yes; });
     }
 
     // Check if transitioning to a proposed configuration is safe.
-    static void check(const server_address_set& c_new) {
+    static void check(const config_member_set& c_new) {
         // We must have at least one voting member in the config.
         if (c_new.empty()) {
             throw std::invalid_argument("Attempt to transition to an empty Raft configuration");
@@ -137,7 +160,7 @@ struct configuration {
     }
 
     // Compute a diff between a proposed configuration and the current one.
-    configuration_diff diff(const server_address_set& c_new) const {
+    configuration_diff diff(const config_member_set& c_new) const {
         configuration_diff diff;
         // joining
         for (const auto& s : c_new) {
@@ -160,31 +183,29 @@ struct configuration {
     // True if the current or previous configuration contains
     // this server.
     bool contains(server_id id) const {
-        auto it = current.find(server_address{.id=id});
+        auto it = current.find(id);
         if (it != current.end()) {
             return true;
         }
-        return previous.find(server_address{.id=id}) != previous.end();
+        return previous.find(id) != previous.end();
     }
 
     // Same as contains() but true only if the member can vote.
-    bool can_vote(server_id id) const {
-        bool can_vote = false;
-        auto it = current.find(server_address{.id=id});
-        if (it != current.end()) {
-            can_vote |= it->can_vote;
+    is_voter can_vote(server_id id) const {
+        auto can_vote = is_voter::no;
+        if (auto it = current.find(id); it != current.end()) {
+            can_vote = it->can_vote;
         }
 
-        it = previous.find(server_address{.id=id});
-        if (it != previous.end()) {
-            can_vote |= it->can_vote;
+        if (auto it = previous.find(id); it != previous.end()) {
+            can_vote = can_vote || it->can_vote;
         }
 
         return can_vote;
     }
 
     // Enter a joint configuration given a new set of servers.
-    void enter_joint(server_address_set c_new) {
+    void enter_joint(config_member_set c_new) {
         if (c_new.empty()) {
             throw std::invalid_argument("Attempt to transition to an empty Raft configuration");
         }
@@ -194,11 +215,9 @@ struct configuration {
 
     // Transition from C_old + C_new to C_new.
     void leave_joint() {
-        assert(is_joint());
+        SCYLLA_ASSERT(is_joint());
         previous.clear();
     }
-
-    friend std::ostream& operator<<(std::ostream&, const configuration&);
 };
 
 struct log_entry {
@@ -209,10 +228,19 @@ struct log_entry {
     term_t term;
     index_t idx;
     std::variant<command, configuration, dummy> data;
+    // LeaseGuard: the leader's bounded-uncertainty time interval, recorded when
+    // the entry was created. Empty unless the leader had leases enabled (and a
+    // synchronized clock) at creation time. Used to reason about the age of a
+    // deposed leader's lease; nullopt means "no lease information" and callers
+    // must fall back to the safe path. Not persisted by all storage backends;
+    // reloaded entries may have this empty even if it was set originally.
+    std::optional<time_bounds> lease_time;
+
+    size_t get_size() const;
 };
 
 using log_entry_ptr = seastar::lw_shared_ptr<const log_entry>;
-
+using log_entry_ptr_list = std::vector<log_entry_ptr>;
 struct error : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
@@ -221,6 +249,12 @@ struct not_a_leader : public error {
     server_id leader;
     explicit not_a_leader(server_id l) : error(format("Not a leader, leader: {}", l)), leader(l) {}
 };
+
+struct not_a_member : public error {
+    explicit not_a_member(sstring err) : error(std::move(err)) {}
+    sstring message() const { return what(); }
+};
+
 
 struct dropped_entry : public error {
     dropped_entry() : error("Entry was dropped because of a leader change") {}
@@ -231,7 +265,10 @@ struct commit_status_unknown : public error {
 };
 
 struct stopped_error : public error {
-    stopped_error() : error("Raft instance is stopped") {}
+    explicit stopped_error(const sstring& reason = "")
+            : error(!reason.empty()
+                    ? fmt::format("Raft instance is stopped, reason: \"{}\"", reason)
+                    : std::string("Raft instance is stopped")) {}
 };
 
 struct conf_change_in_progress : public error {
@@ -248,21 +285,42 @@ struct timeout_error : public error {
 };
 
 struct state_machine_error: public error {
-    state_machine_error(std::experimental::source_location l = std::experimental::source_location::current())
+    state_machine_error(std::source_location l = std::source_location::current())
         : error(fmt::format("State machine error at {}:{}", l.file_name(), l.line())) {}
+};
+
+// Should be thrown by the rpc implementation to signal that the connection to the peer has been lost.
+// It's unspecified if any actions caused by rpc were actually performed on the target node.
+struct transport_error: public error {
+    using error::error;
+};
+
+// Can be thrown by two-way RPCs when the destination is not seen as alive by the failure detector.
+// If thrown, the request was not sent at all.
+struct destination_not_alive_error: public transport_error {
+    server_id destination;
+
+    destination_not_alive_error(server_id destination, std::source_location l = std::source_location::current())
+            : transport_error(fmt::format("Failed to send {} to {}: node is not seen as alive by the failure detector", l.function_name(), destination)) {}
+};
+
+struct command_is_too_big_error: public error {
+    size_t command_size;
+    size_t limit;
+
+    command_is_too_big_error(size_t command_size, size_t limit)
+        : error(fmt::format("Command size {} is greater than the configured limit {}", command_size, limit))
+        , command_size(command_size)
+        , limit(limit) {}
 };
 
 struct no_other_voting_member : public error {
     no_other_voting_member() : error("Cannot stepdown because there is no other voting member") {}
 };
 
-// True if a failure to execute a Raft operation can be re-tried,
-// perhaps with a different server.
-inline bool is_transient_error(const std::exception& e) {
-    return dynamic_cast<const not_a_leader*>(&e) ||
-           dynamic_cast<const dropped_entry*>(&e) ||
-           dynamic_cast<const conf_change_in_progress*>(&e);
-}
+struct request_aborted : public error {
+    request_aborted(const std::string& error_msg) : error(error_msg) {}
+};
 
 inline bool is_uncertainty(const std::exception& e) {
     return dynamic_cast<const commit_status_unknown*>(&e) ||
@@ -290,7 +348,20 @@ struct append_request {
     index_t leader_commit_idx;
     // Log entries to store (empty vector for heartbeat; may send more
     // than one entry for efficiency).
-    std::vector<log_entry_ptr> entries;
+    log_entry_ptr_list entries;
+
+    append_request copy() const {
+        append_request result;
+        result.current_term = current_term;
+        result.prev_log_idx = prev_log_idx;
+        result.prev_log_term = prev_log_term;
+        result.leader_commit_idx = leader_commit_idx;
+        result.entries.reserve(entries.size());
+        for (const auto& e: entries) {
+            result.entries.push_back(make_lw_shared(*e));
+        }
+        return result;
+    }
 };
 
 struct append_reply {
@@ -303,8 +374,11 @@ struct append_reply {
         index_t last_idx;
     };
     struct accepted {
-        // Last entry that was appended (may be smaller than max log index
-        // in case follower's log is longer and appended entries match).
+        // Last entry that was appended, or that the follower already had.
+        // May be smaller than the last index of the request in two cases:
+        // the follower's log is longer and the appended entries match, or
+        // the follower refused to grow its log beyond max_follower_log_size
+        // and appended only a prefix of the request (see log::maybe_append).
         index_t last_new_idx;
     };
     // Current term, for leader to update itself.
@@ -316,6 +390,24 @@ struct append_reply {
     // as a heartbeat.
     index_t commit_idx;
     std::variant<rejected, accepted> result;
+    // LeaseGuard: true if this node's bounded clock was usable as of its last
+    // tick, i.e. it could hold a lease and serve local reads were it the leader.
+    // Lets a leader whose own clock has failed hand leadership to a node that
+    // can still use leases, rather than lead a group that has silently lost
+    // them.
+    //
+    // Purely advisory: it is never used to prove anything about time, only to
+    // pick a leadership-transfer target, so a wrong value costs a pointless
+    // transfer and nothing more. False on a node with leases disabled, and on
+    // one that predates this field.
+    bool clock_ok = false;
+    // Set if the in-memory log of the follower has no room under
+    // max_follower_log_size for the next entry, so it will refuse further
+    // entries until a snapshot shrinks the log. Advisory: it lets the leader
+    // stop sending entries the follower would discard. The follower enforces
+    // the bound itself, so a leader which ignores the flag - an older version
+    // during an upgrade - costs only bandwidth.
+    bool log_full = false;
 };
 
 struct vote_request {
@@ -389,17 +481,47 @@ struct entry_id {
     index_t idx;
 };
 
+// The execute_add_entry/execute_modify_config methods can return this error to signal
+// that the request should be retried.
+// The exception is only used internally for entry/config forwarding and should not be leaked to a user.
+struct transient_error: public error {
+    // for IDL serialization
+    sstring message() const {
+        return what();
+    }
+    // A leader that the client should use for retrying.
+    // Could be empty, if the new leader is not known.
+    // Client should wait for a new leader in this case.
+    server_id leader;
+
+    explicit transient_error(const sstring& message, server_id leader)
+        : error(message)
+        , leader(leader)
+    {
+    }
+
+    explicit transient_error(std::exception_ptr e, server_id leader)
+        : transient_error(format("Transient error: '{}'", e), leader)
+    {
+    }
+
+    friend std::ostream& operator<<(std::ostream& os, const transient_error& e) {
+        fmt::print(os, "transient_error, message: {}, leader: {}", e.what(), e.leader);
+        return os;
+    }
+};
+
 // Response to add_entry or modify_config RPC.
 // Carries either entry id (the entry is not committed yet),
-// not_a_leader (the entry is not added to Raft log), or, for
+// transient_error (the entry is not added to Raft log), or, for
 // modify_config, commit_status_unknown (commit status is
 // unknown).
-using add_entry_reply = std::variant<entry_id, not_a_leader, commit_status_unknown>;
+using add_entry_reply = std::variant<entry_id, transient_error, commit_status_unknown, not_a_member>;
 
 // std::monostate {} if the leader cannot execute the barrier because
 // it did not commit any entries yet
 // raft::not_a_leader if the node is not a leader
-// index_t index that is safe to read without breaking linearizability
+// index_t index that is safe to read once applied without breaking linearizability
 using read_barrier_reply = std::variant<std::monostate, index_t, raft::not_a_leader>;
 
 using rpc_message = std::variant<append_request,
@@ -412,8 +534,10 @@ using rpc_message = std::variant<append_request,
       read_quorum,
       read_quorum_reply>;
 
-// we need something that can be truncated form both sides.
+// we need something that can be truncated from both sides.
 // std::deque move constructor is not nothrow hence cannot be used
+// also, boost::deque deallocates blocks when items are removed,
+// we don't want to hold on to memory we don't use.
 using log_entries = boost::container::deque<log_entry_ptr>;
 
 // 3.4 Leader election
@@ -425,7 +549,7 @@ static constexpr logical_clock::duration ELECTION_TIMEOUT = logical_clock::durat
 
 // rpc, persistence and state_machine classes will have to be implemented by the
 // raft user to provide network, persistency and busyness logic support
-// repectively.
+// respectively.
 class rpc;
 class persistence;
 
@@ -445,9 +569,9 @@ public:
     // more than one entry all of them will be committed simultaneously.
     // Will be eventually called on all replicas, for all committed commands.
     // Raft owns the data since it may be still replicating.
-    // Raft will not call another apply until the retuned future
+    // Raft will not call another apply until the returned future
     // will not become ready.
-    virtual future<> apply(std::vector<command_cref> command) = 0;
+    virtual future<> apply(log_entry_ptr_list command) = 0;
 
     // The function suppose to take a snapshot of a state machine
     // To be called during log compaction or when a leader brings
@@ -466,6 +590,14 @@ public:
     // that can be aborted and waiting for all the rest to complete
     // any unfinished apply/snapshot operation may return an error after
     // this function is called
+    //
+    // No function of this interface is called after abort() is called,
+    // so implementations don't have to handle that case.
+    //
+    // A call in progress when abort() is called may continue. It's expected
+    // to promptly fail with abort_requested_exception, possibly nested, unless
+    // it cannot be interrupted. Failing with any other error means that the
+    // state machine broke, not that it was aborted.
     virtual future<> abort() = 0;
 };
 
@@ -517,6 +649,9 @@ public:
     virtual void send_read_quorum_reply(server_id id, const read_quorum_reply& read_quorum_reply) = 0;
 
     // Forward a read barrier request to the leader.
+    // Should throw a raft::transport_error if the target host is unreachable.
+    // In this case, the call will be retried after some time,
+    // possibly with a different server_id if the leader has changed by then.
     virtual future<read_barrier_reply> execute_read_barrier_on_leader(server_id id) = 0;
 
     // Two-way RPC for adding an entry on the leader
@@ -528,24 +663,32 @@ public:
 
     // Send a configuration change request to the leader. Block until the
     // leader replies.
+    // Should throw a raft::transport_error if the target host is unreachable.
     virtual future<add_entry_reply> send_modify_config(server_id id,
-        const std::vector<server_address>& add,
+        const std::vector<config_member>& add,
         const std::vector<server_id>& del) = 0;
 
-    // When a new server is learn this function is called with the
-    // info about the server.
-    virtual void add_server(server_id id, server_info info) = 0;
-
-    // When a server is removed from local config this call is
-    // executed.
-    virtual void remove_server(server_id id) = 0;
+    // When a configuration is changed this function is called with the
+    // info about the changes. It is also called when a new server
+    // starts and its configuration is loaded from raft storage.
+    //
+    // In fact, today we always call this function first, just
+    // with the added and only then with the removed servers, to
+    // simplify RPC's job of delivering a batch of messages
+    // addressing both  added and removed servers. Passing the
+    // added servers first, then passing a batch, and then passing
+    // the removed servers makes it easier for RPC to deliver all
+    // messages in the batch.
+    virtual void on_configuration_change(server_address_set add,
+            server_address_set del) = 0;
 
     // Stop the RPC instance by aborting the work that can be
     // aborted and waiting for all the rest to complete any
     // unfinished send operation may return an error after this
     // function is called.
     //
-    // The implementation must ensure that `_client->apply_snapshot(...)` is not called
+    // The implementation must ensure that `_client->apply_snapshot`, `_client->execute_add_entry`,
+    // `_client->execute_modify_config` and `_client->execute_read_barrier` are not called
     // after `abort()` is called (even before `abort()` future resolves).
     virtual future<> abort() = 0;
 private:
@@ -579,18 +722,18 @@ public:
     virtual future<snapshot_reply> apply_snapshot(server_id from, install_snapshot snp) = 0;
 
     // Try to execute read barrier, future resolves when the barrier is completed or error happens
-    virtual future<read_barrier_reply> execute_read_barrier(server_id from) = 0;
+    virtual future<read_barrier_reply> execute_read_barrier(server_id from, seastar::abort_source* as) = 0;
 
     // An endpoint on the leader to add an entry to the raft log,
     // as requested by a remote follower.
-    virtual future<add_entry_reply> execute_add_entry(server_id from, command cmd) = 0;
+    virtual future<add_entry_reply> execute_add_entry(server_id from, command cmd, seastar::abort_source* as) = 0;
 
     // An endpoint on the leader to change configuration,
     // as requested by a remote follower.
     // If the future resolves successfully, a dummy entry was committed after the configuration change.
     virtual future<add_entry_reply> execute_modify_config(server_id from,
-        std::vector<server_address> add,
-        std::vector<server_id> del) = 0;
+        std::vector<config_member> add,
+        std::vector<server_id> del, seastar::abort_source* as) = 0;
 
     // Update RPC implementation with this client as
     // the receiver of RPC input.
@@ -640,6 +783,18 @@ public:
     // apply call 'state_machine::load_snapshot(snapshot::id)'
     // Called during Raft server initialization only, should not
     // run in parallel with store.
+    //
+    // If you want to create a Raft cluster with a non-empty state
+    // machine, so that joining servers always receive a snapshot,
+    // you should:
+    // - make sure that members of the initial configuration have
+    //   the same state machine state,
+    // - set the initial snapshot index on members of the initial
+    //   configuration to 1,
+    // - set the initial snapshot index on all subsequently joining
+    //   servers to 0.
+    // This also works if you start with an empty state machine,
+    // so consider it as the go-to default.
     virtual future<snapshot_descriptor> load_snapshot_descriptor() = 0;
 
     // Persist given log entries.
@@ -647,7 +802,7 @@ public:
     // but internally all writes should be serialized into forming
     // one contiguous log that holds entries in order of the
     // function invocation.
-    virtual future<> store_log_entries(const std::vector<log_entry_ptr>& entries) = 0;
+    virtual future<> store_log_entries(const log_entry_ptr_list& entries) = 0;
 
     // Load saved Raft log. Called during Raft server
     // initialization only, should not run in parallel with store.
@@ -683,5 +838,93 @@ public:
     virtual bool is_alive(server_id server) = 0;
 };
 
+// Number of followers the leader cannot send entries to, by reason. Followers
+// the failure detector reports down are not counted.
+struct blocked_followers {
+    // Waiting for the reply to a probe of the follower's log.
+    size_t probe = 0;
+    // The maximal number of append requests is in flight.
+    size_t pipeline_full = 0;
+    // Waiting for a snapshot transfer to complete.
+    size_t snapshot = 0;
+    // The follower reported that its log is full.
+    size_t log_full = 0;
+};
+
+// Counters of a server. Servers given the same instance accumulate into it,
+// so a whole set of them can be exported as one metric series.
+struct server_stats {
+    uint64_t add_command = 0;
+    uint64_t add_dummy = 0;
+    uint64_t add_config = 0;
+    uint64_t append_entries_received = 0;
+    uint64_t append_entries_reply_received = 0;
+    uint64_t request_vote_received = 0;
+    uint64_t request_vote_reply_received = 0;
+    uint64_t waiters_awoken = 0;
+    uint64_t waiters_dropped = 0;
+    uint64_t append_entries_reply_sent = 0;
+    uint64_t append_entries_sent = 0;
+    uint64_t vote_request_sent = 0;
+    uint64_t vote_request_reply_sent = 0;
+    uint64_t install_snapshot_sent = 0;
+    uint64_t snapshot_reply_sent = 0;
+    uint64_t polls = 0;
+    uint64_t store_term_and_vote = 0;
+    uint64_t store_snapshot = 0;
+    uint64_t sm_load_snapshot = 0;
+    uint64_t truncate_persisted_log = 0;
+    uint64_t persisted_log_entries = 0;
+    uint64_t queue_entries_for_apply = 0;
+    uint64_t applied_entries = 0;
+    uint64_t snapshots_taken = 0;
+    uint64_t timeout_now_sent = 0;
+    uint64_t timeout_now_received = 0;
+    uint64_t read_quorum_sent = 0;
+    uint64_t read_quorum_received = 0;
+    uint64_t read_quorum_reply_sent = 0;
+    uint64_t read_quorum_reply_received = 0;
+    // Number of times adding an entry had to wait for log memory.
+    uint64_t log_limiter_waits = 0;
+};
+
+// Everything a server reports about itself on demand, read in one call so
+// that the values are consistent and can be summed over several servers.
+struct server_status {
+    bool is_leader = false;
+    // 0 - follower, 1 - candidate, 2 - leader.
+    size_t state = 0;
+    // Number of entries in the in-memory part of the log.
+    size_t in_memory_log_size = 0;
+    // Bytes used by the in-memory part of the log.
+    size_t log_memory_usage = 0;
+    // The in-memory log has no room under max_follower_log_size for the next
+    // entry from a leader, so entries from it are being refused.
+    bool log_full = false;
+    index_t last_idx;
+    term_t last_term;
+    index_t commit_idx;
+    index_t applied_idx;
+    index_t last_snapshot_idx;
+    term_t last_snapshot_term;
+    // Number of entries waiting for the log to shrink below max_log_size.
+    size_t log_limiter_waiters = 0;
+    blocked_followers blocked;
+};
+
 } // namespace raft
 
+template <>
+struct fmt::formatter<raft::server_address> : fmt::formatter<string_view> {
+    auto format(const raft::server_address&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<raft::config_member> : fmt::formatter<string_view> {
+    auto format(const raft::config_member&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <>
+struct fmt::formatter<raft::configuration> : fmt::formatter<string_view> {
+    auto format(const raft::configuration&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

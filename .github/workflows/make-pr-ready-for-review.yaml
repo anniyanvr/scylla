@@ -1,0 +1,26 @@
+name: Mark PR as Ready When Conflicts Label is Removed
+
+on:
+  pull_request_target:
+    types:
+      - unlabeled
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  mark-ready:
+    if: >-
+      github.event.label.name == 'conflicts' &&
+      github.event.pull_request.draft &&
+      github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    permissions: {}
+
+    steps:
+      - name: Mark pull request as ready for review
+        # Backport token, not GITHUB_TOKEN, so ready_for_review still triggers workflows.
+        run: gh pr ready "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_BACKPORT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}

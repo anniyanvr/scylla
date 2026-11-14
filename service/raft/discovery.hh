@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #pragma once
-#include "raft/raft.hh"
+#include "service/raft/group0_fwd.hh"
+#include <unordered_set>
 
 namespace service {
 
@@ -18,36 +19,41 @@ namespace service {
 // its peers. Once the transitive closure of peers has been built,
 // select the peer with the smallest Raft Id to be the leader. To
 // be used during initial setup of Raft Group 0.
+//
+// This class is public for testing.
+// In production code, `persistent_discovery` should be used.
 class discovery {
 public:
     // During discovery, peers are identified based on their Internet
     // address, not Raft server id.
-    struct server_address_hash {
-        size_t operator()(const raft::server_address& address) const {
-            return std::hash<bytes>{}(address.info);
+    struct discovery_peer_hash {
+        size_t operator()(const discovery_peer& address) const {
+            return std::hash<gms::inet_address>{}(address.ip_addr);
         }
     };
-    struct server_address_equal {
-        bool operator()(const raft::server_address& rhs, const raft::server_address&lhs) const {
-            return rhs.info == lhs.info;
+    struct discovery_peer_equal {
+        bool operator()(const discovery_peer& lhs, const discovery_peer& rhs) const {
+            return lhs.ip_addr == rhs.ip_addr;
         }
     };
-
     // When a fresh cluster is bootstrapping, peer list is
     // used to build a transitive closure of all cluster members
     // and select an initial Raft configuration of the cluster.
-    using peer_list = std::vector<raft::server_address>;
-    using peer_set = std::unordered_set<raft::server_address, server_address_hash, server_address_equal>;
+    using peer_list = std::vector<discovery_peer>;
+    using peer_set = std::unordered_set<discovery_peer, discovery_peer_hash, discovery_peer_equal>;
     struct i_am_leader {};
     struct pause {};
-    using request_list = std::vector<std::pair<raft::server_address, peer_list>>;
-    // @sa discovery::get_output()
-    using output = std::variant<i_am_leader, pause, request_list>;
+    using request_list = std::vector<std::pair<discovery_peer, peer_list>>;
+
+    // @sa discovery::tick()
+    using tick_output = std::variant<i_am_leader, pause, request_list>;
 private:
-    raft::server_address _self;
+    discovery_peer _self;
     // Assigned if this server elects itself a leader.
     bool _is_leader = false;
-    // _seeds + all peers we've discovered, excludes _self
+    // _seeds + all peers we've discovered, excludes _self.
+    // The user of `discovery` must ensure that all _peers are persisted
+    // before externalizing any output (returned from `tick` or `request`).
     peer_set _peers;
     // A subset of _peers which have responded to our requests, excludes _self.
     peer_set _responded;
@@ -83,18 +89,31 @@ public:
     // common seed or seed connections forming a loop. A rule of
     // thumb is to use the same seed list everywhere.
     //
-    discovery(raft::server_address self, const peer_list& seeds);
+    // - the set of discovered peers must survive restarts.
+    // When `discovery` is constructed again after a restart,
+    // `seeds` must contain at least all peers discovered until now,
+    // and `self` must be the same as before.
+    // Each time a new peer is discovered or its Raft ID is updated,
+    // it will become present in the set returned by `peers()`.
+    // The caller of `tick`/`request` must ensure that all peers
+    // discovered before this call are persisted before the output
+    // of this call is externalized (e.g. before a response to `request`
+    // is sent back to the requester, or before a new request is sent
+    // based on the output of `tick`).
+    //
+    // `seeds` may contain `self` but doesn't have to.
+    discovery(discovery_peer self, const peer_list& seeds);
 
     // To be used on the receiving peer to generate a reply
-    // while the discovery protocol is in progress. Always
-    // returns a peer list, even if this node is a leader,
-    // since leader state must be persisted first.
-    peer_list request(const peer_list& peers);
+    // while the discovery protocol is in progress.
+    // Until the node becomes a leader, returns the list of known peers.
+    // When (if) the node becomes a leader, returns std::nullopt.
+    std::optional<peer_list> request(const peer_list& peers);
 
     // Submit a reply from one of the peers to this discovery
-    // state machine. If this node is a leader, resposne is
+    // state machine. If this node is a leader, response is
     // ignored.
-    void response(raft::server_address from, const peer_list& peers);
+    void response(discovery_peer from, const peer_list& peers);
 
     // Until all peers answer, returns a list of messages for the
     // peers which haven't replied yet. As soon as all peers have
@@ -102,7 +121,11 @@ public:
     // a leader, and then a list of messages for all peers which
     // can be used to find the leader. If this node is a leader,
     // returns leader{}.
-    discovery::output get_output();
+    tick_output tick();
+
+    // The list of peers discovered until now (including the seeds and self).
+    // Must be persisted before externalizing output (from `tick` or `request`).
+    const peer_list& get_peer_list() const { return _peer_list; }
 
     // A helper for testing.
     bool is_leader() { return _is_leader; }

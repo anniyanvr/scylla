@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #define BOOST_TEST_MODULE raft
 #include "test/raft/helpers.hh"
@@ -15,12 +15,14 @@ using discovery_network = std::unordered_map<server_id, service::discovery*>;
 
 using service::discovery;
 
+using service::discovery_peer;
+
 void
 run_discovery_impl(discovery_network& network) {
     while (true) {
         for (auto e : network) {
             discovery& from = *e.second;
-            auto output = from.get_output();
+            auto output = from.tick();
             if (std::holds_alternative<discovery::i_am_leader>(output)) {
                 return;
             } else if (std::holds_alternative<discovery::pause>(output)) {
@@ -34,7 +36,9 @@ run_discovery_impl(discovery_network& network) {
                     continue;
                 }
                 discovery& to = *(it->second);
-                from.response(m.first, to.request(m.second));
+                if (auto peer_list = to.request(m.second)) {
+                    from.response(m.first, std::move(*peer_list));
+                }
             }
         }
     }
@@ -52,11 +56,11 @@ void run_discovery(Args&&... args) {
 
 BOOST_AUTO_TEST_CASE(test_basic) {
 
-    server_address addr1 = {.id = id()};
+    discovery_peer addr1 = {id(), {}};
 
     // Must supply an Internet address for self
     BOOST_CHECK_THROW(discovery(addr1, {}), std::logic_error);
-    server_address addr2 = {.id = id(), .info = "192.168.1.2"};
+    discovery_peer addr2 = {id(), gms::inet_address("192.168.1.2")};
     BOOST_CHECK_NO_THROW(discovery(addr2, {}));
     // Must supply an Internet address for each peer
     BOOST_CHECK_THROW(discovery(addr2, {addr1}), std::logic_error);
@@ -72,8 +76,8 @@ BOOST_AUTO_TEST_CASE(test_basic) {
 
 BOOST_AUTO_TEST_CASE(test_discovery) {
 
-    server_address addr1 = {.id = id(), .info = "192.168.1.1"};
-    server_address addr2 = {.id = id(), .info = "192.168.1.2"};
+    discovery_peer addr1 = {id(), gms::inet_address("192.168.1.1")};
+    discovery_peer addr2 = {id(), gms::inet_address("192.168.1.2")};
 
     discovery d1(addr1, {addr2});
     discovery d2(addr2, {addr1});
@@ -84,11 +88,11 @@ BOOST_AUTO_TEST_CASE(test_discovery) {
 
 BOOST_AUTO_TEST_CASE(test_discovery_fullmesh) {
 
-    server_address addr1 = {.id = id(), .info = "127.0.0.13"};
-    server_address addr2 = {.id = id(), .info = "127.0.0.19"};
-    server_address addr3 = {.id = id(), .info = "127.0.0.21"};
+    discovery_peer addr1 = {id(), gms::inet_address("127.0.0.13")};
+    discovery_peer addr2 = {id(), gms::inet_address("127.0.0.19")};
+    discovery_peer addr3 = {id(), gms::inet_address("127.0.0.21")};
 
-    auto seeds = std::vector<server_address>({addr1, addr2, addr3});
+    auto seeds = std::vector<discovery_peer>({addr1, addr2, addr3});
 
     discovery d1(addr1, seeds);
     discovery d2(addr2, seeds);

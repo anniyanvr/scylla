@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 /*
@@ -16,94 +16,160 @@
 #include <assert.h>
 #include <algorithm>
 
-#include <boost/range/algorithm.hpp>
-#include <boost/range/adaptors.hpp>
-#include <boost/range/join.hpp>
-#include <boost/algorithm/cxx11/any_of.hpp>
-#include <boost/algorithm/string/join.hpp>
+#include <ranges>
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/util/closeable.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/shard_id.hh>
+#include <seastar/core/on_internal_error.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
+#include "compaction/compaction_garbage_collector.hh"
+#include "compaction/exceptions.hh"
+#include "dht/i_partitioner.hh"
+#include "sstables/exceptions.hh"
 #include "sstables/sstables.hh"
 #include "sstables/sstable_writer.hh"
 #include "sstables/progress_monitor.hh"
 #include "sstables/sstables_manager.hh"
 #include "compaction.hh"
-#include "compaction_manager.hh"
-#include "mutation_reader.hh"
-#include "schema.hh"
+#include "schema/schema.hh"
 #include "db/system_keyspace.hh"
-#include "service/priority_manager.hh"
 #include "db_clock.hh"
-#include "mutation_compactor.hh"
+#include "mutation/mutation_compactor.hh"
 #include "leveled_manifest.hh"
-#include "dht/token.hh"
+#include "dht/partition_filter.hh"
 #include "mutation_writer/shard_based_splitting_writer.hh"
 #include "mutation_writer/partition_based_splitting_writer.hh"
-#include "mutation_source_metadata.hh"
-#include "mutation_fragment_stream_validator.hh"
-#include "utils/UUID_gen.hh"
-#include "utils/utf8.hh"
-#include "utils/fmt-compat.hh"
+#include "mutation_writer/token_group_based_splitting_writer.hh"
+#include "mutation/mutation_source_metadata.hh"
+#include "mutation/mutation_fragment_stream_validator.hh"
+#include "utils/assert.hh"
+#include "utils/error_injection.hh"
+#include "utils/chunked_vector.hh"
+#include "utils/pretty_printers.hh"
+#include "readers/multi_range.hh"
+#include "readers/compacting.hh"
 #include "tombstone_gc.hh"
+#include "replica/database.hh"
+#include "mutation/timestamp.hh"
 
-namespace sstables {
 
-bool is_eligible_for_compaction(const shared_sstable& sst) noexcept {
+can_gc_fn always_gc = [] (tombstone, is_shadowable) { return true; };
+can_gc_fn never_gc = [] (tombstone, is_shadowable) { return false; };
+
+max_purgeable_fn can_always_purge = [] (const dht::decorated_key&, is_shadowable) -> max_purgeable { return max_purgeable(api::max_timestamp); };
+max_purgeable_fn can_never_purge = [] (const dht::decorated_key&, is_shadowable) -> max_purgeable { return max_purgeable(api::min_timestamp); };
+
+max_purgeable& max_purgeable::combine(max_purgeable other) {
+    if (!other) {
+        return *this;
+    }
+    if (!*this) {
+        *this = std::move(other);
+        return *this;
+    }
+
+    if (_timestamp > other._timestamp) {
+        _source = other._source;
+        _timestamp = other._timestamp;
+    }
+
+    if (_expiry_threshold && other._expiry_threshold) {
+        _expiry_threshold = std::min(*_expiry_threshold, *other._expiry_threshold);
+    } else {
+        _expiry_threshold = std::nullopt;
+    }
+
+    return *this;
+}
+
+max_purgeable::can_purge_result max_purgeable::can_purge(tombstone t) const {
+    if (!*this) {
+        return { };
+    }
+    return {
+        .can_purge = (t.deletion_time < _expiry_threshold.value_or(gc_clock::time_point::min()) || t.timestamp < _timestamp),
+        .timestamp_source = _source,
+    };
+}
+
+auto fmt::formatter<max_purgeable::timestamp_source>::format(max_purgeable::timestamp_source s, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    switch (s) {
+        case max_purgeable::timestamp_source::none:
+            return format_to(ctx.out(), "none");
+        case max_purgeable::timestamp_source::memtable_possibly_shadowing_data:
+            return format_to(ctx.out(), "memtable_possibly_shadowing_data");
+        case max_purgeable::timestamp_source::other_sstables_possibly_shadowing_data:
+            return format_to(ctx.out(), "other_sstables_possibly_shadowing_data");
+    }
+}
+
+auto fmt::formatter<max_purgeable>::format(max_purgeable mp, fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    const sstring expiry_str = mp.expiry_threshold() ? fmt::format("{}", mp.expiry_threshold()->time_since_epoch().count()) : "nullopt";
+    return format_to(ctx.out(), "max_purgeable{{timestamp={}, expiry_treshold={}, source={}}}", mp.timestamp(), expiry_str, mp.source());
+}
+
+namespace compaction {
+
+bool is_eligible_for_compaction(const sstables::shared_sstable& sst) noexcept {
     return !sst->requires_view_building() && !sst->is_quarantined();
+}
+
+bool is_eligible_for_compaction(const sstables::frozen_sstable_run& run) noexcept {
+    return std::ranges::all_of(run->all(), [] (const sstables::shared_sstable& sst) {
+        return is_eligible_for_compaction(sst);
+    });
 }
 
 logging::logger clogger("compaction");
 
-static const std::unordered_map<compaction_type, sstring> compaction_types = {
-    { compaction_type::Compaction, "COMPACTION" },
-    { compaction_type::Cleanup, "CLEANUP" },
-    { compaction_type::Validation, "VALIDATION" },
-    { compaction_type::Scrub, "SCRUB" },
-    { compaction_type::Index_build, "INDEX_BUILD" },
-    { compaction_type::Reshard, "RESHARD" },
-    { compaction_type::Upgrade, "UPGRADE" },
-    { compaction_type::Reshape, "RESHAPE" },
+struct compaction_names {
+    sstring legacy_name; // used by origin and rest API
+    sstring name;
+};
+
+static const std::unordered_map<compaction_type, compaction_names> compaction_types = {
+    { compaction_type::Compaction, {"COMPACTION", "Compact"} },
+    { compaction_type::Cleanup, {"CLEANUP", "Cleanup"} },
+    { compaction_type::Validation, {"VALIDATION", "Validate"} },
+    { compaction_type::Scrub, {"SCRUB", "Scrub"} },
+    { compaction_type::Index_build, {"INDEX_BUILD", "Index_build"} },
+    { compaction_type::Reshard, {"RESHARD", "Reshard"} },
+    { compaction_type::Upgrade, {"UPGRADE", "Upgrade"} },
+    { compaction_type::Reshape, {"RESHAPE", "Reshape"} },
+    { compaction_type::Split, {"SPLIT", "Split"} },
+    { compaction_type::Major, {"MAJOR", "Major"} },
+    { compaction_type::RewriteComponent, {"REWRITE_COMPONENT", "RewriteComponent"} },
 };
 
 sstring compaction_name(compaction_type type) {
     auto ret = compaction_types.find(type);
     if (ret != compaction_types.end()) {
-        return ret->second;
+        return ret->second.legacy_name;
     }
     throw std::runtime_error("Invalid Compaction Type");
 }
 
 compaction_type to_compaction_type(sstring type_name) {
     for (auto& it : compaction_types) {
-        if (it.second == type_name) {
+        if (it.second.legacy_name == type_name) {
             return it.first;
         }
     }
     throw std::runtime_error("Invalid Compaction Type Name");
 }
 
-static std::string_view to_string(compaction_type type) {
-    switch (type) {
-    case compaction_type::Compaction: return "Compact";
-    case compaction_type::Cleanup: return "Cleanup";
-    case compaction_type::Validation: return "Validate";
-    case compaction_type::Scrub: return "Scrub";
-    case compaction_type::Index_build: return "Index_build";
-    case compaction_type::Reshard: return "Reshard";
-    case compaction_type::Upgrade: return "Upgrade";
-    case compaction_type::Reshape: return "Reshape";
+std::string_view to_string(compaction_type type) {
+    auto ret = compaction_types.find(type);
+    if (ret != compaction_types.end()) {
+        return ret->second.name;
     }
     on_internal_error_noexcept(clogger, format("Invalid compaction type {}", int(type)));
     return "(invalid)";
-}
-
-std::ostream& operator<<(std::ostream& os, compaction_type type) {
-    os << to_string(type);
-    return os;
 }
 
 std::string_view to_string(compaction_type_options::scrub::mode scrub_mode) {
@@ -121,10 +187,6 @@ std::string_view to_string(compaction_type_options::scrub::mode scrub_mode) {
     return "(invalid)";
 }
 
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::mode scrub_mode) {
-    return os << to_string(scrub_mode);
-}
-
 std::string_view to_string(compaction_type_options::scrub::quarantine_mode quarantine_mode) {
     switch (quarantine_mode) {
         case compaction_type_options::scrub::quarantine_mode::include:
@@ -138,76 +200,143 @@ std::string_view to_string(compaction_type_options::scrub::quarantine_mode quara
     return "(invalid)";
 }
 
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::quarantine_mode quarantine_mode) {
-    return os << to_string(quarantine_mode);
+tombstone_gc_scope effective_gc_scope(const compaction_group_view& table_s, const schema& s, tombstone_gc_scope descriptor_scope) {
+    auto table_scope = table_s.skip_memtable_for_tombstone_gc(s) ? tombstone_gc_scope::skip_memtable : tombstone_gc_scope::all;
+    return std::max(descriptor_scope, table_scope);
 }
 
-std::ostream& operator<<(std::ostream& os, pretty_printed_data_size data) {
-    static constexpr const char* suffixes[] = { " bytes", "kB", "MB", "GB", "TB", "PB" };
-
-    unsigned exp = 0;
-    while ((data._size >= 1000) && (exp < sizeof(suffixes))) {
-        exp++;
-        data._size /= 1000;
+static max_purgeable get_max_purgeable_timestamp(const compaction_group_view& table_s, sstables::sstable_set::incremental_selector& selector,
+        const std::unordered_set<sstables::shared_sstable>& compacting_set, const dht::decorated_key& dk, uint64_t& bloom_filter_checks,
+        const api::timestamp_type compacting_max_timestamp, const tombstone_gc_scope gc_scope, const is_shadowable is_shadowable) {
+    if (!table_s.tombstone_gc_enabled()) [[unlikely]] {
+        clogger.trace("get_max_purgeable_timestamp {}.{}: tombstone_gc_enabled=false, returning min_timestamp",
+                table_s.schema()->ks_name(), table_s.schema()->cf_name());
+        return max_purgeable(api::min_timestamp);
     }
 
-    os << data._size << suffixes[exp];
-    return os;
-}
+    auto timestamp = api::max_timestamp;
+    if (gc_scope == tombstone_gc_scope::compacting_sstables_only) {
+        clogger.trace("get_max_purgeable_timestamp {}.{}: gc_scope=compacting_sstables_only, returning max_timestamp",
+                table_s.schema()->ks_name(), table_s.schema()->cf_name());
+        return max_purgeable(timestamp);
+    }
 
-std::ostream& operator<<(std::ostream& os, pretty_printed_throughput tp) {
-    uint64_t throughput = tp._duration.count() > 0 ? tp._size / tp._duration.count() : 0;
-    os << pretty_printed_data_size(throughput) << "/s";
-    return os;
-}
-
-static api::timestamp_type get_max_purgeable_timestamp(const table_state& table_s, sstable_set::incremental_selector& selector,
-        const std::unordered_set<shared_sstable>& compacting_set, const dht::decorated_key& dk) {
-    auto timestamp = table_s.min_memtable_timestamp();
+    auto source = max_purgeable::timestamp_source::none;
+    // The queries below are not free -- min_memtable_live_*_timestamp() and
+    // memtable_has_key() are evaluated for every purge attempt -- so bail out before
+    // making them rather than discarding their result.
+    if (gc_scope == tombstone_gc_scope::skip_memtable) {
+        clogger.trace("get_max_purgeable_timestamp {}.{}: gc_scope=skip_memtable, not checking the memtable",
+                table_s.schema()->ks_name(), table_s.schema()->cf_name());
+    } else {
+        api::timestamp_type memtable_min_timestamp;
+        if (is_shadowable) {
+            // For shadowable tombstones, check the minimum live row_marker timestamp
+            // as rows with timestamp larger than the tombstone's would shadow the tombstone,
+            // exposing all live cells in the row with timestamps potentially lower than
+            // the shadowable tombstone (and those are tracked in the min_memtable_live_timestamp).
+            // In contrast, a shadowable tombstone applies to rows with row_marker whose timestamp
+            // is less than or equal to the tombstone's timestamp, the same way as a regular tombstone would.
+            // See https://github.com/scylladb/scylladb/issues/20424
+            memtable_min_timestamp = table_s.min_memtable_live_row_marker_timestamp();
+        } else {
+            // For regular tombstones, check the minimum live data timestamp.
+            // Even if purgeable tombstones shadow dead data in the memtable, it's ok to purge them;
+            // since "resurrecting" the already-dead data will no have effect, as they are already dead.
+            // See https://github.com/scylladb/scylladb/issues/20423
+            memtable_min_timestamp = table_s.min_memtable_live_timestamp();
+        }
+        clogger.trace("get_max_purgeable_timestamp {}.{}: memtable_min_timestamp={} compacting_max_timestamp={} memtable_has_key={} is_shadowable={} min_memtable_live_timestamp={} min_memtable_live_row_marker_timestamp={}",
+                table_s.schema()->ks_name(), table_s.schema()->cf_name(),
+                memtable_min_timestamp, compacting_max_timestamp, table_s.memtable_has_key(dk), is_shadowable, table_s.min_memtable_live_timestamp(), table_s.min_memtable_live_row_marker_timestamp());
+        // Use memtable timestamp if it contains live data older than the sstables being compacted,
+        // and if the memtable also contains the key we're calculating max purgeable timestamp for.
+        // First condition helps to not penalize the common scenario where memtable only contains
+        // newer data.
+        if (memtable_min_timestamp <= compacting_max_timestamp && table_s.memtable_has_key(dk)) {
+            timestamp = memtable_min_timestamp;
+            source = max_purgeable::timestamp_source::memtable_possibly_shadowing_data;
+        }
+    }
     std::optional<utils::hashed_key> hk;
-    for (auto&& sst : boost::range::join(selector.select(dk).sstables, table_s.compacted_undeleted_sstables())) {
+    for (auto&& sst : std::views::concat(selector.select(dk).sstables, table_s.compacted_undeleted_sstables())) {
         if (compacting_set.contains(sst)) {
+            continue;
+        }
+        api::timestamp_type min_timestamp = sst->get_stats_metadata().min_timestamp;
+        auto ts_stats = sst->get_ext_timestamp_stats();
+        if (!ts_stats.empty()) {
+            auto stat = is_shadowable ?
+                    sstables::ext_timestamp_stats_type::min_live_row_marker_timestamp :
+                    sstables::ext_timestamp_stats_type::min_live_timestamp;
+            auto it = ts_stats.find(stat);
+            if (it != ts_stats.end()) {
+                min_timestamp = it->second;
+            } else {
+                // Do not throw an exception in production, just use the legacy min_timestamp set above
+                on_internal_error_noexcept(clogger, format("Missing extended timestamp statstics: stat={} is_shadowable={}", int(stat), bool(is_shadowable)));
+            }
+        }
+        if (clogger.is_enabled(log_level::trace)) {
+            if (!hk) {
+                hk = sstables::sstable::make_hashed_key(*table_s.schema(), dk.key());
+            }
+            clogger.trace("get_max_purgeable_timestamp={}: min_timestamp={} timestamp={} filter_has_key={} is_shadowable={} stats.min_timestamp={} min_live_timestamp={} min_live_row_marker_timestamp={}: sst={}",
+                    min_timestamp >= timestamp || !sst->filter_has_key(*hk) ? timestamp : min_timestamp,
+                    min_timestamp, timestamp, sst->filter_has_key(*hk), is_shadowable,
+                    sst->get_stats_metadata().min_timestamp,
+                    ts_stats[sstables::ext_timestamp_stats_type::min_live_timestamp],
+                    ts_stats[sstables::ext_timestamp_stats_type::min_live_row_marker_timestamp],
+                    sst->get_filename());
+        }
+        // There's no point in looking up the key in the sstable filter if
+        // it does not contain data older than the minimum timestamp.
+        if (min_timestamp >= timestamp) {
             continue;
         }
         if (!hk) {
             hk = sstables::sstable::make_hashed_key(*table_s.schema(), dk.key());
         }
         if (sst->filter_has_key(*hk)) {
-            timestamp = std::min(timestamp, sst->get_stats_metadata().min_timestamp);
+            bloom_filter_checks++;
+            timestamp = min_timestamp;
+            source = max_purgeable::timestamp_source::other_sstables_possibly_shadowing_data;
         }
     }
-    return timestamp;
+    return max_purgeable(timestamp, source);
 }
 
-static std::vector<shared_sstable> get_uncompacting_sstables(const table_state& table_s, std::vector<shared_sstable> sstables) {
-    auto all_sstables = boost::copy_range<std::vector<shared_sstable>>(*table_s.get_sstable_set().all());
+static std::vector<sstables::shared_sstable> get_uncompacting_sstables(const compaction_group_view& table_s, std::vector<sstables::shared_sstable> sstables) {
+    // The fully expired check runs against the table's current schema, like its gc_before.
+    auto sstable_set = table_s.sstable_set_for_tombstone_gc(*table_s.schema());
+    auto all_sstables = *sstable_set->all() | std::ranges::to<std::vector>();
     auto& compacted_undeleted = table_s.compacted_undeleted_sstables();
     all_sstables.insert(all_sstables.end(), compacted_undeleted.begin(), compacted_undeleted.end());
-    boost::sort(all_sstables, [] (const shared_sstable& x, const shared_sstable& y) {
-        return x->generation() < y->generation();
-    });
-    std::sort(sstables.begin(), sstables.end(), [] (const shared_sstable& x, const shared_sstable& y) {
-        return x->generation() < y->generation();
-    });
-    std::vector<shared_sstable> not_compacted_sstables;
-    boost::set_difference(all_sstables, sstables,
-        std::back_inserter(not_compacted_sstables), [] (const shared_sstable& x, const shared_sstable& y) {
-            return x->generation() < y->generation();
-        });
+    std::ranges::sort(all_sstables, std::ranges::less(), std::mem_fn(&sstables::sstable::generation));
+    std::ranges::sort(sstables, std::ranges::less(), std::mem_fn(&sstables::sstable::generation));
+    std::vector<sstables::shared_sstable> not_compacted_sstables;
+    std::ranges::set_difference(all_sstables, sstables, std::back_inserter(not_compacted_sstables),
+            std::ranges::less(), std::mem_fn(&sstables::sstable::generation), std::mem_fn(&sstables::sstable::generation));
     return not_compacted_sstables;
+}
+
+static std::vector<sstables::basic_info> extract_basic_info_from_sstables(const std::vector<sstables::shared_sstable>& sstables) {
+    return sstables | std::views::transform([] (auto&& sst) {
+        return sstables::basic_info{.generation = sst->generation(), .origin = sst->get_origin(), .size = sst->bytes_on_disk()};
+    }) | std::ranges::to<std::vector<sstables::basic_info>>();
 }
 
 class compaction;
 
 class compaction_write_monitor final : public sstables::write_monitor, public backlog_write_progress_manager {
     sstables::shared_sstable _sst;
-    table_state& _table_s;
+    compaction_group_view& _table_s;
     const sstables::writer_offset_tracker* _tracker = nullptr;
     uint64_t _progress_seen = 0;
     api::timestamp_type _maximum_timestamp;
     unsigned _sstable_level;
 public:
-    compaction_write_monitor(sstables::shared_sstable sst, table_state& table_s, api::timestamp_type max_timestamp, unsigned sstable_level)
+    compaction_write_monitor(sstables::shared_sstable sst, compaction_group_view& table_s, api::timestamp_type max_timestamp, unsigned sstable_level)
         : _sst(sst)
         , _table_s(table_s)
         , _maximum_timestamp(max_timestamp)
@@ -216,13 +345,13 @@ public:
 
     ~compaction_write_monitor() {
         if (_sst) {
-            _table_s.get_compaction_strategy().get_backlog_tracker().revert_charges(_sst);
+            _table_s.get_backlog_tracker().revert_charges(_sst);
         }
     }
 
     virtual void on_write_started(const sstables::writer_offset_tracker& tracker) override {
         _tracker = &tracker;
-        _table_s.get_compaction_strategy().get_backlog_tracker().register_partially_written_sstable(_sst, *this);
+        _table_s.get_backlog_tracker().register_partially_written_sstable(_sst, *this);
     }
 
     virtual void on_data_write_completed() override {
@@ -249,19 +378,19 @@ public:
 };
 
 struct compaction_writer {
-    shared_sstable sst;
+    sstables::shared_sstable sst;
     // We use a ptr for pointer stability and so that it can be null
     // when using a noop monitor.
-    sstable_writer writer;
+    sstables::sstable_writer writer;
     // The order in here is important. A monitor must be destroyed before the writer it is monitoring since it has a
     // periodic timer that checks the writer.
     // The writer must be destroyed before the shared_sstable since the it may depend on the sstable
     // (as in the mx::writer over compressed_file_data_sink_impl case that depends on sstables::compression).
     std::unique_ptr<compaction_write_monitor> monitor;
 
-    compaction_writer(std::unique_ptr<compaction_write_monitor> monitor, sstable_writer writer, shared_sstable sst)
+    compaction_writer(std::unique_ptr<compaction_write_monitor> monitor, sstables::sstable_writer writer, sstables::shared_sstable sst)
         : sst(std::move(sst)), writer(std::move(writer)), monitor(std::move(monitor)) {}
-    compaction_writer(sstable_writer writer, shared_sstable sst)
+    compaction_writer(sstables::sstable_writer writer, sstables::shared_sstable sst)
         : compaction_writer(nullptr, std::move(writer), std::move(sst)) {}
 };
 
@@ -274,15 +403,34 @@ class compacted_fragments_writer {
     stop_func_t _stop_compaction_writer;
     std::optional<utils::observer<>> _stop_request_observer;
     bool _unclosed_partition = false;
+    struct partition_state {
+        dht::decorated_key_opt dk;
+        // Partition tombstone is saved for the purpose of replicating it to every fragment storing a partition pL.
+        // Then when reading from the SSTable run, we won't unnecessarily have to open >= 2 fragments, the one which
+        // contains the tombstone and another one(s) that has the partition slice being queried.
+        ::tombstone tombstone;
+        // Used to determine whether any active tombstones need closing at EOS.
+        ::tombstone current_emitted_tombstone;
+        // Track last emitted clustering row, which will be used to close active tombstone if splitting partition
+        position_in_partition last_pos = position_in_partition::before_all_clustered_rows();
+        bool is_splitting_partition = false;
+    } _current_partition;
 private:
     inline void maybe_abort_compaction();
 
     utils::observer<> make_stop_request_observer(utils::observable<>& sro) {
         return sro.observe([this] () mutable {
-            assert(!_unclosed_partition);
+            SCYLLA_ASSERT(!_unclosed_partition);
             consume_end_of_stream();
         });
     }
+
+    void stop_current_writer();
+    bool can_split_large_partition() const;
+    void track_last_position(position_in_partition_view pos);
+    void split_large_partition();
+    void do_consume_new_partition(const dht::decorated_key& dk);
+    stop_iteration do_consume_end_of_partition();
 public:
     explicit compacted_fragments_writer(compaction& c, creator_func_t cpw, stop_func_t scw)
             : _c(c)
@@ -301,7 +449,7 @@ public:
 
     void consume_new_partition(const dht::decorated_key& dk);
 
-    void consume(tombstone t) { _compaction_writer->writer.consume(t); }
+    void consume(tombstone t);
     stop_iteration consume(static_row&& sr, tombstone, bool) {
         maybe_abort_compaction();
         return _compaction_writer->writer.consume(std::move(sr));
@@ -309,32 +457,31 @@ public:
     stop_iteration consume(static_row&& sr) {
         return consume(std::move(sr), tombstone{}, bool{});
     }
-    stop_iteration consume(clustering_row&& cr, row_tombstone, bool) {
-        maybe_abort_compaction();
-        return _compaction_writer->writer.consume(std::move(cr));
-    }
+    stop_iteration consume(clustering_row&& cr, row_tombstone, bool);
     stop_iteration consume(clustering_row&& cr) {
         return consume(std::move(cr), row_tombstone{}, bool{});
     }
-    stop_iteration consume(range_tombstone&& rt) {
-        maybe_abort_compaction();
-        return _compaction_writer->writer.consume(std::move(rt));
-    }
+    stop_iteration consume(range_tombstone_change&& rtc);
 
     stop_iteration consume_end_of_partition();
     void consume_end_of_stream();
 };
 
-struct compaction_read_monitor_generator final : public read_monitor_generator {
+using use_backlog_tracker = bool_class<class use_backlog_tracker_tag>;
+
+struct compaction_read_monitor_generator final : public sstables::read_monitor_generator {
     class compaction_read_monitor final : public  sstables::read_monitor, public backlog_read_progress_manager {
         sstables::shared_sstable _sst;
-        table_state& _table_s;
+        compaction_group_view& _table_s;
         const sstables::reader_position_tracker* _tracker = nullptr;
         uint64_t _last_position_seen = 0;
+        use_backlog_tracker _use_backlog_tracker;
     public:
         virtual void on_read_started(const sstables::reader_position_tracker& tracker) override {
             _tracker = &tracker;
-            _table_s.get_compaction_strategy().get_backlog_tracker().register_compacting_sstable(_sst, *this);
+            if (_use_backlog_tracker) {
+                _table_s.get_backlog_tracker().register_compacting_sstable(_sst, *this);
+            }
         }
 
         virtual void on_read_completed() override {
@@ -352,20 +499,20 @@ struct compaction_read_monitor_generator final : public read_monitor_generator {
         }
 
         void remove_sstable() {
-            if (_sst) {
-                _table_s.get_compaction_strategy().get_backlog_tracker().revert_charges(_sst);
+            if (_sst && _use_backlog_tracker) {
+                _table_s.get_backlog_tracker().revert_charges(_sst);
             }
             _sst = {};
         }
 
-        compaction_read_monitor(sstables::shared_sstable sst, table_state& table_s)
-            : _sst(std::move(sst)), _table_s(table_s) { }
+        compaction_read_monitor(sstables::shared_sstable sst, compaction_group_view& table_s, use_backlog_tracker use_backlog_tracker)
+            : _sst(std::move(sst)), _table_s(table_s), _use_backlog_tracker(use_backlog_tracker) { }
 
         ~compaction_read_monitor() {
             // We failed to finish handling this SSTable, so we have to update the backlog_tracker
             // about it.
-            if (_sst) {
-                _table_s.get_compaction_strategy().get_backlog_tracker().revert_charges(_sst);
+            if (_sst && _use_backlog_tracker) {
+                _table_s.get_backlog_tracker().revert_charges(_sst);
             }
         }
 
@@ -373,12 +520,16 @@ struct compaction_read_monitor_generator final : public read_monitor_generator {
     };
 
     virtual sstables::read_monitor& operator()(sstables::shared_sstable sst) override {
-        auto p = _generated_monitors.emplace(sst->generation(), compaction_read_monitor(sst, _table_s));
+        auto p = _generated_monitors.emplace(sst->generation(), compaction_read_monitor(sst, _table_s, _use_backlog_tracker));
         return p.first->second;
     }
 
-    explicit compaction_read_monitor_generator(table_state& table_s)
-        : _table_s(table_s) {}
+    explicit compaction_read_monitor_generator(compaction_group_view& table_s, use_backlog_tracker use_backlog_tracker = use_backlog_tracker::yes)
+        : _table_s(table_s), _use_backlog_tracker(use_backlog_tracker) {}
+
+    uint64_t compacted() const {
+        return std::ranges::fold_left(_generated_monitors | std::views::values | std::views::transform([](auto& monitor) { return monitor.compacted(); }), uint64_t(0), std::plus());
+    }
 
     void remove_exhausted_sstables(const std::vector<sstables::shared_sstable>& exhausted_sstables) {
         for (auto& sst : exhausted_sstables) {
@@ -389,118 +540,164 @@ struct compaction_read_monitor_generator final : public read_monitor_generator {
         }
     }
 private:
-    table_state& _table_s;
-    std::unordered_map<int64_t, compaction_read_monitor> _generated_monitors;
+    compaction_group_view& _table_s;
+    std::unordered_map<sstables::generation_type, compaction_read_monitor> _generated_monitors;
+    use_backlog_tracker _use_backlog_tracker;
+
+    friend class compaction_progress_monitor;
 };
 
-class formatted_sstables_list {
-    bool _include_origin = true;
-    std::vector<sstring> _ssts;
-public:
-    formatted_sstables_list() = default;
-    explicit formatted_sstables_list(const std::vector<shared_sstable>& ssts, bool include_origin) : _include_origin(include_origin) {
-        _ssts.reserve(ssts.size());
-        for (const auto& sst : ssts) {
-            *this += sst;
-        }
-    }
-    formatted_sstables_list& operator+=(const shared_sstable& sst) {
-        if (_include_origin) {
-            _ssts.emplace_back(format("{}:level={:d}:origin={}", sst->get_filename(), sst->get_sstable_level(), sst->get_origin()));
-        } else {
-            _ssts.emplace_back(format("{}:level={:d}", sst->get_filename(), sst->get_sstable_level()));
-        }
-        return *this;
-    }
-    friend std::ostream& operator<<(std::ostream& os, const formatted_sstables_list& lst);
-};
+void compaction_progress_monitor::set_generator(std::unique_ptr<sstables::read_monitor_generator> generator) {
+    _generator = std::move(generator);
+}
 
-std::ostream& operator<<(std::ostream& os, const formatted_sstables_list& lst) {
-    os << "[";
-    os << boost::algorithm::join(lst._ssts, ",");
-    os << "]";
-    return os;
+void compaction_progress_monitor::reset_generator() {
+    if (_generator) {
+        _progress = dynamic_cast<compaction_read_monitor_generator&>(*_generator).compacted();
+    }
+    _generator = nullptr;
+}
+
+uint64_t compaction_progress_monitor::get_progress() const {
+    if (_generator) {
+        return dynamic_cast<compaction_read_monitor_generator&>(*_generator).compacted();
+    }
+    return _progress;
 }
 
 class compaction {
 protected:
     compaction_data& _cdata;
-    table_state& _table_s;
-    compaction_sstable_creator_fn _sstable_creator;
-    schema_ptr _schema;
-    reader_permit _permit;
-    std::vector<shared_sstable> _sstables;
-    std::vector<unsigned long> _input_sstable_generations;
+    compaction_group_view& _table_s;
+    const compaction_sstable_creator_fn _sstable_creator;
+    const schema_ptr _schema;
+    const reader_permit _permit;
+    std::vector<sstables::shared_sstable> _sstables;
+    std::vector<sstables::generation_type> _input_sstable_generations;
+    std::vector<sstables::basic_info> _input_sstables_basic_info;
     // Unused sstables are tracked because if compaction is interrupted we can only delete them.
     // Deleting used sstables could potentially result in data loss.
-    std::unordered_set<shared_sstable> _new_partial_sstables;
-    std::vector<shared_sstable> _new_unused_sstables;
-    std::vector<shared_sstable> _all_new_sstables;
-    lw_shared_ptr<sstable_set> _compacting;
-    sstables::compaction_type _type;
-    uint64_t _max_sstable_size;
-    uint32_t _sstable_level;
+    std::unordered_set<sstables::shared_sstable> _new_partial_sstables;
+    std::vector<sstables::shared_sstable> _new_unused_sstables;
+    std::vector<sstables::shared_sstable> _all_new_sstables;
+    lw_shared_ptr<sstables::sstable_set> _compacting;
+    const compaction_type _type;
+    const uint64_t _max_sstable_size;
+    const uint32_t _sstable_level;
     uint64_t _start_size = 0;
     uint64_t _end_size = 0;
+    // fully expired files, which are skipped, aren't taken into account.
+    uint64_t _compacting_data_file_size = 0;
+    api::timestamp_type _compacting_max_timestamp = api::min_timestamp;
     uint64_t _estimated_partitions = 0;
+    double _estimated_droppable_tombstone_ratio = 0;
+    uint64_t _bloom_filter_checks = 0;
+    combined_reader_statistics _reader_statistics;
+    tombstone_purge_stats _tombstone_purge_stats;
     db::replay_position _rp;
     encoding_stats_collector _stats_collector;
+    const bool _can_split_large_partition = false;
     bool _contains_multi_fragment_runs = false;
     mutation_source_metadata _ms_metadata = {};
-    compaction_sstable_replacer_fn _replacer;
-    utils::UUID _run_identifier;
-    ::io_priority_class _io_priority;
+    const compaction_sstable_replacer_fn _replacer;
+    const sstables::run_id _run_identifier;
     // optional clone of sstable set to be used for expiration purposes, so it will be set if expiration is enabled.
-    std::optional<sstable_set> _sstable_set;
+    std::optional<sstables::sstable_set> _sstable_set;
     // used to incrementally calculate max purgeable timestamp, as we iterate through decorated keys.
-    std::optional<sstable_set::incremental_selector> _selector;
-    std::unordered_set<shared_sstable> _compacting_for_max_purgeable_func;
+    std::optional<sstables::sstable_set::incremental_selector> _selector;
+    std::unordered_set<sstables::shared_sstable> _compacting_for_max_purgeable_func;
+    // optional owned_ranges vector for cleanup;
+    const owned_ranges_ptr _owned_ranges = {};
+    // required for reshard compaction.
+    const dht::sharder* _sharder = nullptr;
+    const std::optional<dht::incremental_owned_ranges_checker> _owned_ranges_checker;
     // Garbage collected sstables that are sealed but were not added to SSTable set yet.
-    std::vector<shared_sstable> _unused_garbage_collected_sstables;
+    std::vector<sstables::shared_sstable> _unused_garbage_collected_sstables;
     // Garbage collected sstables that were added to SSTable set and should be eventually removed from it.
-    std::vector<shared_sstable> _used_garbage_collected_sstables;
+    std::vector<sstables::shared_sstable> _used_garbage_collected_sstables;
     utils::observable<> _stop_request_observable;
+    tombstone_gc_state _tombstone_gc_state;
+    // See compaction_descriptor::gc_scope.
+    const tombstone_gc_scope _gc_scope = tombstone_gc_scope::all;
+    int64_t _output_repaired_at = 0;
 private:
+    // Keeps track of monitors for input sstable.
+    // If _update_backlog_tracker is set to true, monitors are responsible for adjusting backlog as compaction progresses.
+    compaction_progress_monitor& _progress_monitor;
     compaction_data& init_compaction_data(compaction_data& cdata, const compaction_descriptor& descriptor) const {
         cdata.compaction_fan_in = descriptor.fan_in();
         return cdata;
     }
+
+    // Called in a seastar thread
+    utils::chunked_vector<dht::partition_range>
+    get_ranges_for_invalidation(const std::vector<sstables::shared_sstable>& sstables) {
+        // If owned ranges is disengaged, it means no cleanup work was done and
+        // so nothing needs to be invalidated.
+        if (!_owned_ranges) {
+            return {};
+        }
+        auto owned_ranges = dht::to_partition_ranges_chunked(*_owned_ranges).get();
+
+        auto non_owned_ranges = sstables
+                | std::views::transform([] (const sstables::shared_sstable& sst) {
+            seastar::thread::maybe_yield();
+            return dht::partition_range::make({sst->get_first_decorated_key(), true},
+                                              {sst->get_last_decorated_key(), true});
+        })      | std::ranges::to<utils::chunked_vector<dht::partition_range>>();
+
+        return dht::subtract_ranges(*_schema, std::move(non_owned_ranges), std::move(owned_ranges)).get();
+    }
 protected:
-    compaction(table_state& table_s, compaction_descriptor descriptor, compaction_data& cdata)
+    compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_progress_monitor& progress_monitor, use_backlog_tracker use_backlog_tracker)
         : _cdata(init_compaction_data(cdata, descriptor))
         , _table_s(table_s)
         , _sstable_creator(std::move(descriptor.creator))
-        , _schema(_table_s.schema())
+        , _schema(descriptor.schema ? std::move(descriptor.schema) : _table_s.schema())
         , _permit(_table_s.make_compaction_reader_permit())
         , _sstables(std::move(descriptor.sstables))
         , _type(descriptor.options.type())
         , _max_sstable_size(descriptor.max_sstable_bytes)
         , _sstable_level(descriptor.level)
+        , _can_split_large_partition(descriptor.can_split_large_partition)
         , _replacer(std::move(descriptor.replacer))
         , _run_identifier(descriptor.run_identifier)
-        , _io_priority(descriptor.io_priority)
         , _sstable_set(std::move(descriptor.all_sstables_snapshot))
-        , _selector(_sstable_set ? _sstable_set->make_incremental_selector() : std::optional<sstable_set::incremental_selector>{})
-        , _compacting_for_max_purgeable_func(std::unordered_set<shared_sstable>(_sstables.begin(), _sstables.end()))
+        , _selector(_sstable_set ? _sstable_set->make_incremental_selector() : std::optional<sstables::sstable_set::incremental_selector>{})
+        , _compacting_for_max_purgeable_func(std::unordered_set<sstables::shared_sstable>(_sstables.begin(), _sstables.end()))
+        , _owned_ranges(std::move(descriptor.owned_ranges))
+        , _sharder(descriptor.sharder)
+        , _owned_ranges_checker(_owned_ranges ? std::optional<dht::incremental_owned_ranges_checker>(*_owned_ranges) : std::nullopt)
+        , _tombstone_gc_state(descriptor.gc_state)
+        , _gc_scope(descriptor.gc_scope)
+        , _progress_monitor(progress_monitor)
     {
-        for (auto& sst : _sstables) {
-            _stats_collector.update(sst->get_encoding_stats_for_compaction());
+        if (_gc_scope == tombstone_gc_scope::compacting_sstables_only) {
+            _tombstone_gc_state = _tombstone_gc_state.with_commitlog_check_disabled();
         }
-        std::unordered_set<utils::UUID> ssts_run_ids;
-        _contains_multi_fragment_runs = std::any_of(_sstables.begin(), _sstables.end(), [&ssts_run_ids] (shared_sstable& sst) {
+        std::unordered_set<sstables::run_id> ssts_run_ids;
+        _contains_multi_fragment_runs = std::any_of(_sstables.begin(), _sstables.end(), [&ssts_run_ids] (sstables::shared_sstable& sst) {
             return !ssts_run_ids.insert(sst->run_identifier()).second;
         });
+        _progress_monitor.set_generator(std::make_unique<compaction_read_monitor_generator>(_table_s, use_backlog_tracker));
+    }
+
+    sstables::read_monitor_generator& unwrap_monitor_generator() const {
+        if (_progress_monitor._generator) {
+            return *_progress_monitor._generator;
+        }
+        return sstables::default_read_monitor_generator();
     }
 
     virtual uint64_t partitions_per_sstable() const {
         // some tests use _max_sstable_size == 0 for force many one partition per sstable
         auto max_sstable_size = std::max<uint64_t>(_max_sstable_size, 1);
-        uint64_t estimated_sstables = std::max(1UL, uint64_t(ceil(double(_start_size) / max_sstable_size)));
+        uint64_t estimated_sstables = std::max(1UL, uint64_t(ceil(double(_compacting_data_file_size) / max_sstable_size)));
         return std::min(uint64_t(ceil(double(_estimated_partitions) / estimated_sstables)),
-                        _table_s.get_compaction_strategy().adjust_partition_estimate(_ms_metadata, _estimated_partitions));
+                        _table_s.get_compaction_strategy().adjust_partition_estimate(_ms_metadata, _estimated_partitions, _schema));
     }
 
-    void setup_new_sstable(shared_sstable& sst) {
+    void setup_new_sstable(sstables::shared_sstable& sst) {
         _all_new_sstables.push_back(sst);
         _new_partial_sstables.insert(sst);
         for (auto ancestor : _input_sstable_generations) {
@@ -509,21 +706,22 @@ protected:
     }
 
     void finish_new_sstable(compaction_writer* writer) {
+        writer->writer.set_repaired_at(_output_repaired_at);
         writer->writer.consume_end_of_stream();
-        writer->sst->open_data().get0();
+        writer->sst->open_data().get();
         _end_size += writer->sst->bytes_on_disk();
         _new_unused_sstables.push_back(writer->sst);
         _new_partial_sstables.erase(writer->sst);
     }
 
-    sstable_writer_config make_sstable_writer_config(compaction_type type) {
+    sstables::sstable_writer_config make_sstable_writer_config(compaction_type type) {
         auto s = compaction_name(type);
         std::transform(s.begin(), s.end(), s.begin(), [] (char c) {
             return std::tolower(c);
         });
-        sstable_writer_config cfg = _table_s.configure_writer(std::move(s));
+        sstables::sstable_writer_config cfg = _table_s.configure_writer(std::move(s));
         cfg.max_sstable_size = _max_sstable_size;
-        cfg.monitor = &default_write_monitor();
+        cfg.monitor = &sstables::default_write_monitor();
         cfg.run_identifier = _run_identifier;
         cfg.replay_position = _rp;
         cfg.sstable_level = _sstable_level;
@@ -531,7 +729,7 @@ protected:
     }
 
     api::timestamp_type maximum_timestamp() const {
-        auto m = std::max_element(_sstables.begin(), _sstables.end(), [] (const shared_sstable& sst1, const shared_sstable& sst2) {
+        auto m = std::max_element(_sstables.begin(), _sstables.end(), [] (const sstables::shared_sstable& sst1, const sstables::shared_sstable& sst2) {
             return sst1->get_stats_metadata().max_timestamp < sst2->get_stats_metadata().max_timestamp;
         });
         return (*m)->get_stats_metadata().max_timestamp;
@@ -541,33 +739,35 @@ protected:
         return _stats_collector.get();
     }
 
-    virtual compaction_completion_desc
-    get_compaction_completion_desc(std::vector<shared_sstable> input_sstables, std::vector<shared_sstable> output_sstables) {
-        return compaction_completion_desc{std::move(input_sstables), std::move(output_sstables)};
+    compaction_completion_desc
+    get_compaction_completion_desc(std::vector<sstables::shared_sstable> input_sstables, std::vector<sstables::shared_sstable> output_sstables,
+                                   std::vector<sstables::shared_sstable> output_gc_sstables = {}) {
+        auto ranges = get_ranges_for_invalidation(input_sstables);
+        return compaction_completion_desc{std::move(input_sstables), std::move(output_sstables), std::move(output_gc_sstables), std::move(ranges)};
     }
 
     // Tombstone expiration is enabled based on the presence of sstable set.
     // If it's not present, we cannot purge tombstones without the risk of resurrecting data.
     bool tombstone_expiration_enabled() const {
-        return bool(_sstable_set);
+        return bool(_sstable_set) && _table_s.tombstone_gc_enabled();
     }
 
-    compaction_writer create_gc_compaction_writer() const {
+    compaction_writer create_gc_compaction_writer(sstables::run_id gc_run) const {
         auto sst = _sstable_creator(this_shard_id());
 
-        auto&& priority = _io_priority;
         auto monitor = std::make_unique<compaction_write_monitor>(sst, _table_s, maximum_timestamp(), _sstable_level);
-        sstable_writer_config cfg = _table_s.configure_writer("garbage_collection");
-        cfg.run_identifier = _run_identifier;
+        sstables::sstable_writer_config cfg = _table_s.configure_writer("garbage_collection");
+        cfg.run_identifier = gc_run;
         cfg.monitor = monitor.get();
-        auto writer = sst->get_writer(*schema(), partitions_per_sstable(), cfg, get_encoding_stats(), priority);
+        uint64_t estimated_partitions = std::max(1UL, uint64_t(ceil(partitions_per_sstable() * _estimated_droppable_tombstone_ratio)));
+        auto writer = sst->get_writer(*schema(), estimated_partitions, cfg, get_encoding_stats());
         return compaction_writer(std::move(monitor), std::move(writer), std::move(sst));
     }
 
     void stop_gc_compaction_writer(compaction_writer* c_writer) {
         c_writer->writer.consume_end_of_stream();
         auto sst = c_writer->sst;
-        sst->open_data().get0();
+        sst->open_data().get();
         _unused_garbage_collected_sstables.push_back(std::move(sst));
     }
 
@@ -579,22 +779,32 @@ protected:
     // When compaction finishes, all the temporary sstables generated here will be deleted and removed
     // from table's sstable set.
     compacted_fragments_writer get_gc_compacted_fragments_writer() {
+        // because the temporary sstable run can overlap with the non-gc sstables run created by
+        // get_compacted_fragments_writer(), we have to use a different run_id. the gc_run_id is
+        // created here as:
+        // 1. it can be shared across all sstables created by this writer
+        // 2. it is optional, as gc writer is not always used
+        auto gc_run = sstables::run_id::create_random_id();
         return compacted_fragments_writer(*this,
-             [this] (const dht::decorated_key&) { return create_gc_compaction_writer(); },
+             [this, gc_run] (const dht::decorated_key&) { return create_gc_compaction_writer(gc_run); },
              [this] (compaction_writer* cw) { stop_gc_compaction_writer(cw); },
              _stop_request_observable);
     }
 
     // Retrieves all unused garbage collected sstables that will be subsequently added
     // to the SSTable set, and mark them as used.
-    std::vector<shared_sstable> consume_unused_garbage_collected_sstables() {
+    std::vector<sstables::shared_sstable> consume_unused_garbage_collected_sstables() {
         auto unused = std::exchange(_unused_garbage_collected_sstables, {});
         _used_garbage_collected_sstables.insert(_used_garbage_collected_sstables.end(), unused.begin(), unused.end());
         return unused;
     }
 
-    const std::vector<shared_sstable>& used_garbage_collected_sstables() const {
+    const std::vector<sstables::shared_sstable>& used_garbage_collected_sstables() const {
         return _used_garbage_collected_sstables;
+    }
+
+    virtual bool enable_garbage_collected_sstable_writer() const noexcept {
+        return _contains_multi_fragment_runs && _max_sstable_size != std::numeric_limits<uint64_t>::max() && bool(_replacer);
     }
 public:
     compaction& operator=(const compaction&) = delete;
@@ -604,59 +814,129 @@ public:
     compaction& operator=(compaction&& other) = delete;
 
     virtual ~compaction() {
+        _progress_monitor.reset_generator();
     }
 private:
     // Default range sstable reader that will only return mutation that belongs to current shard.
-    virtual flat_mutation_reader_v2 make_sstable_reader() const = 0;
+    virtual mutation_reader make_sstable_reader(schema_ptr s,
+                                                        reader_permit permit,
+                                                        const dht::partition_range& range,
+                                                        const query::partition_slice& slice,
+                                                        tracing::trace_state_ptr,
+                                                        streamed_mutation::forwarding fwd,
+                                                        mutation_reader::forwarding) = 0;
 
-    virtual sstables::sstable_set make_sstable_set_for_input() const {
-        return _table_s.get_compaction_strategy().make_sstable_set(_schema);
+    mutation_reader setup_sstable_reader() {
+        if (!_owned_ranges_checker) {
+            return make_sstable_reader(_schema,
+                                       _permit,
+                                       query::full_partition_range,
+                                       _schema->full_slice(),
+                                       tracing::trace_state_ptr(),
+                                       ::streamed_mutation::forwarding::no,
+                                       ::mutation_reader::forwarding::no);
+        }
+
+        auto source = mutation_source([this] (schema_ptr s,
+                reader_permit permit,
+                const dht::partition_range& range,
+                const query::partition_slice& slice,
+                tracing::trace_state_ptr trace_state,
+                streamed_mutation::forwarding fwd,
+                mutation_reader::forwarding fwd_mr) {
+            log_trace("Creating sstable set reader with range {}", range);
+            return make_sstable_reader(std::move(s),
+                                       std::move(permit),
+                                       range,
+                                       slice,
+                                       std::move(trace_state),
+                                       fwd,
+                                       fwd_mr);
+        });
+
+        auto owned_range_generator = [this] () -> std::optional<dht::partition_range> {
+            auto r = _owned_ranges_checker->next_owned_range();
+            if (r == nullptr) {
+                return std::nullopt;
+            }
+            log_trace("Skipping to the next owned range {}", *r);
+            return dht::to_partition_range(*r);
+        };
+
+        return make_multi_range_reader(_schema, _permit, std::move(source),
+                                            std::move(owned_range_generator),
+                                            _schema->full_slice(),
+                                            tracing::trace_state_ptr());
     }
 
-    void setup() {
+    virtual sstables::sstable_set make_sstable_set_for_input() const {
+        return _table_s.get_compaction_strategy().make_sstable_set(_table_s);
+    }
+
+    tombstone_gc_state get_tombstone_gc_state() const {
+        return _tombstone_gc_state;
+    }
+
+    future<> setup() {
         auto ssts = make_lw_shared<sstables::sstable_set>(make_sstable_set_for_input());
-        formatted_sstables_list formatted_msg;
         auto fully_expired = _table_s.fully_expired_sstables(_sstables, gc_clock::now());
         min_max_tracker<api::timestamp_type> timestamp_tracker;
 
+        double sum_of_estimated_droppable_tombstone_ratio = 0;
+        _input_sstable_generations.reserve(_sstables.size());
+        _input_sstables_basic_info.reserve(_sstables.size());
+        int64_t repaired_at = 0;
+        std::vector<int64_t> repaired_at_for_compacted_sstables;
+        uint64_t compaction_size = 0;
         for (auto& sst : _sstables) {
+            co_await coroutine::maybe_yield();
             auto& sst_stats = sst->get_stats_metadata();
+            repaired_at_for_compacted_sstables.push_back(sst_stats.repaired_at);
+            repaired_at = std::max(sst_stats.repaired_at, repaired_at);
             timestamp_tracker.update(sst_stats.min_timestamp);
             timestamp_tracker.update(sst_stats.max_timestamp);
+
+            _input_sstables_basic_info.emplace_back(sst->generation(), sst->get_origin(), sst->bytes_on_disk());
 
             // Compacted sstable keeps track of its ancestors.
             _input_sstable_generations.push_back(sst->generation());
             _start_size += sst->bytes_on_disk();
             _cdata.total_partitions += sst->get_estimated_key_count();
-            formatted_msg += sst;
 
             // Do not actually compact a sstable that is fully expired and can be safely
-            // dropped without ressurrecting old data.
+            // dropped without resurrecting old data.
             if (tombstone_expiration_enabled() && fully_expired.contains(sst)) {
                 log_debug("Fully expired sstable {} will be dropped on compaction completion", sst->get_filename());
                 continue;
             }
+            _stats_collector.update(sst->get_encoding_stats_for_compaction());
 
+            compaction_size += sst->data_size();
             // We also capture the sstable, so we keep it alive while the read isn't done
             ssts->insert(sst);
             // FIXME: If the sstables have cardinality estimation bitmaps, use that
             // for a better estimate for the number of partitions in the merged
             // sstable than just adding up the lengths of individual sstables.
             _estimated_partitions += sst->get_estimated_key_count();
-            // TODO:
-            // Note that this is not fully correct. Since we might be merging sstables that originated on
-            // another shard (#cpu changed), we might be comparing RP:s with differing shard ids,
-            // which might vary in "comparable" size quite a bit. However, since the worst that happens
-            // is that we might miss a high water mark for the commit log replayer,
-            // this is kind of ok, esp. since we will hopefully not be trying to recover based on
-            // compacted sstables anyway (CL should be clean by then).
-            _rp = std::max(_rp, sst_stats.position);
+            sum_of_estimated_droppable_tombstone_ratio += sst->estimate_droppable_tombstone_ratio(gc_clock::now(), get_tombstone_gc_state(), _schema);
+            _compacting_data_file_size += sst->ondisk_data_size();
+            _compacting_max_timestamp = std::max(_compacting_max_timestamp, sst->get_stats_metadata().max_timestamp);
+            if (sst->originated_on_this_node().value_or(false) && sst_stats.position.shard_id() == this_shard_id()) {
+                _rp = std::max(_rp, sst_stats.position);
+            }
         }
-        log_info("{} {}", report_start_desc(), formatted_msg);
-        if (ssts->all()->size() < _sstables.size()) {
+        _cdata.compaction_size += compaction_size;        
+        log_debug("{} [{}]", report_start_desc(), fmt::join(_sstables | std::views::transform([] (auto sst) { return to_string(sst, true); }), ","));
+        if (repaired_at) {
+            _output_repaired_at = repaired_at;
+        }
+        log_debug("repaired_at_vec={} output_repaired_at={}", repaired_at_for_compacted_sstables, _output_repaired_at);
+        if (ssts->size() < _sstables.size()) {
             log_debug("{} out of {} input sstables are fully expired sstables that will not be actually compacted",
-                      _sstables.size() - ssts->all()->size(), _sstables.size());
+                      _sstables.size() - ssts->size(), _sstables.size());
         }
+        // _estimated_droppable_tombstone_ratio could exceed 1.0 in certain cases, so limit it to 1.0.
+        _estimated_droppable_tombstone_ratio = std::min(1.0, sum_of_estimated_droppable_tombstone_ratio / ssts->size());
 
         _compacting = std::move(ssts);
 
@@ -668,14 +948,16 @@ private:
     // compacting_reader. It's useful for allowing data from different buckets
     // to be compacted together.
     future<> consume_without_gc_writer(gc_clock::time_point compaction_time) {
-        auto consumer = make_interposer_consumer([this] (flat_mutation_reader_v2 reader) mutable {
-            return seastar::async([this, reader = downgrade_to_v1(std::move(reader))] () mutable {
+        auto consumer = make_interposer_consumer([this] (mutation_reader reader) mutable {
+            return seastar::async([this, reader = std::move(reader)] () mutable {
                 auto close_reader = deferred_close(reader);
-                auto cfc = compacted_fragments_writer(get_compacted_fragments_writer());
+                auto cfc = get_compacted_fragments_writer();
                 reader.consume_in_thread(std::move(cfc));
             });
         });
-        return consumer(upgrade_to_v2(make_compacting_reader(downgrade_to_v1(make_sstable_reader()), compaction_time, max_purgeable_func())));
+        const auto& gc_state = get_tombstone_gc_state();
+        return consumer(make_compacting_reader(setup_sstable_reader(), compaction_time, max_purgeable_func(), gc_state,
+                                               streamed_mutation::forwarding::no, &_tombstone_purge_stats));
     }
 
     future<> consume() {
@@ -686,7 +968,7 @@ private:
         if (!enable_garbage_collected_sstable_writer() && use_interposer_consumer()) {
             return consume_without_gc_writer(now);
         }
-        auto consumer = make_interposer_consumer([this, now] (flat_mutation_reader_v2 reader) mutable
+        auto consumer = make_interposer_consumer([this, now] (mutation_reader reader) mutable
         {
             return seastar::async([this, reader = std::move(reader), now] () mutable {
                 auto close_reader = deferred_close(reader);
@@ -695,8 +977,10 @@ private:
                     using compact_mutations = compact_for_compaction<compacted_fragments_writer, compacted_fragments_writer>;
                     auto cfc = compact_mutations(*schema(), now,
                         max_purgeable_func(),
+                        get_tombstone_gc_state(),
                         get_compacted_fragments_writer(),
-                        get_gc_compacted_fragments_writer());
+                        get_gc_compacted_fragments_writer(),
+                        &_tombstone_purge_stats);
 
                     reader.consume_in_thread(std::move(cfc));
                     return;
@@ -704,27 +988,56 @@ private:
                 using compact_mutations = compact_for_compaction<compacted_fragments_writer, noop_compacted_fragments_consumer>;
                 auto cfc = compact_mutations(*schema(), now,
                     max_purgeable_func(),
+                    get_tombstone_gc_state(),
                     get_compacted_fragments_writer(),
-                    noop_compacted_fragments_consumer());
+                    noop_compacted_fragments_consumer(),
+                    &_tombstone_purge_stats);
                 reader.consume_in_thread(std::move(cfc));
             });
         });
-        return consumer(make_sstable_reader());
+        return consumer(setup_sstable_reader());
     }
 
-    virtual reader_consumer_v2 make_interposer_consumer(reader_consumer_v2 end_consumer) {
+    // based on the specified policies, the `compaction` base class designates
+    // an `end_consumer` which:
+    //
+    //  1. consumes the mutations read from the producer (i.e., reader) and
+    //  2. optionally performs the compaction, then
+    //  3. segregates the mutation stream into multiple chunks, i.e., sstables.
+    //
+    // but the derived compaction classes are allowed to further customize the
+    // the way how segregation is performed with its own rule by interposing this
+    // process. typically, it creates yet another consumer with the same interface
+    // wrapping around the given end consumer. the former consumer acts like a
+    // decorator of the latter.
+    //
+    // if the derived compaction wants to opt in for this behavior, in addition
+    // to overriding `make_interposer_consumer()`, it would have to override
+    // `use_interposer_consumer()` so it returns true.
+    virtual mutation_reader_consumer make_interposer_consumer(mutation_reader_consumer end_consumer) {
         return _table_s.get_compaction_strategy().make_interposer_consumer(_ms_metadata, std::move(end_consumer));
     }
 
     virtual bool use_interposer_consumer() const {
         return _table_s.get_compaction_strategy().use_interposer_consumer();
     }
-
-    compaction_result finish(std::chrono::time_point<db_clock> started_at, std::chrono::time_point<db_clock> ended_at) {
+protected:
+    virtual compaction_result finish(std::chrono::time_point<db_clock> started_at, std::chrono::time_point<db_clock> ended_at) {
         compaction_result ret {
+            .shard_id = this_shard_id(),
+            .type = _type,
+            .sstables_in = std::move(_input_sstables_basic_info),
+            .sstables_out = extract_basic_info_from_sstables(_all_new_sstables),
             .new_sstables = std::move(_all_new_sstables),
-            .ended_at = ended_at,
-            .end_size = _end_size,
+            .stats {
+                .started_at = started_at,
+                .ended_at = ended_at,
+                .start_size = _start_size,
+                .end_size = _end_size,
+                .bloom_filter_checks = _bloom_filter_checks,
+                .reader_statistics = std::move(_reader_statistics),
+                .tombstone_purge_stats = std::move(_tombstone_purge_stats),
+            },
         };
 
         auto ratio = double(_end_size) / double(_start_size);
@@ -733,33 +1046,36 @@ private:
 
         on_end_of_compaction();
 
-        formatted_sstables_list new_sstables_msg(ret.new_sstables, false);
-
         // FIXME: there is some missing information in the log message below.
         // look at CompactionTask::runMayThrow() in origin for reference.
         // - add support to merge summary (message: Partition merge counts were {%s}.).
         // - there is no easy way, currently, to know the exact number of total partitions.
         // By the time being, using estimated key count.
-        log_info("{} {} sstables to {}. {} to {} (~{}% of original) in {}ms = {}. ~{} total partitions merged to {}.",
-                report_finish_desc(),
-                _input_sstable_generations.size(), new_sstables_msg, pretty_printed_data_size(_start_size), pretty_printed_data_size(_end_size), int(ratio * 100),
-                std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(), pretty_printed_throughput(_end_size, duration),
+        log_debug("{} {} sstables to [{}]. {} to {} (~{}% of original) in {}ms = {}. ~{} total partitions merged to {}.",
+                report_finish_desc(), _input_sstable_generations.size(),
+                fmt::join(ret.new_sstables | std::views::transform([] (auto sst) { return to_string(sst, false); }), ","),
+                utils::pretty_printed_data_size(_start_size), utils::pretty_printed_data_size(_end_size), int(ratio * 100),
+                std::chrono::duration_cast<std::chrono::milliseconds>(duration).count(), utils::pretty_printed_throughput(_start_size, duration),
                 _cdata.total_partitions, _cdata.total_keys_written);
 
         return ret;
+    }
+private:
+    void on_interrupt(std::exception_ptr ex) {
+        log_info("{} of {} sstables interrupted due to: {}, at {}", report_start_desc(), _input_sstable_generations.size(), ex, current_backtrace());
+        delete_sstables_for_interrupted_compaction();
     }
 
     virtual std::string_view report_start_desc() const = 0;
     virtual std::string_view report_finish_desc() const = 0;
 
-    std::function<api::timestamp_type(const dht::decorated_key&)> max_purgeable_func() {
+    max_purgeable_fn max_purgeable_func() {
         if (!tombstone_expiration_enabled()) {
-            return [] (const dht::decorated_key& dk) {
-                return api::min_timestamp;
-            };
+            return can_never_purge;
         }
-        return [this] (const dht::decorated_key& dk) {
-            return get_max_purgeable_timestamp(_table_s, *_selector, _compacting_for_max_purgeable_func, dk);
+        return [this] (const dht::decorated_key& dk, is_shadowable is_shadowable) {
+            return get_max_purgeable_timestamp(_table_s, *_selector, _compacting_for_max_purgeable_func, dk, _bloom_filter_checks, _compacting_max_timestamp,
+                    _gc_scope, is_shadowable);
         };
     }
 
@@ -786,10 +1102,27 @@ private:
         // Delete either partially or fully written sstables of a compaction that
         // was either stopped abruptly (e.g. out of disk space) or deliberately
         // (e.g. nodetool stop COMPACTION).
-        for (auto& sst : boost::range::join(_new_partial_sstables, _new_unused_sstables)) {
-            log_debug("Deleting sstable {} of interrupted compaction for {}.{}", sst->get_filename(), _schema->ks_name(), _schema->cf_name());
-            sst->mark_for_deletion();
-        }
+        //
+        // _unused_garbage_collected_sstables is included because a sealed GC
+        // sstable that was never consumed is not tracked anywhere else: it is not
+        // in _new_unused_sstables (it only lands there once
+        // consume_unused_garbage_collected_sstables() runs) and sealing cleared
+        // its implicit deletion mark, so ~sstable() would leave its files behind.
+        //
+        // _used_garbage_collected_sstables is deliberately NOT included: those were
+        // already added to the table's sstable set and are still live there after an
+        // interrupted compaction. Marking them would delete files still referenced
+        // by the sstable set.
+        auto mark_for_deletion = [this] (const auto& sstables) {
+            for (auto& sst : sstables) {
+                log_debug("Deleting sstable {} of interrupted compaction for {}.{}", sst->get_filename(), _schema->ks_name(), _schema->cf_name());
+                sst->mark_for_deletion();
+            }
+        };
+        mark_for_deletion(_new_partial_sstables);
+        mark_for_deletion(_new_unused_sstables);
+        mark_for_deletion(_unused_garbage_collected_sstables);
+        _unused_garbage_collected_sstables.clear();
     }
 protected:
     template <typename... Args>
@@ -825,10 +1158,6 @@ protected:
         log(log_level::trace, std::move(fmt), std::forward<Args>(args)...);
     }
 public:
-    bool enable_garbage_collected_sstable_writer() const noexcept {
-        return _contains_multi_fragment_runs && _max_sstable_size != std::numeric_limits<uint64_t>::max();
-    }
-
     static future<compaction_result> run(std::unique_ptr<compaction> c);
 
     friend class compacted_fragments_writer;
@@ -851,7 +1180,51 @@ void compacted_fragments_writer::maybe_abort_compaction() {
     }
 }
 
-void compacted_fragments_writer::consume_new_partition(const dht::decorated_key& dk) {
+void compacted_fragments_writer::stop_current_writer() {
+    // stop sstable writer being currently used.
+    _stop_compaction_writer(&*_compaction_writer);
+    _compaction_writer = std::nullopt;
+}
+
+bool compacted_fragments_writer::can_split_large_partition() const {
+    return _c._can_split_large_partition;
+}
+
+void compacted_fragments_writer::track_last_position(position_in_partition_view pos) {
+    if (can_split_large_partition()) {
+        _current_partition.last_pos = pos;
+    }
+}
+
+void compacted_fragments_writer::split_large_partition() {
+    // Closes the active range tombstone if needed, before emitting partition end.
+    // after_key(last_pos) is used for both closing and re-opening the active tombstone, which
+    // will result in current fragment storing an inclusive end bound for last pos, and the
+    // next fragment storing an exclusive start bound for last pos. This is very important
+    // for not losing information on the range tombstone.
+    auto after_last_pos = position_in_partition::after_key(*_c.schema(), _current_partition.last_pos.key());
+    if (_current_partition.current_emitted_tombstone) {
+        auto rtc = range_tombstone_change(after_last_pos, tombstone{});
+        _c.log_debug("Closing active tombstone {} with {} for partition {}", _current_partition.current_emitted_tombstone, rtc, *_current_partition.dk);
+        _compaction_writer->writer.consume(std::move(rtc));
+    }
+    _c.log_debug("Splitting large partition {} in order to respect SSTable size limit of {}", *_current_partition.dk, utils::pretty_printed_data_size(_c._max_sstable_size));
+    // Close partition in current writer, and open it again in a new writer.
+    do_consume_end_of_partition();
+    stop_current_writer();
+    do_consume_new_partition(*_current_partition.dk);
+    // Replicate partition tombstone to every fragment, allowing the SSTable run reader
+    // to open a single fragment during the read.
+    if (_current_partition.tombstone) {
+        consume(_current_partition.tombstone);
+    }
+    if (_current_partition.current_emitted_tombstone) {
+        _compaction_writer->writer.consume(range_tombstone_change(after_last_pos, _current_partition.current_emitted_tombstone));
+    }
+    _current_partition.is_splitting_partition = false;
+}
+
+void compacted_fragments_writer::do_consume_new_partition(const dht::decorated_key& dk) {
     maybe_abort_compaction();
     if (!_compaction_writer) {
         _compaction_writer = _create_compaction_writer(dk);
@@ -859,17 +1232,55 @@ void compacted_fragments_writer::consume_new_partition(const dht::decorated_key&
 
     _c.on_new_partition();
     _compaction_writer->writer.consume_new_partition(dk);
-    _c._cdata.total_keys_written++;
     _unclosed_partition = true;
 }
 
-stop_iteration compacted_fragments_writer::consume_end_of_partition() {
-    auto ret = _compaction_writer->writer.consume_end_of_partition();
+stop_iteration compacted_fragments_writer::do_consume_end_of_partition() {
     _unclosed_partition = false;
+    return _compaction_writer->writer.consume_end_of_partition();
+}
+
+void compacted_fragments_writer::consume_new_partition(const dht::decorated_key& dk) {
+    _current_partition = {
+        .dk = dk,
+        .tombstone = tombstone(),
+        .current_emitted_tombstone = tombstone(),
+        .last_pos = position_in_partition::for_partition_start(),
+        .is_splitting_partition = false
+    };
+    do_consume_new_partition(dk);
+    _c._cdata.total_keys_written++;
+}
+
+void compacted_fragments_writer::consume(tombstone t) {
+    _current_partition.tombstone = t;
+    _compaction_writer->writer.consume(t);
+}
+
+stop_iteration compacted_fragments_writer::consume(clustering_row&& cr, row_tombstone, bool) {
+    maybe_abort_compaction();
+    if (_current_partition.is_splitting_partition) [[unlikely]] {
+        split_large_partition();
+    }
+    track_last_position(cr.position());
+    auto ret = _compaction_writer->writer.consume(std::move(cr));
+    if (can_split_large_partition() && ret == stop_iteration::yes) [[unlikely]] {
+        _current_partition.is_splitting_partition = true;
+    }
+    return stop_iteration::no;
+}
+
+stop_iteration compacted_fragments_writer::consume(range_tombstone_change&& rtc) {
+    maybe_abort_compaction();
+    _current_partition.current_emitted_tombstone = rtc.tombstone();
+    track_last_position(rtc.position());
+    return _compaction_writer->writer.consume(std::move(rtc));
+}
+
+stop_iteration compacted_fragments_writer::consume_end_of_partition() {
+    auto ret = do_consume_end_of_partition();
     if (ret == stop_iteration::yes) {
-        // stop sstable writer being currently used.
-        _stop_compaction_writer(&*_compaction_writer);
-        _compaction_writer = std::nullopt;
+        stop_current_writer();
     }
     return ret;
 }
@@ -881,72 +1292,32 @@ void compacted_fragments_writer::consume_end_of_stream() {
     }
 }
 
-class reshape_compaction : public compaction {
-public:
-    reshape_compaction(table_state& table_s, compaction_descriptor descriptor, compaction_data& cdata)
-        : compaction(table_s, std::move(descriptor), cdata) {
-    }
-
-    virtual sstables::sstable_set make_sstable_set_for_input() const override {
-        return sstables::make_partitioned_sstable_set(_schema, make_lw_shared<sstable_list>(sstable_list{}), false);
-    }
-
-    flat_mutation_reader_v2 make_sstable_reader() const override {
-        return _compacting->make_local_shard_sstable_reader(_schema,
-                _permit,
-                query::full_partition_range,
-                _schema->full_slice(),
-                _io_priority,
-                tracing::trace_state_ptr(),
-                ::streamed_mutation::forwarding::no,
-                ::mutation_reader::forwarding::no,
-                default_read_monitor_generator());
-    }
-
-    std::string_view report_start_desc() const override {
-        return "Reshaping";
-    }
-
-    std::string_view report_finish_desc() const override {
-        return "Reshaped";
-    }
-
-    virtual compaction_writer create_compaction_writer(const dht::decorated_key& dk) override {
-        auto sst = _sstable_creator(this_shard_id());
-        setup_new_sstable(sst);
-
-        sstable_writer_config cfg = make_sstable_writer_config(compaction_type::Reshape);
-        return compaction_writer{sst->get_writer(*_schema, partitions_per_sstable(), cfg, get_encoding_stats(), _io_priority), sst};
-    }
-
-    virtual void stop_sstable_writer(compaction_writer* writer) override {
-        if (writer) {
-            finish_new_sstable(writer);
-        }
-    }
-};
-
 class regular_compaction : public compaction {
-    // keeps track of monitors for input sstable, which are responsible for adjusting backlog as compaction progresses.
-    mutable compaction_read_monitor_generator _monitor_generator;
     seastar::semaphore _replacer_lock = {1};
 public:
-    regular_compaction(table_state& table_s, compaction_descriptor descriptor, compaction_data& cdata)
-        : compaction(table_s, std::move(descriptor), cdata)
-        , _monitor_generator(_table_s)
+    regular_compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_progress_monitor& progress_monitor, use_backlog_tracker use_backlog_tracker = use_backlog_tracker::yes)
+        : compaction(table_s, std::move(descriptor), cdata, progress_monitor, use_backlog_tracker)
     {
     }
 
-    flat_mutation_reader_v2 make_sstable_reader() const override {
-        return _compacting->make_local_shard_sstable_reader(_schema,
-                _permit,
-                query::full_partition_range,
-                _schema->full_slice(),
-                _io_priority,
-                tracing::trace_state_ptr(),
-                ::streamed_mutation::forwarding::no,
-                ::mutation_reader::forwarding::no,
-                _monitor_generator);
+    mutation_reader make_sstable_reader(schema_ptr s,
+                                                reader_permit permit,
+                                                const dht::partition_range& range,
+                                                const query::partition_slice& slice,
+                                                tracing::trace_state_ptr trace,
+                                                streamed_mutation::forwarding sm_fwd,
+                                                mutation_reader::forwarding mr_fwd) override {
+        return _compacting->make_local_shard_sstable_reader(std::move(s),
+                std::move(permit),
+                range,
+                slice,
+                std::move(trace),
+                sm_fwd,
+                mr_fwd,
+                unwrap_monitor_generator(),
+                sstables::default_sstable_predicate(),
+                &_reader_statistics,
+                sstables::integrity_check::yes);
     }
 
     std::string_view report_start_desc() const override {
@@ -962,9 +1333,9 @@ public:
         setup_new_sstable(sst);
 
         auto monitor = std::make_unique<compaction_write_monitor>(sst, _table_s, maximum_timestamp(), _sstable_level);
-        sstable_writer_config cfg = make_sstable_writer_config(_type);
+        sstables::sstable_writer_config cfg = make_sstable_writer_config(_type);
         cfg.monitor = monitor.get();
-        return compaction_writer{std::move(monitor), sst->get_writer(*_schema, partitions_per_sstable(), cfg, get_encoding_stats(), _io_priority), sst};
+        return compaction_writer{std::move(monitor), sst->get_writer(*_schema, partitions_per_sstable(), cfg, get_encoding_stats()), sst};
     }
 
     virtual void stop_sstable_writer(compaction_writer* writer) override {
@@ -982,15 +1353,15 @@ public:
         replace_remaining_exhausted_sstables();
     }
 private:
-    void maybe_replace_exhausted_sstables_by_sst(shared_sstable sst) {
+    void maybe_replace_exhausted_sstables_by_sst(sstables::shared_sstable sst) {
         // Skip earlier replacement of exhausted sstables if compaction works with only single-fragment runs,
         // meaning incremental compaction is disabled for this compaction.
         if (!enable_garbage_collected_sstable_writer()) {
             return;
         }
-        auto permit = seastar::get_units(_replacer_lock, 1).get0();
+        auto permit = seastar::get_units(_replacer_lock, 1).get();
         // Replace exhausted sstable(s), if any, by new one(s) in the column family.
-        auto not_exhausted = [s = _schema, &dk = sst->get_last_decorated_key()] (shared_sstable& sst) {
+        auto not_exhausted = [s = _schema, &dk = sst->get_last_decorated_key()] (sstables::shared_sstable& sst) {
             return sst->get_last_decorated_key().tri_compare(*s, dk) > 0;
         };
         auto exhausted = std::partition(_sstables.begin(), _sstables.end(), not_exhausted);
@@ -998,7 +1369,7 @@ private:
         if (exhausted != _sstables.end()) {
             // The goal is that exhausted sstables will be deleted as soon as possible,
             // so we need to release reference to them.
-            std::for_each(exhausted, _sstables.end(), [this] (shared_sstable& sst) {
+            std::for_each(exhausted, _sstables.end(), [this] (sstables::shared_sstable& sst) {
                 _compacting_for_max_purgeable_func.erase(sst);
                 // Fully expired sstable is not actually compacted, therefore it's not present in the compacting set.
                 _compacting->erase(sst);
@@ -1011,19 +1382,89 @@ private:
             // to SSTable set. GC SSTables should be added before compaction completes because
             // a failure could result in data resurrection if data is not made available.
             auto unused_gc_sstables = consume_unused_garbage_collected_sstables();
-            _new_unused_sstables.insert(_new_unused_sstables.end(), unused_gc_sstables.begin(), unused_gc_sstables.end());
 
-            auto exhausted_ssts = std::vector<shared_sstable>(exhausted, _sstables.end());
-            log_debug("Replacing earlier exhausted sstable(s) {} by new sstable {}", formatted_sstables_list(exhausted_ssts, false), sst->get_filename());
-            _replacer(get_compaction_completion_desc(exhausted_ssts, std::move(_new_unused_sstables)));
+            auto exhausted_ssts = std::vector<sstables::shared_sstable>(exhausted, _sstables.end());
+            log_debug("Replacing earlier exhausted sstable(s) [{}] by new sstable(s) [{}] and new gc sstable(s) [{}]",
+                fmt::join(exhausted_ssts | std::views::transform([] (auto sst) { return to_string(sst, false); }), ","),
+                fmt::join(_new_unused_sstables | std::views::transform([] (auto sst) { return to_string(sst, true); }), ","),
+                fmt::join(unused_gc_sstables | std::views::transform([] (auto sst) { return to_string(sst, true); }), ","));
+            _replacer(get_compaction_completion_desc(exhausted_ssts, std::move(_new_unused_sstables), std::move(unused_gc_sstables)));
             _sstables.erase(exhausted, _sstables.end());
-            _monitor_generator.remove_exhausted_sstables(exhausted_ssts);
+            dynamic_cast<compaction_read_monitor_generator&>(unwrap_monitor_generator()).remove_exhausted_sstables(exhausted_ssts);
+        }
+
+        // Release exhausted garbage collected sstables.
+        // A GC sstable is exhausted when it doesn't overlap with any remaining input sstable.
+        // GC sstables serve as safeguards against data resurrection: their tombstones may shadow
+        // data in not-yet-exhausted input sstables. So a GC sstable can only be released once
+        // all overlapping input sstables have been exhausted.
+        auto gc_not_exhausted = [this] (const sstables::shared_sstable& gc_sst) {
+            auto gc_range = ::wrapping_interval<dht::token>::make(
+                gc_sst->get_first_decorated_key().token(),
+                gc_sst->get_last_decorated_key().token());
+            for (const auto& input_sst : _sstables) {
+                auto input_range = ::wrapping_interval<dht::token>::make(
+                    input_sst->get_first_decorated_key().token(),
+                    input_sst->get_last_decorated_key().token());
+                if (gc_range.overlaps(input_range, dht::token_comparator())) {
+                    return true; // overlaps with a remaining input sstable, not exhausted yet
+                }
+            }
+            return false; // no overlap with any remaining input sstable, can be released
+        };
+        exhausted = std::partition(_used_garbage_collected_sstables.begin(), _used_garbage_collected_sstables.end(), gc_not_exhausted);
+        if (exhausted != _used_garbage_collected_sstables.end()) {
+            auto exhausted_gc_ssts = std::vector<sstables::shared_sstable>(exhausted, _used_garbage_collected_sstables.end());
+            log_debug("Releasing {} exhausted GC sstable(s) earlier: [{}]",
+                exhausted_gc_ssts.size(),
+                fmt::join(exhausted_gc_ssts | std::views::transform([] (auto sst) { return to_string(sst, true); }), ","));
+            _replacer(get_compaction_completion_desc(std::move(exhausted_gc_ssts), {}));
+            _used_garbage_collected_sstables.erase(exhausted, _used_garbage_collected_sstables.end());
         }
     }
 
     void replace_remaining_exhausted_sstables() {
+        // A GC sstable can still be unused at this point: mutation_compactor seals
+        // the GC writer *before* the regular one at end of stream, so if the
+        // regular writer had already rotated shut (e.g. the tail of the stream is
+        // entirely purgeable), its consume_end_of_stream() is a no-op and
+        // maybe_replace_exhausted_sstables_by_sst() -- the only place that calls
+        // consume_unused_garbage_collected_sstables() -- never runs again.
+        //
+        // Such an sstable was never added to the table, so it cannot be handed to
+        // the replacer as an old_sstable (that would fail to be removed from the
+        // sstable set).  It is sealed, so seal_sstable() already cleared
+        // mark_for_deletion::implicit and ~sstable() will not unlink it.  Mark it
+        // explicitly, or its files stay on disk forever -- neither attached nor
+        // deleted, and invisible until the next restart rescans the data
+        // directory.
+        //
+        // Marked on the way out rather than inline, because the replacement below
+        // can throw, and this is the last chance to do it: compaction::run() calls
+        // finish(), and with it on_end_of_compaction(), outside the try/catch that
+        // invokes on_interrupt(), so delete_sstables_for_interrupted_compaction()
+        // -- the only other place that marks them -- would not run either.
+        //
+        // Done after the replacement below so the GC sstable, which guards against
+        // data resurrection, outlives the atomic swap of inputs for outputs.
+        auto mark_unused_gc_sstables = defer([this] () noexcept {
+            for (auto& sst : _unused_garbage_collected_sstables) {
+                // Kept clear of the marking below, which is what must not be
+                // skipped: this allocates, and the guard is noexcept, so letting
+                // a formatting failure escape would abort the node with the
+                // sstables still unmarked.
+                try {
+                    log_debug("Deleting unused garbage collected sstable {} for {}.{}",
+                              sst->get_filename(), _schema->ks_name(), _schema->cf_name());
+                } catch (...) {
+                }
+                sst->mark_for_deletion();
+            }
+            _unused_garbage_collected_sstables.clear();
+        });
+
         if (!_sstables.empty() || !used_garbage_collected_sstables().empty()) {
-            std::vector<shared_sstable> old_sstables;
+            std::vector<sstables::shared_sstable> old_sstables;
             std::move(_sstables.begin(), _sstables.end(), std::back_inserter(old_sstables));
 
             // Remove Garbage Collected SSTables from the SSTable set if any was previously added.
@@ -1031,16 +1472,18 @@ private:
             old_sstables.insert(old_sstables.end(), used_gc_sstables.begin(), used_gc_sstables.end());
 
             _replacer(get_compaction_completion_desc(std::move(old_sstables), std::move(_new_unused_sstables)));
-         }
+        }
     }
 
     void update_pending_ranges() {
-        if (!_sstable_set || _sstable_set->all()->empty() || _cdata.pending_replacements.empty()) { // set can be empty for testing scenario.
+        auto pending_replacements = std::exchange(_cdata.pending_replacements, {});
+        if (!_sstable_set || _sstable_set->all()->empty() || pending_replacements.empty()) { // set can be empty for testing scenario.
             return;
         }
         // Releases reference to sstables compacted by this compaction or another, both of which belongs
         // to the same column family
-        for (auto& pending_replacement : _cdata.pending_replacements) {
+        for (auto& pending_replacement : pending_replacements) {
+            bool replaces_snapshot_sstable = false;
             for (auto& sst : pending_replacement.removed) {
                 // Set may not contain sstable to be removed because this compaction may have started
                 // before the creation of that sstable.
@@ -1048,92 +1491,103 @@ private:
                     continue;
                 }
                 _sstable_set->erase(sst);
+                replaces_snapshot_sstable = true;
+            }
+            // If none of the removed sstables is in the snapshot, the added ones hold only data
+            // which was not in it either: data written or flushed after the snapshot was taken.
+            // A compaction with a narrowed gc scope has established that no GC-eligible tombstone
+            // can shadow such data, see tombstone_gc_scope, so it has no reason to consult them.
+            // Adding them anyway lets data written during a long compaction block the purge of
+            // tombstones, once another compaction happens to rewrite it.
+            // Otherwise the added sstables must be consulted: they hold data of the snapshot.
+            if (!replaces_snapshot_sstable && _gc_scope != tombstone_gc_scope::all) {
+                continue;
             }
             for (auto& sst : pending_replacement.added) {
                 _sstable_set->insert(sst);
             }
         }
         _selector.emplace(_sstable_set->make_incremental_selector());
-        _cdata.pending_replacements.clear();
+    }
+};
+
+class reshape_compaction : public regular_compaction {
+private:
+    bool has_sstable_replacer() const noexcept {
+        return bool(_replacer);
+    }
+public:
+    reshape_compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_progress_monitor& progress_monitor)
+        : regular_compaction(table_s, std::move(descriptor), cdata, progress_monitor, use_backlog_tracker::no) {
+    }
+
+    virtual sstables::sstable_set make_sstable_set_for_input() const override {
+        return sstables::make_partitioned_sstable_set(_schema);
+    }
+
+    // Unconditionally enable incremental compaction if the strategy specifies a max output size, e.g. LCS.
+    virtual bool enable_garbage_collected_sstable_writer() const noexcept override {
+        return _max_sstable_size != std::numeric_limits<uint64_t>::max() && bool(_replacer);
+    }
+
+    mutation_reader make_sstable_reader(schema_ptr s,
+                                                reader_permit permit,
+                                                const dht::partition_range& range,
+                                                const query::partition_slice& slice,
+                                                tracing::trace_state_ptr trace,
+                                                streamed_mutation::forwarding sm_fwd,
+                                                mutation_reader::forwarding mr_fwd) override {
+        return _compacting->make_local_shard_sstable_reader(std::move(s),
+                std::move(permit),
+                range,
+                slice,
+                std::move(trace),
+                sm_fwd,
+                mr_fwd,
+                unwrap_monitor_generator(),
+                sstables::default_sstable_predicate(),
+                nullptr,
+                sstables::integrity_check::yes);
+    }
+
+    std::string_view report_start_desc() const override {
+        return "Reshaping";
+    }
+
+    std::string_view report_finish_desc() const override {
+        return "Reshaped";
+    }
+
+    virtual compaction_writer create_compaction_writer(const dht::decorated_key& dk) override {
+        auto sst = _sstable_creator(this_shard_id());
+        setup_new_sstable(sst);
+
+        sstables::sstable_writer_config cfg = make_sstable_writer_config(compaction_type::Reshape);
+        return compaction_writer{sst->get_writer(*_schema, partitions_per_sstable(), cfg, get_encoding_stats()), sst};
+    }
+
+    virtual void stop_sstable_writer(compaction_writer* writer) override {
+        if (writer) {
+            if (has_sstable_replacer()) {
+                regular_compaction::stop_sstable_writer(writer);
+            } else {
+                finish_new_sstable(writer);
+            }
+        }
+    }
+
+    virtual void on_end_of_compaction() override {
+        if (has_sstable_replacer()) {
+            regular_compaction::on_end_of_compaction();
+        }
     }
 };
 
 class cleanup_compaction final : public regular_compaction {
-    class incremental_owned_ranges_checker {
-        const dht::token_range_vector& _sorted_owned_ranges;
-        mutable dht::token_range_vector::const_iterator _it;
-    public:
-        incremental_owned_ranges_checker(const dht::token_range_vector& sorted_owned_ranges)
-                : _sorted_owned_ranges(sorted_owned_ranges)
-                , _it(_sorted_owned_ranges.begin()) {
-        }
-
-        // Must be called with increasing token values.
-        bool belongs_to_current_node(const dht::token& t) const {
-            // While token T is after a range Rn, advance the iterator.
-            // iterator will be stopped at a range which either overlaps with T (if T belongs to node),
-            // or at a range which is after T (if T doesn't belong to this node).
-            while (_it != _sorted_owned_ranges.end() && _it->after(t, dht::token_comparator())) {
-                _it++;
-            }
-
-            return _it != _sorted_owned_ranges.end() && _it->contains(t, dht::token_comparator());
-        }
-    };
-
-    const dht::token_range_vector _owned_ranges;
-    incremental_owned_ranges_checker _owned_ranges_checker;
-private:
-    // Called in a seastar thread
-    dht::partition_range_vector
-    get_ranges_for_invalidation(const std::vector<shared_sstable>& sstables) {
-        auto owned_ranges = dht::to_partition_ranges(_owned_ranges, utils::can_yield::yes);
-
-        auto non_owned_ranges = boost::copy_range<dht::partition_range_vector>(sstables
-                | boost::adaptors::transformed([] (const shared_sstable& sst) {
-            seastar::thread::maybe_yield();
-            return dht::partition_range::make({sst->get_first_decorated_key(), true},
-                                              {sst->get_last_decorated_key(), true});
-        }));
-        // optimize set of potentially overlapping ranges by deoverlapping them.
-        non_owned_ranges = dht::partition_range::deoverlap(std::move(non_owned_ranges), dht::ring_position_comparator(*_schema));
-
-        // subtract *each* owned range from the partition range of *each* sstable*,
-        // such that we'll be left only with a set of non-owned ranges.
-        for (auto& owned_range : owned_ranges) {
-            dht::partition_range_vector new_non_owned_ranges;
-            for (auto& non_owned_range : non_owned_ranges) {
-                auto ret = non_owned_range.subtract(owned_range, dht::ring_position_comparator(*_schema));
-                new_non_owned_ranges.insert(new_non_owned_ranges.end(), ret.begin(), ret.end());
-                seastar::thread::maybe_yield();
-            }
-            non_owned_ranges = std::move(new_non_owned_ranges);
-        }
-        return non_owned_ranges;
-    }
-protected:
-    virtual compaction_completion_desc
-    get_compaction_completion_desc(std::vector<shared_sstable> input_sstables, std::vector<shared_sstable> output_sstables) override {
-        auto ranges_for_for_invalidation = get_ranges_for_invalidation(input_sstables);
-        return compaction_completion_desc{std::move(input_sstables), std::move(output_sstables), std::move(ranges_for_for_invalidation)};
-    }
-
-private:
-    cleanup_compaction(table_state& table_s, compaction_descriptor descriptor, compaction_data& cdata, dht::token_range_vector owned_ranges)
-        : regular_compaction(table_s, std::move(descriptor), cdata)
-        , _owned_ranges(std::move(owned_ranges))
-        , _owned_ranges_checker(_owned_ranges)
-    {
-    }
-
 public:
-    cleanup_compaction(table_state& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_type_options::cleanup opts)
-        : cleanup_compaction(table_s, std::move(descriptor), cdata, std::move(opts.owned_ranges)) {}
-    cleanup_compaction(table_state& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_type_options::upgrade opts)
-        : cleanup_compaction(table_s, std::move(descriptor), cdata, std::move(opts.owned_ranges)) {}
-
-    flat_mutation_reader_v2 make_sstable_reader() const override {
-        return make_filtering_reader(regular_compaction::make_sstable_reader(), make_partition_filter());
+    cleanup_compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_progress_monitor& progress_monitor)
+        : regular_compaction(table_s, std::move(descriptor), cdata, progress_monitor)
+    {
     }
 
     std::string_view report_start_desc() const override {
@@ -1143,111 +1597,100 @@ public:
     std::string_view report_finish_desc() const override {
         return "Cleaned";
     }
+};
 
-    flat_mutation_reader::filter make_partition_filter() const {
-        return [this] (const dht::decorated_key& dk) {
-#ifdef SEASTAR_DEBUG
-            // sstables should never be shared with other shards at this point.
-            assert(dht::shard_of(*_schema, dk.token()) == this_shard_id());
-#endif
+class split_compaction final : public regular_compaction {
+    compaction_type_options::split _options;
+public:
+    split_compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_type_options::split options,
+                         compaction_progress_monitor& progress_monitor)
+            : regular_compaction(table_s, std::move(descriptor), cdata, progress_monitor)
+            , _options(std::move(options))
+    {
+    }
 
-            if (!_owned_ranges_checker.belongs_to_current_node(dk.token())) {
-                log_trace("Token {} does not belong to this node, skipping", dk.token());
-                return false;
-            }
-            return true;
+    mutation_reader_consumer make_interposer_consumer(mutation_reader_consumer end_consumer) override {
+        return [this, end_consumer = std::move(end_consumer)] (mutation_reader reader) mutable -> future<> {
+            return mutation_writer::segregate_by_token_group(std::move(reader),
+                    _options.classifier,
+                    _table_s.get_compaction_strategy().make_interposer_consumer(_ms_metadata, std::move(end_consumer)));
         };
+    }
+
+    bool use_interposer_consumer() const override {
+        return true;
+    }
+
+    std::string_view report_start_desc() const override {
+        return "Splitting";
+    }
+
+    std::string_view report_finish_desc() const override {
+        return "Split";
+    }
+
+    virtual compaction_writer create_compaction_writer(const dht::decorated_key& dk) override {
+        auto sst = _sstable_creator(this_shard_id());
+        setup_new_sstable(sst);
+
+        // Deduce the estimated keys based on the token range that will end up in this new sstable after the split.
+        auto token_range_of_new_sst = _table_s.get_token_range_after_split(dk.token());
+        const auto estimated_keys = _sstables[0]->estimated_keys_for_range(token_range_of_new_sst).get();
+
+        auto monitor = std::make_unique<compaction_write_monitor>(sst, _table_s, maximum_timestamp(), _sstable_level);
+        sstables::sstable_writer_config cfg = make_sstable_writer_config(_type);
+        cfg.monitor = monitor.get();
+
+        return compaction_writer{std::move(monitor), sst->get_writer(*_schema, estimated_keys, cfg, get_encoding_stats()), sst};
     }
 };
 
 class scrub_compaction final : public regular_compaction {
 public:
-    static void report_invalid_partition(compaction_type type, mutation_fragment_stream_validator& validator, const dht::decorated_key& new_key,
-            std::string_view action = "") {
-        const auto& schema = validator.schema();
-        const auto& current_key = validator.previous_partition_key();
-        clogger.error("[{} compaction {}.{}] Invalid partition {} ({}), partition is out-of-order compared to previous partition {} ({}){}{}",
-                type,
-                schema.ks_name(),
-                schema.cf_name(),
-                partition_key_to_string(new_key.key(), schema),
-                new_key,
-                partition_key_to_string(current_key.key(), schema),
-                current_key,
-                action.empty() ? "" : "; ",
-                action);
-    }
-    static void report_invalid_partition_start(compaction_type type, mutation_fragment_stream_validator& validator, const dht::decorated_key& new_key,
-            std::string_view action = "") {
-        const auto& schema = validator.schema();
-        const auto& current_key = validator.previous_partition_key();
-        clogger.error("[{} compaction {}.{}] Invalid partition start for partition {} ({}), previous partition {} ({}) didn't end with a partition-end fragment{}{}",
-                type,
-                schema.ks_name(),
-                schema.cf_name(),
-                partition_key_to_string(new_key.key(), schema),
-                new_key,
-                partition_key_to_string(current_key.key(), schema),
-                current_key,
-                action.empty() ? "" : "; ",
-                action);
-    }
-    static void report_invalid_mutation_fragment(compaction_type type, mutation_fragment_stream_validator& validator, const mutation_fragment_v2& mf,
-            std::string_view action = "") {
-        const auto& schema = validator.schema();
-        const auto& key = validator.previous_partition_key();
-        const auto prev_pos = validator.previous_position();
-        clogger.error("[{} compaction {}.{}] Invalid {} fragment{} ({}) in partition {} ({}),"
-                " fragment is out-of-order compared to previous {} fragment{} ({}){}{}",
-                type,
-                schema.ks_name(),
-                schema.cf_name(),
-                mf.mutation_fragment_kind(),
-                mf.has_key() ? format(" with key {}", mf.key().with_schema(schema)) : "",
-                mf.position(),
-                partition_key_to_string(key.key(), schema),
-                key,
-                prev_pos.region(),
-                prev_pos.has_key() ? format(" with key {}", prev_pos.key().with_schema(schema)) : "",
-                prev_pos,
-                action.empty() ? "" : "; ",
-                action);
-    }
-    static void report_invalid_end_of_stream(compaction_type type, mutation_fragment_stream_validator& validator, std::string_view action = "") {
-        const auto& schema = validator.schema();
-        const auto& key = validator.previous_partition_key();
-        clogger.error("[{} compaction {}.{}] Invalid end-of-stream, last partition {} ({}) didn't end with a partition-end fragment{}{}",
-                type, schema.ks_name(), schema.cf_name(), partition_key_to_string(key.key(), schema), key, action.empty() ? "" : "; ", action);
+    static void report_validation_error(compaction_type type, const ::schema& schema, sstring what, std::string_view action = "") {
+        clogger.error("[{} compaction {}.{}] {}{}{}", type, schema.ks_name(), schema.cf_name(), what, action.empty() ? "" : "; ", action);
     }
 
 private:
-    static sstring partition_key_to_string(const partition_key& key, const ::schema& s) {
-        sstring ret = format("{}", key.with_schema(s));
-        return utils::utf8::validate((const uint8_t*)ret.data(), ret.size()) ? ret : "<non-utf8-key>";
-    }
 
-    class reader : public flat_mutation_reader_v2::impl {
+    class reader : public mutation_reader::impl {
         using skip = bool_class<class skip_tag>;
     private:
         compaction_type_options::scrub::mode _scrub_mode;
-        flat_mutation_reader_v2 _reader;
+        mutation_reader _reader;
         mutation_fragment_stream_validator _validator;
         bool _skip_to_next_partition = false;
+        uint64_t& _validation_errors;
+        bool& _failed_to_fix_sstable;
+        compaction_type_options::scrub::drop_unfixable_sstables _drop_unfixable_sstables;
 
     private:
-        void maybe_abort_scrub() {
-            if (_scrub_mode == compaction_type_options::scrub::mode::abort) {
-                throw compaction_aborted_exception(_schema->ks_name(), _schema->cf_name(), "scrub compaction found invalid data");
-            }
+        [[noreturn]] void throw_invalid_sstable_compaction_aborted_exception(sstring ks, sstring cf, sstring reason) {
+            throw scrub_compaction_aborted_exception{std::move(ks), std::move(cf), std::move(reason)};
         }
 
-        void on_unexpected_partition_start(const mutation_fragment_v2& ps) {
-            maybe_abort_scrub();
-            report_invalid_partition_start(compaction_type::Scrub, _validator, ps.as_partition_start().key(),
-                    "Rectifying by adding assumed missing partition-end");
+        void maybe_abort_scrub(std::function<void()> report_error) {
+            if (_scrub_mode == compaction_type_options::scrub::mode::abort) {
+                report_error();
+                throw_invalid_sstable_compaction_aborted_exception(_schema->ks_name(), _schema->cf_name(), "scrub compaction found invalid data");
+            }
+            ++_validation_errors;
+        }
+
+        skip on_unexpected_partition_start(const mutation_fragment_v2& ps, sstring error) {
+            auto report_fn = [this, error] (std::string_view action = "") {
+                report_validation_error(compaction_type::Scrub, *_schema, error, action);
+            };
+            maybe_abort_scrub(report_fn);
+            report_fn("Rectifying by adding assumed missing partition-end");
 
             auto pe = mutation_fragment_v2(*_schema, _permit, partition_end{});
             if (!_validator(pe)) {
+                if (_drop_unfixable_sstables) {
+                    _failed_to_fix_sstable = true;
+                    end_stream();
+                    return skip::yes;
+                }
                 throw compaction_aborted_exception(
                         _schema->ks_name(),
                         _schema->cf_name(),
@@ -1256,37 +1699,60 @@ private:
             push_mutation_fragment(std::move(pe));
 
             if (!_validator(ps)) {
+                if (_drop_unfixable_sstables) {
+                    _failed_to_fix_sstable = true;
+                    end_stream();
+                    return skip::yes;
+                }
                 throw compaction_aborted_exception(
                         _schema->ks_name(),
                         _schema->cf_name(),
                         "scrub compaction failed to rectify unexpected partition-start, validator rejects it even after the injected partition-end");
             }
+            return skip::no;
         }
 
-        skip on_invalid_partition(const dht::decorated_key& new_key) {
-            maybe_abort_scrub();
+        skip on_invalid_partition(const dht::decorated_key& new_key, sstring error) {
+            auto report_fn = [this, error] (std::string_view action = "") {
+                report_validation_error(compaction_type::Scrub, *_schema, error, action);
+            };
+            maybe_abort_scrub(report_fn);
             if (_scrub_mode == compaction_type_options::scrub::mode::segregate) {
-                report_invalid_partition(compaction_type::Scrub, _validator, new_key, "Detected");
+                report_fn("Detected");
                 _validator.reset(new_key);
                 // Let the segregating interposer consumer handle this.
                 return skip::no;
             }
-            report_invalid_partition(compaction_type::Scrub, _validator, new_key, "Skipping");
+            report_fn("Skipping");
             _skip_to_next_partition = true;
             return skip::yes;
         }
 
-        skip on_invalid_mutation_fragment(const mutation_fragment_v2& mf) {
-            maybe_abort_scrub();
+        skip on_invalid_mutation_fragment(const mutation_fragment_v2& mf, sstring error) {
+            auto report_fn = [this, error] (std::string_view action = "") {
+                report_validation_error(compaction_type::Scrub, *_schema, error, action);
+            };
+            maybe_abort_scrub(report_fn);
 
             const auto& key = _validator.previous_partition_key();
+
+            if (_validator.current_tombstone()) {
+                if (_drop_unfixable_sstables) {
+                    _failed_to_fix_sstable = true;
+                    end_stream();
+                    return skip::yes;
+                }
+                throw compaction_aborted_exception(
+                        _schema->ks_name(),
+                        _schema->cf_name(),
+                        "scrub compaction cannot handle invalid fragments with an active range tombstone change");
+            }
 
             // If the unexpected fragment is a partition end, we just drop it.
             // The only case a partition end is invalid is when it comes after
             // another partition end, and we can just drop it in that case.
             if (!mf.is_end_of_partition() && _scrub_mode == compaction_type_options::scrub::mode::segregate) {
-                report_invalid_mutation_fragment(compaction_type::Scrub, _validator, mf,
-                        "Injecting partition start/end to segregate out-of-order fragment");
+                report_fn("Injecting partition start/end to segregate out-of-order fragment");
                 push_mutation_fragment(*_schema, _permit, partition_end{});
 
                 // We loose the partition tombstone if any, but it will be
@@ -1299,20 +1765,61 @@ private:
                 return skip::no;
             }
 
-            report_invalid_mutation_fragment(compaction_type::Scrub, _validator, mf, "Skipping");
+            report_fn("Skipping");
 
             return skip::yes;
         }
 
-        void on_invalid_end_of_stream() {
-            maybe_abort_scrub();
+        void on_invalid_end_of_stream(sstring error) {
+            auto report_fn = [this, error] (std::string_view action = "") {
+                report_validation_error(compaction_type::Scrub, *_schema, error, action);
+            };
+            maybe_abort_scrub(report_fn);
             // Handle missing partition_end
             push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, partition_end{}));
-            report_invalid_end_of_stream(compaction_type::Scrub, _validator, "Rectifying by adding missing partition-end to the end of the stream");
+            report_fn("Rectifying by adding missing partition-end to the end of the stream");
+        }
+
+        void on_malformed_sstable_exception(std::exception_ptr e) {
+            bool should_abort = _scrub_mode == compaction_type_options::scrub::mode::abort ||
+                    (_scrub_mode == compaction_type_options::scrub::mode::segregate && !_drop_unfixable_sstables);
+            if (should_abort) {
+                throw_invalid_sstable_compaction_aborted_exception(
+                        _schema->ks_name(),
+                        _schema->cf_name(),
+                        format("scrub compaction failed due to unrecoverable error: {:t}", e));
+            }
+            if (_drop_unfixable_sstables) {
+                _failed_to_fix_sstable = true;
+            }
+            end_stream();
+        }
+
+        void end_stream() {
+            // Closes the active range tombstone if needed, before emitting partition end.
+            if (auto current_tombstone = _validator.current_tombstone(); current_tombstone) {
+                const auto& last_pos = _validator.previous_position();
+                auto after_last_pos = position_in_partition::after_key(*_schema, last_pos.key());
+                auto rtc = range_tombstone_change(std::move(after_last_pos), tombstone{});
+                push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, std::move(rtc)));
+            }
+
+            // Emit partition end if needed.
+            if (_validator.previous_mutation_fragment_kind() != mutation_fragment_v2::kind::partition_end) {
+                push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, partition_end{}));
+            }
+
+            // Report the end of stream.
+            _end_of_stream = true;
         }
 
         void fill_buffer_from_underlying() {
+            utils::get_local_injector().inject("rest_api_keyspace_scrub_abort", [] { throw compaction_aborted_exception("", "", "scrub compaction found invalid data"); });
             while (!_reader.is_buffer_empty() && !is_buffer_full()) {
+                if (_end_of_stream && _failed_to_fix_sstable) {
+                    return;
+                }
+
                 auto mf = _reader.pop_mutation_fragment();
                 if (mf.is_partition_start()) {
                     // First check that fragment kind monotonicity stands.
@@ -1321,41 +1828,57 @@ private:
                     // and shouldn't be verified. We know the last fragment the
                     // validator saw is a partition-start, passing it another one
                     // will confuse it.
-                    if (!_skip_to_next_partition && !_validator(mf)) {
-                        on_unexpected_partition_start(mf);
+                    if (!_skip_to_next_partition) {
+                        if (auto res = _validator(mf); !res) {
+                            if (on_unexpected_partition_start(mf, res.what()) == skip::yes) {
+                                continue;
+                            }
+                        }
                         // Continue processing this partition start.
                     }
                     _skip_to_next_partition = false;
                     // Then check that the partition monotonicity stands.
                     const auto& dk = mf.as_partition_start().key();
-                    if (!_validator(dk) && on_invalid_partition(dk) == skip::yes) {
-                        continue;
+                    if (auto res = _validator(dk); !res) {
+                        if (on_invalid_partition(dk, res.what()) == skip::yes) {
+                            continue;
+                        }
                     }
                 } else if (_skip_to_next_partition) {
                     continue;
                 } else {
-                    if (!_validator(mf) && on_invalid_mutation_fragment(mf) == skip::yes) {
-                        continue;
+                    if (auto res = _validator(mf); !res) {
+                        if (on_invalid_mutation_fragment(mf, res.what()) == skip::yes) {
+                            continue;
+                        }
                     }
                 }
                 push_mutation_fragment(std::move(mf));
             }
 
+            if (_end_of_stream && _failed_to_fix_sstable) {
+                return;
+            }
+
             _end_of_stream = _reader.is_end_of_stream() && _reader.is_buffer_empty();
 
             if (_end_of_stream) {
-                if (!_validator.on_end_of_stream()) {
-                    on_invalid_end_of_stream();
+                if (auto res = _validator.on_end_of_stream(); !res) {
+                    on_invalid_end_of_stream(res.what());
                 }
             }
         }
 
     public:
-        reader(flat_mutation_reader_v2 underlying, compaction_type_options::scrub::mode scrub_mode)
+        reader(mutation_reader underlying, compaction_type_options::scrub::mode scrub_mode, uint64_t& validation_errors,
+                bool& failed_to_fix_sstable, compaction_type_options::scrub::drop_unfixable_sstables drop_unfixable_sstables)
             : impl(underlying.schema(), underlying.permit())
             , _scrub_mode(scrub_mode)
             , _reader(std::move(underlying))
             , _validator(*_schema)
+            , _validation_errors(validation_errors)
+            , _failed_to_fix_sstable(failed_to_fix_sstable)
+            , _drop_unfixable_sstables(drop_unfixable_sstables)
         { }
         virtual future<> fill_buffer() override {
             if (_end_of_stream) {
@@ -1375,12 +1898,14 @@ private:
                 } catch (const storage_io_error&) {
                     // Propagate these unchanged.
                     throw;
+                } catch (const sstables::malformed_sstable_exception& e) {
+                    on_malformed_sstable_exception(std::current_exception());
                 } catch (...) {
                     // We don't want failed scrubs to be retried.
                     throw compaction_aborted_exception(
                             _schema->ks_name(),
                             _schema->cf_name(),
-                            format("scrub compaction failed due to unrecoverable error: {}", std::current_exception()));
+                            format("scrub compaction failed due to unrecoverable error: {:t}", std::current_exception()));
                 }
             });
         }
@@ -1403,10 +1928,12 @@ private:
     std::string _scrub_start_description;
     mutable std::string _scrub_finish_description;
     uint64_t _bucket_count = 0;
+    uint64_t _validation_errors = 0;
+    bool _failed_to_fix_sstable = false;
 
 public:
-    scrub_compaction(table_state& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_type_options::scrub options)
-        : regular_compaction(table_s, std::move(descriptor), cdata)
+    scrub_compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_type_options::scrub options, compaction_progress_monitor& progress_monitor)
+        : regular_compaction(table_s, std::move(descriptor), cdata, progress_monitor, use_backlog_tracker::no)
         , _options(options)
         , _scrub_start_description(fmt::format("Scrubbing in {} mode", _options.operation_mode))
         , _scrub_finish_description(fmt::format("Finished scrubbing in {} mode", _options.operation_mode)) {
@@ -1423,9 +1950,18 @@ public:
         return _scrub_finish_description;
     }
 
-    flat_mutation_reader_v2 make_sstable_reader() const override {
-        auto crawling_reader = _compacting->make_crawling_reader(_schema, _permit, _io_priority, nullptr);
-        return make_flat_mutation_reader_v2<reader>(std::move(crawling_reader), _options.operation_mode);
+    mutation_reader make_sstable_reader(schema_ptr s,
+                                                reader_permit permit,
+                                                const dht::partition_range& range,
+                                                const query::partition_slice& slice,
+                                                tracing::trace_state_ptr trace,
+                                                streamed_mutation::forwarding sm_fwd,
+                                                mutation_reader::forwarding mr_fwd) override {
+        if (!range.is_full()) {
+            on_internal_error(clogger, fmt::format("Scrub compaction in mode {} expected full partition range, but got {} instead", _options.operation_mode, range));
+        }
+        auto full_scan_reader = _compacting->make_full_scan_reader(std::move(s), std::move(permit), nullptr, unwrap_monitor_generator(), sstables::integrity_check::yes);
+        return make_mutation_reader<reader>(std::move(full_scan_reader), _options.operation_mode, _validation_errors, _failed_to_fix_sstable, _options.drop_unfixable);
     }
 
     uint64_t partitions_per_sstable() const override {
@@ -1438,14 +1974,14 @@ public:
         }
     }
 
-    reader_consumer_v2 make_interposer_consumer(reader_consumer_v2 end_consumer) override {
+    mutation_reader_consumer make_interposer_consumer(mutation_reader_consumer end_consumer) override {
         if (!use_interposer_consumer()) {
             return end_consumer;
         }
-        return [this, end_consumer = std::move(end_consumer)] (flat_mutation_reader_v2 reader) mutable -> future<> {
-            auto cfg = mutation_writer::segregate_config{_io_priority, memory::stats().total_memory() / 10};
+        return [this, end_consumer = std::move(end_consumer)] (mutation_reader reader) mutable -> future<> {
+            auto cfg = mutation_writer::segregate_config{memory::stats().total_memory() / 10};
             return mutation_writer::segregate_by_partition(std::move(reader), cfg,
-                    [consumer = std::move(end_consumer), this] (flat_mutation_reader_v2 rd) {
+                    [consumer = std::move(end_consumer), this] (mutation_reader rd) {
                 ++_bucket_count;
                 return consumer(std::move(rd));
             });
@@ -1456,12 +1992,51 @@ public:
         return _options.operation_mode == compaction_type_options::scrub::mode::segregate;
     }
 
-    friend flat_mutation_reader_v2 make_scrubbing_reader(flat_mutation_reader_v2 rd, compaction_type_options::scrub::mode scrub_mode);
-    friend flat_mutation_reader make_scrubbing_reader(flat_mutation_reader rd, compaction_type_options::scrub::mode scrub_mode);
+    compaction_result finish(std::chrono::time_point<db_clock> started_at, std::chrono::time_point<db_clock> ended_at) override {
+        auto ret = compaction::finish(started_at, ended_at);
+        ret.stats.validation_errors = _validation_errors;
+        return ret;
+    }
+
+    void drop_unfixable_sstables() {
+        if (!_sstables.empty() || !used_garbage_collected_sstables().empty()) {
+            std::vector<sstables::shared_sstable> old_sstables;
+            std::move(_sstables.begin(), _sstables.end(), std::back_inserter(old_sstables));
+
+            // Remove Garbage Collected SSTables from the SSTable set if any was previously added.
+            auto& used_gc_sstables = used_garbage_collected_sstables();
+            old_sstables.insert(old_sstables.end(), used_gc_sstables.begin(), used_gc_sstables.end());
+
+            _replacer(get_compaction_completion_desc(std::move(old_sstables), {}));
+        }
+
+        // Mark new sstables for deletion as well
+        for (auto& sst : std::views::concat(_new_partial_sstables, _new_unused_sstables)) {
+            sst->mark_for_deletion();
+        }
+    }
+
+    virtual void on_end_of_compaction() override {
+        if (_options.drop_unfixable && _failed_to_fix_sstable) {
+            drop_unfixable_sstables();
+        } else {
+            regular_compaction::on_end_of_compaction();
+        }
+    }
+
+    virtual void stop_sstable_writer(compaction_writer* writer) override {
+        if (_options.drop_unfixable && _failed_to_fix_sstable && writer) {
+            finish_new_sstable(writer);
+        } else {
+            regular_compaction::stop_sstable_writer(writer);
+        }
+    }
+
+    friend mutation_reader make_scrubbing_reader(mutation_reader rd, compaction_type_options::scrub::mode scrub_mode, uint64_t& validation_errors, bool& failed_to_fix_sstable, compaction_type_options::scrub::drop_unfixable_sstables drop_unfixable_sstables);
 };
 
-flat_mutation_reader_v2 make_scrubbing_reader(flat_mutation_reader_v2 rd, compaction_type_options::scrub::mode scrub_mode) {
-    return make_flat_mutation_reader_v2<scrub_compaction::reader>(std::move(rd), scrub_mode);
+mutation_reader make_scrubbing_reader(mutation_reader rd, compaction_type_options::scrub::mode scrub_mode, uint64_t& validation_errors, bool& failed_to_fix_sstable, compaction_type_options::scrub::drop_unfixable_sstables drop_unfixable_sstables) {
+    return make_mutation_reader<scrub_compaction::reader>(std::move(rd), scrub_mode, validation_errors, failed_to_fix_sstable, drop_unfixable_sstables);
 }
 
 class resharding_compaction final : public compaction {
@@ -1479,20 +2054,25 @@ class resharding_compaction final : public compaction {
         uint64_t estimated_partitions = 0;
     };
     std::vector<estimated_values> _estimation_per_shard;
-    std::vector<utils::UUID> _run_identifiers;
+    std::vector<sstables::run_id> _run_identifiers;
+    bool _reshard_vnodes;
 private:
     // return estimated partitions per sstable for a given shard
     uint64_t partitions_per_sstable(shard_id s) const {
         uint64_t estimated_sstables = std::max(uint64_t(1), uint64_t(ceil(double(_estimation_per_shard[s].estimated_size) / _max_sstable_size)));
         return std::min(uint64_t(ceil(double(_estimation_per_shard[s].estimated_partitions) / estimated_sstables)),
-                _table_s.get_compaction_strategy().adjust_partition_estimate(_ms_metadata, _estimation_per_shard[s].estimated_partitions));
+                _table_s.get_compaction_strategy().adjust_partition_estimate(_ms_metadata, _estimation_per_shard[s].estimated_partitions, _schema));
     }
 public:
-    resharding_compaction(table_state& table_s, sstables::compaction_descriptor descriptor, compaction_data& cdata)
-        : compaction(table_s, std::move(descriptor), cdata)
-        , _estimation_per_shard(smp::count)
-        , _run_identifiers(smp::count)
+    resharding_compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_progress_monitor& progress_monitor)
+        : compaction(table_s, std::move(descriptor), cdata, progress_monitor, use_backlog_tracker::no)
+        , _estimation_per_shard(this_smp_shard_count())
+        , _run_identifiers(this_smp_shard_count())
+        , _reshard_vnodes(descriptor.options.as<compaction_type_options::reshard>().vnodes_resharding)
     {
+        if (_reshard_vnodes && !_owned_ranges) {
+            on_internal_error(clogger, "Resharding vnodes requires owned_ranges");
+        }
         for (auto& sst : _sstables) {
             const auto& shards = sst->get_shards_for_this_sstable();
             auto size = sst->bytes_on_disk();
@@ -1502,29 +2082,53 @@ public:
                 _estimation_per_shard[s].estimated_partitions += std::max(uint64_t(1), uint64_t(ceil(double(estimated_partitions) / shards.size())));
             }
         }
-        for (auto i : boost::irange(0u, smp::count)) {
-            _run_identifiers[i] = utils::make_random_uuid();
+        for (auto i : std::views::iota(0u, this_smp_shard_count())) {
+            _run_identifiers[i] = sstables::run_id::create_random_id();
         }
     }
 
     ~resharding_compaction() { }
 
     // Use reader that makes sure no non-local mutation will not be filtered out.
-    flat_mutation_reader_v2 make_sstable_reader() const override {
-        return _compacting->make_range_sstable_reader(_schema,
-                _permit,
-                query::full_partition_range,
-                _schema->full_slice(),
-                _io_priority,
+    mutation_reader make_sstable_reader(schema_ptr s,
+                                                reader_permit permit,
+                                                const dht::partition_range& range,
+                                                const query::partition_slice& slice,
+                                                tracing::trace_state_ptr trace,
+                                                streamed_mutation::forwarding sm_fwd,
+                                                mutation_reader::forwarding mr_fwd) override {
+        return _compacting->make_range_sstable_reader(std::move(s),
+                std::move(permit),
+                range,
+                slice,
                 nullptr,
-                ::streamed_mutation::forwarding::no,
-                ::mutation_reader::forwarding::no);
+                sm_fwd,
+                mr_fwd,
+                unwrap_monitor_generator(),
+                sstables::integrity_check::yes);
 
     }
 
-    reader_consumer_v2 make_interposer_consumer(reader_consumer_v2 end_consumer) override {
-        return [this, end_consumer = std::move(end_consumer)] (flat_mutation_reader_v2 reader) mutable -> future<> {
-            return mutation_writer::segregate_by_shard(std::move(reader), std::move(end_consumer));
+    mutation_reader_consumer make_interposer_consumer(mutation_reader_consumer end_consumer) override {
+        auto owned_ranges = _reshard_vnodes ? _owned_ranges : nullptr;
+        return [end_consumer = std::move(end_consumer), owned_ranges = std::move(owned_ranges)] (mutation_reader reader) mutable -> future<> {
+            if (owned_ranges) {
+                auto classify = [owned_ranges, it = owned_ranges->begin(), idx = mutation_writer::token_group_id(0)] (dht::token t) mutable -> mutation_writer::token_group_id {
+                    dht::token_comparator cmp;
+                    while (it != owned_ranges->end() && it->after(t, cmp)) {
+                        clogger.debug("Token {} is after current range {}: advancing to the next range", t, *it);
+                        ++it;
+                        ++idx;
+                    }
+                    if (it == owned_ranges->end() || !it->contains(t, cmp)) {
+                        on_internal_error(clogger, fmt::format("Token {} is outside of owned ranges", t));
+                    }
+                    return idx;
+                };
+                return mutation_writer::segregate_by_token_group(std::move(reader), std::move(classify), std::move(end_consumer));
+            } else {
+                return mutation_writer::segregate_by_shard(std::move(reader), std::move(end_consumer));
+            }
         };
     }
 
@@ -1541,14 +2145,19 @@ public:
     }
 
     compaction_writer create_compaction_writer(const dht::decorated_key& dk) override {
-        auto shard = dht::shard_of(*_schema, dk.token());
+        auto shards = _sharder->shard_for_writes(dk.token());
+        if (shards.size() != 1) {
+            // Resharding is not supposed to run on tablets, so this case does not have to be supported.
+            on_internal_error(clogger, fmt::format("Got {} shards for token {} in table {}.{}", shards.size(), dk.token(), _schema->ks_name(), _schema->cf_name()));
+        }
+        auto shard = shards[0];
         auto sst = _sstable_creator(shard);
         setup_new_sstable(sst);
 
         auto cfg = make_sstable_writer_config(compaction_type::Reshard);
         // sstables generated for a given shard will share the same run identifier.
         cfg.run_identifier = _run_identifiers.at(shard);
-        return compaction_writer{sst->get_writer(*_schema, partitions_per_sstable(shard), cfg, get_encoding_stats(), _io_priority, shard), sst};
+        return compaction_writer{sst->get_writer(*_schema, partitions_per_sstable(shard), cfg, get_encoding_stats(), shard), sst};
     }
 
     void stop_sstable_writer(compaction_writer* writer) override {
@@ -1560,14 +2169,14 @@ public:
 
 future<compaction_result> compaction::run(std::unique_ptr<compaction> c) {
     return seastar::async([c = std::move(c)] () mutable {
-        c->setup();
+        c->setup().get();
         auto consumer = c->consume();
 
         auto start_time = db_clock::now();
         try {
            consumer.get();
         } catch (...) {
-            c->delete_sstables_for_interrupted_compaction();
+            c->on_interrupt(std::current_exception());
             c = nullptr; // make sure writers are stopped while running in thread context. This is because of calls to file.close().get();
             throw;
         }
@@ -1585,127 +2194,195 @@ compaction_type compaction_type_options::type() const {
         compaction_type::Scrub,
         compaction_type::Reshard,
         compaction_type::Reshape,
+        compaction_type::Split,
+        compaction_type::Major,
+        compaction_type::RewriteComponent,
     };
     static_assert(std::variant_size_v<compaction_type_options::options_variant> == std::size(index_to_type));
     return index_to_type[_options.index()];
 }
 
-static std::unique_ptr<compaction> make_compaction(table_state& table_s, sstables::compaction_descriptor descriptor, compaction_data& cdata) {
+static std::unique_ptr<compaction> make_compaction(compaction_group_view& table_s, compaction_descriptor descriptor, compaction_data& cdata, compaction_progress_monitor& progress_monitor) {
     struct {
-        table_state& table_s;
-        sstables::compaction_descriptor&& descriptor;
+        compaction_group_view& table_s;
+        compaction_descriptor&& descriptor;
         compaction_data& cdata;
+        compaction_progress_monitor& progress_monitor;
 
         std::unique_ptr<compaction> operator()(compaction_type_options::reshape) {
-            return std::make_unique<reshape_compaction>(table_s, std::move(descriptor), cdata);
+            return std::make_unique<reshape_compaction>(table_s, std::move(descriptor), cdata, progress_monitor);
         }
         std::unique_ptr<compaction> operator()(compaction_type_options::reshard) {
-            return std::make_unique<resharding_compaction>(table_s, std::move(descriptor), cdata);
+            return std::make_unique<resharding_compaction>(table_s, std::move(descriptor), cdata, progress_monitor);
         }
         std::unique_ptr<compaction> operator()(compaction_type_options::regular) {
-            return std::make_unique<regular_compaction>(table_s, std::move(descriptor), cdata);
+            return std::make_unique<regular_compaction>(table_s, std::move(descriptor), cdata, progress_monitor);
         }
-        std::unique_ptr<compaction> operator()(compaction_type_options::cleanup options) {
-            return std::make_unique<cleanup_compaction>(table_s, std::move(descriptor), cdata, std::move(options));
+        std::unique_ptr<compaction> operator()(compaction_type_options::major) {
+            return std::make_unique<regular_compaction>(table_s, std::move(descriptor), cdata, progress_monitor);
         }
-        std::unique_ptr<compaction> operator()(compaction_type_options::upgrade options) {
-            return std::make_unique<cleanup_compaction>(table_s, std::move(descriptor), cdata, std::move(options));
+        std::unique_ptr<compaction> operator()(compaction_type_options::cleanup) {
+            return std::make_unique<cleanup_compaction>(table_s, std::move(descriptor), cdata, progress_monitor);
+        }
+        std::unique_ptr<compaction> operator()(compaction_type_options::upgrade) {
+            return std::make_unique<cleanup_compaction>(table_s, std::move(descriptor), cdata, progress_monitor);
         }
         std::unique_ptr<compaction> operator()(compaction_type_options::scrub scrub_options) {
-            return std::make_unique<scrub_compaction>(table_s, std::move(descriptor), cdata, scrub_options);
+            return std::make_unique<scrub_compaction>(table_s, std::move(descriptor), cdata, scrub_options, progress_monitor);
         }
-    } visitor_factory{table_s, std::move(descriptor), cdata};
+        std::unique_ptr<compaction> operator()(compaction_type_options::split split_options) {
+            return std::make_unique<split_compaction>(table_s, std::move(descriptor), cdata, std::move(split_options), progress_monitor);
+        }
+        std::unique_ptr<compaction> operator()(compaction_type_options::component_rewrite) {
+            throw std::runtime_error("component_rewrite compaction should be handled separately");
+        }
+    } visitor_factory{table_s, std::move(descriptor), cdata, progress_monitor};
 
     return descriptor.options.visit(visitor_factory);
 }
 
-future<bool> scrub_validate_mode_validate_reader(flat_mutation_reader_v2 reader, const compaction_data& cdata) {
-    auto schema = reader.schema();
-
-    bool valid = true;
-    std::exception_ptr ex;
-
-    try {
-        auto validator = mutation_fragment_stream_validator(*schema);
-
-        while (auto mf_opt = co_await reader()) {
-            if (cdata.is_stop_requested()) [[unlikely]] {
-                // Compaction manager will catch this exception and re-schedule the compaction.
-                throw compaction_stopped_exception(schema->ks_name(), schema->cf_name(), cdata.stop_requested);
-            }
-
-            const auto& mf = *mf_opt;
-
-            if (mf.is_partition_start()) {
-                const auto& ps = mf.as_partition_start();
-                if (!validator(mf)) {
-                    scrub_compaction::report_invalid_partition_start(compaction_type::Scrub, validator, ps.key());
-                    validator.reset(mf);
-                    valid = false;
-                }
-                if (!validator(ps.key())) {
-                    scrub_compaction::report_invalid_partition(compaction_type::Scrub, validator, ps.key());
-                    validator.reset(ps.key());
-                    valid = false;
-                }
-            } else {
-                if (!validator(mf)) {
-                    scrub_compaction::report_invalid_mutation_fragment(compaction_type::Scrub, validator, mf);
-                    validator.reset(mf);
-                    valid = false;
-                }
-            }
-        }
-        if (!validator.on_end_of_stream()) {
-            scrub_compaction::report_invalid_end_of_stream(compaction_type::Scrub, validator);
-            valid = false;
-        }
-    } catch (...) {
-        ex = std::current_exception();
-    }
-
-    co_await reader.close();
-
-    if (ex) {
-        co_return coroutine::exception(std::move(ex));
-    }
-
-    co_return valid;
+static uint64_t total_bytes_on_disk(const std::vector<sstables::shared_sstable>& sstables) {
+    return std::ranges::fold_left(sstables | std::views::transform(std::mem_fn(&sstables::sstable::bytes_on_disk)), uint64_t(0), std::plus{});
 }
 
-static future<compaction_result> scrub_sstables_validate_mode(sstables::compaction_descriptor descriptor, compaction_data& cdata, table_state& table_s) {
-    auto schema = table_s.schema();
-
-    formatted_sstables_list sstables_list_msg;
-    auto sstables = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(schema, make_lw_shared<sstable_list>(sstable_list{}), false));
-    for (const auto& sst : descriptor.sstables) {
-        sstables_list_msg += sst;
-        sstables->insert(sst);
-    }
-
-    clogger.info("Scrubbing in validate mode {}", sstables_list_msg);
-
-    auto permit = table_s.make_compaction_reader_permit();
-    auto reader = sstables->make_crawling_reader(schema, permit, descriptor.io_priority, nullptr);
-
-    const auto valid = co_await scrub_validate_mode_validate_reader(std::move(reader), cdata);
-
-    clogger.info("Finished scrubbing in validate mode {} - sstable(s) are {}", sstables_list_msg, valid ? "valid" : "invalid");
-
-    if (!valid) {
-        for (auto& sst : *sstables->all()) {
-            co_await sst->move_to_quarantine();
-        }
-    }
-
-    co_return compaction_result {
-        .new_sstables = {},
-        .ended_at = db_clock::now(),
+compaction_result initialize_compaction_result(const compaction_descriptor& descriptor) {
+    return compaction_result {
+        .shard_id = this_shard_id(),
+        .type = descriptor.options.type(),
+        .sstables_in = extract_basic_info_from_sstables(descriptor.sstables),
+        .stats = {
+            .started_at = db_clock::now(),
+            .start_size = total_bytes_on_disk(descriptor.sstables),
+        },
     };
 }
 
+compaction_result finalize_compaction_result(compaction_result result) {
+    result.sstables_out = extract_basic_info_from_sstables(result.new_sstables);
+    result.stats.end_size = total_bytes_on_disk(result.new_sstables);
+    result.stats.ended_at = db_clock::now();
+    return result;
+}
+
+static future<std::vector<sstables::shared_sstable>> maybe_rewrite_with_updated_scrub_time(compaction_descriptor descriptor, compaction_group_view& table_s) {
+    auto creator = [&table_s] (sstables::shared_sstable sst) {
+        return table_s.make_sstable(sst->state(), sst->get_version());
+    };
+    auto modifier = [] (sstables::sstable& sst) {
+        sst.set_scrub_time(db_clock::now());
+    };
+
+    std::vector<sstables::shared_sstable> new_sstables;
+
+    for (auto& sst : descriptor.sstables) {
+        // Automatic scrub only uses scrub in validate mode for sstables with
+        // a Scylla component.
+        // Nothing else currently may update the scrub time when using
+        // scrub in validate mode.
+        if (!sst->has_scylla_component()) {
+            clogger.warn("Cannot rewrite {} with updated scrub time, missing scylla-metadata component", sst);
+            continue;
+        }
+
+        std::exception_ptr ex;
+        try {
+            auto rewritten = co_await sst->link_with_rewritten_component(creator, component_type::Scylla, modifier, sstables::update_sstable_id::no);
+            new_sstables.push_back(std::move(rewritten));
+        } catch (...) {
+            ex = std::current_exception();
+        }
+
+        if (ex) [[unlikely]] {
+            for (auto sst : new_sstables) {
+                co_await sst->unlink();
+            }
+            std::rethrow_exception(ex);
+        }
+    }
+
+    co_await seastar::async( [descriptor = std::move(descriptor), &new_sstables] mutable {
+        auto replaced = std::move(descriptor.sstables)
+                | std::views::filter(std::mem_fn(&sstables::sstable::has_scylla_component))
+                | std::ranges::to<std::vector>();
+        descriptor.replacer({std::move(replaced), new_sstables});
+    });
+
+    co_return new_sstables;
+}
+
+static future<compaction_result> scrub_sstables_validate_mode(compaction_descriptor descriptor, compaction_data& cdata, compaction_group_view& table_s, sstables::read_monitor_generator& monitor_generator) {
+    auto schema = table_s.schema();
+    auto permit = table_s.make_compaction_reader_permit();
+    auto result = initialize_compaction_result(descriptor);
+
+    uint64_t validation_errors = 0;
+    cdata.compaction_size = std::ranges::fold_left(descriptor.sstables | std::views::transform([] (auto& sst) { return sst->data_size(); }), int64_t(0), std::plus{});
+
+    const auto& options = descriptor.options.as<compaction_type_options::scrub>();
+    auto logger_level = options.is_automatic ? log_level::debug : log_level::info;
+
+    for (const auto& sst : descriptor.sstables) {
+        clogger.log(logger_level, "Scrubbing in validate mode {}", sst->get_filename());
+
+        validation_errors += co_await sst->validate(permit, cdata.abort, [&schema] (sstring what) {
+            scrub_compaction::report_validation_error(compaction_type::Scrub, *schema, what);
+        }, monitor_generator(sst));
+        // Did validation actually finish because aborted?
+        if (cdata.is_stop_requested()) {
+            // Compaction manager will catch this exception and re-schedule the compaction.
+            throw compaction_stopped_exception(schema->ks_name(), schema->cf_name(), cdata.stop_requested);
+        }
+
+        clogger.log(validation_errors ? log_level::warn : logger_level, "Finished scrubbing in validate mode {} - sstable is {}", sst->get_filename(), validation_errors == 0 ? "valid" : "invalid");
+    }
+
+    if (validation_errors == 0 && options.update_timestamp) {
+        result.new_sstables = co_await maybe_rewrite_with_updated_scrub_time(std::move(descriptor), table_s);
+    } else if (validation_errors != 0 && options.quarantine_sstables) {
+        for (auto& sst : descriptor.sstables) {
+            try {
+                co_await sst->change_state(sstables::sstable_state::quarantine);
+            } catch (...) {
+                clogger.error("Moving {} to quarantine failed due to {:t}, continuing.", sst->get_filename(), std::current_exception());
+            }
+        }
+    }
+
+    result.stats.validation_errors = validation_errors;
+    co_return finalize_compaction_result(std::move(result));
+}
+
+future<compaction_result> scrub_sstables_validate_mode(compaction_descriptor descriptor, compaction_data& cdata, compaction_group_view& table_s, compaction_progress_monitor& progress_monitor) {
+    progress_monitor.set_generator(std::make_unique<compaction_read_monitor_generator>(table_s, use_backlog_tracker::no));
+    auto d = defer([&] noexcept { progress_monitor.reset_generator(); });
+    auto res = co_await scrub_sstables_validate_mode(std::move(descriptor), cdata, table_s, *progress_monitor._generator);
+    co_return res;
+}
+
+future<compaction_result> rewrite_sstables_component(compaction_descriptor descriptor, compaction_group_view& table_s) {
+    return seastar::async([descriptor = std::move(descriptor), &table_s] () mutable {
+        auto result = initialize_compaction_result(descriptor);
+
+        const auto& options = descriptor.options.as<compaction_type_options::component_rewrite>();
+        // When rewriting a component, we cannot use the standard descriptor creator
+        // because we must preserve the sstable version.
+        auto creator = [&table_s] (sstables::shared_sstable sst) {
+            return table_s.make_sstable(sst->state(), sst->get_version());
+        };
+        result.new_sstables.reserve(descriptor.sstables.size());
+        for (auto& sst : descriptor.sstables) {
+            auto rewritten = sst->link_with_rewritten_component(creator, options.component_to_rewrite, options.modifier, options.update_id).get();
+            result.new_sstables.push_back(rewritten);
+        }
+
+        descriptor.replacer({std::move(descriptor.sstables), result.new_sstables});
+
+        return finalize_compaction_result(std::move(result));
+    });
+}
+
 future<compaction_result>
-compact_sstables(sstables::compaction_descriptor descriptor, compaction_data& cdata, table_state& table_s) {
+compact_sstables(compaction_descriptor descriptor, compaction_data& cdata, compaction_group_view& table_s, compaction_progress_monitor& progress_monitor) {
     if (descriptor.sstables.empty()) {
         return make_exception_future<compaction_result>(std::runtime_error(format("Called {} compaction with empty set on behalf of {}.{}",
                 compaction_name(descriptor.options.type()), table_s.schema()->ks_name(), table_s.schema()->cf_name())));
@@ -1713,13 +2390,16 @@ compact_sstables(sstables::compaction_descriptor descriptor, compaction_data& cd
     if (descriptor.options.type() == compaction_type::Scrub
             && std::get<compaction_type_options::scrub>(descriptor.options.options()).operation_mode == compaction_type_options::scrub::mode::validate) {
         // Bypass the usual compaction machinery for dry-mode scrub
-        return scrub_sstables_validate_mode(std::move(descriptor), cdata, table_s);
+        return scrub_sstables_validate_mode(std::move(descriptor), cdata, table_s, progress_monitor);
     }
-    return compaction::run(make_compaction(table_s, std::move(descriptor), cdata));
+    if (descriptor.options.type() == compaction_type::RewriteComponent) {
+        return rewrite_sstables_component(std::move(descriptor), table_s);
+    }
+    return compaction::run(make_compaction(table_s, std::move(descriptor), cdata, progress_monitor));
 }
 
 std::unordered_set<sstables::shared_sstable>
-get_fully_expired_sstables(const table_state& table_s, const std::vector<sstables::shared_sstable>& compacting, gc_clock::time_point compaction_time) {
+get_fully_expired_sstables(const compaction_group_view& table_s, const std::vector<sstables::shared_sstable>& compacting, gc_clock::time_point compaction_time) {
     clogger.debug("Checking droppable sstables in {}.{}", table_s.schema()->ks_name(), table_s.schema()->cf_name());
 
     if (compacting.empty()) {
@@ -1727,32 +2407,35 @@ get_fully_expired_sstables(const table_state& table_s, const std::vector<sstable
     }
 
     std::unordered_set<sstables::shared_sstable> candidates;
+    // Note: This contains both repaired and unrepaired sstables which means
+    // compaction consults both repaired and unrepaired sstables for tombstone gc.
     auto uncompacting_sstables = get_uncompacting_sstables(table_s, compacting);
     // Get list of uncompacting sstables that overlap the ones being compacted.
     std::vector<sstables::shared_sstable> overlapping = leveled_manifest::overlapping(*table_s.schema(), compacting, uncompacting_sstables);
     int64_t min_timestamp = std::numeric_limits<int64_t>::max();
 
     for (auto& sstable : overlapping) {
-        auto gc_before = sstable->get_gc_before_for_fully_expire(compaction_time);
+        auto gc_before = sstable->get_gc_before_for_fully_expire(compaction_time, table_s.get_tombstone_gc_state(), table_s.schema());
         if (sstable->get_max_local_deletion_time() >= gc_before) {
             min_timestamp = std::min(min_timestamp, sstable->get_stats_metadata().min_timestamp);
         }
     }
 
-    auto compacted_undeleted_gens = boost::copy_range<std::unordered_set<int64_t>>(table_s.compacted_undeleted_sstables()
-        | boost::adaptors::transformed(std::mem_fn(&sstables::sstable::generation)));
+    auto compacted_undeleted_gens = table_s.compacted_undeleted_sstables()
+        | std::views::transform(std::mem_fn(&sstables::sstable::generation))
+        | std::ranges::to<std::unordered_set>();
     auto has_undeleted_ancestor = [&compacted_undeleted_gens] (auto& candidate) {
         // Get ancestors from sstable which is empty after restart. It works for this purpose because
         // we only need to check that a sstable compacted *in this instance* hasn't an ancestor undeleted.
         // Not getting it from sstable metadata because mc format hasn't it available.
-        return boost::algorithm::any_of(candidate->compaction_ancestors(), [&compacted_undeleted_gens] (auto gen) {
+        return std::ranges::any_of(candidate->compaction_ancestors(), [&compacted_undeleted_gens] (const sstables::generation_type& gen) {
             return compacted_undeleted_gens.contains(gen);
         });
     };
 
     // SStables that do not contain live data is added to list of possibly expired sstables.
     for (auto& candidate : compacting) {
-        auto gc_before = candidate->get_gc_before_for_fully_expire(compaction_time);
+        auto gc_before = candidate->get_gc_before_for_fully_expire(compaction_time, table_s.get_tombstone_gc_state(), table_s.schema());
         clogger.debug("Checking if candidate of generation {} and max_deletion_time {} is expired, gc_before is {}",
                     candidate->generation(), candidate->get_stats_metadata().max_local_deletion_time, gc_before);
         // A fully expired sstable which has an ancestor undeleted shouldn't be compacted because
@@ -1783,7 +2466,27 @@ get_fully_expired_sstables(const table_state& table_s, const std::vector<sstable
 }
 
 unsigned compaction_descriptor::fan_in() const {
-    return boost::copy_range<std::unordered_set<utils::UUID>>(sstables | boost::adaptors::transformed(std::mem_fn(&sstables::sstable::run_identifier))).size();
+    auto unique_run_identifiers = std::ranges::transform_view(sstables, &sstables::sstable::run_identifier) | std::ranges::to<std::unordered_set>();
+    return unique_run_identifiers.size();
 }
 
+uint64_t compaction_descriptor::sstables_size() const {
+    return std::ranges::fold_left(sstables | std::views::transform(std::mem_fn(&sstables::sstable::data_size)), uint64_t(0), std::plus{});
+}
+
+}
+
+auto fmt::formatter<::compaction::compaction_type>::format(::compaction::compaction_type type, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", to_string(type));
+}
+
+auto fmt::formatter<::compaction::compaction_type_options::scrub::mode>::format(::compaction::compaction_type_options::scrub::mode mode, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", to_string(mode));
+}
+
+auto fmt::formatter<::compaction::compaction_type_options::scrub::quarantine_mode>::format(::compaction::compaction_type_options::scrub::quarantine_mode mode, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "{}", to_string(mode));
 }

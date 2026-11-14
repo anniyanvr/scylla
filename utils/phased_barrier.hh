@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -21,14 +21,18 @@ class phased_barrier {
 public:
     using phase_type = uint64_t;
 private:
-    using gate = seastar::gate;
+    using gate = seastar::named_gate;
+    sstring _name;
     lw_shared_ptr<gate> _gate;
     phase_type _phase;
 public:
-    phased_barrier()
-        : _gate(make_lw_shared<gate>())
+    explicit phased_barrier(sstring name)
+        : _name(std::move(name))
+        , _gate(make_lw_shared<gate>(_name))
         , _phase(0)
     { }
+    phased_barrier(phased_barrier&&) = default;
+    phased_barrier& operator=(phased_barrier&&) = default;
 
     class operation {
         lw_shared_ptr<gate> _gate;
@@ -58,13 +62,25 @@ public:
         return { _gate };
     }
 
+    future<> close() noexcept {
+        return _gate->close();
+    }
+
+    bool is_closed() const noexcept {
+        return _gate->is_closed();
+    }
+
     // Starts a new phase and waits for all operations started in any of the earlier phases.
     // It is fine to start multiple awaits in parallel.
     // Cannot fail.
     future<> advance_and_await() noexcept {
-        auto new_gate = [] {
+        if (!operations_in_progress()) {
+            ++_phase;
+            return make_ready_future();
+        }
+        auto new_gate = [this] {
             seastar::memory::scoped_critical_alloc_section _;
-            return make_lw_shared<gate>();
+            return make_lw_shared<gate>(_name);
         }();
         ++_phase;
         auto old_gate = std::exchange(_gate, std::move(new_gate));

@@ -3,10 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
 #include <seastar/testing/test_case.hh>
 
@@ -15,21 +16,15 @@
 #include "test/lib/cql_assertions.hh"
 #include "transport/messages/result_message.hh"
 
-#include <boost/range/adaptor/indirected.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/find_if.hpp>
-
-#include "clustering_bounds_comparator.hh"
 #include "dht/i_partitioner.hh"
-#include "mutation_fragment.hh"
-#include "mutation_reader.hh"
-#include "partition_range_compat.hh"
-#include "range.hh"
-#include "sstables/sstables.hh"
-#include "schema_builder.hh"
+#include "mutation/mutation_fragment.hh"
+#include "schema/schema_builder.hh"
+#include "readers/forwardable.hh"
+#include "readers/mutation_reader.hh"
+#include "readers/mutation_reader_fwd.hh"
+#include "replica/database.hh"
 
-class enormous_table_reader final : public flat_mutation_reader::impl {
+class enormous_table_reader final : public mutation_reader::impl {
 // Reader for a table with 4.5 billion rows, all with partition key 0 and an incrementing clustering key
 public:
     static constexpr uint64_t CLUSTERING_ROW_COUNT = 4500ULL * 1000ULL * 1000ULL;
@@ -54,9 +49,9 @@ public:
                 return clustering_key::from_single_value(*_schema, std::move(ck_data));
             };
 
-            auto ck_to_int = [this] (const clustering_key& ck) -> int64_t {
+            auto ck_to_int = [] (const clustering_key& ck) -> int64_t {
                 auto exploded = ck.explode();
-                assert(exploded.size() == 1);
+                SCYLLA_ASSERT(exploded.size() == 1);
                 return value_cast<int64_t>(long_type->deserialize(exploded[0]));
             };
 
@@ -156,7 +151,6 @@ private:
         after_partition_end,
     };
 
-    schema_ptr _schema;
     const query::partition_slice& _slice;
     streamed_mutation::forwarding _fwd;
     partition_production_state _pps = partition_production_state::not_started;
@@ -166,15 +160,14 @@ private:
 };
 
 struct enormous_virtual_reader {
-    flat_mutation_reader operator()(schema_ptr schema,
+    mutation_reader operator()(schema_ptr schema,
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            const io_priority_class& pc,
             tracing::trace_state_ptr trace_state,
             streamed_mutation::forwarding fwd,
             mutation_reader::forwarding fwd_mr) {
-        auto reader = make_flat_mutation_reader<enormous_table_reader>(schema, permit, range, slice);
+        auto reader = make_mutation_reader<enormous_table_reader>(schema, permit, range, slice);
         if (fwd == streamed_mutation::forwarding::yes) {
             return make_forwardable(std::move(reader));
         }
@@ -183,13 +176,9 @@ struct enormous_virtual_reader {
 };
 
 
-static lw_shared_ptr<service::pager::paging_state> extract_paging_state(::shared_ptr<cql_transport::messages::result_message> res) {
+static lw_shared_ptr<const service::pager::paging_state> extract_paging_state(::shared_ptr<cql_transport::messages::result_message> res) {
     auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(res);
-    auto paging_state = rows->rs().get_metadata().paging_state();
-    if (!paging_state) {
-        return nullptr;
-    }
-    return make_lw_shared<service::pager::paging_state>(*paging_state);
+    return rows->rs().get_metadata().paging_state();
 };
 
 static size_t count_rows_fetched(::shared_ptr<cql_transport::messages::result_message> res) {
@@ -205,7 +194,7 @@ static bool has_more_pages(::shared_ptr<cql_transport::messages::result_message>
 SEASTAR_TEST_CASE(scan_enormous_table_test) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.create_table([](std::string_view ks_name) {
-            return *schema_builder(ks_name, "enormous_table")
+            return *schema_builder(this_smp_shard_count(), ks_name, "enormous_table")
                     .with_column("pk", long_type, column_kind::partition_key)
                     .with_column("ck", long_type, column_kind::clustering_key)
                     .set_comment("a very big table (4.5 billion entries, one partition)")
@@ -216,13 +205,13 @@ SEASTAR_TEST_CASE(scan_enormous_table_test) {
 
         uint64_t rows_fetched = 0;
         shared_ptr<cql_transport::messages::result_message> msg;
-        lw_shared_ptr<service::pager::paging_state> paging_state;
+        lw_shared_ptr<const service::pager::paging_state> paging_state;
         std::unique_ptr<cql3::query_options> qo;
         uint64_t fetched_rows_log_counter = 1e7;
         do {
             qo = std::make_unique<cql3::query_options>(db::consistency_level::LOCAL_ONE, std::vector<cql3::raw_value>{},
                     cql3::query_options::specific_options{10000, paging_state, {}, api::new_timestamp()});
-            msg = e.execute_cql("select * from enormous_table;", std::move(qo)).get0();
+            msg = e.execute_cql("select * from enormous_table;", std::move(qo)).get();
             rows_fetched += count_rows_fetched(msg);
             paging_state = extract_paging_state(msg);
             if (rows_fetched >= fetched_rows_log_counter){
@@ -237,7 +226,7 @@ SEASTAR_TEST_CASE(scan_enormous_table_test) {
 SEASTAR_TEST_CASE(count_enormous_table_test) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.create_table([](std::string_view ks_name) {
-            return *schema_builder(ks_name, "enormous_table")
+            return *schema_builder(this_smp_shard_count(), ks_name, "enormous_table")
                     .with_column("pk", long_type, column_kind::partition_key)
                     .with_column("ck", long_type, column_kind::clustering_key)
                     .set_comment("a very big table (4.5 billion entries, one partition)")
@@ -246,7 +235,7 @@ SEASTAR_TEST_CASE(count_enormous_table_test) {
         auto& db = e.local_db();
         db.find_column_family("ks", "enormous_table").set_virtual_reader(mutation_source(enormous_virtual_reader()));
 
-        auto msg = e.execute_cql("select count(*) from enormous_table").get0();
+        auto msg = e.execute_cql("select count(*) from enormous_table").get();
         assert_that(msg).is_rows().with_rows({{{long_type->decompose(int64_t(enormous_table_reader::CLUSTERING_ROW_COUNT))}}});
     });
 }

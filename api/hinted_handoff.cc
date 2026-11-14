@@ -3,56 +3,51 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <algorithm>
 #include <vector>
 
 #include "hinted_handoff.hh"
+#include "api/api.hh"
 #include "api/api-doc/hinted_handoff.json.hh"
 
 #include "gms/inet_address.hh"
-#include "gms/gossiper.hh"
 #include "service/storage_proxy.hh"
+#include "gms/gossiper.hh"
 
 namespace api {
 
 using namespace json;
+using namespace seastar::httpd;
 namespace hh = httpd::hinted_handoff_json;
 
-void set_hinted_handoff(http_context& ctx, routes& r, gms::gossiper& g) {
-    hh::create_hints_sync_point.set(r, [&ctx, &g] (std::unique_ptr<request> req) -> future<json::json_return_type> {
+void set_hinted_handoff(http_context& ctx, routes& r, sharded<service::storage_proxy>& proxy, sharded<gms::gossiper>& g) {
+    hh::create_hints_sync_point.set(r, [&proxy, &g] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto parse_hosts_list = [&g] (sstring arg) {
             std::vector<sstring> hosts_str = split(arg, ",");
-            std::vector<gms::inet_address> hosts;
+            std::vector<locator::host_id> hosts;
             hosts.reserve(hosts_str.size());
 
-            if (hosts_str.empty()) {
-                // No target_hosts specified means that we should wait for hints for all nodes to be sent
-                const auto members_set = g.get_live_members();
-                std::copy(members_set.begin(), members_set.end(), std::back_inserter(hosts));
-            } else {
-                for (const auto& host_str : hosts_str) {
-                    try {
-                        gms::inet_address host;
-                        host = gms::inet_address(host_str);
-                        hosts.push_back(host);
-                    } catch (std::exception& e) {
-                        throw httpd::bad_param_exception(format("Failed to parse host address {}: {}", host_str, e.what()));
-                    }
+            for (const auto& host_str : hosts_str) {
+                auto host = parse_inet_address_param("target_hosts", host_str);
+                try {
+                    hosts.push_back(g.local().get_host_id(host));
+                } catch (std::exception& e) {
+                    throw httpd::bad_param_exception(format("Unknown host address {}: {}", host_str, e.what()));
                 }
             }
+
             return hosts;
         };
 
-        std::vector<gms::inet_address> target_hosts = parse_hosts_list(req->get_query_param("target_hosts"));
-        return ctx.sp.local().create_hint_sync_point(std::move(target_hosts)).then([] (db::hints::sync_point sync_point) {
+        std::vector<locator::host_id> target_hosts = parse_hosts_list(req->get_query_param("target_hosts"));
+        return proxy.local().create_hint_sync_point(std::move(target_hosts)).then([] (db::hints::sync_point sync_point) {
             return json::json_return_type(sync_point.encode());
         });
     });
 
-    hh::get_hints_sync_point.set(r, [&ctx] (std::unique_ptr<request> req) -> future<json::json_return_type> {
+    hh::get_hints_sync_point.set(r, [&proxy] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         db::hints::sync_point sync_point;
         const sstring encoded = req->get_query_param("id");
         try {
@@ -61,74 +56,66 @@ void set_hinted_handoff(http_context& ctx, routes& r, gms::gossiper& g) {
             throw httpd::bad_param_exception(format("Failed to parse the sync point description {}: {}", encoded, e.what()));
         }
 
-        lowres_clock::time_point deadline;
-        const sstring timeout_str = req->get_query_param("timeout");
-        try {
-            deadline = [&] {
-                if (timeout_str.empty()) {
-                    // Empty string - don't wait at all, just check the status
-                    return lowres_clock::time_point::min();
-                } else {
-                    const auto timeout = std::stoll(timeout_str);
-                    if (timeout >= 0) {
-                        // Wait until the point is reached, or until `timeout` seconds elapse
-                        return lowres_clock::now() + std::chrono::seconds(timeout);
-                    } else {
-                        // Negative value indicates infinite timeout
-                        return lowres_clock::time_point::max();
-                    }
-                }
-            } ();
-        } catch (std::exception& e) {
-            throw httpd::bad_param_exception(format("Failed to parse the timeout parameter {}: {}", timeout_str, e.what()));
-        }
+        const auto timeout = try_get_query_param<std::chrono::seconds>(*req, "timeout");
+        const auto deadline = [&] {
+            if (!timeout) {
+                // No timeout - don't wait at all, just check the status
+                return lowres_clock::time_point::min();
+            } else if (*timeout >= std::chrono::seconds::zero()) {
+                // Wait until the point is reached, or until `timeout` elapses
+                return lowres_clock::now() + *timeout;
+            } else {
+                // Negative value indicates infinite timeout
+                return lowres_clock::time_point::max();
+            }
+        } ();
 
         using return_type = hh::ns_get_hints_sync_point::get_hints_sync_point_return_type;
         using return_type_wrapper = hh::ns_get_hints_sync_point::return_type_wrapper;
 
-        return ctx.sp.local().wait_for_hint_sync_point(std::move(sync_point), deadline).then([] {
+        return proxy.local().wait_for_hint_sync_point(std::move(sync_point), deadline).then([] {
             return json::json_return_type(return_type_wrapper(return_type::DONE));
         }).handle_exception_type([] (const timed_out_error&) {
             return json::json_return_type(return_type_wrapper(return_type::IN_PROGRESS));
         });
     });
 
-    hh::list_endpoints_pending_hints.set(r, [] (std::unique_ptr<request> req) {
+    hh::list_endpoints_pending_hints.set(r, [] (std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         std::vector<sstring> res;
         return make_ready_future<json::json_return_type>(res);
     });
 
-    hh::truncate_all_hints.set(r, [] (std::unique_ptr<request> req) {
+    hh::truncate_all_hints.set(r, [] (std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         sstring host = req->get_query_param("host");
         return make_ready_future<json::json_return_type>(json_void());
     });
 
-    hh::schedule_hint_delivery.set(r, [] (std::unique_ptr<request> req) {
+    hh::schedule_hint_delivery.set(r, [] (std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         sstring host = req->get_query_param("host");
         return make_ready_future<json::json_return_type>(json_void());
     });
 
-    hh::pause_hints_delivery.set(r, [] (std::unique_ptr<request> req) {
+    hh::pause_hints_delivery.set(r, [] (std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         sstring pause = req->get_query_param("pause");
         return make_ready_future<json::json_return_type>(json_void());
     });
 
-    hh::get_create_hint_count.set(r, [] (std::unique_ptr<request> req) {
+    hh::get_create_hint_count.set(r, [] (std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         sstring host = req->get_query_param("host");
         return make_ready_future<json::json_return_type>(0);
     });
 
-    hh::get_not_stored_hints_count.set(r, [] (std::unique_ptr<request> req) {
+    hh::get_not_stored_hints_count.set(r, [] (std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         sstring host = req->get_query_param("host");

@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #pragma once
 
-#include <seastar/core/condition-variable.hh>
+#include "utils/assert.hh"
+#include <fmt/core.h>
 #include "raft.hh"
 
 namespace raft {
@@ -30,20 +31,33 @@ public:
     // Highest read id the follower replied to
     read_id max_acked_read = read_id{0};
 
-    // True if the follower is a voting one
-    bool can_vote = true;
+    // is_voter::yes if the follower is a voting one
+    raft::is_voter can_vote = raft::is_voter::yes;
+
+    // LeaseGuard: the follower's clock health as of its last append_reply. A
+    // leader whose own clock has failed uses this to find a replica that can
+    // still hold a lease and hand leadership to it. Starts false, so a follower
+    // we have not heard from is never chosen.
+    bool clock_ok = false;
 
     enum class state {
         // In this state only one append entry is send until matching index is found
         PROBE,
         // In this state multiple append entries are sent optimistically
         PIPELINE,
-        // In this state snapshot is been transfered
+        // In this state snapshot has been transferred
         SNAPSHOT
     };
     state state = state::PROBE;
     // true if a packet was sent already in a probe mode
     bool probe_sent = false;
+    // Set if the follower reported that its in-memory log has reached
+    // max_follower_log_size. While it is set we do not send any entries to the
+    // follower, since it would refuse them; fsm::tick_leader() sends an empty
+    // append_request once per tick instead, to learn when the follower has
+    // room again. Refreshed from every append_reply, so it is never stale for
+    // longer than one round trip.
+    bool log_full = false;
     // number of in flight still un-acked append entries requests
     size_t in_flight = 0;
     static constexpr size_t max_in_flight = 10;
@@ -72,7 +86,7 @@ public:
     }
 
     // Return true if a new replication record can be sent to the follower.
-    bool can_send_to();
+    bool can_send_to() const;
 
     follower_progress(server_id id_arg, index_t next_idx_arg)
         : id(id_arg), next_idx(next_idx_arg)
@@ -88,7 +102,7 @@ class tracker: private progress {
     // Hide size() function we inherited from progress since
     // it is never right to use it directly in case of joint config
     size_t size() const {
-        assert(false);
+        SCYLLA_ASSERT(false);
     }
 public:
     using progress::begin, progress::end, progress::cbegin, progress::cend, progress::size;
@@ -145,8 +159,6 @@ enum class vote_result {
     LOST,
 };
 
-std::ostream& operator<<(std::ostream& os, const vote_result& v);
-
 // State of election in a single quorum
 class election_tracker {
     // All eligible voters
@@ -155,10 +167,10 @@ class election_tracker {
     std::unordered_set<server_id> _responded;
     size_t _granted = 0;
 public:
-    election_tracker(const server_address_set& configuration) {
-        for (const auto& a : configuration) {
-            if (a.can_vote) {
-                _suffrage.emplace(a.id);
+    election_tracker(const config_member_set& configuration) {
+        for (const auto& s : configuration) {
+            if (s.can_vote) {
+                _suffrage.emplace(s.addr.id);
             }
         }
     }
@@ -173,16 +185,20 @@ public:
         }
         return true;
     }
+    // Check if a voter has responded (voted or rejected) in this election.
+    bool has_responded(server_id id) const {
+        return _responded.contains(id);
+    }
     vote_result tally_votes() const {
         auto quorum = _suffrage.size() / 2 + 1;
         if (_granted >= quorum) {
             return vote_result::WON;
         }
-        assert(_responded.size() <= _suffrage.size());
+        SCYLLA_ASSERT(_responded.size() <= _suffrage.size());
         auto unknown = _suffrage.size() - _responded.size();
         return _granted + unknown >= quorum ? vote_result::UNKNOWN : vote_result::LOST;
     }
-    friend std::ostream& operator<<(std::ostream& os, const election_tracker& v);
+    friend fmt::formatter<election_tracker>;
 };
 
 // Candidate's state specific to election
@@ -193,15 +209,32 @@ class votes {
 public:
     votes(configuration configuration);
 
+    // A server is a member of this set iff
+    // it is a voter in the current or previous configuration.
     const server_address_set& voters() const {
         return _voters;
     }
 
     void register_vote(server_id from, bool granted);
     vote_result tally_votes() const;
+    // Check if a voter has responded in the current election round.
+    bool has_responded(server_id id) const {
+        return _current.has_responded(id);
+    }
 
-    friend std::ostream& operator<<(std::ostream& os, const votes& v);
+    friend fmt::formatter<votes>;
 };
 
 } // namespace raft
 
+template <> struct fmt::formatter<raft::election_tracker> : fmt::formatter<string_view> {
+    auto format(const raft::election_tracker& v, fmt::format_context& ctx) const  -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<raft::votes> : fmt::formatter<string_view> {
+    auto format(const raft::votes& v, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+
+template <> struct fmt::formatter<raft::vote_result> : fmt::formatter<string_view> {
+    auto format(const raft::vote_result& v, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

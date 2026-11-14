@@ -1,21 +1,26 @@
 # -*- coding: utf-8 -*-
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the Query operation
 # Some of the Query features are tested in separate files:
-#   * test_key_conditions.py: the KeyConditions paramter.
+#   * test_key_conditions.py: the KeyConditions parameter.
 #   * test_key_condition_expression.py: the KeyConditionExpression parameter.
 #   * test_filter_expression.py: the FilterExpression parameter.
 #   * test_query_filter.py: the QueryFilter parameter.
 
+import operator
 import random
-import pytest
-from botocore.exceptions import ClientError
 from decimal import Decimal
-from util import random_string, random_bytes, full_query, multiset
-from boto3.dynamodb.conditions import Key, Attr
+
+import pytest
+from boto3.dynamodb.conditions import Attr
+from botocore.exceptions import ClientError
+
+from test.alternator.util import random_string, random_bytes, full_query, multiset
+
+python_compare_op_dict = {"LE": operator.le, "LT": operator.lt, "GE": operator.ge, "GT": operator.gt}
 
 def test_query_nonexistent_table(dynamodb):
     client = dynamodb.meta.client
@@ -157,6 +162,13 @@ def test_query_attributes_to_get(dynamodb, test_table):
         expected_items = [{k: x[k] for k in wanted if k in x} for x in items]
         assert multiset(expected_items) == multiset(got_items)
 
+# Verify that it is forbidden to ask for an empty AttributesToGet
+# Reproduces issue #10332.
+def test_query_attributes_to_get_empty(dynamodb, test_table):
+    p = random_string()
+    with pytest.raises(ClientError, match='ValidationException'):
+        full_query(test_table, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, AttributesToGet=[])
+
 # Test that in a table with both hash key and sort key, which keys we can
 # Query by: We can Query by the hash key, by a combination of both hash and
 # sort keys, but *cannot* query by just the sort key, and obviously not
@@ -214,7 +226,6 @@ def test_query_which_key(test_table):
 # ALL_ATTRIBUTES, returns items with all their attributes. Other modes
 # allow returning just specific attributes or just counting the results
 # without returning items at all.
-@pytest.mark.xfail(reason="Select not supported yet. Issue #5058")
 def test_query_select(test_table_sn):
     numbers = [Decimal(i) for i in range(10)]
     # Insert these numbers, in random order, into one partition:
@@ -262,6 +273,10 @@ def test_query_select(test_table_sn):
     # Select with some unknown string generates a validation exception:
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='UNKNOWN')
+    # The Select value is case sensitive - "COUNT" works (checked above),
+    # but "count" doesn't:
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Select='count')
     # If either AttributesToGet or ProjectionExpression appear in the query,
     # only Select=SPECIFIC_ATTRIBUTES (or nothing) is allowed - other Select
     # settings contradict the AttributesToGet or ProjectionExpression, and
@@ -354,7 +369,6 @@ def test_query_exclusivestartkey(test_table_sn):
         # The ExclusiveStartKey option must indicate both partition key and
         # sort key. Note that the Python driver further converts this map
         # into the correct format for the request (including the key types).
-        exclusivestartkey = { 'p': p, 'c': start }
         got_items = test_table_sn.query(
             KeyConditions={'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
             ExclusiveStartKey= { 'p': p, 'c': start },
@@ -362,11 +376,105 @@ def test_query_exclusivestartkey(test_table_sn):
         got_sort_keys = [x['c'] for x in got_items]
         assert expected_sort_keys == got_sort_keys
 
+# In the previous test (test_query_exclusivestartkey) we checked that
+# in a table with a partition and sort key, ExclusiveStartKey that specifies
+# both works. Here we verify that it is not allowed for ExclusiveStartKey
+# to specify *only* the partition key - if you want the query to start in
+# the beginning of the partition, don't specify an ExclusiveStartKey at all.
+def test_query_exclusivestartkey_missing_sortkey(test_table_sn):
+    p = random_string()
+    # The error that DynamoDB reports if the sort key is missing in
+    # ExclusiveStartKey is "The provided starting key is invalid". In
+    # Alternator, the error is "Key column c not found".
+    with pytest.raises(ClientError, match='ValidationException.*[kK]ey'):
+        test_table_sn.query(
+            KeyConditions={'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+            # missing 'c' in ExclusiveStartKey!
+            ExclusiveStartKey= { 'p': p })
+
+# When Query'ing on the partition key 'right', ExclusiveStartKey must be in
+# the same partition 'right' being queried - it must not be some other
+# partition. Reproduces issue #26988.
+@pytest.mark.xfail(reason="issue #26988")
+def test_query_exclusivestartkey_wrong_partition(test_table_sn):
+    # The error that DynamoDB reports if the wrong partition is mentioned
+    # in ExclusiveStartKey is "The provided starting key is outside query
+    # boundaries based on provided conditions".
+    with pytest.raises(ClientError, match='ValidationException.*starting key'):
+        test_table_sn.query(
+            KeyConditions={'p': { 'AttributeValueList': ['right'], 'ComparisonOperator': 'EQ'}},
+            # The partition key part of ExclusiveStartKey should be 'right',
+            # trying something else like 'wrong' should fail
+            ExclusiveStartKey= { 'p': 'wrong', 'c': 0 })
+
+# Check that ExclusiveStartKey cannot contain any spurious column names
+# beyond the actual primary key (here a partition key and sort key)
+# Reproduces issue #26988.
+@pytest.mark.xfail(reason="issue #26988")
+def test_query_exclusivestartkey_spurious_column(test_table_sn):
+    p = random_string()
+    # The error that DynamoDB reports if ExclusiveStartKey has spurious
+    # columns is "The provided starting key is invalid".
+    with pytest.raises(ClientError, match='ValidationException.*starting key'):
+        test_table_sn.query(
+            KeyConditions={'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+            # 'x' is not part of the key, so this should cause an error
+            ExclusiveStartKey= { 'p': p, 'c': 0, 'x': 3 })
+
+# Check that ExclusiveStartKey cannot use the wrong types for key columns.
+# In test_table_sn, the partition key should be a string (not a number), and
+# the sort key should be a number (not a string).
+def test_query_exclusivestartkey_wrong_types(test_table_sn):
+    p = random_string()
+    # DynamoDB gives the error message "The provided key element does not match
+    # the schema", while Alternator gives "Type mismatch: expected type S for
+    # key column p, got type "N"".
+    with pytest.raises(ClientError, match='ValidationException.*match'):
+        test_table_sn.query(
+            KeyConditions={'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+            # 'p' should be a string, not a number.
+            ExclusiveStartKey= { 'p': 7, 'c': 42 })
+    with pytest.raises(ClientError, match='ValidationException.*match'):
+        test_table_sn.query(
+            KeyConditions={'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+            # 'c' should be a number, not a string.
+            ExclusiveStartKey= { 'p': p, 'c': 'dog' })
+
+# The previous tests, and actually all tests in this file, all used a table
+# with both a partition key and a sort key. Naturally, "Query" is meant to
+# be used on a table with a sort key. However, it actually works also on
+# a table with just a partition key. Let's check that it works.
+def test_query_no_sort_key(test_table_s):
+    p = random_string()
+    item = {'p': p, 'animal': 'dog'}
+    test_table_s.put_item(Item=item)
+    got = test_table_s.query(
+            ConsistentRead=True,
+            KeyConditions={'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})['Items']
+    assert got == [item]
+
+# Although a Query is allowed on a table with just a partition key and no
+# sort key (and always returns a single item), ExclusiveStartKey makes no
+# sense for these one-item partitions: Since it is *exclusive*, i.e., the
+# response shouldn't include the given key, the response would be completely
+# empty...  So DynamoDB doesn't allow this case at all.
+# Reproduces issue #26988.
+@pytest.mark.xfail(reason="issue #26988")
+def test_query_no_sort_key_exclusive_start_key(test_table_s):
+    p = random_string()
+    # DynamoDB gives the error message "The provided exclusive start key
+    # is invalid: ExclusiveStartKey: {p=AttributeValue: {S:KPQ4X3JE19}}"
+    with pytest.raises(ClientError, match='ValidationException.*ExclusiveStartKey'):
+        test_table_s.query(
+                KeyConditions={'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+                ExclusiveStartKey={'p': p})
+
 # Test that the ScanIndexForward parameter works, and can be used to
 # return items sorted in reverse order. Combining this with Limit can
 # be used to return the last items instead of the first items of the
 # partition.
-def test_query_reverse(test_table_sn):
+@pytest.mark.parametrize("sort_key_op", [None, 'LT', 'LE', 'GT', 'GE'])
+def test_query_reverse(sort_key_op, test_table_sn):
     numbers = [Decimal(i) for i in range(20)]
     # Insert these numbers, in random order, into one partition:
     p = random_string()
@@ -378,29 +486,29 @@ def test_query_reverse(test_table_sn):
     # order, depending on the ScanIndexForward parameter being True or False.
     # First, no Limit so we should get all numbers (we have few of them, so
     # it all fits in the default 1MB limitation)
-    reversed_numbers = list(reversed(numbers))
-    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=True)['Items']
-    got_sort_keys = [x['c'] for x in got_items]
-    assert got_sort_keys == numbers
-    got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=False)['Items']
-    got_sort_keys = [x['c'] for x in got_items]
-    assert got_sort_keys == reversed_numbers
-    # Now try a few different Limit values, and verify that the query
-    # returns exactly the first Limit sorted numbers - in regular or
-    # reverse order, depending on ScanIndexForward.
-    for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
-        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=True)['Items']
-        assert len(got_items) == min(limit, len(numbers))
+    key_condition = {'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}
+    if sort_key_op:
+        c_bound = random.randint(1, 19)
+        key_condition['c'] = {'AttributeValueList': [c_bound], 'ComparisonOperator': sort_key_op}
+        op = lambda x: python_compare_op_dict[sort_key_op](x, c_bound)
+    else:
+        op = lambda x: True
+
+    for scan_index_forward in [True, False]:
+        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions=key_condition, ScanIndexForward=scan_index_forward)['Items']
         got_sort_keys = [x['c'] for x in got_items]
-        assert got_sort_keys == numbers[0:limit]
-        got_items = test_table_sn.query(ConsistentRead=True, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, Limit=limit, ScanIndexForward=False)['Items']
-        assert len(got_items) == min(limit, len(numbers))
-        got_sort_keys = [x['c'] for x in got_items]
-        assert got_sort_keys == reversed_numbers[0:limit]
+        assert got_sort_keys == list(filter(op, numbers[:: 1 if scan_index_forward else -1]))
+
+        for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
+            got_items = test_table_sn.query(ConsistentRead=True, KeyConditions=key_condition, Limit=limit, ScanIndexForward=scan_index_forward)['Items']
+            got_sort_keys = [x['c'] for x in got_items]
+            assert got_sort_keys == list(filter(op, numbers[:: 1 if scan_index_forward else -1]))[:limit]
+
 
 # Test that paging also works properly with reverse order
 # (ScanIndexForward=false), i.e., reverse-order queries can be resumed
-def test_query_reverse_paging(test_table_sn):
+@pytest.mark.parametrize("sort_key_op", [None, 'LT', 'LE', 'GT', 'GE'])
+def test_query_reverse_paging(sort_key_op, test_table_sn):
     numbers = [Decimal(i) for i in range(20)]
     # Insert these numbers, in random order, into one partition:
     p = random_string()
@@ -412,10 +520,18 @@ def test_query_reverse_paging(test_table_sn):
     # Verify that with ScanIndexForward=False, full_query() returns all
     # these numbers in reversed sorted order - getting pages of Limit items
     # at a time and resuming the query.
+    key_condition = {'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}
+    if sort_key_op:
+        c_bound = random.randint(1, 19)
+        key_condition['c'] = {'AttributeValueList': [c_bound], 'ComparisonOperator': sort_key_op}
+        op = lambda x: python_compare_op_dict[sort_key_op](x, c_bound)
+    else:
+        op = lambda x: True
+
     for limit in [1, 2, 3, 7, 10, 17, 100, 10000]:
-        got_items = full_query(test_table_sn, KeyConditions={'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}}, ScanIndexForward=False, Limit=limit)
+        got_items = full_query(test_table_sn, KeyConditions=key_condition, ScanIndexForward=False, Limit=limit)
         got_sort_keys = [x['c'] for x in got_items]
-        assert got_sort_keys == reversed_numbers
+        assert got_sort_keys == list(filter(op, reversed_numbers))
 
 # Test that a reverse query also works for long partitions. This test
 # reproduces #7586, where reverse queries had to read the entire partition
@@ -445,7 +561,7 @@ def test_query_reverse_long(test_table_sn):
     got_sort_keys = [x['c'] for x in got_items]
     assert got_sort_keys == list(reversed(range(N-50, N)))
 
-    # A similar limited and reveresed query - with an explicit starting
+    # A similar limited and reversed query - with an explicit starting
     # point (2345) instead of the end:
     start = 2345
     got_items = test_table_sn.query(KeyConditions={
@@ -458,6 +574,67 @@ def test_query_reverse_long(test_table_sn):
 
     # Even if a Limit is *not* specified, queries have some built-in size
     # limit (around 1MB) - a query should never return the entire 100MB
+    # partition in one response. One of the development versions had a bug
+    # here - normal (unreversed) queries were limited to 1MB, but reversed
+    # queries returned the entire 100MB.
+    # First check this with regular (unreversed) order:
+    got_items = test_table_sn.query(KeyConditions={
+        'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+        ConsistentRead=True)['Items']
+    n = len(got_items)
+    got_sort_keys = [x['c'] for x in got_items]
+    assert got_sort_keys == list(range(n))
+    assert n < N  # we don't how big n should be, but definitely not N!
+    # And in reverse order:
+    got_items = test_table_sn.query(KeyConditions={
+        'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+        ScanIndexForward=False,
+        ConsistentRead=True)['Items']
+    n = len(got_items)
+    got_sort_keys = [x['c'] for x in got_items]
+    assert got_sort_keys == list(reversed(range(N-n, N)))
+    assert n < N
+
+# The above test_query_reverse_long() tests a very long (over 100MB)
+# partition, so is very slow especially over a slow network. The following
+# is a much smaller subset of the above test that reproduces issue #9487:
+# When doing a reverse query without "Limit" on a partition of 2MB, a result
+# page should nevertheless be limited to 1MB of data and not return the
+# entire 2MB in one page.
+def test_query_reverse_longish(test_table_sn):
+    # Insert a 2MB partition
+    p = random_string()
+    str = 'x' * 10240
+    N = 200
+    with test_table_sn.batch_writer() as batch:
+        for i in range(N):
+            batch.put_item({'p': p, 'c': i, 's': str})
+
+    # Query one page of a specific length (Limit=50) in reverse order.
+    # We should get the requested number of items, starting from the last
+    # item (N-1), in reversed order:
+    got_items = test_table_sn.query(KeyConditions={
+        'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+        ScanIndexForward=False,
+        Limit=50,
+        ConsistentRead=True)['Items']
+    assert len(got_items) == 50
+    got_sort_keys = [x['c'] for x in got_items]
+    assert got_sort_keys == list(reversed(range(N-50, N)))
+
+    # A similar limited and reversed query - with an explicit starting
+    # point (2345) instead of the end:
+    start = 147
+    got_items = test_table_sn.query(KeyConditions={
+        'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+        ExclusiveStartKey={'p': p, 'c': start},
+        ScanIndexForward=False, Limit=50, ConsistentRead=True)['Items']
+    assert len(got_items) == 50
+    got_sort_keys = [x['c'] for x in got_items]
+    assert got_sort_keys == list(reversed(range(start-50, start)))
+
+    # Even if a Limit is *not* specified, queries have some built-in size
+    # limit (around 1MB) - a query should never return the entire 2MB
     # partition in one response. One of the development versions had a bug
     # here - normal (unreversed) queries were limited to 1MB, but reversed
     # queries returned the entire 100MB.
@@ -521,3 +698,55 @@ def test_query_paging_string(test_table_ss):
     got_sort_keys = [x['c'] for x in got_items]
     expected_sort_keys = sorted(x['c'] for x in items)
     assert got_sort_keys == expected_sort_keys
+
+# The following test reproduces #17995: A Query returning a large page
+# composed of many small rows, which causes a lot of processing work for
+# outputting the result, and the risk (before #17995 is fixed) to stall.
+# To see the stall, an option like '--blocked-reactor-notify-ms', '5'
+# must be added to Scylla in test/alternator/run, as the default stall
+# threshold is higher than the one that this test produces.
+# Because this test is slow (takes several seconds to build the large
+# partition) and can't fail or even log a stall without different
+# configuration, we skip it by default, using the "veryslow" mark.
+# Remove this mark, and set the --block-reactor-notify-ms option, to run
+# this test.
+@pytest.mark.veryslow
+def test_query_large_page_small_rows(test_table_sn):
+    p = random_string()
+    # Experimentally, Scylla considers the rows we insert below (which each
+    # have a 10-byte string partition key with a one byte name, a numeric
+    # clustering key with a one byte name, and no other data) as being 32
+    # bytes in size, and returns 32772 of these rows in one (nominally) 1MB
+    # page of Query. So if the partition has just 30,000 rows, it will be
+    # returned entirely in one page.
+    N = 30_000
+    with test_table_sn.batch_writer() as batch:
+        for i in range(N):
+            batch.put_item({'p': p, 'c': i})
+
+    got_items = test_table_sn.query(KeyConditions={
+        'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+        ConsistentRead=True)['Items']
+    n = len(got_items)
+    assert n == N
+
+# This test is a less extreme and faster version of the previous test
+# (test_query_large_page_small_rows): We test a query returning a large but
+# not huge number (700) of tiny rows. If Alternator has a special code path
+# for handling a response with that many rows (namely, to work around problems
+# with RapidJSON's contiguous allocation of array objects - see #23535),
+# then this test exercises this case.
+def test_query_many_small_rows(test_table_sn):
+    p = random_string()
+    N = 700
+    with test_table_sn.batch_writer() as batch:
+        for i in range(N):
+            batch.put_item({'p': p, 'c': i})
+    got_items = test_table_sn.query(KeyConditions={
+        'p': {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}},
+        ConsistentRead=True)['Items']
+    i = 0
+    for item in got_items:
+        assert item == {'p': p, 'c': i}
+        i += 1
+    assert N == i

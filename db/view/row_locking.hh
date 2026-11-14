@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -20,16 +20,17 @@
 // the new.
 
 #include <unordered_map>
-#include <memory>
 
 #include <seastar/core/rwlock.hh>
 #include <seastar/core/future.hh>
 
 #include "db/timeout_clock.hh"
-#include "schema_fwd.hh"
-#include "dht/i_partitioner.hh"
-#include "query-request.hh"
+#include "schema/schema_fwd.hh"
+#include "dht/i_partitioner_fwd.hh"
+#include "dht/decorated_key.hh"
 #include "utils/estimated_histogram.hh"
+#include "utils/latency.hh"
+#include "keys/keys.hh"
 
 class row_locker {
 public:
@@ -43,6 +44,15 @@ public:
         single_lock_stats shared_row;
         single_lock_stats exclusive_partition;
         single_lock_stats shared_partition;
+    };
+    struct latency_stats_tracker {
+        single_lock_stats& lock_stats;
+        utils::latency_counter waiting_latency;
+
+        latency_stats_tracker(single_lock_stats& stats);
+        ~latency_stats_tracker();
+
+        void lock_acquired();
     };
     // row_locker's locking functions lock_pk(), lock_ck() return a
     // "lock_holder" object. When the caller destroys the object it received,

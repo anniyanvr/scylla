@@ -3,12 +3,10 @@
  */
 
 /*
- * This file is part of Scylla.
- *
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include "seastar/include/seastar/testing/perf_tests.hh"
+#include <seastar/testing/perf_tests.hh>
 #include <seastar/testing/test_runner.hh>
 
 #include <random>

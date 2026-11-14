@@ -3,31 +3,34 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <string_view>
+#include <fmt/ranges.h>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
-#include <seastar/testing/test_case.hh>
 #include <seastar/util/defer.hh>
+
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
+#include "test/lib/test_utils.hh"
 
 #include "auth/authenticated_user.hh"
 #include "auth/permission.hh"
 #include "auth/service.hh"
-#include "cql3/query_processor.hh"
-#include "cql3/role_name.hh"
-#include "cql3/role_options.hh"
-#include "cql3/statements/create_role_statement.hh"
 #include "db/config.hh"
 #include "exceptions/exceptions.hh"
 #include "seastarx.hh"
 #include "service/client_state.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/exception_utils.hh"
+
+BOOST_AUTO_TEST_SUITE(cql_auth_query_test)
 
 static const auto alice = std::string_view("alice");
 static const auto bob = std::string_view("bob");
@@ -44,12 +47,17 @@ static shared_ptr<db::config> db_config_with_auth() {
     return config_ptr;
 }
 
+static cql_test_config enable_tablets(cql_test_config cfg) {
+    cfg.initial_tablets = 1;
+    return cfg;
+}
+
 //
 // These functions must be called inside Seastar threads.
 //
 
 static void create_user_if_not_exists(cql_test_env& env, std::string_view user_name) {
-    env.execute_cql(format("CREATE USER IF NOT EXISTS {} WITH PASSWORD '{}'", user_name, user_name)).get();
+    env.execute_cql(seastar::format("CREATE USER IF NOT EXISTS {} WITH PASSWORD '{}'", user_name, user_name)).get();
 }
 
 // Invoke `f` as though the user indicated with `user_name` had logged in. The current logged in user is restored after
@@ -61,7 +69,7 @@ static void with_user(cql_test_env& env, std::string_view user_name, noncopyable
     create_user_if_not_exists(env, user_name);
     cs.set_login(auth::authenticated_user(sstring(user_name)));
 
-    const auto reset = defer([&cs, old_user = std::move(old_user)] {
+    const auto reset = defer([&cs, old_user = std::move(old_user)] mutable noexcept {
         cs.set_login(std::move(*old_user));
     });
 
@@ -78,13 +86,13 @@ void verify_unauthorized_then_ok(
     const auto cql_query_string = sstring(cql_query);
 
     with_user(env, user_name, [&env, &cql_query_string] {
-        BOOST_REQUIRE_THROW(env.execute_cql(cql_query_string).get0(), exceptions::unauthorized_exception);
+        BOOST_REQUIRE_THROW(env.execute_cql(cql_query_string).get(), exceptions::unauthorized_exception);
     });
 
     resolve();
 
     with_user(env, user_name, [&env, &cql_query_string] {
-        env.execute_cql(cql_query_string).get0();
+        env.execute_cql(cql_query_string).get();
     });
 }
 
@@ -99,7 +107,7 @@ SEASTAR_TEST_CASE(create_role_restrictions) {
         //
 
         verify_unauthorized_then_ok(env, alice, "CREATE ROLE lord", [&env] {
-            env.execute_cql("GRANT CREATE ON ALL ROLES TO alice").get0();
+            env.execute_cql("GRANT CREATE ON ALL ROLES TO alice").get();
         });
 
         //
@@ -107,7 +115,7 @@ SEASTAR_TEST_CASE(create_role_restrictions) {
         //
 
         verify_unauthorized_then_ok(env, bob, "CREATE ROLE emperor WITH SUPERUSER = true", [&env] {
-            env.execute_cql("ALTER USER bob SUPERUSER").get0();
+            env.execute_cql("ALTER USER bob SUPERUSER").get();
         });
     }, db_config_with_auth());
 }
@@ -118,14 +126,14 @@ SEASTAR_TEST_CASE(create_role_restrictions) {
 
 SEASTAR_TEST_CASE(alter_role_restrictions) {
     return do_with_cql_env_thread([](auto&& env) {
-        env.execute_cql("CREATE ROLE lord").get0();
+        env.execute_cql("CREATE ROLE lord").get();
 
         //
         // A user cannot alter a role without ALTER on the role.
         //
 
         verify_unauthorized_then_ok(env, alice, "ALTER ROLE lord WITH LOGIN = true", [&env] {
-            env.execute_cql("GRANT ALTER ON ROLE lord TO alice").get0();
+            env.execute_cql("GRANT ALTER ON ROLE lord TO alice").get();
         });
 
         //
@@ -133,7 +141,7 @@ SEASTAR_TEST_CASE(alter_role_restrictions) {
         //
 
         with_user(env, bob, [&env] {
-            env.execute_cql("ALTER ROLE bob WITH LOGIN = true").get0();
+            env.execute_cql("ALTER ROLE bob WITH LOGIN = true").get();
         });
 
         //
@@ -141,7 +149,7 @@ SEASTAR_TEST_CASE(alter_role_restrictions) {
         //
 
         verify_unauthorized_then_ok(env, bob, "ALTER ROLE lord WITH SUPERUSER = true", [&env] {
-            env.execute_cql("ALTER USER bob SUPERUSER").get0();
+            env.execute_cql("ALTER USER bob SUPERUSER").get();
         });
 
         //
@@ -151,7 +159,7 @@ SEASTAR_TEST_CASE(alter_role_restrictions) {
 
         with_user(env, bob, [&env] {
             BOOST_REQUIRE_THROW(
-                    env.execute_cql("ALTER ROLE bob WITH SUPERUSER = true").get0(),
+                    env.execute_cql("ALTER ROLE bob WITH SUPERUSER = true").get(),
                     exceptions::unauthorized_exception);
         });
     }, db_config_with_auth());
@@ -163,14 +171,14 @@ SEASTAR_TEST_CASE(alter_role_restrictions) {
 
 SEASTAR_TEST_CASE(drop_role_restrictions) {
     return do_with_cql_env_thread([](auto&& env) {
-        env.execute_cql("CREATE ROLE LORD").get0();
+        env.execute_cql("CREATE ROLE LORD").get();
 
         //
         // A user cannot drop a role without DROP on the role.
         //
 
         verify_unauthorized_then_ok(env, alice, "DROP ROLE lord", [&env] {
-            env.execute_cql("GRANT DROP ON ROLE lord TO alice").get0();
+            env.execute_cql("GRANT DROP ON ROLE lord TO alice").get();
         });
 
         //
@@ -178,17 +186,17 @@ SEASTAR_TEST_CASE(drop_role_restrictions) {
         //
 
         with_user(env, alice, [&env] {
-            BOOST_REQUIRE_THROW(env.execute_cql("DROP ROLE alice").get0(), exceptions::request_validation_exception);
+            BOOST_REQUIRE_THROW(env.execute_cql("DROP ROLE alice").get(), exceptions::request_validation_exception);
         });
 
         //
         // Only a superuser can drop a role that has been granted a superuser role.
         //
 
-        env.execute_cql("CREATE ROLE emperor WITH SUPERUSER = true").get0();
+        env.execute_cql("CREATE ROLE emperor WITH SUPERUSER = true").get();
 
         verify_unauthorized_then_ok(env, bob, "DROP ROLE emperor", [&env] {
-            env.execute_cql("ALTER USER bob SUPERUSER").get0();
+            env.execute_cql("ALTER USER bob SUPERUSER").get();
         });
 
     }, db_config_with_auth());
@@ -200,14 +208,14 @@ SEASTAR_TEST_CASE(drop_role_restrictions) {
 
 SEASTAR_TEST_CASE(list_roles_restrictions) {
     return do_with_cql_env_thread([](auto&& env) {
-        env.execute_cql("CREATE ROLE lord").get0();
+        env.execute_cql("CREATE ROLE lord").get();
 
         //
         // A user cannot list all roles of a role not granted to them.
         //
 
         verify_unauthorized_then_ok(env, alice, "LIST ROLES OF lord", [&env] {
-            env.execute_cql("GRANT lord TO alice").get0();
+            env.execute_cql("GRANT lord TO alice").get();
         });
     }, db_config_with_auth());
 }
@@ -218,14 +226,14 @@ SEASTAR_TEST_CASE(list_roles_restrictions) {
 
 SEASTAR_TEST_CASE(grant_role_restrictions) {
     return do_with_cql_env_thread([](auto&& env) {
-        env.execute_cql("CREATE ROLE lord").get0();
+        env.execute_cql("CREATE ROLE lord").get();
 
         //
         // A user cannot grant a role to another user without AUTHORIZE on the role being granted.
         //
 
         verify_unauthorized_then_ok(env, alice, "GRANT lord TO alice", [&env] {
-            env.execute_cql("GRANT AUTHORIZE ON ROLE lord TO alice").get0();
+            env.execute_cql("GRANT AUTHORIZE ON ROLE lord TO alice").get();
         });
     }, db_config_with_auth());
 }
@@ -238,15 +246,15 @@ SEASTAR_TEST_CASE(revoke_role_restrictions) {
     return do_with_cql_env_thread([](auto&& env) {
         create_user_if_not_exists(env, alice);
 
-        env.execute_cql("CREATE ROLE lord").get0();
-        env.execute_cql("GRANT lord TO alice").get0();
+        env.execute_cql("CREATE ROLE lord").get();
+        env.execute_cql("GRANT lord TO alice").get();
 
         //
         // A user cannot revoke a role from another user without AUTHORIZE on the role being revoked.
         //
 
         verify_unauthorized_then_ok(env, alice, "REVOKE lord FROM alice", [&env] {
-            env.execute_cql("GRANT AUTHORIZE ON ROLE lord TO alice").get0();
+            env.execute_cql("GRANT AUTHORIZE ON ROLE lord TO alice").get();
         });
     }, db_config_with_auth());
 }
@@ -266,16 +274,16 @@ static void verify_default_permissions(
         std::string_view creation_query,
         const auth::resource& r) {
     create_user_if_not_exists(env, user);
-    env.execute_cql(sstring(grant_query)).get0();
+    env.execute_cql(sstring(grant_query)).get();
 
     with_user(env, user, [&env, creation_query] {
-        env.execute_cql(sstring(creation_query)).get0();
+        env.execute_cql(sstring(creation_query)).get();
     });
 
     const auto default_permissions = auth::get_permissions(
             env.local_auth_service(),
             auth::authenticated_user(user),
-            r).get0();
+            r).get();
 
     BOOST_REQUIRE_EQUAL(
             auth::permissions::to_strings(default_permissions),
@@ -299,7 +307,7 @@ SEASTAR_TEST_CASE(create_keyspace_default_permissions) {
                 env,
                 alice,
                 "GRANT CREATE ON ALL KEYSPACES TO alice",
-                "CREATE KEYSPACE armies WITH REPLICATION = { 'class': 'SimpleStrategy', 'replication_factor': 1 }",
+                "CREATE KEYSPACE armies WITH REPLICATION = { 'class': 'NetworkTopologyStrategy', 'replication_factor': 1 }",
                 auth::make_data_resource("armies"));
     }, db_config_with_auth());
 }
@@ -338,6 +346,326 @@ SEASTAR_TEST_CASE(modify_table_with_index) {
             cquery_nofail(env, "INSERT INTO t (p, v) values (14, 'aaa')");
         });
         assert_that(cquery_nofail(env, "SELECT p FROM t WHERE v='aaa' ALLOW FILTERING;")).is_rows().with_rows(
-                {{int32_type->decompose(14)}});
+                {{int32_type->decompose(14), utf8_type->decompose(sstring("aaa"))}});
     }, db_config_with_auth());
 }
+
+SEASTAR_TEST_CASE(grant_vector_search_indexing) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                create_user_if_not_exists(env, bob);
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v vector<float, 4>)");
+                BOOST_REQUIRE_EXCEPTION(env.execute_cql("GRANT VECTOR_SEARCH_INDEXING ON ks.t TO bob").get(), exceptions::syntax_exception,
+                        exception_predicate::message_contains("does not support any of the requested permissions"));
+                BOOST_REQUIRE_EXCEPTION(env.execute_cql("GRANT VECTOR_SEARCH_INDEXING ON KEYSPACE ks TO bob").get(), exceptions::syntax_exception,
+                        exception_predicate::message_contains("does not support any of the requested permissions"));
+                cquery_nofail(env, "GRANT VECTOR_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+            },
+            db_config_with_auth());
+}
+
+SEASTAR_TEST_CASE(select_from_vector_indexed_table) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v vector<float, 4>)");
+                cquery_nofail(env, "CREATE TABLE ks.t2 (id int PRIMARY KEY, v vector<float, 4>)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.t(v) USING 'vector_index'");
+                create_user_if_not_exists(env, bob);
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (SELECT, VECTOR_SEARCH_INDEXING) on"));
+                });
+                cquery_nofail(env, "GRANT VECTOR_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.t");
+                });
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t2").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has no SELECT permission"));
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+SEASTAR_TEST_CASE(select_from_external_index_system_tables) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                create_user_if_not_exists(env, bob);
+
+                // All tables in external_index_system_resources from client_state.cc.
+                const std::vector<sstring> external_index_system_tables = {
+                    "system.group0_history",
+                    "system.versions",
+                    "system.cdc_streams",
+                    "system.cdc_timestamps",
+                    "system.tablets",
+                };
+
+                // Without VECTOR_SEARCH_INDEXING or TEXT_SEARCH_INDEXING permission, bob cannot select from these tables
+                for (const auto& table : external_index_system_tables) {
+                    with_user(env, bob, [&env, &table] {
+                        BOOST_REQUIRE_EXCEPTION(env.execute_cql(format("SELECT * FROM {}", table)).get(), exceptions::unauthorized_exception,
+                                exception_predicate::message_contains("User bob has none of the permissions (PATTERN_SEARCH_INDEXING, SELECT, TEXT_SEARCH_INDEXING, VECTOR_SEARCH_INDEXING) on"));
+                    });
+                }
+
+                cquery_nofail(env, "GRANT VECTOR_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                // With VECTOR_SEARCH_INDEXING permission, bob can select from these tables
+                for (const auto& table : external_index_system_tables) {
+                    with_user(env, bob, [&env, &table] {
+                        cquery_nofail(env, format("SELECT * FROM {}", table));
+                    });
+                }
+
+                cquery_nofail(env, "REVOKE VECTOR_SEARCH_INDEXING ON ALL KEYSPACES FROM bob");
+                cquery_nofail(env, "GRANT TEXT_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                // With TEXT_SEARCH_INDEXING permission, bob can also select from these tables
+                for (const auto& table : external_index_system_tables) {
+                    with_user(env, bob, [&env, &table] {
+                        cquery_nofail(env, format("SELECT * FROM {}", table));
+                    });
+                }
+
+                cquery_nofail(env, "REVOKE TEXT_SEARCH_INDEXING ON ALL KEYSPACES FROM bob");
+                cquery_nofail(env, "GRANT PATTERN_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                // With PATTERN_SEARCH_INDEXING permission, bob can also select from these tables
+                for (const auto& table : external_index_system_tables) {
+                    with_user(env, bob, [&env, &table] {
+                        cquery_nofail(env, format("SELECT * FROM {}", table));
+                    });
+                }
+            },
+            db_config_with_auth());
+}
+
+// Test that VECTOR_SEARCH_INDEXING permission allows selecting from CDC log table
+// when the base table has a vector index. CDC log tables inherit permissions from
+// their base table, so if the base table allows queries from users with VECTOR_SEARCH_INDEXING
+// permission, the CDC log table should also allow queries from users with that permission.
+SEASTAR_TEST_CASE(select_from_cdc_log_of_vector_indexed_table) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                // Create a table with a vector column and a vector index (which enables CDC)
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v vector<float, 4>)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.t(v) USING 'vector_index'");
+
+                create_user_if_not_exists(env, bob);
+
+                // Without permissions, bob cannot select from the CDC log table
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t_scylla_cdc_log").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (SELECT, VECTOR_SEARCH_INDEXING) on"));
+                });
+
+                // Grant VECTOR_SEARCH_INDEXING permission
+                cquery_nofail(env, "GRANT VECTOR_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                // Now bob can select from the CDC log table
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.t_scylla_cdc_log");
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+SEASTAR_TEST_CASE(grant_text_search_indexing) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                create_user_if_not_exists(env, bob);
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v text)");
+                BOOST_REQUIRE_EXCEPTION(env.execute_cql("GRANT TEXT_SEARCH_INDEXING ON ks.t TO bob").get(), exceptions::syntax_exception,
+                        exception_predicate::message_contains("does not support any of the requested permissions"));
+                BOOST_REQUIRE_EXCEPTION(env.execute_cql("GRANT TEXT_SEARCH_INDEXING ON KEYSPACE ks TO bob").get(), exceptions::syntax_exception,
+                        exception_predicate::message_contains("does not support any of the requested permissions"));
+                cquery_nofail(env, "GRANT TEXT_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+            },
+            db_config_with_auth());
+}
+
+SEASTAR_TEST_CASE(select_from_fulltext_indexed_table) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE TABLE ks.t2 (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.t(v) USING 'fulltext_index'");
+                create_user_if_not_exists(env, bob);
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (SELECT, TEXT_SEARCH_INDEXING) on"));
+                });
+                cquery_nofail(env, "GRANT TEXT_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.t");
+                });
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t2").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has no SELECT permission"));
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+SEASTAR_TEST_CASE(select_from_cdc_log_of_fulltext_indexed_table) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                // Create a table with a text column and a fulltext index (which enables CDC)
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.t(v) USING 'fulltext_index'");
+
+                create_user_if_not_exists(env, bob);
+
+                // Without permissions, bob cannot select from the CDC log table
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t_scylla_cdc_log").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (SELECT, TEXT_SEARCH_INDEXING) on"));
+                });
+
+                // Grant TEXT_SEARCH_INDEXING permission
+                cquery_nofail(env, "GRANT TEXT_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                // Now bob can select from the CDC log table
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.t_scylla_cdc_log");
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+// TEXT_SEARCH_INDEXING and VECTOR_SEARCH_INDEXING are independent permissions.
+// Neither grants SELECT on a table indexed only with the other index type.
+SEASTAR_TEST_CASE(vector_and_text_search_indexing_permissions_are_isolated) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                cquery_nofail(env, "CREATE TABLE ks.vec_t (id int PRIMARY KEY, v vector<float, 4>)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.vec_t(v) USING 'vector_index'");
+                cquery_nofail(env, "CREATE TABLE ks.fts_t (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.fts_t(v) USING 'fulltext_index'");
+
+                create_user_if_not_exists(env, bob);
+                cquery_nofail(env, "GRANT TEXT_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                // TEXT_SEARCH_INDEXING alone does not grant access to a vector-only-indexed table.
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.vec_t").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (SELECT, VECTOR_SEARCH_INDEXING) on"));
+                });
+                // It does grant access to the fulltext-indexed table.
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.fts_t");
+                });
+
+                cquery_nofail(env, "REVOKE TEXT_SEARCH_INDEXING ON ALL KEYSPACES FROM bob");
+                cquery_nofail(env, "GRANT VECTOR_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                // VECTOR_SEARCH_INDEXING alone does not grant access to a fulltext-only-indexed table.
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.fts_t").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (SELECT, TEXT_SEARCH_INDEXING) on"));
+                });
+                // It does grant access to the vector-indexed table.
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.vec_t");
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+
+SEASTAR_TEST_CASE(grant_pattern_search_indexing) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                create_user_if_not_exists(env, bob);
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v text)");
+                BOOST_REQUIRE_EXCEPTION(env.execute_cql("GRANT PATTERN_SEARCH_INDEXING ON ks.t TO bob").get(), exceptions::syntax_exception,
+                        exception_predicate::message_contains("does not support any of the requested permissions"));
+                BOOST_REQUIRE_EXCEPTION(env.execute_cql("GRANT PATTERN_SEARCH_INDEXING ON KEYSPACE ks TO bob").get(), exceptions::syntax_exception,
+                        exception_predicate::message_contains("does not support any of the requested permissions"));
+                cquery_nofail(env, "GRANT PATTERN_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+            },
+            db_config_with_auth());
+}
+
+SEASTAR_TEST_CASE(select_from_pattern_indexed_table) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE TABLE ks.t2 (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.t(v) USING 'pattern_index'");
+                create_user_if_not_exists(env, bob);
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (PATTERN_SEARCH_INDEXING, SELECT) on"));
+                });
+                cquery_nofail(env, "GRANT PATTERN_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.t");
+                });
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t2").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has no SELECT permission"));
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+SEASTAR_TEST_CASE(select_from_cdc_log_of_pattern_indexed_table) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                cquery_nofail(env, "CREATE TABLE ks.t (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.t(v) USING 'pattern_index'");
+
+                create_user_if_not_exists(env, bob);
+
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.t_scylla_cdc_log").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (PATTERN_SEARCH_INDEXING, SELECT) on"));
+                });
+
+                cquery_nofail(env, "GRANT PATTERN_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.t_scylla_cdc_log");
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+// PATTERN_SEARCH_INDEXING and TEXT_SEARCH_INDEXING are independent permissions.
+// Neither grants SELECT on a table indexed only with the other index type.
+SEASTAR_TEST_CASE(pattern_and_text_search_indexing_permissions_are_isolated) {
+    return do_with_cql_env_thread(
+            [](auto&& env) {
+                cquery_nofail(env, "CREATE TABLE ks.pattern_t (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.pattern_t(v) USING 'pattern_index'");
+                cquery_nofail(env, "CREATE TABLE ks.fts_t (id int PRIMARY KEY, v text)");
+                cquery_nofail(env, "CREATE CUSTOM INDEX ON ks.fts_t(v) USING 'fulltext_index'");
+
+                create_user_if_not_exists(env, bob);
+                cquery_nofail(env, "GRANT PATTERN_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.fts_t").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (SELECT, TEXT_SEARCH_INDEXING) on"));
+                });
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.pattern_t");
+                });
+
+                cquery_nofail(env, "REVOKE PATTERN_SEARCH_INDEXING ON ALL KEYSPACES FROM bob");
+                cquery_nofail(env, "GRANT TEXT_SEARCH_INDEXING ON ALL KEYSPACES TO bob");
+
+                with_user(env, bob, [&env] {
+                    BOOST_REQUIRE_EXCEPTION(env.execute_cql("SELECT * FROM ks.pattern_t").get(), exceptions::unauthorized_exception,
+                            exception_predicate::message_contains("User bob has none of the permissions (PATTERN_SEARCH_INDEXING, SELECT) on"));
+                });
+                with_user(env, bob, [&env] {
+                    cquery_nofail(env, "SELECT * FROM ks.fts_t");
+                });
+            },
+            enable_tablets(db_config_with_auth()));
+}
+
+BOOST_AUTO_TEST_SUITE_END()

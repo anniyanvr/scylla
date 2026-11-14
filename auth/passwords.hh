@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,6 +11,7 @@
 #include <random>
 #include <stdexcept>
 
+#include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 
 #include "seastarx.hh"
@@ -21,10 +22,11 @@ class no_supported_schemes : public std::runtime_error {
 public:
     no_supported_schemes();
 };
-
 ///
-/// Apache Cassandra uses a library to provide the bcrypt scheme. Many Linux implementations do not support bcrypt, so
-/// we support alternatives. The cost is loss of direct compatibility with Apache Cassandra system tables.
+/// Apache Cassandra uses a library to provide the bcrypt scheme. In ScyllaDB, we use SHA-512
+/// instead of bcrypt for performance and for historical reasons (see scylladb#24524).
+/// Currently, SHA-512 is always chosen as the hashing scheme for new passwords, but the other
+/// algorithms remain supported for CREATE ROLE WITH HASHED PASSWORD and backward compatibility.
 ///
 enum class scheme {
     bcrypt_y,
@@ -51,13 +53,13 @@ sstring generate_random_salt_bytes(RandomNumberEngine& g) {
 }
 
 ///
-/// Test each allowed hashing scheme and report the best supported one on the current system.
+/// Test given hashing scheme on the current system.
 ///
-/// \throws \ref no_supported_schemes when none of the known schemes is supported.
+/// \throws \ref no_supported_schemes when scheme is unsupported.
 ///
-scheme identify_best_supported_scheme();
+void verify_scheme(scheme scheme);
 
-const char* prefix_for_scheme(scheme) noexcept;
+std::string_view prefix_for_scheme(scheme) noexcept;
 
 ///
 /// Generate a implementation-specific salt string for hashing passwords.
@@ -67,18 +69,29 @@ const char* prefix_for_scheme(scheme) noexcept;
 /// \throws \ref no_supported_schemes when no known hashing schemes are supported on the system.
 ///
 template <typename RandomNumberEngine>
-sstring generate_salt(RandomNumberEngine& g) {
-    static const scheme scheme = identify_best_supported_scheme();
+sstring generate_salt(RandomNumberEngine& g, scheme scheme) {
     static const sstring prefix = sstring(prefix_for_scheme(scheme));
     return prefix + generate_random_salt_bytes(g);
 }
 
 ///
 /// Hash a password combined with an implementation-specific salt string.
+/// Deprecated in favor of `hash_with_salt_async`. This function is still used
+/// when generating password hashes for storage to ensure that
+/// `hash_with_salt` and `hash_with_salt_async` produce identical results,
+/// preserving backward compatibility.
 ///
 /// \throws \ref std::system_error when an unexpected implementation-specific error occurs.
 ///
 sstring hash_with_salt(const sstring& pass, const sstring& salt);
+
+///
+/// Async version of `hash_with_salt` that returns a future.
+/// If possible, hashing uses `coroutine::maybe_yield` to prevent reactor stalls.
+///
+/// \throws \ref std::system_error when an unexpected implementation-specific error occurs.
+///
+seastar::future<sstring> hash_with_salt_async(const sstring& pass, const sstring& salt);
 
 } // namespace detail
 
@@ -88,13 +101,13 @@ sstring hash_with_salt(const sstring& pass, const sstring& salt);
 /// Prior to applying the hashing function, random salt is amended to the cleartext. The random salt bytes are generated
 /// according to the random number engine `g`.
 ///
-/// The result is the encrypted cyphertext, and also the salt used but in a implementation-specific format.
+/// The result is the encrypted ciphertext, and also the salt used but in a implementation-specific format.
 ///
 /// \throws \ref std::system_error when the implementation-specific implementation fails to hash the cleartext.
 ///
 template <typename RandomNumberEngine>
-sstring hash(const sstring& pass, RandomNumberEngine& g) {
-    return detail::hash_with_salt(pass, detail::generate_salt(g));
+sstring hash(const sstring& pass, RandomNumberEngine& g, scheme scheme) {
+    return detail::hash_with_salt(pass, detail::generate_salt(g, scheme));
 }
 
 ///
@@ -107,6 +120,6 @@ sstring hash(const sstring& pass, RandomNumberEngine& g) {
 ///
 /// \throws \ref std::system_error when an unexpected implementation-specific error occurs.
 ///
-bool check(const sstring& pass, const sstring& salted_hash);
+seastar::future<bool> check(const sstring& pass, const sstring& salted_hash);
 
 } // namespace auth::passwords

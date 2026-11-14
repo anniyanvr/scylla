@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  *
  */
 
 #pragma once
 
 #include <cstdint>
+#include <array>
 
 /*
  * Let t_i be the following polynomial depending on i and u:
@@ -36,7 +37,7 @@
  *                                                (u >> 6) & 1,
  *                                                (u >> 7) & 1)
  */
-extern uint32_t crc32_x_pow_radix_8_table_base_0[256];
-extern uint32_t crc32_x_pow_radix_8_table_base_8[256];
-extern uint32_t crc32_x_pow_radix_8_table_base_16[256];
-extern uint32_t crc32_x_pow_radix_8_table_base_24[256];
+extern const std::array<uint32_t, 256> crc32_x_pow_radix_8_table_base_0;
+extern const std::array<uint32_t, 256> crc32_x_pow_radix_8_table_base_8;
+extern const std::array<uint32_t, 256> crc32_x_pow_radix_8_table_base_16;
+extern const std::array<uint32_t, 256> crc32_x_pow_radix_8_table_base_24;

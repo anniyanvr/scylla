@@ -3,92 +3,129 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "failure_detector.hh"
+#include "api/api.hh"
 #include "api/api-doc/failure_detector.json.hh"
-#include "gms/failure_detector.hh"
 #include "gms/application_state.hh"
 #include "gms/gossiper.hh"
+
+extern logging::logger apilog;
+
 namespace api {
+using namespace seastar::httpd;
 
 namespace fd = httpd::failure_detector_json;
 
 void set_failure_detector(http_context& ctx, routes& r, gms::gossiper& g) {
     fd::get_all_endpoint_states.set(r, [&g](std::unique_ptr<request> req) {
-        std::vector<fd::endpoint_state> res;
-        for (auto i : g.endpoint_state_map) {
-            fd::endpoint_state val;
-            val.addrs = boost::lexical_cast<std::string>(i.first);
-            val.is_alive = i.second.is_alive();
-            val.generation = i.second.get_heart_beat_state().get_generation();
-            val.version = i.second.get_heart_beat_state().get_heart_beat_version();
-            val.update_time = i.second.get_update_timestamp().time_since_epoch().count();
-            for (auto a : i.second.get_application_state_map()) {
-                fd::version_value version_val;
-                // We return the enum index and not it's name to stay compatible to origin
-                // method that the state index are static but the name can be changed.
-                version_val.application_state = static_cast<std::underlying_type<gms::application_state>::type>(a.first);
-                version_val.value = a.second.value;
-                version_val.version = a.second.version;
-                val.application_state.push(version_val);
-            }
-            res.push_back(val);
-        }
-        return make_ready_future<json::json_return_type>(res);
+        return g.container().invoke_on(0, [] (gms::gossiper& g) {
+            std::vector<fd::endpoint_state> res;
+            res.reserve(g.num_endpoints());
+            g.for_each_endpoint_state([&] (const gms::endpoint_state& eps) {
+                fd::endpoint_state val;
+                val.addrs = fmt::to_string(eps.get_ip());
+                val.is_alive = g.is_alive(eps.get_host_id());
+                val.generation = eps.get_heart_beat_state().get_generation().value();
+                val.version = eps.get_heart_beat_state().get_heart_beat_version().value();
+                val.update_time = eps.get_update_timestamp().time_since_epoch().count();
+                for (const auto& [as_type, app_state] : eps.get_application_state_map()) {
+                    fd::version_value version_val;
+                    // We return the enum index and not it's name to stay compatible to origin
+                    // method that the state index are static but the name can be changed.
+                    version_val.application_state = static_cast<std::underlying_type<gms::application_state>::type>(as_type);
+                    version_val.value = app_state.value().linearize();
+                    version_val.version = app_state.version().value();
+                    val.application_state.push(version_val);
+                }
+                res.emplace_back(std::move(val));
+            });
+            return make_ready_future<json::json_return_type>(json::stream_range_as_array(res, [](const fd::endpoint_state& i){
+                return i;
+            }));
+        });
     });
 
     fd::get_up_endpoint_count.set(r, [&g](std::unique_ptr<request> req) {
-        return gms::get_up_endpoint_count(g).then([](int res) {
+        return g.container().invoke_on(0, [] (gms::gossiper& g) {
+            int res = g.get_up_endpoint_count();
             return make_ready_future<json::json_return_type>(res);
         });
     });
 
     fd::get_down_endpoint_count.set(r, [&g](std::unique_ptr<request> req) {
-        return gms::get_down_endpoint_count(g).then([](int res) {
+        return g.container().invoke_on(0, [] (gms::gossiper& g) {
+            int res = g.get_down_endpoint_count();
             return make_ready_future<json::json_return_type>(res);
         });
     });
 
     fd::get_phi_convict_threshold.set(r, [] (std::unique_ptr<request> req) {
-        return gms::get_phi_convict_threshold().then([](double res) {
-            return make_ready_future<json::json_return_type>(res);
+        return make_ready_future<json::json_return_type>(8);
+    });
+
+    fd::convict.set(r, [&g] (std::unique_ptr<request> req) -> future<json::json_return_type> {
+        return g.container().invoke_on(0, [req = std::move(req)] (gms::gossiper& g) -> future<json::json_return_type> {
+            auto host_id = require_path_param<locator::host_id>(*req, "host");
+            apilog.info("Convict {}", host_id);
+            co_await g.convict(host_id);
+            co_return seastar::json::json_void();
         });
     });
 
     fd::get_simple_states.set(r, [&g] (std::unique_ptr<request> req) {
-        return gms::get_simple_states(g).then([](const std::map<sstring, sstring>& map) {
-            return make_ready_future<json::json_return_type>(map_to_key_value<fd::mapper>(map));
+        return g.container().invoke_on(0, [] (gms::gossiper& g) {
+            std::vector<fd::mapper> nodes_status;
+            nodes_status.reserve(g.num_endpoints());
+            g.for_each_endpoint_state([&] (const gms::endpoint_state& es) {
+                fd::mapper val;
+                val.key = fmt::to_string(es.get_ip());
+                val.value = g.is_alive(es.get_host_id()) ? "UP" : "DOWN";
+                nodes_status.emplace_back(std::move(val));
+            });
+            return make_ready_future<json::json_return_type>(std::move(nodes_status));
         });
     });
 
     fd::set_phi_convict_threshold.set(r, [](std::unique_ptr<request> req) {
-        double phi = atof(req->get_query_param("phi").c_str());
-        return gms::set_phi_convict_threshold(phi).then([]() {
-            return make_ready_future<json::json_return_type>("");
-        });
+        // TBD
+        unimplemented();
+        std::ignore = atof(req->get_query_param("phi").c_str());
+        return make_ready_future<json::json_return_type>("");
     });
 
     fd::get_endpoint_state.set(r, [&g] (std::unique_ptr<request> req) {
-        return get_endpoint_state(g, req->param["addr"]).then([](const sstring& state) {
-            return make_ready_future<json::json_return_type>(state);
+        return g.container().invoke_on(0, [req = std::move(req)] (gms::gossiper& g) {
+            auto state = g.get_endpoint_state_ptr(g.get_host_id(require_path_param<gms::inet_address>(*req, "addr")));
+            if (!state) {
+                return make_ready_future<json::json_return_type>(format("unknown endpoint {}", req->get_path_param("addr")));
+            }
+            std::stringstream ss;
+            g.append_endpoint_state(ss, *state);
+            return make_ready_future<json::json_return_type>(sstring(ss.str()));
         });
     });
 
     fd::get_endpoint_phi_values.set(r, [](std::unique_ptr<request> req) {
-        return gms::get_arrival_samples().then([](std::map<gms::inet_address, gms::arrival_window> map) {
-            std::vector<fd::endpoint_phi_value> res;
-            auto now = gms::arrival_window::clk::now();
-            for (auto& p : map) {
-                fd::endpoint_phi_value val;
-                val.endpoint = p.first.to_sstring();
-                val.phi = p.second.phi(now);
-                res.emplace_back(std::move(val));
-            }
-            return make_ready_future<json::json_return_type>(res);
-        });
+        // We no longer have a phi failure detector,
+        // just returning the empty value is good enough.
+        std::vector<fd::endpoint_phi_value> res;
+        return make_ready_future<json::json_return_type>(res);
     });
+}
+
+void unset_failure_detector(http_context& ctx, routes& r) {
+    fd::get_all_endpoint_states.unset(r);
+    fd::get_up_endpoint_count.unset(r);
+    fd::get_down_endpoint_count.unset(r);
+    fd::get_phi_convict_threshold.unset(r);
+    fd::get_simple_states.unset(r);
+    fd::set_phi_convict_threshold.unset(r);
+    fd::get_endpoint_state.unset(r);
+    fd::get_endpoint_phi_values.unset(r);
+    fd::convict.unset(r);
 }
 
 }

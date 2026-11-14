@@ -3,29 +3,80 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <algorithm>
+
+#include "utils/assert.hh"
 #include <seastar/util/defer.hh>
 
-#include <boost/icl/interval_map.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/algorithm/remove_if.hpp>
-#include <boost/range/algorithm/sort.hpp>
+#include "sstables.hh"
 
-#include "compatible_ring_position.hh"
-#include "compaction/compaction_strategy_impl.hh"
-#include "compaction/leveled_compaction_strategy.hh"
-#include "compaction/time_window_compaction_strategy.hh"
+#include "dht/ring_position.hh"
 
 #include "sstable_set_impl.hh"
 
 #include "replica/database.hh"
+#include "readers/from_mutations.hh"
+#include "readers/empty.hh"
+#include "readers/combined.hh"
 
 namespace sstables {
 
-void sstable_run::insert(shared_sstable sst) {
+extern logging::logger sstlog;
+
+bool
+sstable_first_key_less_comparator::operator()(const shared_sstable& s1, const shared_sstable& s2) const {
+    auto r = s1->compare_by_first_key(*s2);
+    if (r == 0) {
+        position_in_partition::less_compare less_cmp(*s1->get_schema());
+        return less_cmp(s1->first_partition_first_position(), s2->first_partition_first_position());
+    }
+    return r < 0;
+}
+
+bool sstable_run::will_introduce_overlapping(const shared_sstable& sst) const {
+    // checks if s1 is *all* before s2, meaning their bounds don't overlap.
+    auto completely_ordered_before = [] (const shared_sstable& s1, const shared_sstable& s2) {
+        auto pkey_tri_cmp = [s = s1->get_schema()] (const dht::decorated_key& k1, const dht::decorated_key& k2) {
+            return k1.tri_compare(*s, k2);
+        };
+        auto r = pkey_tri_cmp(s1->get_last_decorated_key(), s2->get_first_decorated_key());
+        if (r == 0) {
+            position_in_partition::tri_compare ckey_tri_cmp(*s1->get_schema());
+            const auto& s1_last_position = s1->last_partition_last_position();
+            const auto& s2_first_position = s2->first_partition_first_position();
+            auto r2 = ckey_tri_cmp(s1_last_position, s2_first_position);
+            // Forgive overlapping if s1's last position and s2's first position are both after key.
+            // That still produces correct results because the writer translates after_all_prefixed
+            // for s1's end bound into bound_kind::incl_end, and s2's start bound into bound_kind::excl_start,
+            // meaning they don't actually overlap.
+            if (r2 == 0 && s1_last_position.get_bound_weight() == bound_weight::after_all_prefixed) {
+                return true;
+            }
+            return r2 < 0;
+        }
+        return r < 0;
+    };
+    // lower bound will be the 1st element which is not *all* before the candidate sstable.
+    // upper bound will be the 1st element which the candidate sstable is *all* before.
+    // if there's overlapping, lower bound will be 1st element which overlaps, whereas upper bound the 1st one which doesn't (or end iterator)
+    // if there's not overlapping, lower and upper bound will both point to 1st element which the candidate sstable is *all* before (or end iterator).
+    auto p = std::equal_range(_all.begin(), _all.end(), sst, completely_ordered_before);
+    return p.first != p.second;
+};
+
+sstable_run::sstable_run(shared_sstable sst)
+    : _all({std::move(sst)}) {
+}
+
+bool sstable_run::insert(shared_sstable sst) {
+    if (will_introduce_overlapping(sst)) {
+        return false;
+    }
     _all.insert(std::move(sst));
+    return true;
 }
 
 void sstable_run::erase(shared_sstable sst) {
@@ -33,12 +84,23 @@ void sstable_run::erase(shared_sstable sst) {
 }
 
 uint64_t sstable_run::data_size() const {
-    return boost::accumulate(_all | boost::adaptors::transformed(std::mem_fn(&sstable::data_size)), uint64_t(0));
+    return std::ranges::fold_left(_all | std::views::transform(std::mem_fn(&sstable::data_size)), uint64_t(0), std::plus{});
 }
 
-double sstable_run::estimate_droppable_tombstone_ratio(gc_clock::time_point gc_before) const {
-    auto estimate_sum = boost::accumulate(_all | boost::adaptors::transformed(std::bind(&sstable::estimate_droppable_tombstone_ratio, std::placeholders::_1, gc_before)), double(0));
+double sstable_run::estimate_droppable_tombstone_ratio(const gc_clock::time_point& compaction_time, const tombstone_gc_state& gc_state, const schema_ptr& s) const {
+    auto estimate_sum = std::ranges::fold_left(_all | std::views::transform(std::bind(&sstable::estimate_droppable_tombstone_ratio, std::placeholders::_1, compaction_time, gc_state, s)), double(0), std::plus{});
     return _all.size() ? estimate_sum / _all.size() : double(0);
+}
+
+sstables::run_id sstable_run::run_identifier() const {
+    return (_all.empty()) ? run_id() : (*_all.begin())->run_identifier();
+}
+
+db_clock::time_point sstable_run::data_file_write_time() const {
+    if (_all.empty()) {
+        return db_clock::time_point();
+    }
+    return std::ranges::max(_all | std::views::transform([](const shared_sstable& s) { return s->data_file_write_time(); }));
 }
 
 std::ostream& operator<<(std::ostream& os, const sstables::sstable_run& run) {
@@ -49,9 +111,9 @@ std::ostream& operator<<(std::ostream& os, const sstables::sstable_run& run) {
         os << format("  Identifier: {}\n", (*run.all().begin())->run_identifier());
     }
 
-    auto frags = boost::copy_range<std::vector<shared_sstable>>(run.all());
-    boost::sort(frags, [] (const shared_sstable& x, const shared_sstable& y) {
-        return x->get_first_decorated_key().token() < y->get_first_decorated_key().token();
+    auto frags = run.all() | std::ranges::to<std::vector<shared_sstable>>();
+    std::ranges::sort(frags, std::ranges::less(), [] (const shared_sstable& x) {
+        return x->get_first_decorated_key().token();
     });
     os << "  Fragments = {\n";
     for (auto& frag : frags) {
@@ -61,15 +123,14 @@ std::ostream& operator<<(std::ostream& os, const sstables::sstable_run& run) {
     return os;
 }
 
-sstable_set::sstable_set(std::unique_ptr<sstable_set_impl> impl, schema_ptr s)
+sstable_set::sstable_set(std::unique_ptr<sstable_set_impl> impl)
         : _impl(std::move(impl))
-        , _schema(std::move(s)) {
-}
+{}
 
 sstable_set::sstable_set(const sstable_set& x)
-        : _impl(x._impl->clone())
-        , _schema(x._schema) {
-}
+        : enable_lw_shared_from_this<sstable_set>()
+        , _impl(x._impl->clone())
+{}
 
 sstable_set::sstable_set(sstable_set&&) noexcept = default;
 
@@ -90,37 +151,55 @@ sstable_set::select(const dht::partition_range& range) const {
     return _impl->select(range);
 }
 
-std::vector<sstable_run>
-sstable_set::select_sstable_runs(const std::vector<shared_sstable>& sstables) const {
-    return _impl->select_sstable_runs(sstables);
+std::vector<frozen_sstable_run>
+sstable_set::all_sstable_runs() const {
+    return _impl->all_sstable_runs();
 }
 
-std::vector<sstable_run>
-partitioned_sstable_set::select_sstable_runs(const std::vector<shared_sstable>& sstables) const {
-    auto has_run = [this] (const shared_sstable& sst) { return _all_runs.contains(sst->run_identifier()); };
-    auto run_ids = boost::copy_range<std::unordered_set<utils::UUID>>(sstables | boost::adaptors::filtered(has_run) | boost::adaptors::transformed(std::mem_fn(&sstable::run_identifier)));
-    return boost::copy_range<std::vector<sstable_run>>(run_ids | boost::adaptors::transformed([this] (utils::UUID run_id) {
-        return _all_runs.at(run_id);
-    }));
+std::vector<frozen_sstable_run>
+partitioned_sstable_set::all_sstable_runs() const {
+    return _all_runs | std::views::values | std::ranges::to<std::vector<frozen_sstable_run>>();
 }
 
-lw_shared_ptr<sstable_list>
+lw_shared_ptr<const sstable_list>
 sstable_set::all() const {
     return _impl->all();
 }
 
 void sstable_set::for_each_sstable(std::function<void(const shared_sstable&)> func) const {
-    return _impl->for_each_sstable(std::move(func));
+    _impl->for_each_sstable_until([func = std::move(func)] (const shared_sstable& sst) {
+        func(sst);
+        return stop_iteration::no;
+    });
 }
 
-void
+stop_iteration sstable_set::for_each_sstable_until(std::function<stop_iteration(const shared_sstable&)> func) const {
+    return _impl->for_each_sstable_until(std::move(func));
+}
+
+bool
 sstable_set::insert(shared_sstable sst) {
-    _impl->insert(sst);
+    return _impl->insert(sst);
 }
 
-void
+bool
 sstable_set::erase(shared_sstable sst) {
-    _impl->erase(sst);
+    return _impl->erase(sst);
+}
+
+size_t
+sstable_set::size() const noexcept {
+    return _impl->size();
+}
+
+uint64_t
+sstable_set::bytes_on_disk() const noexcept {
+    return _impl->bytes_on_disk();
+}
+
+utils::file_size_stats
+sstable_set::get_file_size_stats() const noexcept {
+    return _impl->get_file_size_stats();
 }
 
 sstable_set::~sstable_set() = default;
@@ -135,9 +214,9 @@ sstable_set::incremental_selector::~incremental_selector() = default;
 sstable_set::incremental_selector::incremental_selector(sstable_set::incremental_selector&&) noexcept = default;
 
 sstable_set::incremental_selector::selection
-sstable_set::incremental_selector::select(const dht::ring_position_view& pos) const {
-    if (!_current_range_view || !_current_range_view->contains(pos, _cmp)) {
-        std::tie(_current_range, _current_sstables, _current_next_position) = _impl->select(pos);
+sstable_set::incremental_selector::select(selector_pos s) const {
+    if (!_current_range_view || !_current_range_view->contains(s.pos, _cmp)) {
+        std::tie(_current_range, _current_sstables, _current_next_position) = _impl->select(s);
         _current_range_view = _current_range->transform([] (const dht::ring_position& rp) { return dht::ring_position_view(rp); });
     }
     return {_current_sstables, _current_next_position};
@@ -145,70 +224,57 @@ sstable_set::incremental_selector::select(const dht::ring_position_view& pos) co
 
 sstable_set::incremental_selector
 sstable_set::make_incremental_selector() const {
-    return incremental_selector(_impl->make_incremental_selector(), *_schema);
+    auto selector = _impl->make_incremental_selector();
+    return incremental_selector(std::get<0>(std::move(selector)), std::get<1>(selector));
 }
 
-partitioned_sstable_set::interval_type partitioned_sstable_set::make_interval(const schema& s, const dht::partition_range& range) {
-    return interval_type::closed(
-            compatible_ring_position_or_view(s, dht::ring_position_view(range.start()->value())),
-            compatible_ring_position_or_view(s, dht::ring_position_view(range.end()->value())));
-}
+// Tokens are stored in the interval index in unbiased form, i.e. mapped
+// monotonically into the uint64_t domain. dht::token::minimum() maps to
+// min_unbiased_token, and the tokens a key can have map to
+// [dht::token::first().unbias(), max_unbiased_token].
+//
+// dht::token::maximum() maps to max_unbiased_token, the same value as
+// dht::token::last(). That's harmless: bounds stored in the index always come
+// from sstable keys, so they are never maximum(), and a query bound of
+// maximum() being treated as last() only makes the query interval include the
+// largest token a key can have, which such a bound includes anyway.
+static constexpr uint64_t min_unbiased_token = 0;
+static constexpr uint64_t max_unbiased_token = std::numeric_limits<uint64_t>::max();
 
-partitioned_sstable_set::interval_type partitioned_sstable_set::make_interval(const dht::partition_range& range) const {
-    return make_interval(*_schema, range);
-}
-
-partitioned_sstable_set::interval_type partitioned_sstable_set::make_interval(const schema_ptr& s, const sstable& sst) {
-    return interval_type::closed(
-            compatible_ring_position_or_view(s, dht::ring_position(sst.get_first_decorated_key())),
-            compatible_ring_position_or_view(s, dht::ring_position(sst.get_last_decorated_key())));
-}
-
-partitioned_sstable_set::interval_type partitioned_sstable_set::make_interval(const sstable& sst) {
-    return make_interval(_schema, sst);
-}
-
-partitioned_sstable_set::interval_type partitioned_sstable_set::singular(const dht::ring_position& rp) const {
-    // We should use the view here, since this is used for queries.
-    auto rpv = dht::ring_position_view(rp);
-    auto crp = compatible_ring_position_or_view(*_schema, std::move(rpv));
-    return interval_type::closed(crp, crp);
-}
-
-std::pair<partitioned_sstable_set::map_iterator, partitioned_sstable_set::map_iterator>
-partitioned_sstable_set::query(const dht::partition_range& range) const {
-    if (range.start() && range.end()) {
-        return _leveled_sstables.equal_range(make_interval(range));
+static uint64_t to_unbiased_token(const dht::token& t) noexcept {
+    if (t.is_minimum()) {
+        return min_unbiased_token;
     }
-    else if (range.start() && !range.end()) {
-        auto start = singular(range.start()->value());
-        return { _leveled_sstables.lower_bound(start), _leveled_sstables.end() };
-    } else if (!range.start() && range.end()) {
-        auto end = singular(range.end()->value());
-        return { _leveled_sstables.begin(), _leveled_sstables.upper_bound(end) };
-    } else {
-        return { _leveled_sstables.begin(), _leveled_sstables.end() };
+    if (t.is_maximum()) {
+        return max_unbiased_token;
     }
+    return t.unbias();
 }
 
-bool partitioned_sstable_set::store_as_unleveled(const shared_sstable& sst) const {
-    return _use_level_metadata && sst->get_sstable_level() == 0;
+static dht::token to_token(uint64_t t) noexcept {
+    if (t == min_unbiased_token) {
+        return dht::minimum_token();
+    }
+    return dht::token::bias(t);
 }
 
-dht::ring_position partitioned_sstable_set::to_ring_position(const compatible_ring_position_or_view& crp) {
-    // Ring position views, representing bounds of sstable intervals are
-    // guaranteed to have key() != nullptr;
-    const auto& pos = crp.position();
-    return dht::ring_position(pos.token(), *pos.key());
+partitioned_sstable_set::token_interval partitioned_sstable_set::make_interval(const dht::partition_range& range) {
+    // The key and weight components of the bounds are ignored. That can only
+    // widen the interval, and selection is allowed to return a superset.
+    return {
+        range.start() ? to_unbiased_token(range.start()->value().token()) : min_unbiased_token,
+        range.end() ? to_unbiased_token(range.end()->value().token()) : max_unbiased_token,
+    };
 }
 
-dht::partition_range partitioned_sstable_set::to_partition_range(const interval_type& i) {
-    return dht::partition_range::make(
-            {to_ring_position(i.lower()), boost::icl::is_left_closed(i.bounds())},
-            {to_ring_position(i.upper()), boost::icl::is_right_closed(i.bounds())});
+partitioned_sstable_set::token_interval partitioned_sstable_set::make_interval(const sstable& sst) {
+    return {
+        to_unbiased_token(sst.get_first_decorated_key().token()),
+        to_unbiased_token(sst.get_last_decorated_key().token()),
+    };
 }
 
-dht::partition_range partitioned_sstable_set::to_partition_range(const dht::ring_position_view& pos, const interval_type& i) {
+dht::partition_range partitioned_sstable_set::to_partition_range(const dht::ring_position_view& pos, std::optional<unbiased_token> change) {
     auto lower_bound = [&] {
         if (pos.key()) {
             return dht::partition_range::bound(dht::ring_position(pos.token(), *pos.key()),
@@ -217,152 +283,187 @@ dht::partition_range partitioned_sstable_set::to_partition_range(const dht::ring
             return dht::partition_range::bound(dht::ring_position(pos.token(), pos.get_token_bound()), true);
         }
     }();
-    auto upper_bound = dht::partition_range::bound(to_ring_position(i.lower()), !boost::icl::is_left_closed(i.bounds()));
+    if (!change) {
+        // The selection holds through the end of the ring.
+        return dht::partition_range::make_starting_with(std::move(lower_bound));
+    }
+    // Ends right before the token at which the selection changes, so that the
+    // range doesn't cover any key of that token.
+    auto upper_bound = dht::partition_range::bound(dht::ring_position::starting_at(to_token(*change)), false);
     return dht::partition_range::make(std::move(lower_bound), std::move(upper_bound));
 }
 
-partitioned_sstable_set::partitioned_sstable_set(schema_ptr schema, lw_shared_ptr<sstable_list> all, bool use_level_metadata)
-        : _schema(std::move(schema))
-        , _all(std::move(all))
-        , _use_level_metadata(use_level_metadata) {
+dht::ring_position_ext partitioned_sstable_set::to_next_position(std::optional<unbiased_token> change) {
+    return change ? dht::ring_position_ext::starting_at(to_token(*change)) : dht::ring_position_ext::max();
 }
 
-partitioned_sstable_set::partitioned_sstable_set(schema_ptr schema, const std::vector<shared_sstable>& unleveled_sstables, const interval_map_type& leveled_sstables,
-        const lw_shared_ptr<sstable_list>& all, const std::unordered_map<utils::UUID, sstable_run>& all_runs, bool use_level_metadata)
-        : _schema(schema)
-        , _unleveled_sstables(unleveled_sstables)
-        , _leveled_sstables(leveled_sstables)
+partitioned_sstable_set::partitioned_sstable_set(schema_ptr schema)
+        : _schema(std::move(schema))
+        , _all(make_lw_shared<sstable_list>()) {
+}
+
+static std::unordered_map<run_id, shared_sstable_run> clone_runs(const std::unordered_map<run_id, shared_sstable_run>& runs) {
+    return runs | std::views::transform([] (auto& p) {
+        return std::make_pair(p.first, make_lw_shared<sstable_run>(*p.second));
+    }) | std::ranges::to<std::unordered_map<run_id, shared_sstable_run>>();
+}
+
+partitioned_sstable_set::partitioned_sstable_set(schema_ptr schema, const interval_index_type& sstables,
+        const lw_shared_ptr<sstable_list>& all, const std::unordered_map<run_id, shared_sstable_run>& all_runs, utils::file_size_stats bytes_on_disk)
+        : sstable_set_impl(bytes_on_disk)
+        , _schema(schema)
+        , _sstables(sstables)
         , _all(make_lw_shared<sstable_list>(*all))
-        , _all_runs(all_runs)
-        , _use_level_metadata(use_level_metadata) {
+        , _all_runs(clone_runs(all_runs)) {
 }
 
 std::unique_ptr<sstable_set_impl> partitioned_sstable_set::clone() const {
-    return std::make_unique<partitioned_sstable_set>(_schema, _unleveled_sstables, _leveled_sstables, _all, _all_runs, _use_level_metadata);
+    return std::make_unique<partitioned_sstable_set>(_schema, _sstables, _all, _all_runs, _file_size_stats);
 }
 
 std::vector<shared_sstable> partitioned_sstable_set::select(const dht::partition_range& range) const {
-    auto ipair = query(range);
-    auto b = std::move(ipair.first);
-    auto e = std::move(ipair.second);
-    value_set result;
-    while (b != e) {
-        boost::copy(b++->second, std::inserter(result, result.end()));
-    }
-    auto r = _unleveled_sstables;
-    r.insert(r.end(), result.begin(), result.end());
+    std::vector<shared_sstable> r;
+    auto interval = make_interval(range);
+    // An sstable is held by a single entry of the index, so no deduplication
+    // of the result is needed.
+    _sstables.for_each_overlapping(interval.start, interval.end,
+            [&r] (unbiased_token, unbiased_token, const shared_sstable& sst) { r.push_back(sst); });
     return r;
 }
 
-lw_shared_ptr<sstable_list> partitioned_sstable_set::all() const {
+lw_shared_ptr<const sstable_list> partitioned_sstable_set::all() const {
     return _all;
 }
 
-void partitioned_sstable_set::for_each_sstable(std::function<void(const shared_sstable&)> func) const {
+stop_iteration partitioned_sstable_set::for_each_sstable_until(std::function<stop_iteration(const shared_sstable&)> func) const {
     for (auto& sst : *_all) {
-        func(sst);
+        if (func(sst)) {
+            return stop_iteration::yes;
+        }
     }
+    return stop_iteration::no;
 }
 
-void partitioned_sstable_set::insert(shared_sstable sst) {
-    _all->insert(sst);
-    auto undo_all_insert = defer([&] () { _all->erase(sst); });
-
-    _all_runs[sst->run_identifier()].insert(sst);
-    auto undo_all_runs_insert = defer([&] () { _all_runs[sst->run_identifier()].erase(sst); });
-
-    if (store_as_unleveled(sst)) {
-        _unleveled_sstables.push_back(sst);
-    } else {
-        _leveled_sstables_change_cnt++;
-        _leveled_sstables.add({make_interval(*sst), value_set({sst})});
+future<stop_iteration> partitioned_sstable_set::for_each_sstable_gently_until(std::function<future<stop_iteration>(const shared_sstable&)> func) const {
+    for (auto& sst : *_all) {
+        auto stop = co_await func(sst);
+        if (stop) {
+            co_return stop_iteration::yes;
+        }
     }
+    co_return stop_iteration::no;
+}
+
+bool partitioned_sstable_set::insert(shared_sstable sst) {
+    auto [_, inserted] = _all->insert(sst);
+    if (!inserted) {
+        // sst is already in the set, no further handling is required
+        return false;
+    }
+    auto size_stats = sst->get_file_size_stats();
+    add_file_size_stats(size_stats);
+    auto undo_all_insert = defer([&] noexcept {
+        _all->erase(sst);
+        sub_file_size_stats(size_stats);
+    });
+
+    auto maybe_insert_run_fragment = [this] (const shared_sstable& sst) mutable {
+        auto it = _all_runs.find(sst->run_identifier());
+        if (it == _all_runs.end()) {
+            auto new_run = make_lw_shared<sstable_run>(sst);
+            return _all_runs.emplace(sst->run_identifier(), std::move(new_run)).second;
+        }
+        return it->second->insert(sst);
+    };
+
+    // If sstable doesn't satisfy disjoint invariant, then place it in a new sstable run.
+    while (!maybe_insert_run_fragment(sst)) {
+        sstlog.warn("Generating a new run identifier for SSTable {} as overlapping was detected when inserting it into SSTable run {}",
+                    sst->get_filename(), sst->run_identifier());
+        sst->generate_new_run_identifier();
+    }
+    auto undo_all_runs_insert = defer([&] noexcept { _all_runs[sst->run_identifier()]->erase(sst); });
+
+    _change_cnt++;
+    auto interval = make_interval(*sst);
+    _sstables.insert(interval.start, interval.end, sst);
     undo_all_insert.cancel();
     undo_all_runs_insert.cancel();
+    return true;
 }
 
-void partitioned_sstable_set::erase(shared_sstable sst) {
-    _all_runs[sst->run_identifier()].erase(sst);
-    _all->erase(sst);
-    if (store_as_unleveled(sst)) {
-        _unleveled_sstables.erase(std::remove(_unleveled_sstables.begin(), _unleveled_sstables.end(), sst), _unleveled_sstables.end());
-    } else {
-        _leveled_sstables_change_cnt++;
-        _leveled_sstables.subtract({make_interval(*sst), value_set({sst})});
+bool partitioned_sstable_set::erase(shared_sstable sst) {
+    if (auto it = _all_runs.find(sst->run_identifier()); it != _all_runs.end()) {
+        it->second->erase(sst);
+        if (it->second->empty()) {
+            _all_runs.erase(it);
+        }
     }
+    auto ret = _all->erase(sst) != 0;
+    if (ret) {
+        sub_file_size_stats(sst->get_file_size_stats());
+    }
+    _change_cnt++;
+    auto interval = make_interval(*sst);
+    _sstables.erase(interval.start, interval.end, sst);
+    return ret;
+}
+
+size_t
+partitioned_sstable_set::size() const noexcept {
+    return _all->size();
 }
 
 class partitioned_sstable_set::incremental_selector : public incremental_selector_impl {
-    schema_ptr _schema;
-    const std::vector<shared_sstable>& _unleveled_sstables;
-    const interval_map_type& _leveled_sstables;
-    const uint64_t& _leveled_sstables_change_cnt;
-    uint64_t _last_known_leveled_sstables_change_cnt;
-    map_iterator _it;
+    const uint64_t& _change_cnt;
+    uint64_t _last_known_change_cnt;
+    interval_index_type::cursor _cursor;
 private:
-    dht::ring_position_ext next_position(map_iterator it) {
-        if (it == _leveled_sstables.end()) {
-            return dht::ring_position_view::max();
+    // The cursor can only be advanced forward, and is invalidated by a change
+    // to the index, so in either case it has to be positioned afresh. A fresh
+    // cursor is at min_unbiased_token, so it can always be advanced.
+    void position_cursor(unbiased_token tok) {
+        if (tok >= _cursor.position() && _last_known_change_cnt == _change_cnt) {
+            _cursor.advance_to(tok);
         } else {
-            auto&& next_position = partitioned_sstable_set::to_ring_position(it->first.lower());
-            return dht::ring_position_ext(next_position, dht::ring_position_ext::after_key(!boost::icl::is_left_closed(it->first.bounds())));
-        }
-    }
-    static bool is_before_interval(const compatible_ring_position_or_view& crp, const interval_type& interval) {
-        if (boost::icl::is_left_closed(interval.bounds())) {
-            return crp < interval.lower();
-        } else {
-            return crp <= interval.lower();
-        }
-    }
-    void maybe_invalidate_iterator(const compatible_ring_position_or_view& crp) {
-        if (_last_known_leveled_sstables_change_cnt != _leveled_sstables_change_cnt) {
-            _it = _leveled_sstables.lower_bound(interval_type::closed(crp, crp));
-            _last_known_leveled_sstables_change_cnt = _leveled_sstables_change_cnt;
+            _cursor.seek(tok);
+            _last_known_change_cnt = _change_cnt;
         }
     }
 public:
-    incremental_selector(schema_ptr schema, const std::vector<shared_sstable>& unleveled_sstables, const interval_map_type& leveled_sstables,
-                         const uint64_t& leveled_sstables_change_cnt)
-        : _schema(std::move(schema))
-        , _unleveled_sstables(unleveled_sstables)
-        , _leveled_sstables(leveled_sstables)
-        , _leveled_sstables_change_cnt(leveled_sstables_change_cnt)
-        , _last_known_leveled_sstables_change_cnt(leveled_sstables_change_cnt)
-        , _it(leveled_sstables.begin()) {
+    incremental_selector(const interval_index_type& sstables, const uint64_t& change_cnt)
+        : _change_cnt(change_cnt)
+        , _last_known_change_cnt(change_cnt)
+        , _cursor(sstables.make_cursor()) {
     }
-    virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_ext> select(const dht::ring_position_view& pos) override {
-        auto crp = compatible_ring_position_or_view(*_schema, pos);
-        auto ssts = _unleveled_sstables;
-        using namespace dht;
+    virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_ext> select(const selector_pos& s) override {
+        const dht::ring_position_view& pos = s.pos;
+        position_cursor(to_unbiased_token(pos.token()));
 
-        maybe_invalidate_iterator(crp);
+        std::vector<shared_sstable> ssts;
+        std::ranges::copy(_cursor.covering(), std::back_inserter(ssts));
 
-        while (_it != _leveled_sstables.end()) {
-            if (boost::icl::contains(_it->first, crp)) {
-                ssts.insert(ssts.end(), _it->second.begin(), _it->second.end());
-                return std::make_tuple(partitioned_sstable_set::to_partition_range(_it->first), std::move(ssts), next_position(std::next(_it)));
-            }
-            // We don't want to skip current interval if pos lies before it.
-            if (is_before_interval(crp, _it->first)) {
-                return std::make_tuple(partitioned_sstable_set::to_partition_range(pos, _it->first), std::move(ssts), next_position(_it));
-            }
-            _it++;
-        }
-        return std::make_tuple(partition_range::make_open_ended_both_sides(), std::move(ssts), ring_position_view::max());
+        // The sstables covering pos also cover every position up to the one at
+        // which the covering set changes.
+        auto change = _cursor.change_at();
+        return std::make_tuple(partitioned_sstable_set::to_partition_range(pos, change), std::move(ssts),
+                partitioned_sstable_set::to_next_position(change));
     }
 };
 
-time_series_sstable_set::time_series_sstable_set(schema_ptr schema)
+time_series_sstable_set::time_series_sstable_set(schema_ptr schema, bool enable_optimized_twcs_queries)
     : _schema(std::move(schema))
     , _reversed_schema(_schema->make_reversed())
+    , _enable_optimized_twcs_queries(enable_optimized_twcs_queries)
     , _sstables(make_lw_shared<container_t>(position_in_partition::less_compare(*_schema)))
     , _sstables_reversed(make_lw_shared<container_t>(position_in_partition::less_compare(*_reversed_schema)))
 {}
 
 time_series_sstable_set::time_series_sstable_set(const time_series_sstable_set& s)
-    : _schema(s._schema)
+    : sstable_set_impl(s)
+    , _schema(s._schema)
     , _reversed_schema(s._reversed_schema)
+    , _enable_optimized_twcs_queries(s._enable_optimized_twcs_queries)
     , _sstables(make_lw_shared(*s._sstables))
     , _sstables_reversed(make_lw_shared(*s._sstables_reversed))
 {}
@@ -372,35 +473,63 @@ std::unique_ptr<sstable_set_impl> time_series_sstable_set::clone() const {
 }
 
 std::vector<shared_sstable> time_series_sstable_set::select(const dht::partition_range& range) const {
-    return boost::copy_range<std::vector<shared_sstable>>(*_sstables | boost::adaptors::map_values);
+    return *_sstables | std::views::values | std::ranges::to<std::vector>();
 }
 
-lw_shared_ptr<sstable_list> time_series_sstable_set::all() const {
-    return make_lw_shared<sstable_list>(boost::copy_range<sstable_list>(*_sstables | boost::adaptors::map_values));
+lw_shared_ptr<const sstable_list> time_series_sstable_set::all() const {
+    return make_lw_shared<const sstable_list>(*_sstables | std::views::values | std::ranges::to<sstable_list>());
 }
 
-void time_series_sstable_set::for_each_sstable(std::function<void(const shared_sstable&)> func) const {
+size_t
+time_series_sstable_set::size() const noexcept {
+    return _sstables->size();
+}
+
+stop_iteration time_series_sstable_set::for_each_sstable_until(std::function<stop_iteration(const shared_sstable&)> func) const {
     for (auto& entry : *_sstables) {
-        func(entry.second);
+        if (func(entry.second)) {
+            return stop_iteration::yes;
+        }
     }
+    return stop_iteration::no;
+}
+
+future<stop_iteration> time_series_sstable_set::for_each_sstable_gently_until(std::function<future<stop_iteration>(const shared_sstable&)> func) const {
+    for (const auto& [pos, sst] : *_sstables) {
+        auto stop = co_await func(sst);
+        if (stop) {
+            co_return stop_iteration::yes;
+        }
+    }
+    co_return stop_iteration::no;
 }
 
 // O(log n)
-void time_series_sstable_set::insert(shared_sstable sst) {
+bool time_series_sstable_set::insert(shared_sstable sst) {
+  try {
     auto min_pos = sst->min_position();
     auto max_pos_reversed = sst->max_position().reversed();
     _sstables->emplace(std::move(min_pos), sst);
+    add_file_size_stats(sst->get_file_size_stats());
     _sstables_reversed->emplace(std::move(max_pos_reversed), std::move(sst));
+  } catch (...) {
+    erase(sst);
+    throw;
+  }
+  return true;
 }
 
 // O(n) worst case, but should be close to O(log n) most of the time
-void time_series_sstable_set::erase(shared_sstable sst) {
+bool time_series_sstable_set::erase(shared_sstable sst) {
+    bool found;
     {
         auto [first, last] = _sstables->equal_range(sst->min_position());
         auto it = std::find_if(first, last,
                 [&sst] (const std::pair<position_in_partition, shared_sstable>& p) { return sst == p.second; });
-        if (it != last) {
+        found = it != last;
+        if (found) {
             _sstables->erase(it);
+            sub_file_size_stats(sst->get_file_size_stats());
         }
     }
 
@@ -410,21 +539,22 @@ void time_series_sstable_set::erase(shared_sstable sst) {
     if (it != last) {
         _sstables_reversed->erase(it);
     }
+    return found;
 }
 
-std::unique_ptr<incremental_selector_impl> time_series_sstable_set::make_incremental_selector() const {
+sstable_set_impl::selector_and_schema_t time_series_sstable_set::make_incremental_selector() const {
     struct selector : public incremental_selector_impl {
         const time_series_sstable_set& _set;
 
         selector(const time_series_sstable_set& set) : _set(set) {}
 
         virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_ext>
-        select(const dht::ring_position_view&) override {
+        select(const selector_pos&) override {
             return std::make_tuple(dht::partition_range::make_open_ended_both_sides(), _set.select(), dht::ring_position_view::max());
         }
     };
 
-    return std::make_unique<selector>(*this);
+    return std::make_tuple(std::make_unique<selector>(*this), std::cref(*_schema));
 }
 
 // Queue of readers of sstables in a time_series_sstable_set,
@@ -459,17 +589,17 @@ class sstable_position_reader_queue : public position_reader_queue {
 
     position_in_partition::tri_compare _cmp;
 
-    std::function<flat_mutation_reader_v2(sstable&)> _create_reader;
+    std::function<mutation_reader(sstable&)> _create_reader;
     std::function<bool(const sstable&)> _filter;
 
     // After construction contains a reader which returns only the partition
     // start (and end, if not in forwarding mode) markers. This is the first
     // returned reader.
-    std::optional<flat_mutation_reader_v2> _dummy_reader;
+    std::optional<mutation_reader> _dummy_reader;
 
     bool _reversed;
 
-    flat_mutation_reader_v2 create_reader(sstable& sst) {
+    mutation_reader create_reader(sstable& sst) {
         return _create_reader(sst);
     }
 
@@ -480,10 +610,10 @@ class sstable_position_reader_queue : public position_reader_queue {
 public:
     // Assumes that `create_reader` returns readers that emit only fragments from partition `pk`.
     //
-    // For reversed reads `query_schema` must be reversed (see docs/design-notes/reverse-reads.md).
+    // For reversed reads `query_schema` must be reversed (see docs/dev/reverse-reads.md).
     sstable_position_reader_queue(const time_series_sstable_set& set,
             schema_ptr query_schema,
-            std::function<flat_mutation_reader_v2(sstable&)> create_reader,
+            std::function<mutation_reader(sstable&)> create_reader,
             std::function<bool(const sstable&)> filter,
             partition_key pk,
             reader_permit permit,
@@ -496,8 +626,8 @@ public:
         , _cmp(*_query_schema)
         , _create_reader(std::move(create_reader))
         , _filter(std::move(filter))
-        , _dummy_reader(upgrade_to_v2(make_flat_mutation_reader_from_mutations(_query_schema,
-                std::move(permit), {mutation(_query_schema, std::move(pk))}, _query_schema->full_slice(), fwd_sm)))
+        , _dummy_reader(make_mutation_reader_from_mutations(_query_schema,
+                std::move(permit), mutation(_query_schema, std::move(pk)), _query_schema->full_slice(), fwd_sm))
         , _reversed(reversed)
     {
         while (_it != _end && !this->filter(*_it->second)) {
@@ -530,8 +660,8 @@ public:
 
         // by !empty(bound) and `_it` invariant:
         //      _it != _end, _it->first <= bound, and filter(*_it->second) == true
-        assert(_cmp(_it->first, bound) <= 0);
-        // we don't assert(filter(*_it->second)) due to the requirement that `filter` is called at most once for each sstable
+        SCYLLA_ASSERT(_cmp(_it->first, bound) <= 0);
+        // we don't SCYLLA_ASSERT(filter(*_it->second)) due to the requirement that `filter` is called at most once for each sstable
 
         // Find all sstables with the same position as `_it` (they form a contiguous range in the container).
         auto next = std::find_if(std::next(_it), _end, [this] (const value_t& v) { return _cmp(v.first, _it->first) != 0; });
@@ -571,7 +701,7 @@ public:
 };
 
 std::unique_ptr<position_reader_queue> time_series_sstable_set::make_position_reader_queue(
-        std::function<flat_mutation_reader_v2(sstable&)> create_reader,
+        std::function<mutation_reader(sstable&)> create_reader,
         std::function<bool(const sstable&)> filter,
         partition_key pk, schema_ptr query_schema, reader_permit permit,
         streamed_mutation::forwarding fwd_sm, bool reversed) const {
@@ -580,35 +710,15 @@ std::unique_ptr<position_reader_queue> time_series_sstable_set::make_position_re
             std::move(pk), std::move(permit), fwd_sm, reversed);
 }
 
-std::unique_ptr<incremental_selector_impl> partitioned_sstable_set::make_incremental_selector() const {
-    return std::make_unique<incremental_selector>(_schema, _unleveled_sstables, _leveled_sstables, _leveled_sstables_change_cnt);
+sstable_set_impl::selector_and_schema_t partitioned_sstable_set::make_incremental_selector() const {
+    return std::make_tuple(std::make_unique<incremental_selector>(_sstables, _change_cnt), std::cref(*_schema));
 }
 
-std::unique_ptr<sstable_set_impl> compaction_strategy_impl::make_sstable_set(schema_ptr schema) const {
-    // with use_level_metadata enabled, L0 sstables will not go to interval map, which suits well STCS.
-    return std::make_unique<partitioned_sstable_set>(schema, make_lw_shared<sstable_list>(), true);
+sstable_set make_partitioned_sstable_set(schema_ptr schema) {
+    return sstable_set(std::make_unique<partitioned_sstable_set>(schema));
 }
 
-std::unique_ptr<sstable_set_impl> leveled_compaction_strategy::make_sstable_set(schema_ptr schema) const {
-    return std::make_unique<partitioned_sstable_set>(std::move(schema), make_lw_shared<sstable_list>());
-}
-
-std::unique_ptr<sstable_set_impl> time_window_compaction_strategy::make_sstable_set(schema_ptr schema) const {
-    return std::make_unique<time_series_sstable_set>(std::move(schema));
-}
-
-sstable_set make_partitioned_sstable_set(schema_ptr schema, lw_shared_ptr<sstable_list> all, bool use_level_metadata) {
-    return sstable_set(std::make_unique<partitioned_sstable_set>(schema, std::move(all), use_level_metadata), schema);
-}
-
-sstable_set
-compaction_strategy::make_sstable_set(schema_ptr schema) const {
-    return sstable_set(
-            _compaction_strategy_impl->make_sstable_set(schema),
-            schema);
-}
-
-using sstable_reader_factory_type = std::function<flat_mutation_reader_v2(shared_sstable&, const dht::partition_range& pr)>;
+using sstable_reader_factory_type = std::function<mutation_reader(shared_sstable&, const dht::partition_range& pr)>;
 
 static logging::logger irclogger("incremental_reader_selector");
 
@@ -620,21 +730,28 @@ class incremental_reader_selector : public reader_selector {
     lw_shared_ptr<const sstable_set> _sstables;
     tracing::trace_state_ptr _trace_state;
     std::optional<sstable_set::incremental_selector> _selector;
-    std::unordered_set<int64_t> _read_sstable_gens;
+    std::unordered_set<generation_type> _read_sstable_gens;
     sstable_reader_factory_type _fn;
 
-    flat_mutation_reader_v2 create_reader(shared_sstable sst) {
+    mutation_reader create_reader(shared_sstable sst) {
         tracing::trace(_trace_state, "Reading partition range {} from sstable {}", *_pr, seastar::value_of([&sst] { return sst->get_filename(); }));
         return _fn(sst, *_pr);
     }
 
+    dht::ring_position_view pr_end() const {
+        return dht::ring_position_view::for_range_end(*_pr);
+    }
+
+    bool end_of_stream() const {
+        return _selector_position.is_max() || dht::ring_position_tri_compare(*_s, _selector_position, pr_end()) > 0;
+    }
 public:
     explicit incremental_reader_selector(schema_ptr s,
             lw_shared_ptr<const sstable_set> sstables,
             const dht::partition_range& pr,
             tracing::trace_state_ptr trace_state,
             sstable_reader_factory_type fn)
-        : reader_selector(s, pr.start() ? pr.start()->value() : dht::ring_position_view::min())
+        : reader_selector(s, pr.start() ? pr.start()->value() : dht::ring_position_view::min(), sstables->size())
         , _pr(&pr)
         , _sstables(std::move(sstables))
         , _trace_state(std::move(trace_state))
@@ -644,7 +761,7 @@ public:
         irclogger.trace("{}: created for range: {} with {} sstables",
                 fmt::ptr(this),
                 *_pr,
-                _sstables->all()->size());
+                _sstables->size());
     }
 
     incremental_reader_selector(const incremental_reader_selector&) = delete;
@@ -653,22 +770,25 @@ public:
     incremental_reader_selector(incremental_reader_selector&&) = delete;
     incremental_reader_selector& operator=(incremental_reader_selector&&) = delete;
 
-    virtual std::vector<flat_mutation_reader_v2> create_new_readers(const std::optional<dht::ring_position_view>& pos) override {
+    virtual std::vector<mutation_reader> create_new_readers(const std::optional<dht::ring_position_view>& pos) override {
         irclogger.trace("{}: {}({})", fmt::ptr(this), __FUNCTION__, seastar::lazy_deref(pos));
 
-        auto readers = std::vector<flat_mutation_reader_v2>();
+        auto readers = std::vector<mutation_reader>();
 
         do {
-            auto selection = _selector->select(_selector_position);
+            auto selection = _selector->select({_selector_position, _pr});
             _selector_position = selection.next_position;
 
-            irclogger.trace("{}: {} sstables to consider, advancing selector to {}", fmt::ptr(this), selection.sstables.size(),
-                    _selector_position);
+            irclogger.trace("{}: {} sstables to consider, advancing selector to {}, eos={}", fmt::ptr(this), selection.sstables.size(),
+                    _selector_position, end_of_stream());
 
-            readers = boost::copy_range<std::vector<flat_mutation_reader_v2>>(selection.sstables
-                    | boost::adaptors::filtered([this] (auto& sst) { return _read_sstable_gens.emplace(sst->generation()).second; })
-                    | boost::adaptors::transformed([this] (auto& sst) { return this->create_reader(sst); }));
-        } while (!_selector_position.is_max() && readers.empty() && (!pos || dht::ring_position_tri_compare(*_s, *pos, _selector_position) >= 0));
+            readers.clear();
+            for (auto& sst : selection.sstables) {
+                if (_read_sstable_gens.emplace(sst->generation()).second) {
+                    readers.push_back(create_reader(sst));
+                }
+            }
+        } while (!end_of_stream() && readers.empty() && (!pos || dht::ring_position_tri_compare(*_s, *pos, _selector_position) >= 0));
 
         irclogger.trace("{}: created {} new readers", fmt::ptr(this), readers.size());
 
@@ -681,12 +801,18 @@ public:
         return readers;
     }
 
-    virtual std::vector<flat_mutation_reader_v2> fast_forward_to(const dht::partition_range& pr) override {
+    virtual std::vector<mutation_reader> fast_forward_to(const dht::partition_range& pr) override {
         _pr = &pr;
 
-        auto pos = dht::ring_position_view::for_range_start(*_pr);
-        if (dht::ring_position_tri_compare(*_s, pos, _selector_position) >= 0) {
-            return create_new_readers(pos);
+        // Select new sstables as long as the selector position Y hasn't
+        // advanced past the new range [X, Z], i.e. Y is either before the new
+        // range or contained in it.
+        //
+        // Select with no position restriction, since the next sstables may
+        // start anywhere within the range, and we must return at least one
+        // reader to the caller if any are available within the range.
+        if (!end_of_stream()) {
+            return create_new_readers(std::nullopt);
         }
 
         return {};
@@ -701,19 +827,31 @@ public:
 //
 // Assumes the given `pos` and `schema` are alive during the function's lifetime.
 static std::predicate<const sstable&> auto
-make_pk_filter(const dht::ring_position& pos, const schema& schema) {
-    return [&pos, key = key::from_partition_key(schema, *pos.key()), cmp = dht::ring_position_comparator(schema)] (const sstable& sst) {
+make_pk_filter(const dht::ring_position& pos, const utils::hashed_key& hash, const schema& schema) {
+    return [&pos, hash, cmp = dht::ring_position_comparator(schema)] (const sstable& sst) {
         return cmp(pos, sst.get_first_decorated_key()) >= 0 &&
                cmp(pos, sst.get_last_decorated_key()) <= 0 &&
-               sst.filter_has_key(key);
+               sst.filter_has_key(hash);
     };
 }
 
-// Filter out sstables for reader using bloom filter
+const sstable_predicate& default_sstable_predicate() {
+    static const sstable_predicate predicate = [] (const sstable&) { return true; };
+    return predicate;
+}
+
+static std::predicate<const sstable&> auto
+make_sstable_filter(const dht::ring_position& pos, const utils::hashed_key& hash, const schema& schema, const sstable_predicate& predicate) {
+    return [pk_filter = make_pk_filter(pos, hash, schema), &predicate] (const sstable& sst) {
+        return predicate(sst) && pk_filter(sst);
+    };
+}
+
+// Filter out sstables for reader using bloom filter and supplied predicate
 static std::vector<shared_sstable>
-filter_sstable_for_reader_by_pk(std::vector<shared_sstable>&& sstables, const schema& schema, const dht::ring_position& pos) {
-    auto filter = [_filter = make_pk_filter(pos, schema)] (const shared_sstable& sst) { return !_filter(*sst); };
-    sstables.erase(boost::remove_if(sstables, filter), sstables.end());
+filter_sstable_for_reader(std::vector<shared_sstable>&& sstables, const schema& schema, const dht::ring_position& pos, const utils::hashed_key& hash, const sstable_predicate& predicate) {
+    auto filter = [_filter = make_sstable_filter(pos, hash, schema, predicate)] (const shared_sstable& sst) { return !_filter(*sst); };
+    std::erase_if(sstables, filter);
     return std::move(sstables);
 }
 
@@ -733,7 +871,14 @@ filter_sstable_for_reader_by_ck(std::vector<shared_sstable>&& sstables, replica:
     stats->clustering_filter_count++;
     stats->sstables_checked_by_clustering_filter += sstables.size();
 
+    // `sstable::may_contain_rows()` interprets the ranges using the table (non-reversed)
+    // schema, so a native-reversed slice must have its range bounds put back in table order.
     auto ck_filtering_all_ranges = slice.get_all_ranges();
+    if (slice.is_reversed()) {
+        for (auto& r : ck_filtering_all_ranges) {
+            r = query::reverse(r);
+        }
+    }
     // fast path to include all sstables if only one full range was specified.
     // For example, this happens if query only specifies a partition key.
     if (ck_filtering_all_ranges.size() == 1 && ck_filtering_all_ranges[0].is_full()) {
@@ -751,12 +896,26 @@ filter_sstable_for_reader_by_ck(std::vector<shared_sstable>&& sstables, replica:
     return std::move(sstables);
 }
 
-std::vector<sstable_run>
-sstable_set_impl::select_sstable_runs(const std::vector<shared_sstable>& sstables) const {
-    throw_with_backtrace<std::bad_function_call>();
+std::vector<frozen_sstable_run>
+sstable_set_impl::all_sstable_runs() const {
+    auto all_sstables = all();
+    std::unordered_map<sstables::run_id, sstable_run> runs_m;
+    std::vector<frozen_sstable_run> all_runs;
+
+    for (auto&& sst : *all_sstables) {
+        // When a run cannot accept sstable due to overlapping, treat the rejected sstable
+        // as a single-fragment run.
+        if (!runs_m[sst->run_identifier()].insert(sst)) {
+            all_runs.push_back(make_lw_shared<const sstable_run>(sst));
+        }
+    }
+    for (auto&& r : runs_m | std::views::values) {
+        all_runs.push_back(make_lw_shared<const sstable_run>(std::move(r)));
+    }
+    return all_runs;
 }
 
-flat_mutation_reader_v2
+mutation_reader
 sstable_set_impl::create_single_key_sstable_reader(
         replica::column_family* cf,
         schema_ptr schema,
@@ -764,42 +923,44 @@ sstable_set_impl::create_single_key_sstable_reader(
         utils::estimated_histogram& sstable_histogram,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
-        mutation_reader::forwarding fwd_mr) const
+        mutation_reader::forwarding fwd_mr,
+        const sstable_predicate& predicate,
+        sstables::integrity_check integrity) const
 {
     const auto& pos = pr.start()->value();
-    auto selected_sstables = filter_sstable_for_reader_by_pk(select(pr), *schema, pos);
+    auto hash = utils::make_hashed_key(static_cast<bytes_view>(key::from_partition_key(*schema, *pos.key())));
+    auto selected_sstables = filter_sstable_for_reader(select(pr), *schema, pos, hash, predicate);
     auto num_sstables = selected_sstables.size();
     if (!num_sstables) {
-        return make_empty_flat_reader_v2(schema, permit);
+        return make_empty_mutation_reader(schema, permit);
     }
-    auto readers = boost::copy_range<std::vector<flat_mutation_reader_v2>>(
-        filter_sstable_for_reader_by_ck(std::move(selected_sstables), *cf, schema, slice)
-        | boost::adaptors::transformed([&] (const shared_sstable& sstable) {
+    auto readers = filter_sstable_for_reader_by_ck(std::move(selected_sstables), *cf, schema, slice)
+        | std::views::transform([&] (const shared_sstable& sstable) {
             tracing::trace(trace_state, "Reading key {} from sstable {}", pos, seastar::value_of([&sstable] { return sstable->get_filename(); }));
-            return sstable->make_reader(schema, permit, pr, slice, pc, trace_state, fwd);
-        })
-    );
+            return sstable->make_reader(schema, permit, pr, slice, trace_state, fwd, mutation_reader::forwarding::yes,
+                default_read_monitor(), integrity, &hash);
+          })
+        | std::ranges::to<std::vector<mutation_reader>>();
 
     // If filter_sstable_for_reader_by_ck filtered any sstable that contains the partition
     // we want to emit partition_start/end if no rows were found,
     // to prevent https://github.com/scylladb/scylla/issues/3552.
     //
-    // Use `make_flat_mutation_reader_from_mutations` with an empty mutation to emit
+    // Use `make_mutation_reader_from_mutations` with an empty mutation to emit
     // the partition_start/end pair and append it to the list of readers passed
     // to make_combined_reader to ensure partition_start/end are emitted even if
     // all sstables actually containing the partition were filtered.
     auto num_readers = readers.size();
     if (num_readers != num_sstables) {
-        readers.push_back(upgrade_to_v2(make_flat_mutation_reader_from_mutations(schema, permit, {mutation(schema, *pos.key())}, slice, fwd)));
+        readers.push_back(make_mutation_reader_from_mutations(schema, permit, mutation(schema, *pos.key()), slice, fwd));
     }
     sstable_histogram.add(num_readers);
     return make_combined_reader(schema, std::move(permit), std::move(readers), fwd, fwd_mr);
 }
 
-flat_mutation_reader_v2
+mutation_reader
 time_series_sstable_set::create_single_key_sstable_reader(
         replica::column_family* cf,
         schema_ptr schema,
@@ -807,10 +968,11 @@ time_series_sstable_set::create_single_key_sstable_reader(
         utils::estimated_histogram& sstable_histogram,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd_sm,
-        mutation_reader::forwarding fwd_mr) const {
+        mutation_reader::forwarding fwd_mr,
+        const sstable_predicate& predicate,
+        sstables::integrity_check integrity) const {
     const auto& pos = pr.start()->value();
     // First check if the optimized algorithm for TWCS single partition queries can be applied.
     // Multiple conditions must be satisfied:
@@ -822,7 +984,7 @@ time_series_sstable_set::create_single_key_sstable_reader(
     //    TWCS sstables will usually pass this condition.
     // 4. The optimized query path must be enabled.
     using sst_entry = std::pair<position_in_partition, shared_sstable>;
-    if (!cf->get_config().enable_optimized_twcs_queries
+    if (!_enable_optimized_twcs_queries
             || schema->has_static_columns()
             || std::any_of(_sstables->begin(), _sstables->end(),
                 [] (const sst_entry& e) {
@@ -832,24 +994,34 @@ time_series_sstable_set::create_single_key_sstable_reader(
         // Some of the conditions were not satisfied so we use the standard query path.
         return sstable_set_impl::create_single_key_sstable_reader(
                 cf, std::move(schema), std::move(permit), sstable_histogram,
-                pr, slice, pc, std::move(trace_state), fwd_sm, fwd_mr);
+                pr, slice, std::move(trace_state), fwd_sm, fwd_mr, predicate, integrity);
     }
 
-    auto pk_filter = make_pk_filter(pos, *schema);
-    auto it = std::find_if(_sstables->begin(), _sstables->end(), [&] (const sst_entry& e) { return pk_filter(*e.second); });
+    auto hash = utils::make_hashed_key(static_cast<bytes_view>(key::from_partition_key(*schema, *pos.key())));
+    auto sst_filter = make_sstable_filter(pos, hash, *schema, predicate);
+    auto it = std::find_if(_sstables->begin(), _sstables->end(), [&] (const sst_entry& e) { return sst_filter(*e.second); });
     if (it == _sstables->end()) {
         // No sstables contain data for the queried partition.
-        return make_empty_flat_reader_v2(std::move(schema), std::move(permit));
+        return make_empty_mutation_reader(std::move(schema), std::move(permit));
     }
 
     auto& stats = *cf->cf_stats();
     stats.clustering_filter_count++;
 
-    auto create_reader = [schema, permit, &pr, &slice, &pc, trace_state, fwd_sm] (sstable& sst) {
-        return sst.make_reader(schema, permit, pr, slice, pc, trace_state, fwd_sm);
+    auto create_reader = [schema, permit, &pr, &slice, trace_state, fwd_sm, hash] (sstable& sst) {
+        return sst.make_reader(schema, permit, pr, slice, trace_state, fwd_sm, mutation_reader::forwarding::yes,
+                default_read_monitor(), integrity_check::no, &hash);
     };
 
-    auto ck_filter = [ranges = slice.get_all_ranges()] (const sstable& sst) { return sst.may_contain_rows(ranges); };
+    auto pk_filter = make_pk_filter(pos, hash, *schema);
+    // See the comment in `filter_sstable_for_reader_by_ck()`.
+    auto ck_ranges = slice.get_all_ranges();
+    if (slice.is_reversed()) {
+        for (auto& r : ck_ranges) {
+            r = query::reverse(r);
+        }
+    }
+    auto ck_filter = [ranges = std::move(ck_ranges)] (const sstable& sst) { return sst.may_contain_rows(ranges); };
 
     // We're going to pass this filter into sstable_position_reader_queue. The queue guarantees that
     // the filter is going to be called at most once for each sstable and exactly once after
@@ -886,9 +1058,10 @@ compound_sstable_set::compound_sstable_set(schema_ptr schema, std::vector<lw_sha
 std::unique_ptr<sstable_set_impl> compound_sstable_set::clone() const {
     std::vector<lw_shared_ptr<sstable_set>> cloned_sets;
     cloned_sets.reserve(_sets.size());
-    for (auto& set : _sets) {
+    for (const auto& set : _sets) {
         // implicit clone by using sstable_set's copy ctor.
-        cloned_sets.push_back(make_lw_shared(std::move(*set)));
+        auto cloned_set = make_lw_shared(*set);
+        cloned_sets.push_back(std::move(cloned_set));
     }
     return std::make_unique<compound_sstable_set>(_schema, std::move(cloned_sets));
 }
@@ -907,10 +1080,10 @@ std::vector<shared_sstable> compound_sstable_set::select(const dht::partition_ra
     return ret;
 }
 
-std::vector<sstable_run> compound_sstable_set::select_sstable_runs(const std::vector<shared_sstable>& sstables) const {
-    std::vector<sstable_run> ret;
+std::vector<frozen_sstable_run> compound_sstable_set::all_sstable_runs() const {
+    std::vector<frozen_sstable_run> ret;
     for (auto& set : _sets) {
-        auto runs = set->select_sstable_runs(sstables);
+        auto runs = set->all_sstable_runs();
         if (ret.empty()) {
             ret = std::move(runs);
         } else {
@@ -921,9 +1094,9 @@ std::vector<sstable_run> compound_sstable_set::select_sstable_runs(const std::ve
     return ret;
 }
 
-lw_shared_ptr<sstable_list> compound_sstable_set::all() const {
+lw_shared_ptr<const sstable_list> compound_sstable_set::all() const {
     auto sets = _sets;
-    auto it = std::partition(sets.begin(), sets.end(), [] (const auto& set) { return !set->all()->empty(); });
+    auto it = std::partition(sets.begin(), sets.end(), [] (const auto& set) { return set->size() > 0; });
     auto non_empty_set_count = std::distance(sets.begin(), it);
 
     if (!non_empty_set_count) {
@@ -936,7 +1109,7 @@ lw_shared_ptr<sstable_list> compound_sstable_set::all() const {
     }
 
     auto ret = make_lw_shared<sstable_list>();
-    for (auto& set : boost::make_iterator_range(sets.begin(), it)) {
+    for (auto& set : std::ranges::subrange(sets.begin(), it)) {
         auto ssts = set->all();
         ret->reserve(ret->size() + ssts->size());
         ret->insert(ssts->begin(), ssts->end());
@@ -944,19 +1117,40 @@ lw_shared_ptr<sstable_list> compound_sstable_set::all() const {
     return ret;
 }
 
-void compound_sstable_set::for_each_sstable(std::function<void(const shared_sstable&)> func) const {
+stop_iteration compound_sstable_set::for_each_sstable_until(std::function<stop_iteration(const shared_sstable&)> func) const {
     for (auto& set : _sets) {
-        set->for_each_sstable([&func] (const shared_sstable& sst) {
-            func(sst);
-        });
+        if (set->for_each_sstable_until([&func] (const shared_sstable& sst) { return func(sst); })) {
+            return stop_iteration::yes;
+        }
     }
+    return stop_iteration::no;
 }
 
-void compound_sstable_set::insert(shared_sstable sst) {
+future<stop_iteration> compound_sstable_set::for_each_sstable_gently_until(std::function<future<stop_iteration>(const shared_sstable&)> func) const {
+    for (auto& set : _sets) {
+        auto stop = co_await set->for_each_sstable_gently_until([&func] (const shared_sstable& sst) { return func(sst); });
+        if (stop) {
+            co_return stop_iteration::yes;
+        }
+    }
+    co_return stop_iteration::no;
+}
+
+bool compound_sstable_set::insert(shared_sstable sst) {
     throw_with_backtrace<std::bad_function_call>();
 }
-void compound_sstable_set::erase(shared_sstable sst) {
+bool compound_sstable_set::erase(shared_sstable sst) {
     throw_with_backtrace<std::bad_function_call>();
+}
+
+size_t
+compound_sstable_set::size() const noexcept {
+    return std::ranges::fold_left(_sets | std::views::transform(std::mem_fn(&sstable_set::size)), size_t(0), std::plus{});
+}
+
+utils::file_size_stats
+compound_sstable_set::get_file_size_stats() const noexcept {
+    return std::ranges::fold_left(_sets | std::views::transform(std::mem_fn(&sstable_set::get_file_size_stats)), utils::file_size_stats{}, std::plus{});
 }
 
 class compound_sstable_set::incremental_selector : public incremental_selector_impl {
@@ -965,9 +1159,9 @@ class compound_sstable_set::incremental_selector : public incremental_selector_i
     std::vector<sstable_set::incremental_selector> _selectors;
 private:
     std::vector<sstable_set::incremental_selector> make_selectors(const std::vector<lw_shared_ptr<sstable_set>>& sets) {
-        return boost::copy_range<std::vector<sstable_set::incremental_selector>>(_sets | boost::adaptors::transformed([] (const auto& set) {
+        return _sets | std::views::transform([] (const auto& set) {
             return set->make_incremental_selector();
-        }));
+        }) | std::ranges::to<std::vector<sstable_set::incremental_selector>>();
     }
 public:
     incremental_selector(const schema& schema, const std::vector<lw_shared_ptr<sstable_set>>& sets)
@@ -976,7 +1170,7 @@ public:
             , _selectors(make_selectors(sets)) {
     }
 
-    virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_ext> select(const dht::ring_position_view& pos) override {
+    virtual std::tuple<dht::partition_range, std::vector<shared_sstable>, dht::ring_position_ext> select(const selector_pos& pos) override {
         // Return all sstables selected on the requested position from all selectors.
         std::vector<shared_sstable> sstables;
         // Return the lowest next position from all selectors, such that this function will be called again to select the
@@ -1000,13 +1194,13 @@ public:
     }
 };
 
-std::unique_ptr<incremental_selector_impl> compound_sstable_set::make_incremental_selector() const {
+sstable_set_impl::selector_and_schema_t compound_sstable_set::make_incremental_selector() const {
     if (_sets.empty()) {
         // compound_sstable_set must manage one sstable set at least.
         abort();
     }
     auto sets = _sets;
-    auto it = std::partition(sets.begin(), sets.end(), [] (const lw_shared_ptr<sstable_set>& set) { return !set->all()->empty(); });
+    auto it = std::partition(sets.begin(), sets.end(), [] (const lw_shared_ptr<sstable_set>& set) { return set->size() > 0; });
     auto non_empty_set_count = std::distance(sets.begin(), it);
 
     // optimize for common case where only primary set contains sstables, so its selector can be built without an interposer.
@@ -1015,14 +1209,14 @@ std::unique_ptr<incremental_selector_impl> compound_sstable_set::make_incrementa
         const auto& set = sets.front();
         return set->_impl->make_incremental_selector();
     }
-    return std::make_unique<incremental_selector>(*_schema, _sets);
+    return std::make_tuple(std::make_unique<incremental_selector>(*_schema, _sets), std::cref(*_schema));
 }
 
 sstable_set make_compound_sstable_set(schema_ptr schema, std::vector<lw_shared_ptr<sstable_set>> sets) {
-    return sstable_set(std::make_unique<compound_sstable_set>(schema, std::move(sets)), schema);
+    return sstable_set(std::make_unique<compound_sstable_set>(schema, std::move(sets)));
 }
 
-flat_mutation_reader_v2
+mutation_reader
 compound_sstable_set::create_single_key_sstable_reader(
         replica::column_family* cf,
         schema_ptr schema,
@@ -1030,33 +1224,33 @@ compound_sstable_set::create_single_key_sstable_reader(
         utils::estimated_histogram& sstable_histogram,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
-        mutation_reader::forwarding fwd_mr) const {
+        mutation_reader::forwarding fwd_mr,
+        const sstable_predicate& predicate,
+        sstables::integrity_check integrity) const {
     auto sets = _sets;
-    auto it = std::partition(sets.begin(), sets.end(), [] (const auto& set) { return !set->all()->empty(); });
+    auto it = std::partition(sets.begin(), sets.end(), [] (const auto& set) { return set->size() > 0; });
     auto non_empty_set_count = std::distance(sets.begin(), it);
 
     if (!non_empty_set_count) {
-        return make_empty_flat_reader_v2(schema, permit);
+        return make_empty_mutation_reader(schema, permit);
     }
     // optimize for common case where only 1 set is populated, avoiding the expensive combined reader
     if (non_empty_set_count == 1) {
         const auto& non_empty_set = *std::begin(sets);
-        return non_empty_set->create_single_key_sstable_reader(cf, std::move(schema), std::move(permit), sstable_histogram, pr, slice, pc, trace_state, fwd, fwd_mr);
+        return non_empty_set->create_single_key_sstable_reader(cf, std::move(schema), std::move(permit), sstable_histogram, pr, slice, trace_state, fwd, fwd_mr, predicate, integrity);
     }
 
-    auto readers = boost::copy_range<std::vector<flat_mutation_reader_v2>>(
-        boost::make_iterator_range(sets.begin(), it)
-        | boost::adaptors::transformed([&] (const lw_shared_ptr<sstable_set>& non_empty_set) {
-            return non_empty_set->create_single_key_sstable_reader(cf, schema, permit, sstable_histogram, pr, slice, pc, trace_state, fwd, fwd_mr);
-        })
-    );
+    auto readers = std::ranges::subrange(sets.begin(), it)
+        | std::views::transform([&] (const lw_shared_ptr<sstable_set>& non_empty_set) {
+            return non_empty_set->create_single_key_sstable_reader(cf, schema, permit, sstable_histogram, pr, slice, trace_state, fwd, fwd_mr, predicate, integrity);
+          })
+        | std::ranges::to<std::vector<mutation_reader>>();
     return make_combined_reader(std::move(schema), std::move(permit), std::move(readers), fwd, fwd_mr);
 }
 
-flat_mutation_reader_v2
+mutation_reader
 sstable_set::create_single_key_sstable_reader(
         replica::column_family* cf,
         schema_ptr schema,
@@ -1064,30 +1258,92 @@ sstable_set::create_single_key_sstable_reader(
         utils::estimated_histogram& sstable_histogram,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
-        mutation_reader::forwarding fwd_mr) const {
-    assert(pr.is_singular() && pr.start()->value().has_key());
+        mutation_reader::forwarding fwd_mr,
+        const sstable_predicate& predicate,
+        sstables::integrity_check integrity) const {
+    SCYLLA_ASSERT(pr.is_singular() && pr.start()->value().has_key());
     return _impl->create_single_key_sstable_reader(cf, std::move(schema),
-            std::move(permit), sstable_histogram, pr, slice, pc, std::move(trace_state), fwd, fwd_mr);
+            std::move(permit), sstable_histogram, pr, slice, std::move(trace_state), fwd, fwd_mr, predicate, integrity);
 }
 
-flat_mutation_reader_v2
+class auto_closed_sstable_reader final : public mutation_reader::impl {
+    shared_sstable _sst;
+    mutation_reader_opt _reader;
+private:
+    future<> maybe_auto_close_sstable_reader(const dht::partition_range& pr) {
+        if (!_sst) {
+            co_return;
+        }
+
+        auto pos = dht::ring_position_view::for_range_start(pr);
+        auto last_pos_in_reader = dht::ring_position_view(_sst->get_last_decorated_key());
+
+        // If we're fast forwarding past the underlying reader, let's close it
+        // and replace it by an empty reader.
+        if (dht::ring_position_tri_compare(*_schema, pos, last_pos_in_reader) > 0) {
+            co_await _reader->close();
+            _reader = make_empty_mutation_reader(_schema, _permit);
+            _sst = nullptr;
+        }
+    }
+public:
+    auto_closed_sstable_reader(shared_sstable sst,
+                               mutation_reader sst_reader,
+                               reader_permit permit)
+            : impl(sst_reader.schema(), std::move(permit))
+            , _sst(std::move(sst))
+            , _reader(std::move(sst_reader)) {
+    }
+    virtual future<> fill_buffer() override {
+        return _reader->fill_buffer().then([this] {
+            _reader->move_buffer_content_to(*this);
+            _end_of_stream = _reader->is_end_of_stream();
+        });
+    }
+    future<> fast_forward_to(const dht::partition_range& pr) override {
+        clear_buffer();
+
+        co_await maybe_auto_close_sstable_reader(pr);
+
+        _end_of_stream = false;
+        co_await _reader->fast_forward_to(pr);
+    }
+    virtual future<> fast_forward_to(position_range pr) override {
+        return make_exception_future<>(make_backtraced_exception_ptr<std::bad_function_call>());
+    }
+    virtual future<> next_partition() override {
+        clear_buffer_to_next_partition();
+        if (is_buffer_empty() && !is_end_of_stream()) {
+            return _reader->next_partition();
+        }
+        return make_ready_future<>();
+    }
+    virtual future<> close() noexcept override {
+        return _reader->close();
+    }
+};
+
+mutation_reader make_auto_closed_sstable_reader(shared_sstable sst, mutation_reader sst_reader, reader_permit permit) {
+    return make_mutation_reader<auto_closed_sstable_reader>(std::move(sst), std::move(sst_reader), std::move(permit));
+}
+
+mutation_reader
 sstable_set::make_range_sstable_reader(
         schema_ptr s,
         reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor_generator& monitor_generator) const
+        read_monitor_generator& monitor_generator,
+        integrity_check integrity) const
 {
-    auto reader_factory_fn = [s, permit, &slice, &pc, trace_state, fwd, fwd_mr, &monitor_generator]
+    auto reader_factory_fn = [s, permit, &slice, trace_state, fwd, fwd_mr, &monitor_generator, integrity]
             (shared_sstable& sst, const dht::partition_range& pr) mutable {
-        return sst->make_reader(s, permit, pr, slice, pc, trace_state, fwd, fwd_mr, monitor_generator(sst));
+        return sst->make_reader(s, permit, pr, slice, trace_state, fwd, fwd_mr, monitor_generator(sst), integrity);
     };
     return make_combined_reader(s, std::move(permit), std::make_unique<incremental_reader_selector>(s,
                     shared_from_this(),
@@ -1098,24 +1354,35 @@ sstable_set::make_range_sstable_reader(
             fwd_mr);
 }
 
-flat_mutation_reader_v2
+mutation_reader
 sstable_set::make_local_shard_sstable_reader(
         schema_ptr s,
         reader_permit permit,
         const dht::partition_range& pr,
         const query::partition_slice& slice,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_state,
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding fwd_mr,
-        read_monitor_generator& monitor_generator) const
+        read_monitor_generator& monitor_generator,
+        const sstable_predicate& predicate,
+        combined_reader_statistics* statistics,
+        integrity_check integrity) const
 {
-    auto reader_factory_fn = [s, permit, &slice, &pc, trace_state, fwd, fwd_mr, &monitor_generator]
+    auto reader_factory_fn = [s, permit, &slice, trace_state, fwd, fwd_mr, &monitor_generator, &predicate, integrity]
             (shared_sstable& sst, const dht::partition_range& pr) mutable {
-        assert(!sst->is_shared());
-        return sst->make_reader(s, permit, pr, slice, pc, trace_state, fwd, fwd_mr, monitor_generator(sst));
+        SCYLLA_ASSERT(!sst->is_shared());
+        if (!predicate(*sst)) {
+            return make_empty_mutation_reader(s, permit);
+        }
+        auto reader = sst->make_reader(s, permit, pr, slice, trace_state, fwd, fwd_mr, monitor_generator(sst), integrity);
+        // Auto-closed sstable reader is only enabled in the context of fast-forward to partition ranges
+        if (!fwd && fwd_mr) {
+            return make_auto_closed_sstable_reader(sst, std::move(reader), permit);
+        }
+        return reader;
     };
-    if (auto sstables = _impl->all(); sstables->size() == 1) [[unlikely]] {
+    if (_impl->size() == 1) [[unlikely]] {
+        auto sstables = _impl->all();
         auto sst = *sstables->begin();
         return reader_factory_fn(sst, pr);
     }
@@ -1125,18 +1392,20 @@ sstable_set::make_local_shard_sstable_reader(
                     std::move(trace_state),
                     std::move(reader_factory_fn)),
             fwd,
-            fwd_mr);
+            fwd_mr,
+            statistics);
 }
 
-flat_mutation_reader_v2 sstable_set::make_crawling_reader(
+mutation_reader sstable_set::make_full_scan_reader(
         schema_ptr schema,
         reader_permit permit,
-        const io_priority_class& pc,
         tracing::trace_state_ptr trace_ptr,
-        read_monitor_generator& monitor_generator) const {
-    std::vector<flat_mutation_reader_v2> readers;
-    _impl->for_each_sstable([&] (const shared_sstable& sst) mutable {
-        readers.emplace_back(sst->make_crawling_reader(schema, permit, pc, trace_ptr, monitor_generator(sst)));
+        read_monitor_generator& monitor_generator,
+        integrity_check integrity) const {
+    std::vector<mutation_reader> readers;
+    readers.reserve(size());
+    for_each_sstable([&] (const shared_sstable& sst) mutable {
+        readers.emplace_back(sst->make_full_scan_reader(schema, permit, trace_ptr, monitor_generator(sst), integrity));
     });
     return make_combined_reader(schema, std::move(permit), std::move(readers), streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
 }

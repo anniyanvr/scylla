@@ -1,19 +1,16 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "validation.hh"
-#include "schema.hh"
-#include "keys.hh"
+#include "schema/schema.hh"
+#include "keys/keys.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "exceptions/exceptions.hh"
 
@@ -25,7 +22,7 @@ namespace validation {
 std::optional<sstring> is_cql_key_invalid(const schema& schema, partition_key_view key) {
     // C* validates here that the thrift key is not empty.
     // It can only be empty if it is not composite and its only component in CQL form is empty.
-    if (schema.partition_key_size() == 1 && key.begin(schema)->empty()) {
+    if (schema.partition_key_size() == 1 && (*key.begin(schema)).empty()) {
         return sstring("Key may not be empty");
     }
 
@@ -46,7 +43,7 @@ std::optional<sstring> is_cql_key_invalid(const schema& schema, partition_key_vi
 
 void
 validate_cql_key(const schema& schema, partition_key_view key) {
-    if (const auto err = is_cql_key_invalid(schema, key); err) {
+    if (auto err = is_cql_key_invalid(schema, key); err) {
         throw exceptions::invalid_request_exception(std::move(*err));
     }
 }
@@ -62,11 +59,12 @@ validate_column_family(data_dictionary::database db, const sstring& keyspace_nam
         throw exceptions::invalid_request_exception("non-empty table is required");
     }
 
-    try {
-        return db.find_schema(keyspace_name, cf_name);
-    } catch (...) {
+    auto t = db.try_find_table(keyspace_name, cf_name);
+    if (!t) {
         throw exceptions::invalid_request_exception(format("unconfigured table {}", cf_name));
     }
+
+    return t->schema();
 }
 
 void validate_keyspace(data_dictionary::database db, const sstring& keyspace_name) {

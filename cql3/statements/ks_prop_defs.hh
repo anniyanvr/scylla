@@ -1,27 +1,38 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/statements/property_definitions.hh"
+#include "data_dictionary/storage_options.hh"
+#include "locator/abstract_replication_strategy_fwd.hh"
+#include "data_dictionary/consistency_config_options.hh"
 
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <optional>
+#include <set>
 
 namespace data_dictionary {
 class keyspace_metadata;
 }
+
+namespace db {
+    class config;
+}
+
+namespace gms {
+    class inet_address;
+}
+
+namespace gms { class feature_service; }
 
 namespace locator {
     class token_metadata;
@@ -38,31 +49,47 @@ class ks_prop_defs : public property_definitions {
 public:
     static constexpr auto KW_DURABLE_WRITES = "durable_writes";
     static constexpr auto KW_REPLICATION = "replication";
+    static constexpr auto KW_STORAGE = "storage";
+    static constexpr auto KW_TABLETS = "tablets";
+    static constexpr auto KW_CONSISTENCY = "consistency";
+
+    // The keywords a keyspace statement accepts besides registry-backed config options.
+    static std::set<sstring> keywords() {
+        return {KW_DURABLE_WRITES, KW_REPLICATION, KW_STORAGE, KW_TABLETS, KW_CONSISTENCY};
+    }
 
     static constexpr auto REPLICATION_STRATEGY_CLASS_KEY = "class";
+    static constexpr auto DEFAULT_REPLICATION_STRATEGY_CLASS = "NetworkTopologyStrategy";
+
     static constexpr auto REPLICATION_FACTOR_KEY = "replication_factor";
 private:
     std::optional<sstring> _strategy_class;
 public:
-    void validate();
-    std::map<sstring, sstring> get_replication_options() const;
-    std::optional<sstring> get_replication_strategy_class() const;
-    lw_shared_ptr<data_dictionary::keyspace_metadata> as_ks_metadata(sstring ks_name, const locator::token_metadata&);
-    lw_shared_ptr<data_dictionary::keyspace_metadata> as_ks_metadata_update(lw_shared_ptr<data_dictionary::keyspace_metadata> old, const locator::token_metadata&);
+    ks_prop_defs() = default;
 
-#if 0
-    public KSMetaData asKSMetadataUpdate(KSMetaData old) throws RequestValidationException
-    {
-        String sClass = strategyClass;
-        Map<String, String> sOptions = getReplicationOptions();
-        if (sClass == null)
-        {
-            sClass = old.strategyClass.getName();
-            sOptions = old.strategyOptions;
-        }
-        return KSMetaData.newKeyspace(old.name, sClass, sOptions, getBoolean(KW_DURABLE_WRITES, old.durableWrites));
-    }
-#endif
+    explicit ks_prop_defs(map_type options);
+
+    /// Converts options to a flattened map of properties.
+    ///
+    /// It holds that:
+    ///
+    ///   ks_prop_defs(flattened()) == *this
+    ///
+    map_type flattened() const;
+
+    void validate(const gms::feature_service&);
+    locator::replication_strategy_config_options get_replication_options() const;
+    std::optional<sstring> get_replication_strategy_class() const;
+    void set_default_replication_strategy_class_option();
+    std::optional<unsigned> get_initial_tablets(std::optional<unsigned> default_value, bool enforce_tablets = false) const;
+    std::optional<data_dictionary::consistency_config_option> get_consistency_option() const;
+    data_dictionary::storage_options get_storage_options() const;
+    bool get_durable_writes() const;
+    bool has_keyspace_config_properties(const gms::feature_service&) const;
+    bool has_non_keyspace_config_properties(const gms::feature_service&) const;
+    std::vector<std::pair<sstring, std::optional<sstring>>> get_keyspace_config_updates(const gms::feature_service&) const;
+    lw_shared_ptr<data_dictionary::keyspace_metadata> as_ks_metadata(sstring ks_name, const locator::token_metadata&, const gms::feature_service&, const db::config&);
+    lw_shared_ptr<data_dictionary::keyspace_metadata> as_ks_metadata_update(lw_shared_ptr<data_dictionary::keyspace_metadata> old, const locator::token_metadata&, const gms::feature_service&, const db::config&);
 };
 
 }

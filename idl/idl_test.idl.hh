@@ -3,10 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 // TODO: test final types more
+
+#include "idl/uuid.idl.hh"
 
 class simple_compound {
     uint32_t foo;
@@ -81,4 +83,8 @@ struct const_template_arg_wrapper {
 
 struct const_template_arg_test_object {
     std::vector<const_template_arg_wrapper<const simple_compound>> first;
+};
+
+struct frozen_object stub [[writable]] {
+    utils::UUID id;
 };

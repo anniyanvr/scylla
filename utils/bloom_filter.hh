@@ -1,7 +1,4 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
@@ -11,14 +8,11 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #pragma once
 #include "i_filter.hh"
-#include "utils/murmur_hash.hh"
 #include "utils/large_bitset.hh"
-
-#include <vector>
 
 namespace utils {
 namespace filter {
@@ -35,7 +29,6 @@ private:
     static thread_local struct stats {
         uint64_t memory_size = 0;
     } _shard_stats;
-    stats& _stats = _shard_stats;
 
 public:
     int num_hashes() { return _hash_count; }
@@ -45,14 +38,11 @@ public:
     ~bloom_filter() noexcept;
 
     virtual void add(const bytes_view& key) override;
+    virtual void add(const hashed_key& key) override;
 
     virtual bool is_present(const bytes_view& key) override;
 
     virtual bool is_present(hashed_key key) override;
-
-    virtual void clear() override {
-        _bitset.clear();
-    }
 
     virtual void close() override { }
 
@@ -83,8 +73,7 @@ struct always_present_filter: public i_filter {
     }
 
     virtual void add(const bytes_view& key) override { }
-
-    virtual void clear() override { }
+    virtual void add(const hashed_key& key) override { }
 
     virtual void close() override { }
 
@@ -92,6 +81,9 @@ struct always_present_filter: public i_filter {
         return 0;
     }
 };
+
+// Get the size of the bitset (in bits, not bytes) for the specific parameters.
+size_t get_bitset_size(int64_t num_elements, int buckets_per);
 
 filter_ptr create_filter(int hash, large_bitset&& bitset, filter_format format);
 filter_ptr create_filter(int hash, int64_t num_elements, int buckets_per, filter_format format);

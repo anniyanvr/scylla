@@ -3,10 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #pragma once
+#include <seastar/core/abort_source.hh>
 #include "raft.hh"
+#include <functional>
+#include <seastar/core/shared_ptr.hh>
 
 namespace raft {
 
@@ -22,24 +25,76 @@ public:
         // automatically snapshot state machine after applying
         // this number of entries
         size_t snapshot_threshold = 1024;
-        // how many entries to leave in the log after tacking a snapshot
+        // Automatically snapshot state machine if the log memory usage exceeds this value.
+        // The value is in bytes.
+        // Must be smaller than max_log_size.
+        // It is recommended to set this value to no more than half of the max_log_size,
+        // so that snapshots are taken in advance and there is no backpressure due to max_log_size.
+        size_t snapshot_threshold_log_size = 2 * 1024 * 1024;
+        // how many entries to leave in the log after taking a snapshot
         size_t snapshot_trailing = 200;
+        // Limit on the total number of bytes, consumed by snapshot trailing entries.
+        // Must be smaller than snapshot_threshold_log_size.
+        // It is recommended to set this value to no more than half of snapshot_threshold_log_size
+        // so that not all memory is held for trailing when taking a snapshot.
+        size_t snapshot_trailing_size = 1 * 1024 * 1024;
         // max size of appended entries in bytes
         size_t append_request_threshold = 100000;
-        // Max number of entries of in-memory part of the log after
+        // Limit in bytes on the size of in-memory part of the log after
         // which requests are stopped to be admitted until the log
-        // is shrunk back by a snapshot. Should be greater than
-        // whatever the default number of trailing log entries
-        // is configured by the snapshot, otherwise the state
-        // machine will deadlock on attempt to submit a new entry.
-        size_t max_log_size = 5000;
+        // is shrunk back by a snapshot.
+        // The following condition must be satisfied:
+        // max_command_size <= max_log_size - snapshot_trailing_size
+        // this ensures that trailing log entries won't block incoming commands and at least
+        // one command can fit in the log
+        size_t max_log_size = 4 * 1024 * 1024;
         // If set to true will enable prevoting stage during election
         bool enable_prevoting = true;
         // If set to true, forward configuration and entries from
-        // follower to the leader autmatically. This guarantees
+        // follower to the leader automatically. This guarantees
         // add_entry()/modify_config() never throws not_a_leader,
         // but makes timed_out_error more likely.
         bool enable_forwarding = true;
+
+        // Max size of a single command, add_entry with a bigger command will throw command_is_too_big_error.
+        // The following condition must be satisfied:
+        // max_command_size <= max_log_size - snapshot_trailing_size
+        // this ensures that trailing log entries won't block incoming commands and at least
+        // one command can fit in the log
+        size_t max_command_size = 100 * 1024;
+        // A callback to invoke if one of internal server
+        // background activities has stopped because of an error.
+        std::function<void(std::exception_ptr e)> on_background_error;
+        // Human-readable tag used in log messages instead of server_id.
+        // Helps distinguish raft instances when multiple groups share the
+        // same server_id. If empty, server_id is used as the default.
+        sstring tag;
+
+        // Selects which voting member fast-bootstraps as the initial leader on
+        // a fresh group: the one at rank (fast_bootstrap_seed % number_of_voters)
+        // in ascending server_id order. Callers that manage many groups (e.g.
+        // one per tablet) can derive this from the group id so that leadership
+        // is spread across nodes instead of always landing on the smallest-id
+        // one. The default of 0 selects the smallest-id voter. raft::server
+        // always enables fast bootstrap (unlike a bare fsm, which disables it
+        // when no seed is provided).
+        uint64_t fast_bootstrap_seed = 0;
+
+        // LeaseGuard leader leases. When set, the leader serves linearizable
+        // reads locally (no quorum round-trip) while its lease is valid, and
+        // defers committing writes until a deposed leader's lease has expired.
+        // Requires a bounded-uncertainty clock; see raft/bounded_clock.hh.
+        struct leaseguard_configuration {
+            // Lease duration (Δ). Should be on the order of the election
+            // timeout.
+            lease_clock::duration delta;
+            // Clock providing bounded-uncertainty time readings. The caller owns
+            // it and must keep it alive for the lifetime of the server. A
+            // reference_wrapper (rather than a plain reference) is used so that
+            // configuration remains copy-assignable. See raft/bounded_clock.hh.
+            std::reference_wrapper<bounded_clock> clock;
+        };
+        std::optional<leaseguard_configuration> leaseguard;
     };
 
     virtual ~server() {}
@@ -47,15 +102,48 @@ public:
     // Returned future is resolved depending on wait_type parameter:
     //  'committed' - when the entry is committed
     //  'applied'   - when the entry is applied (happens after it is committed)
-    // May fail because of an internal error or because leader changed and an entry was either
-    // replaced by the new leader or the server lost track of it. The former will result in
-    // dropped_entry exception the later in commit_status_unknown.
     //
     // If forwarding is enabled and this is a follower, and the returned future resolves without exception,
     // this means that the entry is committed/applied locally (depending on the wait type).
     // Applied locally means the local state machine replica applied this command;
     // committed locally means simply that the commit index is beyond this entry's index.
-    virtual future<> add_entry(command command, wait_type type) = 0;
+    //
+    // The caller may pass a pointer to an abort_source to make the operation abortable.
+    // If it passes nullptr, the operation is unabortable.
+    //
+    // Successful `add_entry` does not guarantee that `state_machine::apply` will be called
+    // locally for this entry. Between the commit and the application we may load a snapshot
+    // containing this entry, so the state machine's state 'jumps' forward in time, skipping
+    // the local entry application. For `wait_type::applied` this should be fine, because
+    // state machine implementations shouldn't care whether an entry was applied via
+    // `state_machine::apply` or via a snapshot load.
+    //
+    // When forwarding is disabled, `add_entry` guarantees that entries will be appended
+    // to the log in the same order in which the `add_entry` calls were issued.
+    // More precisely, if `add_entry(A)` is called before `add_entry(B)` - without
+    // waiting for A's future before starting the call for B - the command A
+    // will be placed in the log before B (assuming that both are successfully
+    // appended).
+    //
+    // Moreover, when forwarding is disabled, `add_entry` guarantees that entries
+    // will be appended only in the term that was current at the moment when
+    // `add_entry` was called. If the term changes before the function manages
+    // to append the entry, a `raft::not_a_leader` exception will be thrown.
+    //
+    // Exceptions:
+    // raft::commit_status_unknown
+    //     Thrown if the leader has changed and the log entry has either
+    //     been replaced by the new leader or the server has lost track of it.
+    //     It may also be thrown in case of a transport error while forwarding add_entry to the leader.
+    // raft::dropped_entry
+    //     Thrown if the entry was replaced because of a leader change.
+    // raft::request_aborted
+    //     Thrown if abort is requested before the operation finishes.
+    // raft::stopped_error
+    //     Thrown if abort() was called on the server instance.
+    // raft::not_a_leader
+    //     Thrown if the node is not a leader and forwarding is not enabled through enable_forwarding config option.
+    virtual future<> add_entry(command command, wait_type type, seastar::abort_source* as) = 0;
 
     // Set a new cluster configuration. If the configuration is
     // identical to the previous one does nothing.
@@ -63,9 +151,9 @@ public:
     // Does not preempt before adding entry to this server's
     // in-memory log.
     //
-    // Provided node_info is passed to rpc::add_server() for each
-    // new server and rpc::remove_server() is called for each
-    // departing server.
+    // Provided node_info is passed to
+    // rpc::on_configuration_change() for each added or removed
+    // server.
     // struct node_info is expected to contain connection
     // information/credentials which is then used by RPC.
     // Can be called on a leader only, otherwise throws not_a_leader.
@@ -79,7 +167,21 @@ public:
     // Note: committing a dummy entry extends the opportunity for
     // uncertainty, thus commit_status_unknown exception may be
     // returned even in case of a successful config change.
-    virtual future<> set_configuration(server_address_set c_new) = 0;
+    //
+    // The caller may pass a pointer to an abort_source to make the operation abortable.
+    // If it passes nullptr, the operation is unabortable.
+    //
+    // Exceptions:
+    // raft::conf_change_in_progress
+    //     Thrown if the previous set_configuration/modify_config is not completed.
+    // raft::commit_status_unknown
+    //     Thrown if the leader has changed and the config mutation has either
+    //     been replaced by the new leader or the server has lost track of it.
+    //     It may also be thrown in case of a transport error while
+    //     forwarding the corresponding add_entry to the leader.
+    // raft::request_aborted
+    //     Thrown if abort is requested before the operation finishes.
+    virtual future<> set_configuration(config_member_set c_new, seastar::abort_source* as) = 0;
 
     // A simplified wrapper around set_configuration() which adds
     // and deletes servers. Unlike set_configuration(),
@@ -99,8 +201,26 @@ public:
     // The local commit index is not necessarily up-to-date yet and the state of the local state machine
     // replica may still come from before the configuration entry.
     // (exception: if no server was actually added or removed, then nothing gets committed and the leader responds immediately).
-    virtual future<> modify_config(std::vector<server_address> add,
-        std::vector<server_id> del) = 0;
+    //
+    // The caller may pass a pointer to an abort_source to make the operation abortable.
+    // If abort is requested before the operation finishes, the future will contain `raft::request_aborted` exception.
+    // It the caller passes nullptr, the operation is unabortable.
+    //
+    // Exceptions:
+    // raft::commit_status_unknown
+    //     Thrown if the leader has changed and the config mutation has either
+    //     been replaced by the new leader or the server has lost track of it.
+    //     It may also be thrown in case of a transport error while forwarding modify_config to the leader.
+    // raft::request_aborted
+    //     Thrown if abort is requested before the operation finishes.
+    // raft::stopped_error
+    //     Thrown if abort() was called on the server instance.
+    // raft::not_a_leader
+    //     Thrown if the node is not a leader and forwarding is not enabled through enable_forwarding config option.
+    // raft::conf_change_in_progress
+    //     Thrown if the previous set_configuration/modify_config is not completed.
+    virtual future<> modify_config(std::vector<config_member> add,
+        std::vector<server_id> del, seastar::abort_source* as) = 0;
 
     // Return the currently known configuration
     virtual raft::configuration get_configuration() const = 0;
@@ -115,7 +235,12 @@ public:
     // to know if they succeeded or not. If this server was
     // a leader it will relinquish its leadership and cease
     // replication.
-    virtual future<> abort() = 0;
+    virtual future<> abort(sstring reason = "") = 0;
+
+    // Returns whether the server is running.
+    // A server becomes alive after start() and becomes dead after abort()
+    // is called or an error happens in one of the internal fibers.
+    virtual bool is_alive() const = 0;
 
     // Return Raft protocol current term.
     virtual term_t get_current_term() const = 0;
@@ -123,17 +248,116 @@ public:
     // May be called before attempting a read from the local state
     // machine. The read should proceed only after the returned
     // future has resolved successfully.
-    virtual future<> read_barrier() = 0;
+    //
+    // The caller may pass a pointer to an abort_source to make the operation abortable.
+    // If it passes nullptr, the operation is unabortable.
+    //
+    // Exceptions:
+    // raft::request_aborted
+    //     Thrown if abort is requested before the operation finishes.
+    // raft::stopped_error
+    //     Thrown if abort() was called on the server instance.
+    virtual future<> read_barrier(seastar::abort_source* as) = 0;
+
+    // Waits until the entry with the given index is applied to the local state machine.
+    //
+    // Unlike read_barrier, it does not communicate with other servers, so it works
+    // without a quorum. If the entry with index idx is not committed, a new leader might
+    // overwrite it. Then, the function returns once the new entry is applied.
+    //
+    // The caller may pass a pointer to an abort_source to make the operation abortable.
+    // If it passes nullptr, the operation is unabortable.
+    //
+    // Exceptions:
+    // raft::request_aborted
+    //     Thrown if abort is requested before the operation finishes.
+    // raft::stopped_error
+    //     Thrown if abort() was called on the server instance.
+    virtual future<> wait_for_apply(index_t idx, seastar::abort_source* as) = 0;
 
     // Initiate leader stepdown process.
-    // If the node is not a leader returns not_a_leader exception.
-    // In case of a timeout returns timeout_error.
-    virtual future<> stepdown(logical_clock::duration timeout) = 0;
+    // If target is specified, the leadership transfer will be attempted to that target only.
+    // The target must be a voting member of the current configuration other than the leader
+    // itself. With any other target the transfer has no one to hand leadership to: it blocks the
+    // group's writes until the timeout expires, then throws raft::timeout_error.
+    //
+    // Exceptions:
+    // raft::timeout_error
+    //     Thrown in case of timeout.
+    // raft::not_a_leader
+    //     Thrown if the node is not a leader and forwarding is not enabled through enable_forwarding config option.
+    // raft::no_other_voting_member
+    //     Thrown if there is no other voting member.
+    // std::logic_error
+    //     Thrown if the stepdown process is already in progress.
+    virtual future<> stepdown(logical_clock::duration timeout, server_id target = {}) = 0;
 
-    // Register metrics for this server. Metric are global but their names
-    // depend on the server's ID, so it is possible to register metrics
-    // of two servers iff their IDs are different.
-    virtual void register_metrics() = 0;
+    virtual server_status get_status() const = 0;
+
+    // Returns true if this servers thinks that it is the leader.
+    // The information is only relevant for the current_term() only
+    virtual bool is_leader() = 0;
+
+    // Returns ID of the server that is thought to be the current leader.
+    // Returns an empty ID if there is an ongoing election.
+    // The information is only relevant for the current_term() only.
+    virtual raft::server_id current_leader() const = 0;
+
+    // The function should be called periodically to advance logical clock.
+    virtual void tick() = 0;
+
+    // Returned future is resolved when state changes
+    // State changes can be coalesced, so it is not guaranteed that the caller will
+    // get notification about each one of them. The state can even be the same after
+    // the call as before, but term should be different.
+    //
+    // The caller may pass a pointer to an abort_source to make the function abortable.
+    // If it passes nullptr, the function is unabortable.
+    //
+    // Exceptions:
+    // raft::stopped_error
+    //     Thrown if abort() was called on the server instance.
+    // raft::request_aborted
+    //     Thrown if abort is requested before the operation finishes.
+    virtual future<> wait_for_state_change(seastar::abort_source* as) = 0;
+
+    // The returned future is resolved when a leader is elected for the current term.
+    // Note that it is not guaranteed that the leader will remain the same by the time
+    // the future is resolved, so the caller must check the synchronous
+    // `current_leader()` function and retry `wait_for_leader()` if it returns an empty
+    // `raft::server_id`.
+    //
+    // With `reset`, a follower first forgets the leader it knows of, so the future
+    // resolves only once a leader sends it a message again. For a caller which knows
+    // from outside of raft that the leader `current_leader()` names is gone - e.g. it
+    // was removed from the configuration - but this server hasn't heard from the new
+    // leader yet. `reset` does nothing on a leader or a candidate.
+    //
+    // The caller may pass a pointer to an abort_source to make the function abortable.
+    // If it passes nullptr, the function is unabortable.
+    //
+    // Exceptions:
+    // raft::stopped_error
+    //     Thrown if abort() was called on the server instance.
+    // raft::request_aborted
+    //     Thrown if abort is requested before the operation finishes.
+    virtual future<> wait_for_leader(seastar::abort_source* as, bool reset = false) = 0;
+
+    // Manually trigger snapshot creation and log truncation.
+    //
+    // Does nothing if the current apply index is less or equal to the last persisted snapshot descriptor index
+    // and returns `false`.
+    //
+    // Otherwise returns `true`; when the future resolves, it is guaranteed that the snapshot descriptor
+    // is persisted, but not that the snapshot is loaded to the state machine yet (it will be eventually).
+    //
+    // The request may be resolved by the regular snapshotting mechanisms (e.g. a snapshot
+    // is created because the Raft log grows too large). In this case there is no guarantee
+    // how many trailing entries will be left trailing behind the snapshot. However,
+    // if there are no operations running on the server concurrently with the request and all
+    // committed entries are already applied, the created snapshot is guaranteed to leave
+    // zero trailing entries.
+    virtual future<bool> trigger_snapshot(seastar::abort_source* as) = 0;
 
     // Ad hoc functions for testing
     virtual void wait_until_candidate() = 0;
@@ -141,15 +365,18 @@ public:
     virtual future<> wait_log_idx_term(std::pair<index_t, term_t> idx_log) = 0;
     virtual std::pair<index_t, term_t> log_last_idx_term() = 0;
     virtual void elapse_election() = 0;
-    virtual bool is_leader() = 0;
-    virtual void tick() = 0;
     // Server id of this server
     virtual raft::server_id id() const = 0;
+
+    virtual size_t max_command_size() const = 0;
 };
 
+// A null `stats` gives the server counters of its own; passing the same
+// instance to several servers accumulates their counters together.
 std::unique_ptr<server> create_server(server_id uuid, std::unique_ptr<rpc> rpc,
         std::unique_ptr<state_machine> state_machine, std::unique_ptr<persistence> persistence,
-        seastar::shared_ptr<failure_detector> failure_detector, server::configuration config);
+        seastar::shared_ptr<failure_detector> failure_detector, server::configuration config,
+        seastar::lw_shared_ptr<server_stats> stats = nullptr);
 
 } // namespace raft
 

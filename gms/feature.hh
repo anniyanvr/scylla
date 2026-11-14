@@ -3,18 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <any>
 
-#include <boost/signals2.hpp>
+#include <boost/signals2/connection.hpp>
+#include <boost/signals2/signal_type.hpp>
 #include <boost/signals2/dummy_mutex.hpp>
 
-#include <seastar/core/shared_future.hh>
 #include <seastar/util/noncopyable_function.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sstring.hh>
 
 using namespace seastar;
 
@@ -70,11 +72,8 @@ public:
     const sstring& name() const {
         return _name;
     }
-    explicit operator bool() const {
+    operator bool() const {
         return _enabled;
-    }
-    friend inline std::ostream& operator<<(std::ostream& os, const feature& f) {
-        return os << "{ gossip feature = " << f._name << " }";
     }
     void when_enabled(listener& callback) const {
         callback.set_connection(_s.connect(callback.get_slot()));
@@ -84,6 +83,8 @@ public:
     }
     // Will call the callback functor when this feature is enabled, unless
     // the returned listener_registration is destroyed earlier.
+    [[nodiscard("the listener_registration returned by when_enabled must be kept alive "
+                "in order to keep the callback registered")]]
     listener_registration when_enabled(seastar::noncopyable_function<void()> callback) const {
         struct wrapper : public listener {
             seastar::noncopyable_function<void()> _func;
@@ -96,50 +97,5 @@ public:
     }
 };
 
-namespace features {
-
-extern const std::string_view RANGE_TOMBSTONES;
-extern const std::string_view LARGE_PARTITIONS;
-extern const std::string_view MATERIALIZED_VIEWS;
-extern const std::string_view COUNTERS;
-extern const std::string_view INDEXES;
-extern const std::string_view DIGEST_MULTIPARTITION_READ;
-extern const std::string_view CORRECT_COUNTER_ORDER;
-extern const std::string_view SCHEMA_TABLES_V3;
-extern const std::string_view CORRECT_NON_COMPOUND_RANGE_TOMBSTONES;
-extern const std::string_view WRITE_FAILURE_REPLY;
-extern const std::string_view XXHASH;
-extern const std::string_view UDF;
-extern const std::string_view ROLES;
-extern const std::string_view LA_SSTABLE;
-extern const std::string_view STREAM_WITH_RPC_STREAM;
-extern const std::string_view MC_SSTABLE;
-extern const std::string_view MD_SSTABLE;
-extern const std::string_view ROW_LEVEL_REPAIR;
-extern const std::string_view TRUNCATION_TABLE;
-extern const std::string_view CORRECT_STATIC_COMPACT_IN_MC;
-extern const std::string_view UNBOUNDED_RANGE_TOMBSTONES;
-extern const std::string_view VIEW_VIRTUAL_COLUMNS;
-extern const std::string_view DIGEST_INSENSITIVE_TO_EXPIRY;
-extern const std::string_view COMPUTED_COLUMNS;
-extern const std::string_view CDC;
-extern const std::string_view NONFROZEN_UDTS;
-extern const std::string_view HINTED_HANDOFF_SEPARATE_CONNECTION;
-extern const std::string_view LWT;
-extern const std::string_view PER_TABLE_PARTITIONERS;
-extern const std::string_view PER_TABLE_CACHING;
-extern const std::string_view DIGEST_FOR_NULL_VALUES;
-extern const std::string_view CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX;
-extern const std::string_view ALTERNATOR_STREAMS;
-extern const std::string_view ALTERNATOR_TTL;
-extern const std::string_view RANGE_SCAN_DATA_VARIANT;
-extern const std::string_view CDC_GENERATIONS_V2;
-extern const std::string_view UDA;
-extern const std::string_view SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT;
-extern const std::string_view SUPPORTS_RAFT_CLUSTER_MANAGEMENT;
-extern const std::string_view USES_RAFT_CLUSTER_MANAGEMENT;
-extern const std::string_view TOMBSTONE_GC_OPTIONS;
-
-}
 
 } // namespace gms

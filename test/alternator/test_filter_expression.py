@@ -1,6 +1,6 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the FilterExpression parameter of the Query and Scan operations.
 # FilterExpression is a newer version of the older "QueryFilter" and
@@ -9,7 +9,7 @@
 import pytest
 from botocore.exceptions import ClientError
 import random
-from util import full_query, full_query_and_counts, full_scan, random_string, random_bytes, multiset
+from test.alternator.util import full_query, full_query_and_counts, full_scan, random_string, random_bytes, multiset
 
 # The test_table_sn_with_data fixture is the regular test_table_sn fixture
 # with a partition inserted with many items. The sort key 'c' of the items
@@ -40,7 +40,7 @@ def random_sets():
 def random_bool():
     return bool(random.randint(0,1))
 def random_item(p, i):
-    item = {'p': p, 'c': i, 's': random_s(), 'b': random_b(), 'i': random_i(),
+    item = {'p': p, 'c': i, 's': random_s(), 'b': random_b(), 'i': i,
             'l': random_l(), 'm': random_m(), 'ns': random_set(), 'ss': random_sets(), 'bool': random_bool() }
     # The "r" attribute doesn't appears on all items, and when it does it has a random type
     if i == 0:
@@ -75,30 +75,30 @@ def test_table_sn_with_data(test_table_sn):
 # must use KeyCondition or KeyConditionExpression instead. In the first test
 # we don't use a KeyCondition at all and get a generic error message about
 # Query always needing one. In the second test we do have a KeyCondition plus
-# a (redundent) FilterExpression on the key attribute, and that isn't allowed
+# a (redundant) FilterExpression on the key attribute, and that isn't allowed
 # either.
 def test_filter_expression_partition_key_1(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
     with pytest.raises(ClientError, match='ValidationException.*Condition'):
-        got_items = full_query(table, FilterExpression='p=:p', ExpressionAttributeValues={':p': p})
+        full_query(table, FilterExpression='p=:p', ExpressionAttributeValues={':p': p})
 
 def test_filter_expression_partition_key_2(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
     with pytest.raises(ClientError, match='ValidationException.* p'):
-        got_items = full_query(table, KeyConditionExpression='p=:p', FilterExpression='p=:p', ExpressionAttributeValues={':p': p})
+        full_query(table, KeyConditionExpression='p=:p', FilterExpression='p=:p', ExpressionAttributeValues={':p': p})
 
 # FilterExpression is also not allowed on the sort key.
 def test_filter_expression_sort_key(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
     with pytest.raises(ClientError, match='ValidationException.* key '):
-        got_items = full_query(table, KeyConditionExpression='p=:p', FilterExpression='c=:c',
+        full_query(table, KeyConditionExpression='p=:p', FilterExpression='c=:c',
             ExpressionAttributeValues={':p': p, ':c': 3})
 
 # Test the "=" operator on different types of attributes (numeric, string,
 # bytes, list, map, set, bool):
 def test_filter_expression_eq(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
-    for xn in ['i', 's', 'b', 'l', 'm', 'ns', 'bool']:
+    for xn in ['i', 's', 'b', 'l', 'm', 'ns', 'ss', 'bool']:
         xv = items[2][xn]
         got_items = full_query(table, KeyConditionExpression='p=:p', FilterExpression=(xn+'=:xv'),
             ExpressionAttributeValues={':p': p, ':xv': xv})
@@ -387,7 +387,6 @@ def test_filter_expression_map_contains(test_table_sn_with_data):
     assert(got_items == expected_items)
     # One value from a map:
     i = next(iter(items[2]['m']))
-    v = items[2]['m'][i]
     got_items = full_query(table, KeyConditionExpression='p=:p', FilterExpression='contains(m, :i)',
         ExpressionAttributeValues={':p': p, ':i': i})
     #The following could have made sense, but it's what DynamoDB does:
@@ -669,13 +668,13 @@ def test_filter_expression_and_sort_key_condition(test_table_sn_with_data):
 # In particular, test that FilterExpression may inspect attributes which will
 # not be returned by the query, because of the ProjectionExpression.
 # This test reproduces issue #6951.
-def test_filter_expression_and_projection_expression(test_table):
+def test_filter_expression_and_projection_expression(test_table_ss):
     p = random_string()
-    test_table.put_item(Item={'p': p, 'c': 'hi', 'x': 'dog', 'y': 'cat'})
-    test_table.put_item(Item={'p': p, 'c': 'yo', 'x': 'mouse', 'y': 'horse'})
+    test_table_ss.put_item(Item={'p': p, 'c': 'hi', 'x': 'dog', 'y': 'cat'})
+    test_table_ss.put_item(Item={'p': p, 'c': 'yo', 'x': 'mouse', 'y': 'horse'})
     # Note that the filter is on the column x, but x is not included in the
     # results because of ProjectionExpression. The filter should still work.
-    got_items = full_query(test_table,
+    got_items = full_query(test_table_ss,
         KeyConditionExpression='p=:p',
         FilterExpression='x=:x',
         ProjectionExpression='y',
@@ -683,7 +682,7 @@ def test_filter_expression_and_projection_expression(test_table):
     # Note that:
     # 1. Exactly one item matches the filter on x
     # 2. The returned record for that item will include *only* the attribute y
-    #    as requestd by ProjectionExpression. It won't include x - it was just
+    #    as requested by ProjectionExpression. It won't include x - it was just
     #    needed for the filter, but didn't appear in ProjectionExpression.
     expected_items = [{'y': 'horse'}]
     assert(got_items == expected_items)
@@ -697,12 +696,12 @@ def test_filter_expression_and_projection_expression(test_table):
 # future we add an optimization to not read ":attrs" when not needed, this
 # test will make sure "when not needed" remembers also the filtering.
 # This test also reproduces issue #6951.
-def test_filter_expression_and_projection_expression_2(test_table):
+def test_filter_expression_and_projection_expression_2(test_table_ss):
     p = random_string()
-    test_table.put_item(Item={'p': p, 'c': 'yo', 'x': 'mouse', 'y': 'horse'})
+    test_table_ss.put_item(Item={'p': p, 'c': 'yo', 'x': 'mouse', 'y': 'horse'})
     # Note that the filter is on the column x, but x is not included in the
     # results because of ProjectionExpression. The filter should still work.
-    got_items = full_query(test_table,
+    got_items = full_query(test_table_ss,
         KeyConditionExpression='p=:p',
         FilterExpression='x=:x',
         ProjectionExpression='p',
@@ -712,12 +711,11 @@ def test_filter_expression_and_projection_expression_2(test_table):
 # Test that a FilterExpression and Select=COUNT may be given together. Namely,
 # test that FilterExpression may inspect attributes which will not be returned
 # by the query, because the responses are just counted.
-@pytest.mark.xfail(reason="Select not supported yet - #5058")
-def test_filter_expression_and_select_count(test_table):
+def test_filter_expression_and_select_count(test_table_ss):
     p = random_string()
-    test_table.put_item(Item={'p': p, 'c': 'hi', 'x': 'dog', 'y': 'cat'})
-    test_table.put_item(Item={'p': p, 'c': 'yo', 'x': 'mouse', 'y': 'horse'})
-    (prefilter_count, postfilter_count, pages, got_items) = full_query_and_counts(test_table,
+    test_table_ss.put_item(Item={'p': p, 'c': 'hi', 'x': 'dog', 'y': 'cat'})
+    test_table_ss.put_item(Item={'p': p, 'c': 'yo', 'x': 'mouse', 'y': 'horse'})
+    (prefilter_count, postfilter_count, pages, got_items) = full_query_and_counts(test_table_ss,
         KeyConditionExpression='p=:p',
         FilterExpression='x=:x',
         Select='COUNT',
@@ -731,14 +729,14 @@ def test_filter_expression_and_select_count(test_table):
 # It is not allowed to combine the new-style FilterExpression with the
 # old-style AttributesToGet. You must use ProjectionExpression instead
 # (tested in test_filter_expression_and_projection_expression() above).
-def test_filter_expression_and_attributes_to_get(test_table):
+def test_filter_expression_and_attributes_to_get(test_table_ss):
     p = random_string()
     # DynamoDB complains: "Can not use both expression and non-expression
     # parameters in the same request: Non-expression parameters:
     # {AttributesToGet} Expression parameters: {FilterExpression,
     # KeyConditionExpression}.
     with pytest.raises(ClientError, match='ValidationException.* both'):
-        full_query(test_table,
+        full_query(test_table_ss,
             KeyConditionExpression='p=:p',
             FilterExpression='x=:x',
             AttributesToGet=['y'],
@@ -749,11 +747,11 @@ def test_filter_expression_and_attributes_to_get(test_table):
 # support that too. This test just checks one operators - we don't
 # test all the different operators again here, we will assume the same
 # code is used internally so if one operator worked, all will work.
-def test_filter_expression_nested_attribute(test_table):
+def test_filter_expression_nested_attribute(test_table_ss):
     p = random_string()
-    test_table.put_item(Item={'p': p, 'c': 'hi', 'x': {'a': 'dog', 'b': 3}})
-    test_table.put_item(Item={'p': p, 'c': 'yo', 'x': {'a': 'mouse', 'b': 4}})
-    got_items = full_query(test_table,
+    test_table_ss.put_item(Item={'p': p, 'c': 'hi', 'x': {'a': 'dog', 'b': 3}})
+    test_table_ss.put_item(Item={'p': p, 'c': 'yo', 'x': {'a': 'mouse', 'b': 4}})
+    got_items = full_query(test_table_ss,
         KeyConditionExpression='p=:p',
         FilterExpression='x.a=:a',
         ExpressionAttributeValues={':p': p, ':a': 'mouse'})
@@ -766,26 +764,26 @@ def test_filter_expression_nested_attribute(test_table):
 # sub-attributes of the same top-level attribute, or one be a sub-attribute
 # of the other. We need to verify that these corner cases work correctly.
 # This test reproduces issue #6951 (for the nested attribute case).
-def test_filter_expression_and_projection_expression_nested(test_table):
+def test_filter_expression_and_projection_expression_nested(test_table_ss):
     p = random_string()
-    test_table.put_item(Item={'p': p, 'c': 'hi', 'x': {'a': 'dog', 'b': 3}, 'y': 'cat'})
-    test_table.put_item(Item={'p': p, 'c': 'yo', 'x': {'a': 'mouse', 'b': 4}, 'y': 'horse'})
+    test_table_ss.put_item(Item={'p': p, 'c': 'hi', 'x': {'a': 'dog', 'b': 3}, 'y': 'cat'})
+    test_table_ss.put_item(Item={'p': p, 'c': 'yo', 'x': {'a': 'mouse', 'b': 4}, 'y': 'horse'})
     # Case 1: filter on x.a, but project only x.b:
-    got_items = full_query(test_table,
+    got_items = full_query(test_table_ss,
         KeyConditionExpression='p=:p',
         FilterExpression='x.a=:a',
         ProjectionExpression='x.b',
         ExpressionAttributeValues={':p': p, ':a': 'mouse'})
     assert(got_items == [{'x': {'b': 4}}])
     # Case 2: filter on x.a, project entire x:
-    got_items = full_query(test_table,
+    got_items = full_query(test_table_ss,
         KeyConditionExpression='p=:p',
         FilterExpression='x.a=:a',
         ProjectionExpression='x',
         ExpressionAttributeValues={':p': p, ':a': 'mouse'})
     assert(got_items == [{'x': {'a': 'mouse', 'b': 4}}])
     # Case 3: filter on entire x, project only x.a:
-    got_items = full_query(test_table,
+    got_items = full_query(test_table_ss,
         KeyConditionExpression='p=:p',
         FilterExpression='x=:x',
         ProjectionExpression='x.a',
@@ -831,3 +829,50 @@ def test_filter_expression_scan_sort_key(filled_test_table):
     expected_items = [item for item in items if item['c'] == 3]
     print(expected_items)
     assert multiset(expected_items) == multiset(got_items)
+
+# When FilterExpression is used in a Query or Scan, the expression is parsed
+# before doing the query, so a parse error will be detected even if the query
+# yields no items. However, before we fixed SCYLLADB-2346, some of the
+# validations of the FilterExpression were only done at filtering time, so these
+# errors were NOT be reported if the query happens to return zero items - in
+# which case the filter was never actually invoked.
+# This test verifies that such errors are now correctly reported, even when
+# the query returns no items.
+def test_filter_expression_validation_without_results(test_table_sn):
+    # Use a partition key that doesn't exist, so the query returns zero items.
+    # The FilterExpression errors should still be caught eagerly.
+    p = random_string()
+    # begins_with() requires a string or bytes argument, not a number.
+    # This must raise a ValidationException even though the table is empty.
+    with pytest.raises(ClientError, match='ValidationException.*Invalid FilterExpression.*begins_with'):
+        test_table_sn.query(KeyConditionExpression='p=:p',
+            FilterExpression='begins_with(s, :n)',
+            ExpressionAttributeValues={':p': p, ':n': 3})
+    # The function begins_with() requires two arguments, not just one.
+    with pytest.raises(ClientError, match='ValidationException.*Invalid FilterExpression.*begins_with'):
+        test_table_sn.query(KeyConditionExpression='p=:p',
+            FilterExpression='begins_with(s)',
+            ExpressionAttributeValues={':p': p})
+    # An unknown function name must also raise a ValidationException eagerly.
+    with pytest.raises(ClientError, match='ValidationException.*Invalid FilterExpression.*dog'):
+        test_table_sn.query(KeyConditionExpression='p=:p',
+            FilterExpression='dog(s, :v)',
+            ExpressionAttributeValues={':p': p, ':v': 'hello'})
+    # list_append() and if_not_exists() are functions that exist for use in
+    # UpdateExpression, but are not allowed in a FilterExpression. Using them
+    # here must be eagerly rejected as an unknown function, even though the
+    # query returns zero items.
+    with pytest.raises(ClientError, match='ValidationException.*Invalid FilterExpression.*list_append'):
+        test_table_sn.query(KeyConditionExpression='p=:p',
+            FilterExpression='list_append(s, :v) = :v',
+            ExpressionAttributeValues={':p': p, ':v': 'hello'})
+    with pytest.raises(ClientError, match='ValidationException.*Invalid FilterExpression.*if_not_exists'):
+        test_table_sn.query(KeyConditionExpression='p=:p',
+            FilterExpression='if_not_exists(s, :v) = :v',
+            ExpressionAttributeValues={':p': p, ':v': 'hello'})
+    # attribute_type()'s second parameter must be a string constant, not a
+    # path to a document attribute. This must be caught eagerly too.
+    with pytest.raises(ClientError, match='ValidationException.*Invalid FilterExpression.*attribute_type'):
+        test_table_sn.query(KeyConditionExpression='p=:p',
+            FilterExpression='attribute_type(s, i)',
+            ExpressionAttributeValues={':p': p})

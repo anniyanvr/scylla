@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -13,24 +13,21 @@
 #include <seastar/core/shared_ptr.hh>
 #include <variant>
 #include <concepts>
-#include <numeric>
 
-#include "bytes.hh"
-#include "cql3/statements/bound.hh"
 #include "cql3/column_identifier.hh"
-#include "cql3/assignment_testable.hh"
 #include "cql3/cql3_type.hh"
 #include "cql3/functions/function_name.hh"
-#include "data_dictionary/data_dictionary.hh"
-#include "gc_clock.hh"
-#include "range.hh"
 #include "seastarx.hh"
-#include "utils/overloaded_functor.hh"
-#include "utils/variant_element.hh"
 #include "cql3/values.hh"
-#include "replica/database_fwd.hh"
+#include "utils/chunked_string.hh"
 
 class row;
+
+namespace db {
+namespace functions {
+    class function;
+}
+}
 
 namespace secondary_index {
 class index;
@@ -51,10 +48,8 @@ namespace selection {
     class selection;
 } // namespace selection
 
-namespace functions {
-
-class function;
-
+namespace restrictions {
+    class restriction;
 }
 
 namespace expr {
@@ -63,83 +58,87 @@ struct allow_local_index_tag {};
 using allow_local_index = bool_class<allow_local_index_tag>;
 
 struct binary_operator;
+struct unary_operator;
 struct conjunction;
 struct column_value;
-struct token;
+struct subscript;
 struct unresolved_identifier;
 struct column_mutation_attribute;
 struct function_call;
 struct cast;
 struct field_selection;
-struct null;
 struct bind_variable;
 struct untyped_constant;
 struct constant;
 struct tuple_constructor;
 struct collection_constructor;
 struct usertype_constructor;
+struct temporary;
 
 template <typename T>
 concept ExpressionElement
         = std::same_as<T, conjunction>
         || std::same_as<T, binary_operator>
+        || std::same_as<T, unary_operator>
         || std::same_as<T, column_value>
-        || std::same_as<T, token>
+        || std::same_as<T, subscript>
         || std::same_as<T, unresolved_identifier>
         || std::same_as<T, column_mutation_attribute>
         || std::same_as<T, function_call>
         || std::same_as<T, cast>
         || std::same_as<T, field_selection>
-        || std::same_as<T, null>
         || std::same_as<T, bind_variable>
         || std::same_as<T, untyped_constant>
         || std::same_as<T, constant>
         || std::same_as<T, tuple_constructor>
         || std::same_as<T, collection_constructor>
         || std::same_as<T, usertype_constructor>
+        || std::same_as<T, temporary>
         ;
 
 template <typename Func>
 concept invocable_on_expression
         = std::invocable<Func, conjunction>
         && std::invocable<Func, binary_operator>
+        && std::invocable<Func, unary_operator>
         && std::invocable<Func, column_value>
-        && std::invocable<Func, token>
+        && std::invocable<Func, subscript>
         && std::invocable<Func, unresolved_identifier>
         && std::invocable<Func, column_mutation_attribute>
         && std::invocable<Func, function_call>
         && std::invocable<Func, cast>
         && std::invocable<Func, field_selection>
-        && std::invocable<Func, null>
         && std::invocable<Func, bind_variable>
         && std::invocable<Func, untyped_constant>
         && std::invocable<Func, constant>
         && std::invocable<Func, tuple_constructor>
         && std::invocable<Func, collection_constructor>
         && std::invocable<Func, usertype_constructor>
+        && std::invocable<Func, temporary>
         ;
 
 template <typename Func>
 concept invocable_on_expression_ref
         = std::invocable<Func, conjunction&>
         && std::invocable<Func, binary_operator&>
+        && std::invocable<Func, unary_operator&>
         && std::invocable<Func, column_value&>
-        && std::invocable<Func, token&>
+        && std::invocable<Func, subscript&>
         && std::invocable<Func, unresolved_identifier&>
         && std::invocable<Func, column_mutation_attribute&>
         && std::invocable<Func, function_call&>
         && std::invocable<Func, cast&>
         && std::invocable<Func, field_selection&>
-        && std::invocable<Func, null&>
         && std::invocable<Func, bind_variable&>
         && std::invocable<Func, untyped_constant&>
         && std::invocable<Func, constant&>
         && std::invocable<Func, tuple_constructor&>
         && std::invocable<Func, collection_constructor&>
         && std::invocable<Func, usertype_constructor&>
+        && std::invocable<Func, temporary&>
         ;
 
-/// A CQL expression -- union of all possible expression types.  bool means a Boolean constant.
+/// A CQL expression -- union of all possible expression types.
 class expression final {
     // 'impl' holds a variant of all expression types, but since 
     // variants of incomplete types are not allowed, we forward declare it
@@ -147,7 +146,6 @@ class expression final {
     struct impl;                 
     std::unique_ptr<impl> _v;
 public:
-    expression(); // FIXME: remove
     expression(ExpressionElement auto e);
 
     expression(const expression&);
@@ -155,8 +153,11 @@ public:
     expression& operator=(const expression&);
     expression& operator=(expression&&) noexcept = default;
 
-    friend auto visit(invocable_on_expression auto&& visitor, const expression& e);
-    friend auto visit(invocable_on_expression_ref auto&& visitor, expression& e);
+    template <invocable_on_expression Visitor>
+    friend decltype(auto) visit(Visitor&& visitor, const expression& e);
+
+    template <invocable_on_expression_ref Visitor>
+    friend decltype(auto) visit(Visitor&& visitor, expression& e);
 
     template <ExpressionElement E>
     friend bool is(const expression& e);
@@ -166,35 +167,69 @@ public:
 
     template <ExpressionElement E>
     friend const E* as_if(const expression* e);
+
+    template <ExpressionElement E>
+    friend E* as_if(expression* e);
+
+    // Prints given expression using additional options
+    struct printer {
+        const expression& expr_to_print;
+        bool debug_mode = true;
+        bool for_metadata = false;
+    };
+
+    friend bool operator==(const expression& e1, const expression& e2);
 };
+
+/// Checks if two expressions are equal. If they are, they definitely
+/// perform the same computation. If they are unequal, they may perform
+/// the same computation or different computations.
+bool operator==(const expression& e1, const expression& e2);
 
 // An expression that doesn't contain subexpressions
 template <typename E>
 concept LeafExpression
-        = std::same_as<bool, E>
-        || std::same_as<token, E> 
-        || std::same_as<unresolved_identifier, E> 
-        || std::same_as<null, E> 
+        = std::same_as<unresolved_identifier, E>
         || std::same_as<bind_variable, E> 
         || std::same_as<untyped_constant, E> 
         || std::same_as<constant, E>
+        || std::same_as<column_value, E>
+        || std::same_as<temporary, E>
         ;
 
-/// A column, optionally subscripted by a value (eg, c1 or c2['abc']).
+/// A column, usually encountered on the left side of a restriction.
+/// An expression like `mycol < 5` would be expressed as a binary_operator
+/// with column_value on the left hand side.
+/// The column_definition* points inside the schema_ptr used during preparation.
 struct column_value {
     const column_definition* col;
-    std::optional<expression> sub; ///< If present, this LHS is col[sub], otherwise just col.
-    /// For easy creation of vector<column_value> from vector<column_definition*>.
+
     column_value(const column_definition* col) : col(col) {}
-    /// The compiler doesn't auto-generate this due to the other constructor's existence.
-    column_value(const column_definition* col, expr::expression sub) : col(col), sub(std::move(sub)) {}
+
+    friend bool operator==(const column_value&, const column_value&) = default;
 };
 
-/// Represents token function on LHS of an operator relation.  No need to list column definitions
-/// here -- token takes exactly the partition key as its argument.
-struct token {};
+/// A subscripted value, eg list_colum[2], val[sub]
+struct subscript {
+    expression val; // The value that is being subscripted
+    expression sub; // The value between the square braces
+    data_type type; // may be null before prepare
 
-enum class oper_t { EQ, NEQ, LT, LTE, GTE, GT, IN, CONTAINS, CONTAINS_KEY, IS_NOT, LIKE };
+    friend bool operator==(const subscript&, const subscript&) = default;
+};
+
+/// Gets the subscripted column_value out of the subscript.
+/// Only columns can be subscripted in CQL, so we can expect that the subscripted expression is a column_value.
+const column_value& get_subscripted_column(const subscript&);
+
+/// Gets the column_definition* out of expression that can be a column_value or subscript
+/// Only columns can be subscripted in CQL, so we can expect that the subscripted expression is a column_value.
+const column_value& get_subscripted_column(const expression&);
+
+enum class oper_t { EQ, NEQ, LT, LTE, GTE, GT, IN, NOT_IN, CONTAINS, CONTAINS_KEY, IS, IS_NOT, LIKE, ADD, SUB };
+
+/// The operator of a unary expression.
+enum class unary_oper_t { NEG };
 
 /// Describes the nature of clustering-key comparisons.  Useful for implementing SCYLLA_CLUSTERING_BOUND.
 enum class comparison_order : char {
@@ -202,29 +237,56 @@ enum class comparison_order : char {
     clustering, ///< Table's clustering order. (a,b)>(1,1) means any row past (1,1) in storage.
 };
 
-/// Operator restriction: LHS op RHS.
+enum class null_handling_style {
+    sql,           // evaluate(NULL = NULL) -> NULL, evaluate(NULL < x) -> NULL
+    lwt_nulls,     // evaluate(NULL = NULL) -> TRUE, evaluate(NULL < x) -> exception
+};
+
+// An operation on two items (left hand side and right hand side).
+// For example: "col = 2", "(col1, col2) = (?, 3)"
 struct binary_operator {
     expression lhs;
     oper_t op;
     expression rhs;
     comparison_order order;
+    null_handling_style null_handling = null_handling_style::sql;
 
     binary_operator(expression lhs, oper_t op, expression rhs, comparison_order order = comparison_order::cql);
+
+    friend bool operator==(const binary_operator&, const binary_operator&) = default;
 };
 
-/// A conjunction of restrictions.
+// A unary operation on an expression.
+// Currently only negation (unary_oper_t::NEG) for numeric types is supported.
+struct unary_operator {
+    unary_oper_t op;
+    expression operand;
+
+    friend bool operator==(const unary_operator&, const unary_operator&) = default;
+};
+
+// A conjunction of expressions separated by the AND keyword.
+// For example: "a < 3 AND col1 = ? AND pk IN (1, 2)"
 struct conjunction {
     std::vector<expression> children;
+
+    friend bool operator==(const conjunction&, const conjunction&) = default;
 };
 
-// Gets resolved eventually into a column_value.
+// A string that represents a column name.
+// It's not validated in any way, it's just a name that someone wrote.
+// During preparation it's resolved and converted into a validated column_value.
+// For example "my_col", "pk1"
 struct unresolved_identifier {
     ::shared_ptr<column_identifier_raw> ident;
 
     ~unresolved_identifier();
+
+    friend bool operator==(const unresolved_identifier&, const unresolved_identifier&) = default;
 };
 
 // An attribute attached to a column mutation: writetime or ttl
+// For example: "WRITETIME(my_col)", "TTL(some_col)"
 struct column_mutation_attribute {
     enum class attribute_kind { writetime, ttl };
 
@@ -232,19 +294,25 @@ struct column_mutation_attribute {
     // note: only unresolved_identifier is legal here now. One day, when prepare()
     // on expressions yields expressions, column_value will also be legal here.
     expression column;
+
+    friend bool operator==(const column_mutation_attribute&, const column_mutation_attribute&) = default;
 };
 
+// Function call.
+// For example: "some_func(123, 456)", "token(col1, col2)"
 struct function_call {
-    std::variant<functions::function_name, shared_ptr<functions::function>> func;
+    // Before preparation "func" is a function_name.
+    // During preparation it's converted into db::functions::function
+    std::variant<functions::function_name, shared_ptr<db::functions::function>> func;
     std::vector<expression> args;
 
     // 0-based index of the function call within a CQL statement.
     // Used to populate the cache of execution results while passing to
     // another shard (handling `bounce_to_shard` messages) in LWT statements.
     //
-    // The id is set only for the function calls that are a part of LWT
-    // statement restrictions for the partition key. Otherwise, the id is not
-    // set and the call is not considered when using or populating the cache.
+    // The id is set only for the function calls that take part in computing
+    // the partition key. Otherwise, the id is not set and the call is not
+    // considered when using or populating the cache.
     //
     // For example in a query like:
     // INSERT INTO t (pk) VALUES (uuid()) IF NOT EXISTS
@@ -252,58 +320,71 @@ struct function_call {
     // but it changes with each uuid() call.
     // uuid() call result is cached and sent to the proper shard.
     //
-    // Cache id is kept in shared_ptr because of how prepare_context works.
-    // During fill_prepare_context all function cache ids are collected
-    // inside prepare_context.
-    // Later when some condition occurs we might decide to clear
-    // cache ids of all function calls found in prepare_context.
-    // However by this time these function calls could have been
-    // copied multiple times. Prepare_context keeps a shared_ptr
-    // to function_call ids, and then clearing the shared id
-    // clears it in all possible copies.
-    // This logic was introduced back when everything was shared_ptr<term>,
-    // now a better solution might exist.
-    //
-    // This field can be nullptr, it means that there is no cache id set.
-    ::shared_ptr<std::optional<uint8_t>> lwt_cache_id;
+    std::optional<uint8_t> lwt_cache_id;
+
+    friend bool operator==(const function_call&, const function_call&) = default;
 };
 
+// Represents casting an expression to a given type.
+// There are two types of casts - C style and SQL style.
+// For example: "(text)ascii_column", "CAST(int_column as blob)"
 struct cast {
+    enum class cast_style {
+        c,  // (int)arg
+        sql // CAST(arg as int)
+    };
+    cast_style style;
     expression arg;
-    std::variant<cql3_type, shared_ptr<cql3_type::raw>> type;
+    std::variant<data_type, shared_ptr<cql3_type::raw>> type;
+
+    friend bool operator==(const cast&, const cast&) = default;
 };
 
+// Represents accessing a field inside a struct (user defined type).
+// For example: "udt_val.udt_field"
 struct field_selection {
     expression structure;
     shared_ptr<column_identifier_raw> field;
+    size_t field_idx = 0; // invalid before prepare
+    data_type type; // may be null before prepare
+
+    friend bool operator==(const field_selection&, const field_selection&) = default;
 };
 
-struct null {
-};
-
+// Represents a bind marker, both named and unnamed.
+// For example: "?", ":myvar"
+// It contains only the index, for named bind markers the names are kept inside query_options.
 struct bind_variable {
-    enum class shape_type { scalar, scalar_in, tuple, tuple_in };
-    // FIXME: infer shape from expression rather than from grammar
-    shape_type shape;
+    // Index of this bind marker inside the query string.
+    // Consecutive bind markers are numbered 0, 1, 2, 3, ...
     int32_t bind_index;
 
     // Describes where this bound value will be assigned.
     // Contains value type and other useful information.
     ::lw_shared_ptr<column_specification> receiver;
+
+    friend bool operator==(const bind_variable&, const bind_variable&) = default;
 };
 
 // A constant which does not yet have a date type. It is partially typed
 // (we know if it's floating or int) but not sized.
+// For example: "123", "1.341", "null"
+// During preparation it's assigned an exact type and converted into expr::constant.
 struct untyped_constant {
-    enum type_class { integer, floating_point, string, boolean, duration, uuid, hex };
+    enum type_class { integer, floating_point, string, boolean, duration, uuid, hex, null };
     type_class partial_type;
-    sstring raw_text;
+    utils::chunked_string raw_text;
+
+    friend bool operator==(const untyped_constant&, const untyped_constant&) = default;
 };
+
+untyped_constant make_untyped_null();
 
 // Represents a constant value with known value and type
 // For null and unset the type can sometimes be set to empty_type
+// For example: "123", "abcddef", "[1, 2, 3, 4, 5]"
 struct constant {
-    // A value serialized using the internal (latest) cql_serialization_format
+    // The CQL value, serialized to binary representation.
     cql3::raw_value value;
 
     // Never nullptr, for NULL and UNSET might be empty_type
@@ -311,7 +392,6 @@ struct constant {
 
     constant(cql3::raw_value value, data_type type);
     static constant make_null(data_type val_type = empty_type);
-    static constant make_unset_value(data_type val_type = empty_type);
     static constant make_bool(bool bool_val);
 
     bool is_null() const;
@@ -320,29 +400,51 @@ struct constant {
     bool has_empty_value_bytes() const;
 
     cql3::raw_value_view view() const;
+
+    friend bool operator==(const constant&, const constant&) = default;
 };
 
-// Denotes construction of a tuple from its elements, e.g.  ('a', ?, some_column) in CQL.
+// Denotes construction of a tuple from its elements.
+// For example: "('a', ?, some_column)"
+// During preparation tuple constructors with constant values are converted to expr::constant.
 struct tuple_constructor {
     std::vector<expression> elements;
 
     // Might be nullptr before prepare.
     // After prepare always holds a valid type, although it might be reversed_type(tuple_type).
     data_type type;
+
+    friend bool operator==(const tuple_constructor&, const tuple_constructor&) = default;
 };
 
 // Constructs a collection of same-typed elements
+// For example: "[1, 2, ?]", "{5, 6, 7}", {1: 2, 3: 4}"
+// During preparation collection constructors with constant values are converted to expr::constant.
 struct collection_constructor {
-    enum class style_type { list, set, map };
+    enum class style_type { list_or_vector, set, map, vector };
     style_type style;
+
+    // For map constructors, elements is a list of key-pair tuples.
     std::vector<expression> elements;
 
     // Might be nullptr before prepare.
     // After prepare always holds a valid type, although it might be reversed_type(collection_type).
     data_type type;
+
+    friend bool operator==(const collection_constructor&, const collection_constructor&) = default;
 };
 
+// Called with error message string.
+using error_sink_fn = std::function<void(const std::string&)>;
+
+std::map<sstring, sstring> convert_property_map(const collection_constructor&, error_sink_fn);
+
+std::map<sstring, std::variant<sstring, std::vector<sstring>>>
+convert_extended_property_map(const collection_constructor&, error_sink_fn);
+
 // Constructs an object of a user-defined type
+// For example: "{field1: 23343, field2: ?}"
+// During preparation usertype constructors with constant values are converted to expr::constant.
 struct usertype_constructor {
     using elements_map_type = std::unordered_map<column_identifier, expression>;
     elements_map_type elements;
@@ -350,15 +452,53 @@ struct usertype_constructor {
     // Might be nullptr before prepare.
     // After prepare always holds a valid type, although it might be reversed_type(user_type).
     data_type type;
+
+    friend bool operator==(const usertype_constructor&, const usertype_constructor&) = default;
+};
+
+// Represents a value that is external to the expression, but is not a
+// bind_variable or a column_value. If bind_variable:s are function parameters,
+// and column_value:s are globals, then temporary:s can be thought of as local
+// variables, introduced by the "compiler" rather than written by the user.
+//
+// Note expressions only read temporary values; something outside the expression
+// writes them. Each slot has exactly one writer and any number of readers. What
+// writes a slot is not a property of the slot - the writers in use today are an
+// aggregation inner-loop step, holding state that accumulates across the rows of
+// a group (e.g. a running SUM), and an external_values_provider, supplying per-row
+// input that doesn't come from the base table (e.g. a BM25 relevance score
+// returned by the vector store). Slots are allocated in one space, in the order
+// their writers appear: prepare first, then split_aggregation().
+//
+// A slot is restored to an initial value at the start of a group if its writer
+// registered one; see selection_with_processing.
+//
+// `type` is a property of the slot rather than of an individual node: all
+// temporary:s sharing an index must declare the same type. It is not legal for
+// two nodes to disagree, and selection_with_processing rejects that with
+// on_internal_error.
+struct temporary {
+    size_t index; // within evaluation_inputs::temporaries
+    data_type type;
+
+    // The expression this temporary stands in for, when it replaced one that
+    // the user wrote. Used solely for result-set metadata formatting: without
+    // it an unaliased replaced expression comes back named "@temporary0"
+    // instead of by the text the user typed. Temporaries introduced by the
+    // machinery itself, such as aggregation state, leave it empty.
+    std::optional<expression> replaced_expr;
+
+    friend bool operator==(const temporary&, const temporary&) = default;
 };
 
 // now that all expression types are fully defined, we can define expression::impl
 struct expression::impl final {
     using variant_type = std::variant<
-            conjunction, binary_operator, column_value, token, unresolved_identifier,
-            column_mutation_attribute, function_call, cast, field_selection, null,
-            bind_variable, untyped_constant, constant, tuple_constructor, collection_constructor,
-            usertype_constructor>;
+            conjunction, binary_operator, column_value, unresolved_identifier,
+            column_mutation_attribute, function_call, cast, field_selection,
+            bind_variable, untyped_constant, constant, tuple_constructor,
+            collection_constructor, usertype_constructor, subscript, temporary,
+            unary_operator>;
     variant_type v;
     impl(variant_type v) : v(std::move(v)) {}
 };
@@ -367,16 +507,14 @@ expression::expression(ExpressionElement auto e)
         : _v(std::make_unique<impl>(std::move(e))) {
 }
 
-inline expression::expression()
-        : expression(conjunction{}) {
+template <invocable_on_expression Visitor>
+decltype(auto) visit(Visitor&& visitor, const expression& e) {
+    return std::visit(std::forward<Visitor>(visitor), e._v->v);
 }
 
-auto visit(invocable_on_expression auto&& visitor, const expression& e) {
-    return std::visit(visitor, e._v->v);
-}
-
-auto visit(invocable_on_expression_ref auto&& visitor, expression& e) {
-    return std::visit(visitor, e._v->v);
+template <invocable_on_expression_ref Visitor>
+decltype(auto) visit(Visitor&& visitor, expression& e) {
+    return std::visit(std::forward<Visitor>(visitor), e._v->v);
 }
 
 template <ExpressionElement E>
@@ -394,283 +532,121 @@ const E* as_if(const expression* e) {
     return std::get_if<E>(&e->_v->v);
 }
 
+template <ExpressionElement E>
+E* as_if(expression* e) {
+    return std::get_if<E>(&e->_v->v);
+}
+
 /// Creates a conjunction of a and b.  If either a or b is itself a conjunction, its children are inserted
 /// directly into the resulting conjunction's children, flattening the expression tree.
 extern expression make_conjunction(expression a, expression b);
-
-extern std::ostream& operator<<(std::ostream&, oper_t);
-
-/// True iff restr is satisfied with respect to the row provided from a partition slice.
-extern bool is_satisfied_by(
-        const expression& restr,
-        const std::vector<bytes>& partition_key, const std::vector<bytes>& clustering_key,
-        const query::result_row_view& static_row, const query::result_row_view* row,
-        const selection::selection&, const query_options&);
-
-/// A set of discrete values.
-using value_list = std::vector<managed_bytes>; // Sorted and deduped using value comparator.
-
-/// General set of values.  Empty set and single-element sets are always value_list.  nonwrapping_range is
-/// never singular and never has start > end.  Universal set is a nonwrapping_range with both bounds null.
-using value_set = std::variant<value_list, nonwrapping_range<managed_bytes>>;
-
-/// A set of all column values that would satisfy an expression.  If column is null, a set of all token values
-/// that satisfy.
-///
-/// An expression restricts possible values of a column or token:
-/// - `A>5` restricts A from below
-/// - `A>5 AND A>6 AND B<10 AND A=12 AND B>0` restricts A to 12 and B to between 0 and 10
-/// - `A IN (1, 3, 5)` restricts A to 1, 3, or 5
-/// - `A IN (1, 3, 5) AND A>3` restricts A to just 5
-/// - `A=1 AND A<=0` restricts A to an empty list; no value is able to satisfy the expression
-/// - `A>=NULL` also restricts A to an empty list; all comparisons to NULL are false
-/// - an expression without A "restricts" A to unbounded range
-extern value_set possible_lhs_values(const column_definition*, const expression&, const query_options&);
-
-/// Turns value_set into a range, unless it's a multi-valued list (in which case this throws).
-extern nonwrapping_range<managed_bytes> to_range(const value_set&);
-
-/// A range of all X such that X op val.
-nonwrapping_range<clustering_key_prefix> to_range(oper_t op, const clustering_key_prefix& val);
-
-/// True iff the index can support the entire expression.
-extern bool is_supported_by(const expression&, const secondary_index::index&);
-
-/// True iff any of the indices from the manager can support the entire expression.  If allow_local, use all
-/// indices; otherwise, use only global indices.
-extern bool has_supporting_index(
-        const expression&, const secondary_index::secondary_index_manager&, allow_local_index allow_local);
 
 extern sstring to_string(const expression&);
 
 extern std::ostream& operator<<(std::ostream&, const column_value&);
 
-extern std::ostream& operator<<(std::ostream&, const expression&);
-
-extern bool recurse_until(const expression& e, const noncopyable_function<bool (const expression&)>& predicate_fun);
-
-// Looks into the expression and finds the given expression variant
-// for which the predicate function returns true.
-// If nothing is found returns nullptr.
-// For example:
-// find_in_expression<binary_operator>(e, [](const binary_operator&) {return true;})
-// Will return the first binary operator found in the expression
-template<ExpressionElement ExprElem, class Fn>
-requires std::invocable<Fn, const ExprElem&>
-      && std::same_as<std::invoke_result_t<Fn, const ExprElem&>, bool>
-const ExprElem* find_in_expression(const expression& e, Fn predicate_fun) {
-    const ExprElem* ret = nullptr;
-    recurse_until(e, [&] (const expression& e) {
-        if (auto expr_elem = as_if<ExprElem>(&e)) {
-            if (predicate_fun(*expr_elem)) {
-                ret = expr_elem;
-                return true;
-            }
-        }
-        return false;
-    });
-    return ret;
-}
-
-/// If there is a binary_operator atom b for which f(b) is true, returns it.  Otherwise returns null.
-template<class Fn>
-requires std::invocable<Fn, const binary_operator&>
-      && std::same_as<std::invoke_result_t<Fn, const binary_operator&>, bool>
-const binary_operator* find_binop(const expression& e, Fn predicate_fun) {
-    return find_in_expression<binary_operator>(e, predicate_fun);
-}
-
-/// Counts binary_operator atoms b for which f(b) is true.
-size_t count_if(const expression& e, const noncopyable_function<bool (const binary_operator&)>& f);
-
-inline const binary_operator* find(const expression& e, oper_t op) {
-    return find_binop(e, [&] (const binary_operator& o) { return o.op == op; });
-}
-
-inline bool needs_filtering(oper_t op) {
-    return (op == oper_t::CONTAINS) || (op == oper_t::CONTAINS_KEY) || (op == oper_t::LIKE) ||
-           (op == oper_t::IS_NOT) || (op == oper_t::NEQ) ;
-}
-
-inline auto find_needs_filtering(const expression& e) {
-    return find_binop(e, [] (const binary_operator& bo) { return needs_filtering(bo.op); });
-}
-
-inline bool is_slice(oper_t op) {
-    return (op == oper_t::LT) || (op == oper_t::LTE) || (op == oper_t::GT) || (op == oper_t::GTE);
-}
-
-inline bool has_slice(const expression& e) {
-    return find_binop(e, [] (const binary_operator& bo) { return is_slice(bo.op); });
-}
-
-inline bool is_compare(oper_t op) {
-    switch (op) {
-    case oper_t::EQ:
-    case oper_t::LT:
-    case oper_t::LTE:
-    case oper_t::GT:
-    case oper_t::GTE:
-    case oper_t::NEQ:
-        return true;
-    default:
-        return false;
-    }
-}
-
-inline bool is_multi_column(const binary_operator& op) {
-    return expr::is<tuple_constructor>(op.lhs);
-}
-
-inline bool has_token(const expression& e) {
-    return find_binop(e, [] (const binary_operator& o) { return expr::is<token>(o.lhs); });
-}
-
-inline bool has_slice_or_needs_filtering(const expression& e) {
-    return find_binop(e, [] (const binary_operator& o) { return is_slice(o.op) || needs_filtering(o.op); });
-}
-
-inline bool is_clustering_order(const binary_operator& op) {
-    return op.order == comparison_order::clustering;
-}
-
-inline auto find_clustering_order(const expression& e) {
-    return find_binop(e, is_clustering_order);
-}
-
-/// True iff binary_operator involves a collection.
-extern bool is_on_collection(const binary_operator&);
-
-// Checks whether the given column occurs in the expression.
-// Uses column_defintion::operator== for comparison, columns with the same name but different schema will not be equal.
-bool contains_column(const column_definition& column, const expression& e);
-
-// Checks whether this expression contains a nonpure function.
-// The expression must be prepared, so that function names are converted to function pointers.
-bool contains_nonpure_function(const expression&);
-
-// Checks whether the given column has an EQ restriction in the expression.
-// EQ restriction is `col = ...` or `(col, col2) = ...`
-// IN restriction is NOT an EQ restriction, this function will not look for IN restrictions.
-// Uses column_defintion::operator== for comparison, columns with the same name but different schema will not be equal.
-bool has_eq_restriction_on_column(const column_definition& column, const expression& e);
-
-/// Replaces every column_definition in an expression with this one.  Throws if any LHS is not a single
-/// column_value.
-extern expression replace_column_def(const expression&, const column_definition*);
-
-// Replaces all occurences of token(p1, p2) on the left hand side with the given colum.
-// For example this changes token(p1, p2) < token(1, 2) to my_column_name < token(1, 2).
-extern expression replace_token(const expression&, const column_definition*);
-
-// Recursively copies e and returns it. Calls replace_candidate() on all nodes. If it returns nullopt,
-// continue with the copying. If it returns an expression, that expression replaces the current node.
-extern expression search_and_replace(const expression& e,
-        const noncopyable_function<std::optional<expression> (const expression& candidate)>& replace_candidate);
-
-extern expression prepare_expression(const expression& expr, data_dictionary::database db, const sstring& keyspace, lw_shared_ptr<column_specification> receiver);
-extern expression prepare_expression_multi_column(const expression& expr, data_dictionary::database db, const sstring& keyspace, const std::vector<lw_shared_ptr<column_specification>>& receivers);
+data_type type_of(const expression& e);
 
 
-/**
- * @return whether this object can be assigned to the provided receiver. We distinguish
- * between 3 values: 
- *   - EXACT_MATCH if this object is exactly of the type expected by the receiver
- *   - WEAKLY_ASSIGNABLE if this object is not exactly the expected type but is assignable nonetheless
- *   - NOT_ASSIGNABLE if it's not assignable
- * Most caller should just call the is_assignable() method on the result, though functions have a use for
- * testing "strong" equality to decide the most precise overload to pick when multiple could match.
- */
-extern assignment_testable::test_result test_assignment(const expression& expr, data_dictionary::database db, const sstring& keyspace, const column_specification& receiver);
-
-// Test all elements of exprs for assignment. If all are exact match, return exact match. If any is not assignable,
-// return not assignable. Otherwise, return weakly assignable.
-extern assignment_testable::test_result test_assignment_all(const std::vector<expression>& exprs, data_dictionary::database db, const sstring& keyspace, const column_specification& receiver);
-
-extern shared_ptr<assignment_testable> as_assignment_testable(expression e);
-
-inline oper_t pick_operator(statements::bound b, bool inclusive) {
-    return is_start(b) ?
-            (inclusive ? oper_t::GTE : oper_t::GT) :
-            (inclusive ? oper_t::LTE : oper_t::LT);
-}
-
-// Extracts all binary operators which have the given column on their left hand side.
-// Extracts only single-column restrictions.
-// Does not include multi-column restrictions.
-// Does not include token() restrictions.
-// Does not include boolean constant restrictions.
-// For example "WHERE c = 1 AND (a, c) = (2, 1) AND token(p) < 2 AND FALSE" will return {"c = 1"}.
-std::vector<expression> extract_single_column_restrictions_for_column(const expression&, const column_definition&);
-
-std::optional<bool> get_bool_value(const constant&);
-
-// Similar to evaluate(), but ignores any NULL values in the final list value.
-// In an IN restriction nulls can be ignored, because nothing equals NULL.
-constant evaluate_IN_list(const expression&, const query_options&);
-
-// Takes a prepared expression and calculates its value.
-// Evaluates bound values, calls functions and returns just the bytes and type.
-constant evaluate(const expression& e, const query_options&);
-constant evaluate(const bind_variable&, const query_options&);
-constant evaluate(const tuple_constructor&, const query_options&);
-constant evaluate(const collection_constructor&, const query_options&);
-constant evaluate(const usertype_constructor&, const query_options&);
-constant evaluate(const function_call&, const query_options&);
-
-utils::chunked_vector<managed_bytes> get_list_elements(const constant&);
-utils::chunked_vector<managed_bytes> get_set_elements(const constant&);
-std::vector<managed_bytes_opt> get_tuple_elements(const constant&);
-std::vector<managed_bytes_opt> get_user_type_elements(const constant&);
-std::vector<std::pair<managed_bytes, managed_bytes>> get_map_elements(const constant&);
-
-// Gets the elements of a constant which can be a list, set, tuple or user type
-std::vector<managed_bytes_opt> get_elements(const constant&);
-
-// Get elements of list<tuple<>> as vector<vector<managed_bytes_opt>
-// It is useful with IN restrictions like (a, b) IN [(1, 2), (3, 4)].
-utils::chunked_vector<std::vector<managed_bytes_opt>> get_list_of_tuples_elements(const constant&);
-
-// Retrieves information needed in prepare_context.
-// Collects the column specification for the bind variables in this expression.
-// Sets lwt_cache_id field in function_calls.
-void fill_prepare_context(expression&, cql3::prepare_context&);
-
-// Checks whether there is a bind_variable inside this expression
-// It's important to note, that even when there are no bind markers,
-// there can be other things that prevent immediate evaluation of an expression.
-// For example an expression can contain calls to nonpure functions.
-bool contains_bind_marker(const expression& e);
 } // namespace expr
 
 } // namespace cql3
 
+/// Custom formatter for an expression.  Supports multiple modes:
+///     {:user} for user-oriented output, suitable for error messages (default).
+///             The output is CQL text which can be parsed back to the same
+///             expression (as written by the user), so identifiers - e.g.,
+///             column names, the field names of a user-defined type
+///             literal, and function names - are quoted when needed. This is
+///             relied upon for saving a view's WHERE clause in the schema.
+///     {:debug} for debug-oriented output
+///     {:result_set_metadata} for stable output suitable for result set metadata (column headings)
+///
 /// Required for fmt::join() to work on expression.
 template <>
-struct fmt::formatter<cql3::expr::expression> {
+class fmt::formatter<cql3::expr::expression> {
+    bool _debug = false;
+    bool _for_metadata = false;
+private:
+    constexpr static bool try_match_and_advance(format_parse_context& ctx, std::string_view s) {
+        auto [ctx_end, s_end] = std::ranges::mismatch(ctx, s);
+        if (s_end == s.end()) {
+            ctx.advance_to(ctx_end);
+            return true;
+        }
+        return false;
+    }
+public:
     constexpr auto parse(format_parse_context& ctx) {
-        return ctx.end();
+        using namespace std::string_view_literals;
+        if (try_match_and_advance(ctx, "debug"sv)) {
+            _debug = true;
+        } else if (try_match_and_advance(ctx, "user"sv)) {
+            _debug = false;
+        } else if (try_match_and_advance(ctx, "result_set_metadata"sv)) {
+            _for_metadata = true;
+        }
+        return ctx.begin();
     }
 
     template <typename FormatContext>
-    auto format(const cql3::expr::expression& expr, FormatContext& ctx) {
-        std::ostringstream os;
-        os << expr;
-        return format_to(ctx.out(), "{}", os.str());
+    auto format(const cql3::expr::expression& expr, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", cql3::expr::expression::printer{.expr_to_print = expr, .debug_mode = _debug, .for_metadata = _for_metadata});
     }
 };
 
-/// Required for fmt::join() to work on column_value.
+/// Required for fmt::join() to work on expression::printer.
 template <>
-struct fmt::formatter<cql3::expr::column_value> {
+struct fmt::formatter<cql3::expr::expression::printer> {
     constexpr auto parse(format_parse_context& ctx) {
         return ctx.end();
     }
 
     template <typename FormatContext>
-    auto format(const cql3::expr::column_value& col, FormatContext& ctx) {
-        std::ostringstream os;
-        os << col;
-        return format_to(ctx.out(), "{}", os.str());
+    auto format(const cql3::expr::expression::printer& pr, FormatContext& ctx) const -> decltype(ctx.out());
+};
+
+/// Required for fmt::join() to work on ExpressionElement, and for {:user}/{:debug} to work on ExpressionElement.
+template <cql3::expr::ExpressionElement E>
+struct fmt::formatter<E> : public fmt::formatter<cql3::expr::expression> {
+};
+
+template <>
+struct fmt::formatter<cql3::expr::column_mutation_attribute::attribute_kind> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(cql3::expr::column_mutation_attribute::attribute_kind k, FormatContext& ctx) const {
+        switch (k) {
+            case cql3::expr::column_mutation_attribute::attribute_kind::writetime:
+                return fmt::format_to(ctx.out(), "WRITETIME");
+            case cql3::expr::column_mutation_attribute::attribute_kind::ttl:
+                return fmt::format_to(ctx.out(), "TTL");
+        }
+        return fmt::format_to(ctx.out(), "unrecognized_attribute_kind({})", static_cast<int>(k));
     }
+};
+
+template <>
+struct fmt::formatter<cql3::expr::oper_t> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+
+    template <typename FormatContext>
+    auto format(const cql3::expr::oper_t& op, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", to_string(op));
+    }
+
+private:
+    static std::string_view to_string(const cql3::expr::oper_t& op);
+};
+
+template <>
+struct fmt::formatter<cql3::expr::unary_oper_t> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+
+    template <typename FormatContext>
+    auto format(const cql3::expr::unary_oper_t& op, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", to_string(op));
+    }
+
+private:
+    static std::string_view to_string(const cql3::expr::unary_oper_t& op);
 };

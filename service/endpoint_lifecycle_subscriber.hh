@@ -1,20 +1,19 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include "gms/inet_address.hh"
+#include "locator/host_id.hh"
 #include "utils/atomic_vector.hh"
+#include "service/client_routes.hh"
 
 namespace service {
 
@@ -37,28 +36,37 @@ public:
      *
      * @param endpoint the newly added endpoint.
      */
-    virtual void on_join_cluster(const gms::inet_address& endpoint) = 0;
+    virtual void on_join_cluster(const gms::inet_address& endpoint, locator::host_id host_id) {}
 
     /**
      * Called when a new node leave the cluster (decommission or removeToken).
      *
-     * @param endpoint the endpoint that is leaving.
+     * @param endpoint the IP of the endpoint that is leaving.
+     * @param host_id the host ID of the endpoint that is leaving.
      */
-    virtual void on_leave_cluster(const gms::inet_address& endpoint) = 0;
+    virtual void on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& host_id) {}
+
+    /**
+     * Called when a node is no longer in topology and doesn't own any tokens.
+     *
+     * @param host_id the host ID of the endpoint that was released.
+     */
+    virtual void on_released(const locator::host_id& host_id) {}
 
     /**
      * Called when a node is marked UP.
      *
      * @param endpoint the endpoint marked UP.
      */
-    virtual void on_up(const gms::inet_address& endpoint) = 0;
+    virtual void on_up(const gms::inet_address& endpoint, locator::host_id host_id) {}
 
     /**
      * Called when a node is marked DOWN.
      *
      * @param endpoint the endpoint marked DOWN.
      */
-    virtual void on_down(const gms::inet_address& endpoint) = 0;
+    virtual void on_down(const gms::inet_address& endpoint, locator::host_id host_id) {}
+    virtual void on_client_routes_change(const client_routes_service::client_route_keys& client_route_keys) {}
 };
 
 class endpoint_lifecycle_notifier {
@@ -68,10 +76,13 @@ public:
     void register_subscriber(endpoint_lifecycle_subscriber* subscriber);
     future<> unregister_subscriber(endpoint_lifecycle_subscriber* subscriber) noexcept;
 
-    future<> notify_down(gms::inet_address endpoint);
-    future<> notify_left(gms::inet_address endpoint);
-    future<> notify_up(gms::inet_address endpoint);
-    future<> notify_joined(gms::inet_address endpoint);
+    future<> notify_down(gms::inet_address endpoint, locator::host_id host_id);
+    future<> notify_left(gms::inet_address endpoint, locator::host_id host_id);
+    future<> notify_released(locator::host_id host_id);
+    future<> notify_up(gms::inet_address endpoint, locator::host_id host_id);
+    future<> notify_joined(gms::inet_address endpoint, locator::host_id host_id);
+
+    future<> notify_client_routes_change(const client_routes_service::client_route_keys& client_route_keys);
 };
 
 }

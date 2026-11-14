@@ -3,49 +3,66 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <boost/type.hpp>
+#include <type_traits>
 #include <random>
 #include <unordered_set>
 #include <algorithm>
-#include <seastar/core/sleep.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
-#include "keys.hh"
-#include "schema_builder.hh"
+#include "keys/keys.hh"
 #include "replica/database.hh"
 #include "db/system_keyspace.hh"
-#include "db/system_distributed_keyspace.hh"
+#include "db/schema_tables.hh"
 #include "dht/token-sharding.hh"
 #include "locator/token_metadata.hh"
-#include "gms/application_state.hh"
-#include "gms/inet_address.hh"
-#include "gms/gossiper.hh"
-#include "gms/feature_service.hh"
+#include "locator/tablets.hh"
+#include "schema/schema_builder.hh"
+#include "types/set.hh"
+#include "utils/assert.hh"
+#include "utils/error_injection.hh"
 #include "utils/UUID_gen.hh"
+#include "utils/stall_free.hh"
+#include "utils/to_string.hh"
 
 #include "cdc/generation.hh"
 #include "cdc/cdc_options.hh"
 #include "cdc/generation_service.hh"
+#include "cdc/log.hh"
+#include "gms/feature_service.hh"
+#include "service/migration_listener.hh"
+#include "service/raft/group0_state_machine.hh"
 
 extern logging::logger cdc_log;
 
-static int get_shard_count(const gms::inet_address& endpoint, const gms::gossiper& g) {
-    auto ep_state = g.get_application_state_ptr(endpoint, gms::application_state::SHARD_COUNT);
-    return ep_state ? std::stoi(ep_state->value) : -1;
-}
-
-static unsigned get_sharding_ignore_msb(const gms::inet_address& endpoint, const gms::gossiper& g) {
-    auto ep_state = g.get_application_state_ptr(endpoint, gms::application_state::IGNORE_MSB_BITS);
-    return ep_state ? std::stoi(ep_state->value) : 0;
+namespace db {
+    extern thread_local data_type cdc_streams_set_type;
 }
 
 namespace cdc {
 
-extern const api::timestamp_clock::duration generation_leeway =
-    std::chrono::duration_cast<api::timestamp_clock::duration>(std::chrono::seconds(5));
+api::timestamp_clock::duration get_generation_leeway() {
+    static thread_local auto generation_leeway =
+            std::chrono::duration_cast<api::timestamp_clock::duration>(std::chrono::seconds(5));
+
+    utils::get_local_injector().inject("increase_cdc_generation_leeway", [&] {
+        generation_leeway = std::chrono::duration_cast<api::timestamp_clock::duration>(std::chrono::minutes(5));
+    });
+
+    return generation_leeway;
+}
+
+stream_state read_stream_state(int8_t val) {
+    if (val != std::to_underlying(stream_state::current)
+            && val != std::to_underlying(stream_state::closed)
+            && val != std::to_underlying(stream_state::opened)) {
+        throw std::runtime_error(format("invalid value {} for stream state", val));
+    }
+    return static_cast<stream_state>(val);
+}
 
 static void copy_int_to_bytes(int64_t i, size_t offset, bytes& b) {
     i = net::hton(i);
@@ -61,10 +78,10 @@ static constexpr auto stream_id_index_shift = stream_id_version_shift + stream_i
 static constexpr auto stream_id_random_shift = stream_id_index_shift + stream_id_index_bits;
 
 /**
- * Responsibilty for encoding stream_id moved from factory method to
- * this constructor, to keep knowledge of composition in a single place.
- * Note this is private and friended to topology_description_generator,
- * because he is the one who defined the "order" we view vnodes etc.
+ * Responsibility for encoding stream_id moved from the create_stream_ids
+ * function to this constructor, to keep knowledge of composition in a
+ * single place. Note the make_new_generation_description function
+ * defines the "order" in which we view vnodes etc.
  */
 stream_id::stream_id(dht::token token, size_t vnode_index)
     : _value(bytes::initialized_later(), 2 * sizeof(int64_t))
@@ -90,8 +107,8 @@ stream_id::stream_id(dht::token token, size_t vnode_index)
     copy_int_to_bytes(dht::token::to_int64(token), 0, _value);
     copy_int_to_bytes(low_qword, sizeof(int64_t), _value);
     // not a hot code path. make sure we did not mess up the shifts and masks.
-    assert(version() == version_1);
-    assert(index() == vnode_index);
+    SCYLLA_ASSERT(version() == version_1);
+    SCYLLA_ASSERT(index() == vnode_index);
 }
 
 stream_id::stream_id(bytes b)
@@ -108,20 +125,8 @@ bool stream_id::is_set() const {
     return !_value.empty();
 }
 
-bool stream_id::operator==(const stream_id& o) const {
-    return _value == o._value;
-}
-
-bool stream_id::operator!=(const stream_id& o) const {
-    return !(*this == o);
-}
-
-bool stream_id::operator<(const stream_id& o) const {
-    return _value < o._value;
-}
-
 static int64_t bytes_to_int64(bytes_view b, size_t offset) {
-    assert(b.size() >= offset + sizeof(int64_t));
+    SCYLLA_ASSERT(b.size() >= offset + sizeof(int64_t));
     int64_t res;
     std::copy_n(b.begin() + offset, sizeof(int64_t), reinterpret_cast<int8_t *>(&res));
     return net::ntoh(res);
@@ -151,6 +156,10 @@ const bytes& stream_id::to_bytes() const {
     return _value;
 }
 
+bytes stream_id::to_bytes() && {
+    return std::move(_value);
+}
+
 partition_key stream_id::to_partition_key(const schema& log_schema) const {
     return partition_key::from_single_value(log_schema, _value);
 }
@@ -160,26 +169,39 @@ bool token_range_description::operator==(const token_range_description& o) const
         && sharding_ignore_msb == o.sharding_ignore_msb;
 }
 
-topology_description::topology_description(std::vector<token_range_description> entries)
+topology_description::topology_description(utils::chunked_vector<token_range_description> entries)
     : _entries(std::move(entries)) {}
 
 bool topology_description::operator==(const topology_description& o) const {
     return _entries == o._entries;
 }
 
-const std::vector<token_range_description>& topology_description::entries() const& {
+const utils::chunked_vector<token_range_description>& topology_description::entries() const& {
     return _entries;
 }
 
-std::vector<token_range_description>&& topology_description::entries() && {
+utils::chunked_vector<token_range_description>&& topology_description::entries() && {
     return std::move(_entries);
+}
+
+future<topology_description> topology_description::clone_async() const {
+    utils::chunked_vector<token_range_description> vec{};
+
+    co_await utils::reserve_gently(vec, _entries.size());
+
+    for (const auto& entry : _entries) {
+        vec.push_back(entry);
+        co_await coroutine::maybe_yield();
+    }
+
+    co_return topology_description{std::move(vec)};
 }
 
 static std::vector<stream_id> create_stream_ids(
         size_t index, dht::token start, dht::token end, size_t shard_count, uint8_t ignore_msb) {
     std::vector<stream_id> result;
     result.reserve(shard_count);
-    dht::sharder sharder(shard_count, ignore_msb);
+    dht::static_sharder sharder(shard_count, ignore_msb);
     for (size_t shard_idx = 0; shard_idx < shard_count; ++shard_idx) {
         auto t = dht::find_first_token_for_shard(sharder, start, end, shard_idx);
         // compose the id from token and the "index" of the range end owning vnode
@@ -190,449 +212,160 @@ static std::vector<stream_id> create_stream_ids(
     return result;
 }
 
-class topology_description_generator final {
-    unsigned _ignore_msb_bits;
-    const std::unordered_set<dht::token>& _bootstrap_tokens;
-    const locator::token_metadata_ptr _tmptr;
-    const gms::gossiper& _gossiper;
-
-    // Compute a set of tokens that split the token ring into vnodes
-    auto get_tokens() const {
-        auto tokens = _tmptr->sorted_tokens();
-        auto it = tokens.insert(
-                tokens.end(), _bootstrap_tokens.begin(), _bootstrap_tokens.end());
-        std::sort(it, tokens.end());
-        std::inplace_merge(tokens.begin(), it, tokens.end());
-        tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
-        return tokens;
-    }
-
-    // Fetch sharding parameters for a node that owns vnode ending with this.end
-    // Returns <shard_count, ignore_msb> pair.
-    std::pair<size_t, uint8_t> get_sharding_info(dht::token end) const {
-        if (_bootstrap_tokens.contains(end)) {
-            return {smp::count, _ignore_msb_bits};
-        } else {
-            auto endpoint = _tmptr->get_endpoint(end);
-            if (!endpoint) {
-                throw std::runtime_error(
-                        format("Can't find endpoint for token {}", end));
+bool is_cdc_generation_optimal(const cdc::topology_description& gen, const locator::token_metadata& tm) {
+    if (tm.sorted_tokens().size() != gen.entries().size()) {
+        // We probably have garbage streams from old generations
+        cdc_log.info("Generation size does not match the token ring");
+        return false;
+    } else {
+        std::unordered_set<dht::token> gen_ends;
+        for (const auto& entry : gen.entries()) {
+            gen_ends.insert(entry.token_range_end);
+        }
+        for (const auto& metadata_token : tm.sorted_tokens()) {
+            if (!gen_ends.contains(metadata_token)) {
+                cdc_log.warn("CDC generation missing token {}", metadata_token);
+                return false;
             }
-            auto sc = get_shard_count(*endpoint, _gossiper);
-            return {sc > 0 ? sc : 1, get_sharding_ignore_msb(*endpoint, _gossiper)};
         }
+        return true;
     }
+}
 
-    token_range_description create_description(size_t index, dht::token start, dht::token end) const {
-        token_range_description desc;
-
-        desc.token_range_end = end;
-
-        auto [shard_count, ignore_msb] = get_sharding_info(end);
-        desc.streams = create_stream_ids(index, start, end, shard_count, ignore_msb);
-        desc.sharding_ignore_msb = ignore_msb;
-
-        return desc;
-    }
-public:
-    topology_description_generator(
-            unsigned ignore_msb_bits,
-            const std::unordered_set<dht::token>& bootstrap_tokens,
-            const locator::token_metadata_ptr tmptr,
-            const gms::gossiper& gossiper)
-        : _ignore_msb_bits(ignore_msb_bits)
-        , _bootstrap_tokens(bootstrap_tokens)
-        , _tmptr(std::move(tmptr))
-        , _gossiper(gossiper)
-    {}
-
-    /*
-     * Generate a set of CDC stream identifiers such that for each shard
-     * and vnode pair there exists a stream whose token falls into this vnode
-     * and is owned by this shard. It is sometimes not possible to generate
-     * a CDC stream identifier for some (vnode, shard) pair because not all
-     * shards have to own tokens in a vnode. Small vnode can be totally owned
-     * by a single shard. In such case, a stream identifier that maps to
-     * end of the vnode is generated.
-     *
-     * Then build a cdc::topology_description which maps tokens to generated
-     * stream identifiers, such that if token T is owned by shard S in vnode V,
-     * it gets mapped to the stream identifier generated for (S, V).
-     */
-    // Run in seastar::async context.
-    topology_description generate() const {
-        const auto tokens = get_tokens();
-
-        std::vector<token_range_description> vnode_descriptions;
-        vnode_descriptions.reserve(tokens.size());
-
-        vnode_descriptions.push_back(
-                create_description(0, tokens.back(), tokens.front()));
-        for (size_t idx = 1; idx < tokens.size(); ++idx) {
-            vnode_descriptions.push_back(
-                    create_description(idx, tokens[idx - 1], tokens[idx]));
+static future<utils::chunked_vector<mutation>> get_common_cdc_generation_mutations(
+        schema_ptr s,
+        const partition_key& pkey,
+        noncopyable_function<clustering_key (dht::token)>&& get_ckey_from_range_end,
+        const cdc::topology_description& desc,
+        size_t mutation_size_threshold,
+        api::timestamp_type ts) {
+    utils::chunked_vector<mutation> res;
+    res.emplace_back(s, pkey);
+    size_t size_estimate = 0;
+    size_t total_size_estimate = 0;
+    for (auto& e : desc.entries()) {
+        if (size_estimate >= mutation_size_threshold) {
+            total_size_estimate += size_estimate;
+            res.emplace_back(s, pkey);
+            size_estimate = 0;
         }
 
-        return {std::move(vnode_descriptions)};
-    }
-};
+        set_type_impl::native_type streams;
+        streams.reserve(e.streams.size());
+        for (auto& stream: e.streams) {
+            streams.push_back(data_value(stream.to_bytes()));
+        }
 
-bool should_propose_first_generation(const gms::inet_address& me, const gms::gossiper& g) {
-    auto my_host_id = g.get_host_id(me);
-    auto& eps = g.get_endpoint_states();
-    return std::none_of(eps.begin(), eps.end(),
-            [&] (const std::pair<gms::inet_address, gms::endpoint_state>& ep) {
-        return my_host_id < g.get_host_id(ep.first);
+        size_estimate += e.streams.size() * 20;
+        auto ckey = get_ckey_from_range_end(e.token_range_end);
+        res.back().set_cell(ckey, to_bytes("streams"), make_set_value(db::cdc_streams_set_type, std::move(streams)), ts);
+        res.back().set_cell(ckey, to_bytes("ignore_msb"), int8_t(e.sharding_ignore_msb), ts);
+
+        co_await coroutine::maybe_yield();
+    }
+
+    total_size_estimate += size_estimate;
+
+    // Copy mutations n times, where n is picked so that the memory size of all mutations together exceeds `max_command_size`.
+    utils::get_local_injector().inject("cdc_generation_mutations_replication", [&res, total_size_estimate, mutation_size_threshold] {
+        utils::chunked_vector<mutation> new_res;
+
+        size_t number_of_copies = (mutation_size_threshold / total_size_estimate + 1) * 2;
+        for (size_t i = 0; i < number_of_copies; ++i) {
+            std::copy(res.begin(), res.end(), std::back_inserter(new_res));
+        }
+
+        res = std::move(new_res);
     });
+
+    co_return res;
 }
 
-// non-static for testing
-size_t limit_of_streams_in_topology_description() {
-    // Each stream takes 16B and we don't want to exceed 4MB so we can have
-    // at most 262144 streams but not less than 1 per vnode.
-    return 4 * 1024 * 1024 / 16;
+future<utils::chunked_vector<mutation>> get_cdc_generation_mutations_v2(
+        schema_ptr s,
+        utils::UUID id,
+        const cdc::topology_description& desc,
+        size_t mutation_size_threshold,
+        api::timestamp_type ts) {
+    auto pkey = partition_key::from_singular(*s, id);
+    auto get_ckey = [s] (dht::token range_end) {
+        return clustering_key::from_singular(*s, dht::token::to_int64(range_end));
+    };
+
+    auto res = co_await get_common_cdc_generation_mutations(s, pkey, std::move(get_ckey), desc, mutation_size_threshold, ts);
+    res.back().set_static_cell(to_bytes("num_ranges"), int32_t(desc.entries().size()), ts);
+    co_return res;
 }
 
-// non-static for testing
-topology_description limit_number_of_streams_if_needed(topology_description&& desc) {
-    uint64_t streams_count = 0;
-    for (auto& tr_desc : desc.entries()) {
-        streams_count += tr_desc.streams.size();
-    }
+future<utils::chunked_vector<mutation>> get_cdc_generation_mutations_v3(
+        schema_ptr s,
+        utils::UUID id,
+        const cdc::topology_description& desc,
+        size_t mutation_size_threshold,
+        api::timestamp_type ts) {
+    auto pkey = partition_key::from_singular(*s, CDC_GENERATIONS_V3_KEY);
+    auto get_ckey = [&] (dht::token range_end) {
+        return clustering_key::from_exploded(*s, {timeuuid_type->decompose(id), long_type->decompose(dht::token::to_int64(range_end))}) ;
+    };
 
-    size_t limit = std::max(limit_of_streams_in_topology_description(), desc.entries().size());
-    if (limit >= streams_count) {
-        return std::move(desc);
-    }
-    size_t streams_per_vnode_limit = limit / desc.entries().size();
-    auto entries = std::move(desc).entries();
-    auto start = entries.back().token_range_end;
-    for (size_t idx = 0; idx < entries.size(); ++idx) {
-        auto end = entries[idx].token_range_end;
-        if (entries[idx].streams.size() > streams_per_vnode_limit) {
-            entries[idx].streams =
-                create_stream_ids(idx, start, end, streams_per_vnode_limit, entries[idx].sharding_ignore_msb);
-        }
-        start = end;
-    }
-    return topology_description(std::move(entries));
+    co_return co_await get_common_cdc_generation_mutations(s, pkey, std::move(get_ckey), desc, mutation_size_threshold, ts);
 }
 
-future<cdc::generation_id> generation_service::make_new_generation(const std::unordered_set<dht::token>& bootstrap_tokens, bool add_delay) {
+// Compute a set of tokens that split the token ring into vnodes.
+static auto get_tokens(const std::unordered_set<dht::token>& bootstrap_tokens, const locator::token_metadata_ptr tmptr) {
+    auto tokens = tmptr->sorted_tokens();
+    auto it = tokens.insert(tokens.end(), bootstrap_tokens.begin(), bootstrap_tokens.end());
+    std::sort(it, tokens.end());
+    std::inplace_merge(tokens.begin(), it, tokens.end());
+    tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+    return tokens;
+}
+
+static token_range_description create_token_range_description(
+        size_t index,
+        dht::token start,
+        dht::token end,
+        const noncopyable_function<std::pair<size_t, uint8_t> (dht::token)>& get_sharding_info) {
+    token_range_description desc;
+
+    desc.token_range_end = end;
+
+    auto [shard_count, ignore_msb] = get_sharding_info(end);
+    desc.streams = create_stream_ids(index, start, end, shard_count, ignore_msb);
+    desc.sharding_ignore_msb = ignore_msb;
+
+    return desc;
+}
+
+cdc::topology_description make_new_generation_description(
+        const std::unordered_set<dht::token>& bootstrap_tokens,
+        const noncopyable_function<std::pair<size_t, uint8_t>(dht::token)>& get_sharding_info,
+        const locator::token_metadata_ptr tmptr) {
+    const auto tokens = get_tokens(bootstrap_tokens, tmptr);
+    if (tokens.empty()) {
+        on_internal_error(cdc_log, "Attempted to create a CDC generation from an empty list of tokens");
+    }
+
+    utils::chunked_vector<token_range_description> vnode_descriptions;
+    vnode_descriptions.reserve(tokens.size());
+
+    vnode_descriptions.push_back(create_token_range_description(0, tokens.back(), tokens.front(), get_sharding_info));
+    for (size_t idx = 1; idx < tokens.size(); ++idx) {
+        vnode_descriptions.push_back(create_token_range_description(idx, tokens[idx - 1], tokens[idx], get_sharding_info));
+    }
+
+    return {std::move(vnode_descriptions)};
+}
+
+db_clock::time_point new_generation_timestamp(bool add_delay, std::chrono::milliseconds ring_delay) {
     using namespace std::chrono;
     using namespace std::chrono_literals;
 
-    const locator::token_metadata_ptr tmptr = _token_metadata.get();
-    auto gen = topology_description_generator(_cfg.ignore_msb_bits, bootstrap_tokens, tmptr, _gossiper).generate();
-
-    // We need to call this as late in the procedure as possible.
-    // In the V2 format we can do this after inserting the generation data into the table;
-    // in the V1 format we must do it before (because the timestamp is the partition key in the V1 format).
-    auto new_generation_timestamp = [add_delay, ring_delay = _cfg.ring_delay] {
-        auto ts = db_clock::now();
-        if (add_delay && ring_delay != 0ms) {
-            ts += 2 * ring_delay + duration_cast<milliseconds>(generation_leeway);
-        }
-        return ts;
-    };
-
-    // Our caller should ensure that there are normal tokens in the token ring.
-    auto normal_token_owners = tmptr->count_normal_token_owners();
-    assert(normal_token_owners);
-
-    if (_feature_service.cluster_supports_cdc_generations_v2()) {
-        auto uuid = utils::make_random_uuid();
-        cdc_log.info("Inserting new generation data at UUID {}", uuid);
-        // This may take a while.
-        co_await _sys_dist_ks.local().insert_cdc_generation(uuid, gen, { normal_token_owners });
-
-        // Begin the race.
-        cdc::generation_id_v2 gen_id{new_generation_timestamp(), uuid};
-
-        cdc_log.info("New CDC generation: {}", gen_id);
-        co_return gen_id;
+    auto ts = db_clock::now();
+    if (add_delay && ring_delay != 0ms) {
+        ts += 2 * ring_delay + duration_cast<milliseconds>(get_generation_leeway());
     }
-
-    // The CDC_GENERATIONS_V2 feature is not enabled: some nodes may still not understand the V2 format.
-    // We must create a generation in the old format.
-
-    // If the cluster is large we may end up with a generation that contains
-    // large number of streams. This is problematic because we store the
-    // generation in a single row (V1 format). For a generation with large number of rows
-    // this will lead to a row that can be as big as 32MB. This is much more
-    // than the limit imposed by commitlog_segment_size_in_mb. If the size of
-    // the row that describes a new generation grows above
-    // commitlog_segment_size_in_mb, the write will fail and the new node won't
-    // be able to join. To avoid such problem we make sure that such row is
-    // always smaller than 4MB. We do that by removing some CDC streams from
-    // each vnode if the total number of streams is too large.
-    gen = limit_number_of_streams_if_needed(std::move(gen));
-
-    cdc_log.warn(
-        "Creating a new CDC generation in the old storage format due to a partially upgraded cluster:"
-        " the CDC_GENERATIONS_V2 feature is known by this node, but not enabled in the cluster."
-        " The old storage format forces us to create a suboptimal generation."
-        " It is recommended to finish the upgrade and then create a new generation either by bootstrapping"
-        " a new node or running the checkAndRepairCdcStreams nodetool command.");
-
-    // Begin the race.
-    cdc::generation_id_v1 gen_id{new_generation_timestamp()};
-
-    co_await _sys_dist_ks.local().insert_cdc_topology_description(gen_id, std::move(gen), { normal_token_owners });
-
-    cdc_log.info("New CDC generation: {}", gen_id);
-    co_return gen_id;
-}
-
-/* Retrieves CDC streams generation timestamp from the given endpoint's application state (broadcasted through gossip).
- * We might be during a rolling upgrade, so the timestamp might not be there (if the other node didn't upgrade yet),
- * but if the cluster already supports CDC, then every newly joining node will propose a new CDC generation,
- * which means it will gossip the generation's timestamp.
- */
-static std::optional<cdc::generation_id> get_generation_id_for(const gms::inet_address& endpoint, const gms::gossiper& g) {
-    auto gen_id_string = g.get_application_state_value(endpoint, gms::application_state::CDC_GENERATION_ID);
-    cdc_log.trace("endpoint={}, gen_id_string={}", endpoint, gen_id_string);
-    return gms::versioned_value::cdc_generation_id_from_string(gen_id_string);
-}
-
-static future<std::optional<cdc::topology_description>> retrieve_generation_data(
-        cdc::generation_id gen_id,
-        db::system_distributed_keyspace& sys_dist_ks,
-        db::system_distributed_keyspace::context ctx) {
-    return std::visit(make_visitor(
-    [&] (const cdc::generation_id_v1& id) {
-        return sys_dist_ks.read_cdc_topology_description(id, ctx);
-    },
-    [&] (const cdc::generation_id_v2& id) {
-        return sys_dist_ks.read_cdc_generation(id.id);
-    }
-    ), gen_id);
-}
-
-static future<> do_update_streams_description(
-        cdc::generation_id gen_id,
-        db::system_distributed_keyspace& sys_dist_ks,
-        db::system_distributed_keyspace::context ctx) {
-    if (co_await sys_dist_ks.cdc_desc_exists(get_ts(gen_id), ctx)) {
-        cdc_log.info("Generation {}: streams description table already updated.", gen_id);
-        co_return;
-    }
-
-    // We might race with another node also inserting the description, but that's ok. It's an idempotent operation.
-
-    auto topo = co_await retrieve_generation_data(gen_id, sys_dist_ks, ctx);
-    if (!topo) {
-        throw no_generation_data_exception(gen_id);
-    }
-
-    co_await sys_dist_ks.create_cdc_desc(get_ts(gen_id), *topo, ctx);
-    cdc_log.info("CDC description table successfully updated with generation {}.", gen_id);
-}
-
-/* Inform CDC users about a generation of streams (identified by the given timestamp)
- * by inserting it into the cdc_streams table.
- *
- * Assumes that the cdc_generation_descriptions table contains this generation.
- *
- * Returning from this function does not mean that the table update was successful: the function
- * might run an asynchronous task in the background.
- */
-static future<> update_streams_description(
-        cdc::generation_id gen_id,
-        shared_ptr<db::system_distributed_keyspace> sys_dist_ks,
-        noncopyable_function<unsigned()> get_num_token_owners,
-        abort_source& abort_src) {
-    try {
-        co_await do_update_streams_description(gen_id, *sys_dist_ks, { get_num_token_owners() });
-    } catch (...) {
-        cdc_log.warn(
-            "Could not update CDC description table with generation {}: {}. Will retry in the background.",
-            gen_id, std::current_exception());
-
-        // It is safe to discard this future: we keep system distributed keyspace alive.
-        (void)(([] (cdc::generation_id gen_id,
-                    shared_ptr<db::system_distributed_keyspace> sys_dist_ks,
-                    noncopyable_function<unsigned()> get_num_token_owners,
-                    abort_source& abort_src) -> future<> {
-            while (true) {
-                co_await sleep_abortable(std::chrono::seconds(60), abort_src);
-                try {
-                    co_await do_update_streams_description(gen_id, *sys_dist_ks, { get_num_token_owners() });
-                    co_return;
-                } catch (...) {
-                    cdc_log.warn(
-                        "Could not update CDC description table with generation {}: {}. Will try again.",
-                        gen_id, std::current_exception());
-                }
-            }
-        })(gen_id, std::move(sys_dist_ks), std::move(get_num_token_owners), abort_src));
-    }
-}
-
-static db_clock::time_point as_timepoint(const utils::UUID& uuid) {
-    return db_clock::time_point(utils::UUID_gen::unix_timestamp(uuid));
-}
-
-static future<std::vector<db_clock::time_point>> get_cdc_desc_v1_timestamps(
-        db::system_distributed_keyspace& sys_dist_ks,
-        abort_source& abort_src,
-        const noncopyable_function<unsigned()>& get_num_token_owners) {
-    while (true) {
-        try {
-            co_return co_await sys_dist_ks.get_cdc_desc_v1_timestamps({ get_num_token_owners() });
-        } catch (...) {
-            cdc_log.warn(
-                    "Failed to retrieve generation timestamps for rewriting: {}. Retrying in 60s.",
-                    std::current_exception());
-        }
-        co_await sleep_abortable(std::chrono::seconds(60), abort_src);
-    }
-}
-
-// Contains a CDC log table's creation time (extracted from its schema's id)
-// and its CDC TTL setting.
-struct time_and_ttl {
-    db_clock::time_point creation_time;
-    int ttl;
-};
-
-/*
- * See `maybe_rewrite_streams_descriptions`.
- * This is the long-running-in-the-background part of that function.
- * It returns the timestamp of the last rewritten generation (if any).
- */
-static future<std::optional<cdc::generation_id_v1>> rewrite_streams_descriptions(
-        std::vector<time_and_ttl> times_and_ttls,
-        shared_ptr<db::system_distributed_keyspace> sys_dist_ks,
-        noncopyable_function<unsigned()> get_num_token_owners,
-        abort_source& abort_src) {
-    cdc_log.info("Retrieving generation timestamps for rewriting...");
-    auto tss = co_await get_cdc_desc_v1_timestamps(*sys_dist_ks, abort_src, get_num_token_owners);
-    cdc_log.info("Generation timestamps retrieved.");
-
-    // Find first generation timestamp such that some CDC log table may contain data before this timestamp.
-    // This predicate is monotonic w.r.t the timestamps.
-    auto now = db_clock::now();
-    std::sort(tss.begin(), tss.end());
-    auto first = std::partition_point(tss.begin(), tss.end(), [&] (db_clock::time_point ts) {
-        // partition_point finds first element that does *not* satisfy the predicate.
-        return std::none_of(times_and_ttls.begin(), times_and_ttls.end(),
-                [&] (const time_and_ttl& tat) {
-            // In this CDC log table there are no entries older than the table's creation time
-            // or (now - the table's ttl). We subtract 10s to account for some possible clock drift.
-            // If ttl is set to 0 then entries in this table never expire. In that case we look
-            // only at the table's creation time.
-            auto no_entries_older_than =
-                (tat.ttl == 0 ? tat.creation_time : std::max(tat.creation_time, now - std::chrono::seconds(tat.ttl)))
-                    - std::chrono::seconds(10);
-            return no_entries_older_than < ts;
-        });
-    });
-
-    // Find first generation timestamp such that some CDC log table may contain data in this generation.
-    // This and all later generations need to be written to the new streams table.
-    if (first != tss.begin()) {
-        --first;
-    }
-
-    if (first == tss.end()) {
-        cdc_log.info("No generations to rewrite.");
-        co_return std::nullopt;
-    }
-
-    cdc_log.info("First generation to rewrite: {}", *first);
-
-    bool each_success = true;
-    co_await max_concurrent_for_each(first, tss.end(), 10, [&] (db_clock::time_point ts) -> future<> {
-        while (true) {
-            try {
-                co_return co_await do_update_streams_description(cdc::generation_id_v1{ts}, *sys_dist_ks, { get_num_token_owners() });
-            } catch (const no_generation_data_exception& e) {
-                cdc_log.error("Failed to rewrite streams for generation {}: {}. Giving up.", ts, e);
-                each_success = false;
-                co_return;
-            } catch (...) {
-                cdc_log.warn("Failed to rewrite streams for generation {}: {}. Retrying in 60s.", ts, std::current_exception());
-            }
-            co_await sleep_abortable(std::chrono::seconds(60), abort_src);
-        }
-    });
-
-    if (each_success) {
-        cdc_log.info("Rewriting stream tables finished successfully.");
-    } else {
-        cdc_log.info("Rewriting stream tables finished, but some generations could not be rewritten (check the logs).");
-    }
-
-    if (first != tss.end()) {
-        co_return cdc::generation_id_v1{*std::prev(tss.end())};
-    }
-
-    co_return std::nullopt;
-}
-
-future<> generation_service::maybe_rewrite_streams_descriptions() {
-    if (!_db.has_schema(_sys_dist_ks.local().NAME, _sys_dist_ks.local().CDC_DESC_V1)) {
-        // This cluster never went through a Scylla version which used this table
-        // or the user deleted the table. Nothing to do.
-        co_return;
-    }
-
-    if (co_await db::system_keyspace::cdc_is_rewritten()) {
-        co_return;
-    }
-
-    if (_cfg.dont_rewrite_streams) {
-        cdc_log.warn("Stream rewriting disabled. Manual administrator intervention may be required...");
-        co_return;
-    }
-
-    // For each CDC log table get the TTL setting (from CDC options) and the table's creation time
-    std::vector<time_and_ttl> times_and_ttls;
-    for (auto& [_, cf] : _db.get_column_families()) {
-        auto& s = *cf->schema();
-        auto base = cdc::get_base_table(_db, s.ks_name(), s.cf_name());
-        if (!base) {
-            // Not a CDC log table.
-            continue;
-        }
-        auto& cdc_opts = base->cdc_options();
-        if (!cdc_opts.enabled()) {
-            // This table is named like a CDC log table but it's not one.
-            continue;
-        }
-
-        times_and_ttls.push_back(time_and_ttl{as_timepoint(s.id()), cdc_opts.ttl()});
-    }
-
-    if (times_and_ttls.empty()) {
-        // There's no point in rewriting old generations' streams (they don't contain any data).
-        cdc_log.info("No CDC log tables present, not rewriting stream tables.");
-        co_return co_await db::system_keyspace::cdc_set_rewritten(std::nullopt);
-    }
-
-    auto get_num_token_owners = [tm = _token_metadata.get()] { return tm->count_normal_token_owners(); };
-
-    // This code is racing with node startup. At this point, we're most likely still waiting for gossip to settle
-    // and some nodes that are UP may still be marked as DOWN by us.
-    // Let's sleep a bit to increase the chance that the first attempt at rewriting succeeds (it's still ok if
-    // it doesn't - we'll retry - but it's nice if we succeed without any warnings).
-    co_await sleep_abortable(std::chrono::seconds(10), _abort_src);
-
-    cdc_log.info("Rewriting stream tables in the background...");
-    auto last_rewritten = co_await rewrite_streams_descriptions(
-            std::move(times_and_ttls),
-            _sys_dist_ks.local_shared(),
-            std::move(get_num_token_owners),
-            _abort_src);
-
-    co_await db::system_keyspace::cdc_set_rewritten(last_rewritten);
-}
-
-static void assert_shard_zero(const sstring& where) {
-    if (this_shard_id() != 0) {
-        on_internal_error(cdc_log, format("`{}`: must be run on shard 0", where));
-    }
+    return ts;
 }
 
 class and_reducer {
@@ -661,400 +394,454 @@ public:
     }
 };
 
-class generation_handling_nonfatal_exception : public std::runtime_error {
-    using std::runtime_error::runtime_error;
-};
-
-constexpr char could_not_retrieve_msg_template[]
-        = "Could not retrieve CDC streams with timestamp {} upon gossip event. Reason: \"{}\". Action: {}.";
-
 generation_service::generation_service(
-            config cfg, gms::gossiper& g, sharded<db::system_distributed_keyspace>& sys_dist_ks,
-            abort_source& abort_src, const locator::shared_token_metadata& stm, gms::feature_service& f,
+            config cfg,
+            sharded<db::system_keyspace>& sys_ks,
             replica::database& db)
         : _cfg(std::move(cfg))
-        , _gossiper(g)
-        , _sys_dist_ks(sys_dist_ks)
-        , _abort_src(abort_src)
-        , _token_metadata(stm)
-        , _feature_service(f)
+        , _sys_ks(sys_ks)
         , _db(db)
 {
 }
 
 future<> generation_service::stop() {
-    try {
-        co_await std::move(_cdc_streams_rewrite_complete);
-    } catch (...) {
-        cdc_log.error("CDC stream rewrite failed: ", std::current_exception());
-    }
-
-    if (this_shard_id() == 0) {
-        co_await _gossiper.unregister_(shared_from_this());
-    }
-
     _stopped = true;
+    return make_ready_future<>();
 }
 
 generation_service::~generation_service() {
-    assert(_stopped);
+    SCYLLA_ASSERT(_stopped);
 }
 
-future<> generation_service::after_join(std::optional<cdc::generation_id>&& startup_gen_id) {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-    assert(db::system_keyspace::bootstrap_complete());
-
-    _gen_id = std::move(startup_gen_id);
-    _gossiper.register_(shared_from_this());
-
-    _joined = true;
-
-    // Retrieve the latest CDC generation seen in gossip (if any).
-    co_await scan_cdc_generations();
-
-    // Ensure that the new CDC stream description table has all required streams.
-    // See the function's comment for details.
-    //
-    // Since this depends on the entire cluster (and therefore we cannot guarantee
-    // timely completion), run it in the background and wait for it in stop().
-    _cdc_streams_rewrite_complete = maybe_rewrite_streams_descriptions();
-}
-
-future<> generation_service::on_join(gms::inet_address ep, gms::endpoint_state ep_state) {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    auto val = ep_state.get_application_state_ptr(gms::application_state::CDC_GENERATION_ID);
-    if (!val) {
-        return make_ready_future();
-    }
-
-    return on_change(ep, gms::application_state::CDC_GENERATION_ID, *val);
-}
-
-future<> generation_service::on_change(gms::inet_address ep, gms::application_state app_state, const gms::versioned_value& v) {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    if (app_state != gms::application_state::CDC_GENERATION_ID) {
-        return make_ready_future();
-    }
-
-    auto gen_id = gms::versioned_value::cdc_generation_id_from_string(v.value);
-    cdc_log.debug("Endpoint: {}, CDC generation ID change: {}", ep, gen_id);
-
-    return handle_cdc_generation(gen_id);
-}
-
-future<> generation_service::check_and_repair_cdc_streams() {
-    if (!_joined) {
-        throw std::runtime_error("check_and_repair_cdc_streams: node not initialized yet");
-    }
-
-    std::optional<cdc::generation_id> latest = _gen_id;
-    const auto& endpoint_states = _gossiper.get_endpoint_states();
-    for (const auto& [addr, state] : endpoint_states) {
-        if (_gossiper.is_left(addr)) {
-            cdc_log.info("check_and_repair_cdc_streams ignored node {} because it is in LEFT state", addr);
-            continue;
-        }
-        if (!_gossiper.is_normal(addr)) {
-            throw std::runtime_error(format("All nodes must be in NORMAL or LEFT state while performing check_and_repair_cdc_streams"
-                    " ({} is in state {})", addr, _gossiper.get_gossip_status(state)));
-        }
-
-        const auto gen_id = get_generation_id_for(addr, _gossiper);
-        if (!latest || (gen_id && get_ts(*gen_id) > get_ts(*latest))) {
-            latest = gen_id;
-        }
-    }
-
-    auto tmptr = _token_metadata.get();
-    auto sys_dist_ks = get_sys_dist_ks();
-
-    bool should_regenerate = false;
-
-    if (!latest) {
-        cdc_log.warn("check_and_repair_cdc_streams: no generation observed in gossip");
-        should_regenerate = true;
-    } else if (std::holds_alternative<cdc::generation_id_v1>(*latest)
-            && _feature_service.cluster_supports_cdc_generations_v2()) {
-        cdc_log.info(
-            "Cluster still using CDC generation storage format V1 (id: {}), even though it already understands the V2 format."
-            " Creating a new generation using V2.", *latest);
-        should_regenerate = true;
-    } else {
-        cdc_log.info("check_and_repair_cdc_streams: last generation observed in gossip: {}", *latest);
-
-        static const auto timeout_msg = "Timeout while fetching CDC topology description";
-        static const auto topology_read_error_note = "Note: this is likely caused by"
-                " node(s) being down or unreachable. It is recommended to check the network and"
-                " restart/remove the failed node(s), then retry checkAndRepairCdcStreams command";
-        static const auto exception_translating_msg = "Translating the exception to `request_execution_exception`";
-
-        std::optional<topology_description> gen;
-        try {
-            gen = co_await retrieve_generation_data(*latest, *sys_dist_ks, { tmptr->count_normal_token_owners() });
-        } catch (exceptions::request_timeout_exception& e) {
-            cdc_log.error("{}: \"{}\". {}.", timeout_msg, e.what(), exception_translating_msg);
-            throw exceptions::request_execution_exception(exceptions::exception_code::READ_TIMEOUT,
-                    format("{}. {}.", timeout_msg, topology_read_error_note));
-        } catch (exceptions::unavailable_exception& e) {
-            static const auto unavailable_msg = "Node(s) unavailable while fetching CDC topology description";
-            cdc_log.error("{}: \"{}\". {}.", unavailable_msg, e.what(), exception_translating_msg);
-            throw exceptions::request_execution_exception(exceptions::exception_code::UNAVAILABLE,
-                    format("{}. {}.", unavailable_msg, topology_read_error_note));
-        } catch (...) {
-            const auto ep = std::current_exception();
-            if (is_timeout_exception(ep)) {
-                cdc_log.error("{}: \"{}\". {}.", timeout_msg, ep, exception_translating_msg);
-                throw exceptions::request_execution_exception(exceptions::exception_code::READ_TIMEOUT,
-                        format("{}. {}.", timeout_msg, topology_read_error_note));
-            }
-            // On exotic errors proceed with regeneration
-            cdc_log.error("Exception while reading CDC topology description: \"{}\". Regenerating streams anyway.", ep);
-            should_regenerate = true;
-        }
-
-        if (!gen) {
-            cdc_log.error(
-                "Could not find CDC generation with timestamp {} in distributed system tables (current time: {}),"
-                " even though some node gossiped about it.",
-                latest, db_clock::now());
-            should_regenerate = true;
-        } else {
-            if (tmptr->sorted_tokens().size() != gen->entries().size()) {
-                // We probably have garbage streams from old generations
-                cdc_log.info("Generation size does not match the token ring, regenerating");
-                should_regenerate = true;
-            } else {
-                std::unordered_set<dht::token> gen_ends;
-                for (const auto& entry : gen->entries()) {
-                    gen_ends.insert(entry.token_range_end);
-                }
-                for (const auto& metadata_token : tmptr->sorted_tokens()) {
-                    if (!gen_ends.contains(metadata_token)) {
-                        cdc_log.warn("CDC generation {} missing token {}. Regenerating.", latest, metadata_token);
-                        should_regenerate = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    if (!should_regenerate) {
-        if (latest != _gen_id) {
-            co_await do_handle_cdc_generation(*latest);
-        }
-        cdc_log.info("CDC generation {} does not need repair", latest);
-        co_return;
-    }
-
-    const auto new_gen_id = co_await make_new_generation({}, true);
-
-    // Need to artificially update our STATUS so other nodes handle the generation ID change
-    // FIXME: after 0e0282cd nodes do not require a STATUS update to react to CDC generation changes.
-    // The artificial STATUS update here should eventually be removed (in a few releases).
-    auto status = _gossiper.get_application_state_ptr(
-            utils::fb_utilities::get_broadcast_address(), gms::application_state::STATUS);
-    if (!status) {
-        cdc_log.error("Our STATUS is missing");
-        cdc_log.error("Aborting CDC generation repair due to missing STATUS");
-        co_return;
-    }
-    // Update _gen_id first, so that do_handle_cdc_generation (which will get called due to the status update)
-    // won't try to update the gossiper, which would result in a deadlock inside add_local_application_state
-    _gen_id = new_gen_id;
-    co_await _gossiper.add_local_application_state({
-            { gms::application_state::CDC_GENERATION_ID, gms::versioned_value::cdc_generation_id(new_gen_id) },
-            { gms::application_state::STATUS, *status }
-    });
-    co_await db::system_keyspace::update_cdc_generation_id(new_gen_id);
-}
-
-future<> generation_service::handle_cdc_generation(std::optional<cdc::generation_id> gen_id) {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    if (!gen_id) {
-        co_return;
-    }
-
-    if (!db::system_keyspace::bootstrap_complete() || !_sys_dist_ks.local_is_initialized()
-            || !_sys_dist_ks.local().started()) {
-        // The service should not be listening for generation changes until after the node
-        // is bootstrapped. Therefore we would previously assume that this condition
-        // can never become true and call on_internal_error here, but it turns out that
-        // it may become true on decommission: the node enters NEEDS_BOOTSTRAP
-        // state before leaving the token ring, so bootstrap_complete() becomes false.
-        // In that case we can simply return.
-        co_return;
-    }
-
-    if (co_await container().map_reduce(and_reducer(), [ts = get_ts(*gen_id)] (generation_service& svc) {
+future<> generation_service::handle_cdc_generation(cdc::generation_id gen_id) {
+    auto ts = get_ts(gen_id);
+    if (co_await container().map_reduce(and_reducer(), [ts] (generation_service& svc) {
         return !svc._cdc_metadata.prepare(ts);
     })) {
         co_return;
     }
 
-    bool using_this_gen = false;
-    try {
-        using_this_gen = co_await do_handle_cdc_generation_intercept_nonfatal_errors(*gen_id);
-    } catch (generation_handling_nonfatal_exception& e) {
-        cdc_log.warn(could_not_retrieve_msg_template, gen_id, e.what(), "retrying in the background");
-        async_handle_cdc_generation(*gen_id);
-        co_return;
-    } catch (...) {
-        cdc_log.error(could_not_retrieve_msg_template, gen_id, std::current_exception(), "not retrying");
-        co_return; // Exotic ("fatal") exception => do not retry
-    }
+    auto gen_data = co_await _sys_ks.local().read_cdc_generation(gen_id.id);
+
+    bool using_this_gen = co_await container().map_reduce(or_reducer(), [ts, &gen_data] (generation_service& svc) -> future<bool> {
+        // We need to copy it here before awaiting anything to avoid destruction of the captures.
+        const auto timestamp = ts;
+        topology_description gen_copy = co_await gen_data.clone_async();
+        co_return svc._cdc_metadata.insert(timestamp, std::move(gen_copy));
+    });
 
     if (using_this_gen) {
-        cdc_log.info("Starting to use generation {}", *gen_id);
-        co_await update_streams_description(*gen_id, get_sys_dist_ks(),
-                [tmptr = _token_metadata.get()] { return tmptr->count_normal_token_owners(); },
-                _abort_src);
+        cdc_log.info("Started using generation {}.", gen_id);
     }
-}
-
-void generation_service::async_handle_cdc_generation(cdc::generation_id gen_id) {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    (void)(([] (cdc::generation_id gen_id, shared_ptr<generation_service> svc) -> future<> {
-        while (true) {
-            co_await sleep_abortable(std::chrono::seconds(5), svc->_abort_src);
-
-            try {
-                bool using_this_gen = co_await svc->do_handle_cdc_generation_intercept_nonfatal_errors(gen_id);
-                if (using_this_gen) {
-                    cdc_log.info("Starting to use generation {}", gen_id);
-                    co_await update_streams_description(gen_id, svc->get_sys_dist_ks(),
-                            [tmptr = svc->_token_metadata.get()] { return tmptr->count_normal_token_owners(); },
-                            svc->_abort_src);
-                }
-                co_return;
-            } catch (generation_handling_nonfatal_exception& e) {
-                cdc_log.warn(could_not_retrieve_msg_template, gen_id, e.what(), "continuing to retry in the background");
-            } catch (...) {
-                cdc_log.error(could_not_retrieve_msg_template, gen_id, std::current_exception(), "not retrying anymore");
-                co_return; // Exotic ("fatal") exception => do not retry
-            }
-
-            if (co_await svc->container().map_reduce(and_reducer(), [ts = get_ts(gen_id)] (generation_service& svc) {
-                return svc._cdc_metadata.known_or_obsolete(ts);
-            })) {
-                co_return;
-            }
-        }
-    })(gen_id, shared_from_this()));
-}
-
-future<> generation_service::scan_cdc_generations() {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    std::optional<cdc::generation_id> latest;
-    for (const auto& ep: _gossiper.get_endpoint_states()) {
-        auto gen_id = get_generation_id_for(ep.first, _gossiper);
-        if (!latest || (gen_id && get_ts(*gen_id) > get_ts(*latest))) {
-            latest = gen_id;
-        }
-    }
-
-    if (latest) {
-        cdc_log.info("Latest generation seen during startup: {}", *latest);
-        co_await handle_cdc_generation(latest);
-    } else {
-        cdc_log.info("No generation seen during startup.");
-    }
-}
-
-future<bool> generation_service::do_handle_cdc_generation_intercept_nonfatal_errors(cdc::generation_id gen_id) {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    // Use futurize_invoke to catch all exceptions from do_handle_cdc_generation.
-    return futurize_invoke([this, gen_id] {
-        return do_handle_cdc_generation(gen_id);
-    }).handle_exception([] (std::exception_ptr ep) -> future<bool> {
-        try {
-            std::rethrow_exception(ep);
-        } catch (exceptions::request_timeout_exception& e) {
-            throw generation_handling_nonfatal_exception(e.what());
-        } catch (exceptions::unavailable_exception& e) {
-            throw generation_handling_nonfatal_exception(e.what());
-        } catch (exceptions::read_failure_exception& e) {
-            throw generation_handling_nonfatal_exception(e.what());
-        } catch (...) {
-            const auto ep = std::current_exception();
-            if (is_timeout_exception(ep)) {
-                throw generation_handling_nonfatal_exception(format("{}", ep));
-            }
-            throw;
-        }
-    });
-}
-
-future<bool> generation_service::do_handle_cdc_generation(cdc::generation_id gen_id) {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    auto sys_dist_ks = get_sys_dist_ks();
-    auto gen = co_await retrieve_generation_data(gen_id, *sys_dist_ks, { _token_metadata.get()->count_normal_token_owners() });
-    if (!gen) {
-        throw std::runtime_error(format(
-            "Could not find CDC generation {} in distributed system tables (current time: {}),"
-            " even though some node gossiped about it.",
-            gen_id, db_clock::now()));
-    }
-
-    // We always gossip about the generation with the greatest timestamp. Specific nodes may remember older generations,
-    // but eventually they forget when their clocks move past the latest generation's timestamp.
-    // The cluster as a whole is only interested in the last generation so restarting nodes may learn what it is.
-    // We assume that generation changes don't happen ``too often'' so every node can learn about a generation
-    // before it is superseded by a newer one which causes nodes to start gossiping the about the newer one.
-    // The assumption follows from the requirement of bootstrapping nodes sequentially.
-    if (!_gen_id || get_ts(*_gen_id) < get_ts(gen_id)) {
-        _gen_id = gen_id;
-        co_await db::system_keyspace::update_cdc_generation_id(gen_id);
-        co_await _gossiper.add_local_application_state(
-                gms::application_state::CDC_GENERATION_ID, gms::versioned_value::cdc_generation_id(gen_id));
-    }
-
-    // Return `true` iff the generation was inserted on any of our shards.
-    co_return co_await container().map_reduce(or_reducer(), [ts = get_ts(gen_id), &gen] (generation_service& svc) {
-        auto gen_ = *gen;
-        return svc._cdc_metadata.insert(ts, std::move(gen_));
-    });
-}
-
-shared_ptr<db::system_distributed_keyspace> generation_service::get_sys_dist_ks() {
-    assert_shard_zero(__PRETTY_FUNCTION__);
-
-    if (!_sys_dist_ks.local_is_initialized()) {
-        throw std::runtime_error("system distributed keyspace not initialized");
-    }
-
-    return _sys_dist_ks.local_shared();
-}
-
-std::ostream& operator<<(std::ostream& os, const generation_id& gen_id) {
-    std::visit(make_visitor(
-    [&os] (const generation_id_v1& id) { os << id.ts; },
-    [&os] (const generation_id_v2& id) { os << "(" << id.ts << ", " << id.id << ")"; }
-    ), gen_id);
-    return os;
-}
-
-bool operator==(const generation_id& a, const generation_id& b) {
-    return std::visit(make_visitor(
-    [] (const generation_id_v1& a, const generation_id_v1& b) { return a.ts == b.ts; },
-    [] (const generation_id_v2& a, const generation_id_v2& b) { return a.ts == b.ts && a.id == b.id; },
-    [] (const generation_id_v1& a, const generation_id_v2& b) { return false; },
-    [] (const generation_id_v2& a, const generation_id_v1& b) { return false; }
-    ), a, b);
 }
 
 db_clock::time_point get_ts(const generation_id& gen_id) {
-    return std::visit(make_visitor(
-    [] (const generation_id_v1& id) { return id.ts; },
-    [] (const generation_id_v2& id) { return id.ts; }
-    ), gen_id);
+    return gen_id.ts;
+}
+
+future<mutation> create_table_streams_mutation(table_id table, db_clock::time_point stream_ts, const locator::tablet_map& map, api::timestamp_type ts) {
+    auto s = db::system_keyspace::cdc_streams_state();
+
+    mutation m(s, partition_key::from_single_value(*s,
+        data_value(table.uuid()).serialize_nonnull()
+    ));
+    m.set_static_cell("timestamp", stream_ts, ts);
+
+    for (auto tid : map.tablet_ids()) {
+        auto sid = cdc::stream_id(map.get_last_token(tid), 0);
+        auto ck = clustering_key::from_singular(*s, dht::token::to_int64(sid.token()));
+        m.set_cell(ck, "stream_id", data_value(std::move(sid).to_bytes()), ts);
+        co_await coroutine::maybe_yield();
+    }
+
+    co_return std::move(m);
+}
+
+future<mutation> create_table_streams_mutation(table_id table, db_clock::time_point stream_ts, const utils::chunked_vector<cdc::stream_id>& stream_ids, api::timestamp_type ts) {
+    auto s = db::system_keyspace::cdc_streams_state();
+
+    mutation m(s, partition_key::from_single_value(*s,
+        data_value(table.uuid()).serialize_nonnull()
+    ));
+    m.set_static_cell("timestamp", stream_ts, ts);
+
+    for (const auto& sid : stream_ids) {
+        auto ck = clustering_key::from_singular(*s, dht::token::to_int64(sid.token()));
+        m.set_cell(ck, "stream_id", data_value(sid.to_bytes()), ts);
+        co_await coroutine::maybe_yield();
+    }
+
+    co_return std::move(m);
+}
+
+utils::chunked_vector<mutation>
+make_drop_table_streams_mutations(table_id table, api::timestamp_type ts) {
+    utils::chunked_vector<mutation> mutations;
+    mutations.reserve(2);
+    for (auto s : {db::system_keyspace::cdc_streams_state(),
+                   db::system_keyspace::cdc_streams_history()}) {
+        mutation m(s, partition_key::from_single_value(*s,
+            data_value(table.uuid()).serialize_nonnull()
+        ));
+        m.partition().apply(tombstone(ts, gc_clock::now()));
+        mutations.emplace_back(std::move(m));
+    }
+    return mutations;
+}
+
+future<> generation_service::load_cdc_tablet_streams(std::optional<std::unordered_set<table_id>> changed_tables) {
+    // track which tables we expect to get data for, and which we actually get.
+    // when a table is dropped we won't get any streams for it. we will use this to
+    // know which tables are dropped and remove their stream map from the metadata.
+    std::unordered_set<table_id> tables_to_process;
+    if (changed_tables) {
+        tables_to_process = *changed_tables;
+    } else {
+        tables_to_process = _cdc_metadata.get_tables_with_cdc_tablet_streams() | std::ranges::to<std::unordered_set<table_id>>();
+    }
+
+    auto read_streams_state = [this] (const std::optional<std::unordered_set<table_id>>& tables, noncopyable_function<future<>(table_id, db_clock::time_point, utils::chunked_vector<cdc::stream_id>)> f) -> future<> {
+        if (tables) {
+            for (auto table : *tables) {
+                co_await _sys_ks.local().read_cdc_streams_state(table, [&] (table_id table, db_clock::time_point base_ts, utils::chunked_vector<cdc::stream_id> base_stream_set) -> future<> {
+                    return f(table, base_ts, std::move(base_stream_set));
+                });
+            }
+        } else {
+            co_await _sys_ks.local().read_cdc_streams_state(std::nullopt, [&] (table_id table, db_clock::time_point base_ts, utils::chunked_vector<cdc::stream_id> base_stream_set) -> future<> {
+                return f(table, base_ts, std::move(base_stream_set));
+            });
+        }
+    };
+
+    co_await read_streams_state(changed_tables, [this, &tables_to_process] (table_id table, db_clock::time_point base_ts, utils::chunked_vector<cdc::stream_id> base_stream_set) -> future<> {
+        table_streams new_table_map;
+
+        auto append_stream = [&new_table_map] (db_clock::time_point stream_tp, utils::chunked_vector<cdc::stream_id> stream_set) {
+            auto ts = std::chrono::duration_cast<api::timestamp_clock::duration>(stream_tp.time_since_epoch()).count();
+            new_table_map[ts] = committed_stream_set {stream_tp, std::move(stream_set)};
+        };
+
+        // if we already have a loaded streams map, and the base timestamp is unchanged, then read
+        // the history entries starting from the latest one we have and append it to the existing map.
+        // we can do it because we only append new rows with higher timestamps to the history table.
+        std::optional<std::reference_wrapper<const committed_stream_set>> from_streams;
+        std::optional<db_clock::time_point> from_ts;
+        const auto& all_streams = _cdc_metadata.get_all_tablet_streams();
+        if (auto it = all_streams.find(table); it != all_streams.end()) {
+            const auto& current_map = *it->second;
+            if (current_map.cbegin()->second.ts == base_ts) {
+                const auto& latest_entry = current_map.crbegin()->second;
+                from_streams = std::cref(latest_entry);
+                from_ts = latest_entry.ts;
+            }
+        }
+
+        if (!from_ts) {
+            append_stream(base_ts, std::move(base_stream_set));
+        }
+
+        co_await _sys_ks.local().read_cdc_streams_history(table, from_ts, [&] (table_id tid, db_clock::time_point ts, cdc_stream_diff diff) -> future<> {
+            const auto& prev_stream_set = new_table_map.empty() ?
+                    from_streams->get().streams : std::crbegin(new_table_map)->second.streams;
+
+            append_stream(ts, co_await cdc::metadata::construct_next_stream_set(
+                    prev_stream_set, std::move(diff.opened_streams), diff.closed_streams));
+        });
+
+        co_await container().invoke_on_all(coroutine::lambda([&] (generation_service& svc) -> future<> {
+            table_streams new_table_map_copy;
+            for (const auto& [ts, entry] : new_table_map) {
+                new_table_map_copy[ts] = entry;
+                co_await coroutine::maybe_yield();
+            }
+            if (!from_ts) {
+                svc._cdc_metadata.load_tablet_streams_map(table, std::move(new_table_map_copy));
+            } else {
+                svc._cdc_metadata.append_tablet_streams_map(table, std::move(new_table_map_copy));
+            }
+        }));
+
+        tables_to_process.erase(table);
+    });
+
+    // the remaining tables have no streams - remove them from the metadata
+    co_await container().invoke_on_all([&] (generation_service& svc) {
+        for (auto table : tables_to_process) {
+            svc._cdc_metadata.remove_tablet_streams_map(table);
+        }
+    });
+}
+
+future<> generation_service::query_cdc_timestamps(table_id table, bool ascending, noncopyable_function<future<>(db_clock::time_point)> f) {
+    const auto& all_tables = _cdc_metadata.get_all_tablet_streams();
+    auto table_it = all_tables.find(table);
+    if (table_it == all_tables.end()) {
+        co_return;
+    }
+    const auto table_streams_ptr = table_it->second; // keep alive
+    const auto& table_streams = *table_streams_ptr;
+
+    if (ascending) {
+        for (auto it = table_streams.cbegin(); it != table_streams.cend(); ++it) {
+            co_await f(it->second.ts);
+        }
+    } else {
+        for (auto it = table_streams.crbegin(); it != table_streams.crend(); ++it) {
+            co_await f(it->second.ts);
+        }
+    }
+}
+
+future<> generation_service::query_cdc_streams(table_id table, noncopyable_function<future<>(db_clock::time_point, const utils::chunked_vector<cdc::stream_id>& current, cdc::cdc_stream_diff)> f) {
+    const auto& all_tables = _cdc_metadata.get_all_tablet_streams();
+    auto table_it = all_tables.find(table);
+    if (table_it == all_tables.end()) {
+        co_return;
+    }
+    const auto table_streams_ptr = table_it->second; // keep alive
+    const auto& table_streams = *table_streams_ptr;
+
+    auto it_prev = table_streams.end();
+    auto it = table_streams.begin();
+    while (it != table_streams.end()) {
+        const auto& entry = it->second;
+
+        if (it_prev != table_streams.end()) {
+            const auto& prev_entry = it_prev->second;
+            auto diff = co_await cdc::metadata::generate_stream_diff(prev_entry.streams, entry.streams);
+            co_await f(entry.ts, entry.streams, std::move(diff));
+        } else {
+            co_await f(entry.ts, entry.streams, cdc::cdc_stream_diff{.closed_streams = {}, .opened_streams = entry.streams});
+        }
+        it_prev = it;
+        ++it;
+    }
+}
+
+future<mutation> get_switch_streams_mutation(table_id table, db_clock::time_point stream_ts, cdc_stream_diff diff, api::timestamp_type ts) {
+    auto history_schema = db::system_keyspace::cdc_streams_history();
+
+    auto decomposed_ts = timestamp_type->decompose(stream_ts);
+    auto closed_kind = byte_type->decompose(std::to_underlying(stream_state::closed));
+    auto opened_kind = byte_type->decompose(std::to_underlying(stream_state::opened));
+
+    mutation m(history_schema, partition_key::from_single_value(*history_schema,
+        data_value(table.uuid()).serialize_nonnull()
+    ));
+
+    for (auto&& sid : diff.closed_streams) {
+        co_await coroutine::maybe_yield();
+        auto ck = clustering_key::from_exploded(*history_schema, { decomposed_ts, closed_kind, long_type->decompose(dht::token::to_int64(sid.token())) });
+        m.set_cell(ck, "stream_id", data_value(std::move(sid).to_bytes()), ts);
+    }
+    for (auto&& sid : diff.opened_streams) {
+        co_await coroutine::maybe_yield();
+        auto ck = clustering_key::from_exploded(*history_schema, { decomposed_ts, opened_kind, long_type->decompose(dht::token::to_int64(sid.token())) });
+        m.set_cell(ck, "stream_id", data_value(std::move(sid).to_bytes()), ts);
+    }
+
+    co_return std::move(m);
+}
+
+future<> generation_service::generate_tablet_resize_update(service::group0_update_collector& muts, table_id table, const locator::tablet_map& new_tablet_map, api::timestamp_type ts) {
+    if (!_cdc_metadata.get_all_tablet_streams().contains(table)) {
+        // not a CDC table
+        co_return;
+    }
+
+    utils::chunked_vector<cdc::stream_id> new_streams;
+    co_await utils::reserve_gently(new_streams, new_tablet_map.tablet_count());
+    for (auto tid : new_tablet_map.tablet_ids()) {
+        new_streams.emplace_back(new_tablet_map.get_last_token(tid), 0);
+        co_await coroutine::maybe_yield();
+    }
+
+    const auto& table_streams = *_cdc_metadata.get_all_tablet_streams().at(table);
+    auto current_streams_it = std::crbegin(table_streams);
+    if (current_streams_it == std::crend(table_streams)) {
+        // no streams at all - this should not happen
+        on_internal_error(cdc_log, format("generate_tablet_resize_update: no streams for table {}", table));
+    }
+    const auto& current_streams = current_streams_it->second;
+
+    auto new_ts = new_generation_timestamp(true, _cfg.ring_delay);
+    new_ts = std::max(new_ts, current_streams.ts + std::chrono::milliseconds(1)); // ensure timestamps are increasing
+
+    auto diff = co_await _cdc_metadata.generate_stream_diff(current_streams.streams, new_streams);
+    auto mut = co_await get_switch_streams_mutation(table, new_ts, std::move(diff), ts);
+    co_await muts.add(std::move(mut));
+}
+
+future<utils::chunked_vector<mutation>> get_cdc_stream_gc_mutations(table_id table, db_clock::time_point base_ts, const utils::chunked_vector<cdc::stream_id>& base_stream_set, api::timestamp_type ts) {
+    utils::chunked_vector<mutation> muts;
+    muts.reserve(2);
+
+    auto gc_now = gc_clock::now();
+    auto tombstone_ts = ts - 1;
+
+    {
+        // write the new base stream set to cdc_streams_state
+        auto s = db::system_keyspace::cdc_streams_state();
+        mutation m(s, partition_key::from_single_value(*s,
+            data_value(table.uuid()).serialize_nonnull()
+        ));
+        m.partition().apply(tombstone(tombstone_ts, gc_now));
+        m.set_static_cell("timestamp", data_value(base_ts), ts);
+
+        for (const auto& sid : base_stream_set) {
+            co_await coroutine::maybe_yield();
+            auto ck = clustering_key::from_singular(*s, dht::token::to_int64(sid.token()));
+            m.set_cell(ck, "stream_id", data_value(sid.to_bytes()), ts);
+        }
+        muts.emplace_back(std::move(m));
+    }
+
+    {
+        // remove all entries from cdc_streams_history up to the new base
+        auto s = db::system_keyspace::cdc_streams_history();
+        mutation m(s, partition_key::from_single_value(*s,
+            data_value(table.uuid()).serialize_nonnull()
+        ));
+        auto range = query::clustering_range::make_ending_with({
+                clustering_key_prefix::from_single_value(*s, timestamp_type->decompose(base_ts)), true});
+        auto bv = bound_view::from_range(range);
+        m.partition().apply_delete(*s, range_tombstone{bv.first, bv.second, tombstone{ts, gc_now}});
+        muts.emplace_back(std::move(m));
+    }
+
+    co_return std::move(muts);
+}
+
+table_streams::const_iterator get_new_base_for_gc(const table_streams& streams_map, std::chrono::seconds ttl) {
+    // find the most recent timestamp that is older than ttl_seconds, which will become the new base.
+    // all streams with older timestamps can be removed because they are closed for more than ttl_seconds
+    // (they are all replaced by streams with the newer timestamp).
+
+    auto ts_upper_bound = db_clock::now() - ttl;
+
+    auto it = streams_map.begin();
+    while (it != streams_map.end()) {
+        auto next_it = std::next(it);
+        if (next_it == streams_map.end()) {
+            break;
+        }
+
+        auto next_tp = next_it->second.ts;
+        if (next_tp <= ts_upper_bound) {
+            // the next timestamp is older than ttl_seconds, so the current one is obsolete
+            it = next_it;
+        } else {
+            break;
+        }
+    }
+
+    return it;
+}
+
+future<utils::chunked_vector<mutation>> generation_service::garbage_collect_cdc_streams_for_table(table_id table, std::optional<std::chrono::seconds> ttl, api::timestamp_type ts) {
+    const auto& table_streams = *_cdc_metadata.get_all_tablet_streams().at(table);
+
+    // if TTL is not provided by the caller then use the table's CDC TTL
+    auto base_schema = cdc::get_base_table(_db, *_db.find_schema(table));
+    ttl = ttl.or_else([&] -> std::optional<std::chrono::seconds> {
+        auto ttl_seconds = base_schema->cdc_options().ttl();
+        if (ttl_seconds > 0) {
+            return std::chrono::seconds(ttl_seconds);
+        } else {
+            // ttl=0 means no ttl
+            return std::nullopt;
+        }
+    });
+    if (!ttl) {
+        co_return utils::chunked_vector<mutation>{};
+    }
+
+    auto new_base_it = get_new_base_for_gc(table_streams, *ttl);
+    if (new_base_it == table_streams.begin() || new_base_it == table_streams.end()) {
+        // nothing to gc
+        co_return utils::chunked_vector<mutation>{};
+    }
+
+    for (auto it = table_streams.begin(); it != new_base_it; ++it) {
+        cdc_log.info("Garbage collecting CDC stream metadata for table {}: removing generation {} because it is older than the CDC TTL of {} seconds",
+                table, it->second.ts, *ttl);
+    }
+
+    co_return co_await get_cdc_stream_gc_mutations(table, new_base_it->second.ts, new_base_it->second.streams, ts);
+}
+
+future<> generation_service::garbage_collect_cdc_streams(utils::chunked_vector<canonical_mutation>& muts, api::timestamp_type ts) {
+    for (auto table : _cdc_metadata.get_tables_with_cdc_tablet_streams()) {
+        co_await coroutine::maybe_yield();
+
+        auto table_muts = co_await garbage_collect_cdc_streams_for_table(table, std::nullopt, ts);
+        for (auto&& m : table_muts) {
+            muts.emplace_back(std::move(m));
+        }
+    }
+}
+
+future<utils::chunked_vector<canonical_mutation>> generation_service::maybe_finalize_pending_stream_enables(const locator::token_metadata& tm, api::timestamp_type ts) {
+    utils::chunked_vector<canonical_mutation> muts;
+    const bool tablet_merge_block_feature = _db.features().cdc_block_tablet_merges_for_alternator_streams;
+
+    if (tablet_merge_block_feature && utils::get_local_injector().enter("delay_cdc_stream_finalization")) {
+        co_return std::move(muts);
+    }
+
+    co_await _db.get_tables_metadata().for_each_table_gently([&] (table_id id, lw_shared_ptr<replica::table> t) -> future<> {
+        auto s = t->schema();
+        if (!s->cdc_options().enable_requested()) {
+            co_return;
+        }
+
+        // Only tablet tables can have enable_requested set
+        if (!tm.tablets().has_tablet_map(id)) {
+            co_return;
+        }
+
+        if (!tablet_merge_block_feature) {
+            on_internal_error(cdc_log, format(
+                    "Table {}.{} has pending Alternator Streams enablement before feature CDC_BLOCK_TABLET_MERGES_FOR_ALTERNATOR_STREAMS is cluster-enabled",
+                    s->ks_name(), s->cf_name()));
+        }
+
+        auto& tmap = tm.tablets().get_tablet_map(id);
+        if (tmap.needs_merge()) {
+            cdc_log.debug("Table {}.{}: deferring stream enablement, tablet merge still in progress", s->ks_name(), s->cf_name());
+            co_return;
+        }
+
+        cdc_log.info("Table {}.{}: finalizing deferred stream enablement (no in-progress merges)", s->ks_name(), s->cf_name());
+
+        // Build a new schema with enabled=true, enable_requested=false
+        schema_builder builder(s);
+        cdc::options new_opts = s->cdc_options();
+        new_opts.enabled(true);
+        new_opts.enable_requested(false);
+        new_opts.tablet_merge_blocked(true);
+        builder.with_cdc_options(new_opts);
+        auto new_schema = builder.build();
+
+        // Generate the schema mutation (table metadata update only, no columns/indices changed)
+        utils::chunked_vector<mutation> schema_muts;
+        db::schema_tables::add_table_or_view_to_schema_mutation(new_schema, ts, false, schema_muts);
+
+        // Trigger the CDC migration listener hook which creates the CDC log table.
+        // This runs on_before_update_column_family listeners (including CDC's own
+        // listener that creates/updates the log table schema).
+        co_await seastar::async([&] {
+            _db.get_notifier().before_update_column_family(*new_schema, *s, schema_muts, ts);
+        });
+
+        for (auto& m : schema_muts) {
+            muts.emplace_back(canonical_mutation(m));
+            co_await coroutine::maybe_yield();
+        }
+    });
+
+    co_return std::move(muts);
 }
 
 } // namespace cdc

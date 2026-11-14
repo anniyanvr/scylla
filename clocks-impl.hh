@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -16,13 +16,21 @@
 extern std::atomic<int64_t> clocks_offset;
 
 template<typename Duration>
-static inline void forward_jump_clocks(Duration delta)
+inline void forward_jump_clocks(Duration delta)
 {
     auto d = std::chrono::duration_cast<std::chrono::seconds>(delta).count();
     clocks_offset.fetch_add(d, std::memory_order_relaxed);
 }
 
-static inline std::chrono::seconds get_clocks_offset()
+// Unlike forward_jump_clocks(), which moves the clocks by a relative amount,
+// this sets the offset to an absolute value - so the caller can also undo a
+// previous jump, by setting the offset back to 0.
+inline void set_clocks_offset(std::chrono::seconds off)
+{
+    clocks_offset.store(off.count(), std::memory_order_relaxed);
+}
+
+inline std::chrono::seconds get_clocks_offset()
 {
     auto off = clocks_offset.load(std::memory_order_relaxed);
     return std::chrono::seconds(off);

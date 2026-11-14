@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include "clocks-impl.hh"
-#include "hashing.hh"
+#include "utils/hashing.hh"
 
 #include <seastar/core/lowres_clock.hh>
 
@@ -34,7 +34,7 @@ public:
         return time_point(std::chrono::duration_cast<duration>(std::chrono::seconds(t)));
     }
 
-    static time_point now() {
+    static time_point now() noexcept {
         return time_point(std::chrono::duration_cast<duration>(base::now().time_since_epoch())) + get_clocks_offset();
     }
 
@@ -58,12 +58,10 @@ using ttl_opt = std::optional<gc_clock::duration>;
 // 20 years in seconds
 static constexpr gc_clock::duration max_ttl = gc_clock::duration{20 * 365 * 24 * 60 * 60};
 
-std::ostream& operator<<(std::ostream& os, gc_clock::time_point tp);
-
 template<>
 struct appending_hash<gc_clock::time_point> {
     template<typename Hasher>
-    void operator()(Hasher& h, gc_clock::time_point t) const {
+    void operator()(Hasher& h, gc_clock::time_point t) const noexcept {
         // Remain backwards-compatible with the 32-bit duration::rep (refs #4460).
         uint64_t d64 = t.time_since_epoch().count();
         feed_hash(h, uint32_t(d64 & 0xffff'ffff));
@@ -107,3 +105,9 @@ struct serializer<gc_clock::duration> {
 };
 
 }
+
+template<>
+struct fmt::formatter<gc_clock::time_point> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(gc_clock::time_point, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

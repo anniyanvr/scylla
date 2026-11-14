@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "mutation_fragment.hh"
-#include "converting_mutation_partition_applier.hh"
+#include "mutation/mutation_fragment.hh"
+#include "mutation/mutation_fragment_v2.hh"
+#include "mutation/converting_mutation_partition_applier.hh"
 
 // A StreamedMutationTransformer which transforms the stream to a different schema
 class schema_upgrader {

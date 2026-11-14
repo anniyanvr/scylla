@@ -3,84 +3,175 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "storage_service.hh"
+#include "api/api.hh"
+#include "api/api-doc/column_family.json.hh"
 #include "api/api-doc/storage_service.json.hh"
+#include "api/api-doc/storage_proxy.json.hh"
+#include "api/api-doc/tasks.json.hh"
+#include "api/scrub_status.hh"
 #include "db/config.hh"
 #include "db/schema_tables.hh"
-#include "utils/hash.hh"
-#include <sstream>
+#include "gms/feature_service.hh"
+#include "schema/schema_builder.hh"
+#include "sstables/sstables_manager.hh"
+#include <optional>
+#include <stdexcept>
 #include <time.h>
 #include <algorithm>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/filtered.hpp>
+#include <functional>
+#include <iterator>
+#include <chrono>
+#include <boost/regex.hpp>
+#include <string>
 #include <boost/algorithm/string/trim_all.hpp>
-#include <boost/algorithm/string/case_conv.hpp>
 #include <boost/functional/hash.hpp>
+#include <fmt/ranges.h>
+#include "service/raft/raft_group0_client.hh"
 #include "service/storage_service.hh"
+#include "service/topology_state_machine.hh"
 #include "service/load_meter.hh"
-#include "db/commitlog/commitlog.hh"
+#include "gms/feature_service.hh"
 #include "gms/gossiper.hh"
 #include "db/system_keyspace.hh"
-#include "seastar/http/exception.hh"
+#include "db/snapshot_types.hh"
+#include <seastar/http/exception.hh>
+#include <seastar/util/short_streams.hh>
+#include <seastar/util/closeable.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/coroutine/exception.hh>
 #include "repair/row_level.hh"
 #include "locator/snitch_base.hh"
+#include "locator/tablets.hh"
 #include "column_family.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "release.hh"
 #include "compaction/compaction_manager.hh"
+#include "compaction/task_manager_module.hh"
 #include "sstables/sstables.hh"
 #include "replica/database.hh"
 #include "db/extensions.hh"
 #include "db/snapshot-ctl.hh"
 #include "transport/controller.hh"
-#include "thrift/controller.hh"
 #include "locator/token_metadata.hh"
 #include "cdc/generation_service.hh"
-#include "service/storage_proxy.hh"
 #include "locator/abstract_replication_strategy.hh"
 #include "sstables_loader.hh"
 #include "db/view/view_builder.hh"
+#include "utils/rjson.hh"
+#include "utils/user_provided_param.hh"
+
+using namespace seastar::httpd;
+using namespace std::chrono_literals;
 
 extern logging::logger apilog;
 
 namespace api {
 
-const locator::token_metadata& http_context::get_token_metadata() {
-        return *shared_token_metadata.local().get();
-}
-
 namespace ss = httpd::storage_service_json;
+namespace sp = httpd::storage_proxy_json;
+namespace t = httpd::tasks_json;
+namespace cf = httpd::column_family_json;
 using namespace json;
 
-sstring validate_keyspace(http_context& ctx, const parameters& param) {
-    const auto& ks_name = param["keyspace"];
+sstring validate_keyspace(const http_context& ctx, sstring ks_name) {
     if (ctx.db.local().has_keyspace(ks_name)) {
         return ks_name;
     }
     throw bad_param_exception(replica::no_such_keyspace(ks_name).what());
 }
 
-// splits a request parameter assumed to hold a comma-separated list of table names
-// verify that the tables are found, otherwise a bad_param_exception exception is thrown
-// containing the description of the respective no_such_column_family error.
-std::vector<sstring> parse_tables(const sstring& ks_name, http_context& ctx, const std::unordered_map<sstring, sstring>& query_params, sstring param_name) {
-    auto it = query_params.find(param_name);
-    if (it == query_params.end()) {
-        return {};
-    }
-    std::vector<sstring> names = split(it->second, ",");
+sstring validate_keyspace(const http_context& ctx, const std::unique_ptr<http::request>& req) {
+    return validate_keyspace(ctx, req->get_path_param("keyspace"));
+}
+
+sstring validate_keyspace(const http_context& ctx, const http::request& req) {
+    return validate_keyspace(ctx, req.get_path_param("keyspace"));
+}
+
+table_id validate_table(const replica::database& db, sstring ks_name, sstring table_name) {
     try {
-        for (const auto& table_name : names) {
-            ctx.db.local().find_column_family(ks_name, table_name);
+        return db.find_uuid(ks_name, table_name);
+    } catch (replica::no_such_column_family& e) {
+        throw bad_param_exception(e.what());
+    }
+}
+
+static void ensure_tablets_disabled(const http_context& ctx, const sstring& ks_name, const sstring& api_endpoint_path) {
+    if (ctx.db.local().find_keyspace(ks_name).uses_tablets()) {
+        throw bad_param_exception{fmt::format("{} is per-table in keyspace '{}'. Please provide table name using 'cf' parameter.", api_endpoint_path, ks_name)};
+    }
+}
+
+static bool any_of_keyspaces_use_tablets(const http_context& ctx) {
+    auto& db = ctx.db.local();
+    auto uses_tablets = [&db](const auto& ks_name) {
+        return db.find_keyspace(ks_name).uses_tablets();
+    };
+
+    auto keyspaces = db.get_all_keyspaces();
+    return std::any_of(std::begin(keyspaces), std::end(keyspaces), uses_tablets);
+}
+
+std::vector<table_info> parse_table_infos(const sstring& ks_name, const http_context& ctx, sstring value) {
+    std::vector<table_info> res;
+    try {
+        if (value.empty()) {
+            const auto& cf_meta_data = ctx.db.local().find_keyspace(ks_name).metadata().get()->cf_meta_data();
+            res.reserve(cf_meta_data.size());
+            for (const auto& [name, schema] : cf_meta_data) {
+                res.emplace_back(table_info{name, schema->id()});
+            }
+        } else {
+            std::vector<sstring> names = split(value, ",");
+            res.reserve(names.size());
+            const auto& db = ctx.db.local();
+            for (const auto& table_name : names) {
+                res.emplace_back(table_info{table_name, db.find_uuid(ks_name, table_name)});
+            }
         }
+    } catch (const replica::no_such_keyspace& e) {
+        throw bad_param_exception(e.what());
     } catch (const replica::no_such_column_family& e) {
         throw bad_param_exception(e.what());
     }
-    return names;
+    return res;
+}
+
+std::pair<sstring, std::vector<table_info>> parse_table_infos(const http_context& ctx, const http::request& req, sstring cf_param_name) {
+    auto keyspace = validate_keyspace(ctx, req);
+    auto tis = parse_table_infos(keyspace, ctx, req.get_query_param(cf_param_name));
+    return std::make_pair(std::move(keyspace), std::move(tis));
+}
+
+std::optional<std::chrono::seconds> validate_ttl(const std::string& value) {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    // Match an integer, optional whitespace, and an optional single-character suffix
+    static const boost::regex re(R"((\d+)\s*([smhd])?)", boost::regex_constants::icase);
+    boost::smatch match;
+    if (!boost::regex_match(value, match, re)) {
+        throw bad_param_exception(fmt::format("TTL value '{}' is not valid, expected a non-negative integer with an optional suffix [smhd]", value));
+    }
+
+    int res = parse_number_param<int>("ttl", match[1].str());
+
+    auto suffix = match[2].str();
+    auto c = suffix.empty() ? 's' : std::tolower(suffix[0]);
+    switch (c) {
+    case 's': return std::chrono::seconds(res);
+    case 'm': return std::chrono::minutes(res);
+    case 'h': return std::chrono::hours(res);
+    case 'd': return std::chrono::days(res);
+    }
+
+    std::unreachable();
 }
 
 static ss::token_range token_range_endpoints_to_json(const dht::token_range_endpoints& d) {
@@ -91,7 +182,7 @@ static ss::token_range token_range_endpoints_to_json(const dht::token_range_endp
     r.rpc_endpoints = d._rpc_endpoints;
     for (auto det : d._endpoint_details) {
         ss::endpoint_detail ed;
-        ed.host = boost::lexical_cast<std::string>(det._host);
+        ed.host = fmt::to_string(det._host);
         ed.datacenter = det._datacenter;
         if (det._rack != "") {
             ed.rack = det._rack;
@@ -101,21 +192,7 @@ static ss::token_range token_range_endpoints_to_json(const dht::token_range_endp
     return r;
 }
 
-using ks_cf_func = std::function<future<json::json_return_type>(http_context&, std::unique_ptr<request>, sstring, std::vector<sstring>)>;
-
-static auto wrap_ks_cf(http_context &ctx, ks_cf_func f) {
-    return [&ctx, f = std::move(f)](std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_families = parse_tables(keyspace, ctx, req->query_parameters, "cf");
-        if (column_families.empty()) {
-            column_families = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
-        }
-        return f(ctx, std::move(req), std::move(keyspace), std::move(column_families));
-    };
-}
-
-seastar::future<json::json_return_type> run_toppartitions_query(db::toppartitions_query& q, http_context &ctx, bool legacy_request) {
-    namespace cf = httpd::column_family_json;
+seastar::future<json::json_return_type> run_toppartitions_query(db::toppartitions_query& q, bool legacy_request) {
     return q.scatter().then([&q, legacy_request] {
         return sleep(q.duration()).then([&q, legacy_request] {
             return q.gather(q.capacity()).then([&q, legacy_request] (auto topk_results) {
@@ -145,34 +222,8 @@ seastar::future<json::json_return_type> run_toppartitions_query(db::toppartition
     });
 }
 
-future<json::json_return_type> set_tables_autocompaction(http_context& ctx, service::storage_service& ss, const sstring &keyspace, std::vector<sstring> tables, bool enabled) {
-    if (tables.empty()) {
-        tables = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
-    }
-
-    apilog.info("set_tables_autocompaction: enabled={} keyspace={} tables={}", enabled, keyspace, tables);
-    return do_with(keyspace, std::move(tables), [&ctx, enabled] (const sstring &keyspace, const std::vector<sstring>& tables) {
-        return ctx.db.invoke_on(0, [&ctx, &keyspace, &tables, enabled] (replica::database& db) {
-            auto g = replica::database::autocompaction_toggle_guard(db);
-            return ctx.db.invoke_on_all([&keyspace, &tables, enabled] (replica::database& db) {
-                return parallel_for_each(tables, [&db, &keyspace, enabled] (const sstring& table) {
-                    replica::column_family& cf = db.find_column_family(keyspace, table);
-                    if (enabled) {
-                        cf.enable_auto_compaction();
-                    } else {
-                        return cf.disable_auto_compaction();
-                    }
-                    return make_ready_future<>();
-                });
-            }).finally([g = std::move(g)] {});
-        });
-    }).then([] {
-        return make_ready_future<json::json_return_type>(json_void());
-    });
-}
-
 void set_transport_controller(http_context& ctx, routes& r, cql_transport::controller& ctl) {
-    ss::start_native_transport.set(r, [&ctl](std::unique_ptr<request> req) {
+    ss::start_native_transport.set(r, [&ctl](std::unique_ptr<http::request> req) {
         return smp::submit_to(0, [&] {
             return ctl.start_server();
         }).then([] {
@@ -180,7 +231,7 @@ void set_transport_controller(http_context& ctx, routes& r, cql_transport::contr
         });
     });
 
-    ss::stop_native_transport.set(r, [&ctl](std::unique_ptr<request> req) {
+    ss::stop_native_transport.set(r, [&ctl](std::unique_ptr<http::request> req) {
         return smp::submit_to(0, [&] {
             return ctl.request_stop_server();
         }).then([] {
@@ -188,7 +239,7 @@ void set_transport_controller(http_context& ctx, routes& r, cql_transport::contr
         });
     });
 
-    ss::is_native_transport_running.set(r, [&ctl] (std::unique_ptr<request> req) {
+    ss::is_native_transport_running.set(r, [&ctl] (std::unique_ptr<http::request> req) {
         return smp::submit_to(0, [&] {
             return !ctl.listen_addresses().empty();
         }).then([] (bool running) {
@@ -203,43 +254,36 @@ void unset_transport_controller(http_context& ctx, routes& r) {
     ss::is_native_transport_running.unset(r);
 }
 
-void set_rpc_controller(http_context& ctx, routes& r, thrift_controller& ctl) {
-    ss::stop_rpc_server.set(r, [&ctl](std::unique_ptr<request> req) {
-        return smp::submit_to(0, [&] {
-            return ctl.request_stop_server();
-        }).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::start_rpc_server.set(r, [&ctl](std::unique_ptr<request> req) {
-        return smp::submit_to(0, [&] {
-            return ctl.start_server();
-        }).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::is_rpc_server_running.set(r, [&ctl] (std::unique_ptr<request> req) {
-        return smp::submit_to(0, [&] {
-            return !ctl.listen_addresses().empty();
-        }).then([] (bool running) {
-            return make_ready_future<json::json_return_type>(running);
+// NOTE: preserved only for backward compatibility
+void set_thrift_controller(http_context& ctx, routes& r) {
+    ss::is_thrift_server_running.set(r, [] (std::unique_ptr<http::request> req) {
+        return smp::submit_to(0, [] {
+            return make_ready_future<json::json_return_type>(false);
         });
     });
 }
 
-void unset_rpc_controller(http_context& ctx, routes& r) {
-    ss::stop_rpc_server.unset(r);
-    ss::start_rpc_server.unset(r);
-    ss::is_rpc_server_running.unset(r);
+void unset_thrift_controller(http_context& ctx, routes& r) {
+    ss::is_thrift_server_running.unset(r);
 }
 
-void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
-    ss::repair_async.set(r, [&ctx, &repair](std::unique_ptr<request> req) {
-        static std::vector<sstring> options = {"primaryRange", "parallelism", "incremental",
+void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair, sharded<gms::gossip_address_map>& am) {
+    ss::repair_async.set(r, [&ctx, &repair, &am](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        static std::unordered_set<sstring> options = {"primaryRange", "parallelism", "incremental",
                 "jobThreads", "ranges", "columnFamilies", "dataCenters", "hosts", "ignore_nodes", "trace",
-                "startToken", "endToken" };
+                "startToken", "endToken", "ranges_parallelism", "small_table_optimization"};
+
+        // Nodetool still sends those unsupported options. Ignore them to avoid failing nodetool repair.
+        static std::unordered_set<sstring> legacy_options_to_ignore = {"pullRepair", "ignoreUnreplicatedKeyspaces"};
+
+        for (auto& x : req->get_query_params()) {
+            if (legacy_options_to_ignore.contains(x.first)) {
+                continue;
+            }
+            if (!options.contains(x.first)) {
+                throw httpd::bad_param_exception(format("option {} is not supported", x.first));
+            }
+        }
         std::unordered_map<sstring, sstring> options_map;
         for (auto o : options) {
             auto s = req->get_query_param(o);
@@ -252,24 +296,31 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
         // returns immediately, not waiting for the repair to finish. The user
         // then has other mechanisms to track the ongoing repair's progress,
         // or stop it.
-        return repair_start(repair, validate_keyspace(ctx, req->param),
-                options_map).then([] (int i) {
-                    return make_ready_future<json::json_return_type>(i);
-                });
+        try {
+            int res = co_await repair_start(repair, am, validate_keyspace(ctx, req), options_map);
+            co_return json::json_return_type(res);
+        } catch (const std::invalid_argument& e) {
+            // if the option is not sane, repair_start() throws immediately, so
+            // convert the exception to an HTTP error
+            throw httpd::bad_param_exception(e.what());
+        } catch (const tablets_unsupported& e) {
+            throw base_exception("Cannot repair tablet keyspace. Use /storage_service/tablets/repair to repair tablet keyspaces.",
+                    http::reply::status_type::forbidden);
+        }
     });
 
-    ss::get_active_repair_async.set(r, [&repair] (std::unique_ptr<request> req) {
+    ss::get_active_repair_async.set(r, [&repair] (std::unique_ptr<http::request> req) {
         return repair.local().get_active_repairs().then([] (std::vector<int> res) {
             return make_ready_future<json::json_return_type>(res);
         });
     });
 
-    ss::repair_async_status.set(r, [&repair] (std::unique_ptr<request> req) {
-        return repair.local().get_status(boost::lexical_cast<int>( req->get_query_param("id")))
+    ss::repair_async_status.set(r, [&repair] (std::unique_ptr<http::request> req) {
+        return repair.local().get_status(require_query_param<int>(*req, "id"))
                 .then_wrapped([] (future<repair_status>&& fut) {
             ss::ns_repair_async_status::return_type_wrapper res;
             try {
-                res = fut.get0();
+                res = fut.get();
             } catch(std::runtime_error& e) {
                 throw httpd::bad_param_exception(e.what());
             }
@@ -277,32 +328,20 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
         });
     });
 
-    ss::repair_await_completion.set(r, [&repair] (std::unique_ptr<request> req) {
-        int id;
+    ss::repair_await_completion.set(r, [&repair] (std::unique_ptr<http::request> req) {
         using clock = std::chrono::steady_clock;
-        clock::time_point expire;
-        try {
-            id = boost::lexical_cast<int>(req->get_query_param("id"));
-            // If timeout is not provided, it means no timeout.
-            sstring s = req->get_query_param("timeout");
-            int64_t timeout = s.empty() ? int64_t(-1) : boost::lexical_cast<int64_t>(s);
-            if (timeout < 0 && timeout != -1) {
-                return make_exception_future<json::json_return_type>(
-                        httpd::bad_param_exception("timeout can only be -1 (means no timeout) or non negative integer"));
-            }
-            if (timeout < 0) {
-                expire = clock::time_point::max();
-            } else {
-                expire = clock::now() + std::chrono::seconds(timeout);
-            }
-        } catch (std::exception& e) {
-            return make_exception_future<json::json_return_type>(httpd::bad_param_exception(e.what()));
+        const auto id = require_query_param<int>(*req, "id");
+        // If timeout is not provided, it means no timeout.
+        const auto timeout = get_query_param<std::chrono::seconds>(*req, "timeout", -1s);
+        if (timeout < -1s) {
+            throw httpd::bad_param_exception("timeout can only be -1 (means no timeout) or non negative integer");
         }
+        const clock::time_point expire = timeout < 0s ? clock::time_point::max() : clock::now() + timeout;
         return repair.local().await_completion(id, expire)
                 .then_wrapped([] (future<repair_status>&& fut) {
             ss::ns_repair_async_status::return_type_wrapper res;
             try {
-                res = fut.get0();
+                res = fut.get();
             } catch (std::exception& e) {
                 return make_exception_future<json::json_return_type>(httpd::bad_param_exception(e.what()));
             }
@@ -310,13 +349,13 @@ void set_repair(http_context& ctx, routes& r, sharded<repair_service>& repair) {
         });
     });
 
-    ss::force_terminate_all_repair_sessions.set(r, [&repair] (std::unique_ptr<request> req) {
+    ss::force_terminate_all_repair_sessions.set(r, [&repair] (std::unique_ptr<http::request> req) {
         return repair.local().abort_all().then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
     });
 
-    ss::force_terminate_all_repair_sessions_new.set(r, [&repair] (std::unique_ptr<request> req) {
+    ss::force_terminate_all_repair_sessions_new.set(r, [&repair] (std::unique_ptr<http::request> req) {
         return repair.local().abort_all().then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
@@ -333,23 +372,43 @@ void unset_repair(http_context& ctx, routes& r) {
     ss::force_terminate_all_repair_sessions_new.unset(r);
 }
 
+static sstables_loader::stream_scope parse_stream_scope(const sstring& scope_str) {
+    using namespace ss::ns_start_restore;
+    auto sc = scope_str.empty() ? scope::all : str2scope(scope_str);
+
+    switch (sc) {
+    case scope::all: return sstables_loader::stream_scope::all;
+    case scope::dc: return sstables_loader::stream_scope::dc;
+    case scope::rack: return sstables_loader::stream_scope::rack;
+    case scope::node: return sstables_loader::stream_scope::node;
+    case scope::NUM_ITEMS:
+        break;
+    }
+
+    throw httpd::bad_param_exception("invalid scope parameter value");
+}
+
 void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>& sst_loader) {
-    ss::load_new_ss_tables.set(r, [&ctx, &sst_loader](std::unique_ptr<request> req) {
-        auto ks = validate_keyspace(ctx, req->param);
+    ss::load_new_ss_tables.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) {
+        auto ks = validate_keyspace(ctx, req);
         auto cf = req->get_query_param("cf");
-        auto stream = req->get_query_param("load_and_stream");
-        auto primary_replica = req->get_query_param("primary_replica_only");
-        boost::algorithm::to_lower(stream);
-        boost::algorithm::to_lower(primary_replica);
-        bool load_and_stream = stream == "true" || stream == "1";
-        bool primary_replica_only = primary_replica == "true" || primary_replica == "1";
+        bool load_and_stream = get_query_param<bool>(*req, "load_and_stream");
+        bool primary_replica_only = get_query_param<bool>(*req, "primary_replica_only");
+        bool skip_cleanup = get_query_param<bool>(*req, "skip_cleanup");
+        auto scope = parse_stream_scope(req->get_query_param("scope"));
+        bool skip_reshape = get_query_param<bool>(*req, "skip_reshape");
+
+        if (scope != sstables_loader::stream_scope::all && !load_and_stream) {
+            throw httpd::bad_param_exception("scope takes no effect without load-and-stream");
+        }
+
         // No need to add the keyspace, since all we want is to avoid always sending this to the same
         // CPU. Even then I am being overzealous here. This is not something that happens all the time.
-        auto coordinator = std::hash<sstring>()(cf) % smp::count;
+        auto coordinator = std::hash<sstring>()(cf) % this_smp_shard_count();
         return sst_loader.invoke_on(coordinator,
                 [ks = std::move(ks), cf = std::move(cf),
-                load_and_stream, primary_replica_only] (sstables_loader& loader) {
-            return loader.load_new_sstables(ks, cf, load_and_stream, primary_replica_only);
+                load_and_stream, primary_replica_only, skip_cleanup, skip_reshape, scope] (sstables_loader& loader) {
+            return loader.load_new_sstables(ks, cf, load_and_stream, primary_replica_only, skip_cleanup, skip_reshape, scope);
         }).then_wrapped([] (auto&& f) {
             if (f.failed()) {
                 auto msg = fmt::format("Failed to load new sstables: {}", f.get_exception());
@@ -358,156 +417,216 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
             return make_ready_future<json::json_return_type>(json_void());
         });
     });
+
+    ss::start_restore.set(r, [&sst_loader] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto endpoint = req->get_query_param("endpoint");
+        auto keyspace = req->get_query_param("keyspace");
+        auto table = req->get_query_param("table");
+        auto bucket = req->get_query_param("bucket");
+        auto prefix = req->get_query_param("prefix");
+        auto scope = parse_stream_scope(req->get_query_param("scope"));
+        auto primary_replica_only = get_query_param<bool>(*req, "primary_replica_only");
+
+        rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
+        rjson::value parsed = rjson::parse(std::move(content));
+        if (!parsed.IsArray()) {
+            throw httpd::bad_param_exception("malformatted sstables in body");
+        }
+        auto sstables = parsed.GetArray() |
+            std::views::transform([] (const auto& s) { return sstring(rjson::to_string_view(s)); }) |
+            std::ranges::to<std::vector>();
+        apilog.info("Restore invoked with following parameters: keyspace={}, table={}, endpoint={}, bucket={}, prefix={}, sstables_count={}, scope={}, primary_replica_only={}",
+                    keyspace,
+                    table,
+                    endpoint,
+                    bucket,
+                    prefix,
+                    sstables.size(),
+                    scope,
+                    primary_replica_only);
+        auto task_id = co_await sst_loader.local().download_new_sstables(keyspace, table, prefix, std::move(sstables), endpoint, bucket, scope, primary_replica_only);
+        co_return json::json_return_type(fmt::to_string(task_id));
+    });
+
+    ss::tablet_aware_restore.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) -> future<json_return_type> {
+        std::string keyspace = req->get_query_param("keyspace");
+        std::string table = req->get_query_param("table");
+        std::string snapshot = req->get_query_param("snapshot");
+
+        rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
+        rjson::value parsed = rjson::parse(std::move(content));
+        if (!parsed.IsArray()) {
+            throw httpd::bad_param_exception("backup locations (in body) must be a JSON array");
+        }
+
+        if (parsed.Empty()) {
+            throw httpd::bad_param_exception("backup locations array (in body) must not be empty");
+        }
+
+        auto get_member = [] (const auto& location, const char* name) {
+            if (!location.HasMember(name) || !location[name].IsString()) {
+                throw httpd::bad_param_exception(fmt::format("backup location entry must have '{}' string member", name));
+            }
+            return sstring(rjson::to_string_view(location[name]));
+        };
+
+        std::vector<tablet_restore_location> restore_locations;
+        for (const auto& location : parsed.GetArray()) {
+            if (!location.IsObject()) {
+                throw httpd::bad_param_exception("backup location (in body) must be a JSON object");
+            }
+
+            auto endpoint = get_member(location, "endpoint");
+            auto bucket = get_member(location, "bucket");
+            auto dc = get_member(location, "datacenter");
+            auto prefix = location.HasMember("prefix") ? rjson::to_string_view(location["prefix"]) : std::string_view{};
+
+            if (!location.HasMember("manifests") || !location["manifests"].IsArray()) {
+                throw httpd::bad_param_exception("backup location entry must have 'manifests' array");
+            }
+
+            auto manifests = location["manifests"].GetArray() |
+                std::views::transform([] (const auto& m) { return sstring(rjson::to_string_view(m)); }) |
+                std::ranges::to<utils::chunked_vector<sstring>>();
+
+            if (manifests.empty()) {
+                throw httpd::bad_param_exception("backup location 'manifests' array must not be empty");
+            }
+
+            apilog.info("Tablet restore for {}:{} called. Parameters: snapshot={} datacenter={} endpoint={} bucket={} prefix={} manifests_count={}",
+                        keyspace, table, snapshot, dc, endpoint, bucket, prefix, manifests.size());
+
+            restore_locations.push_back(tablet_restore_location{
+                .datacenter = std::move(dc),
+                .endpoint = std::move(endpoint),
+                .bucket = std::move(bucket),
+                .prefix = sstring(prefix),
+                .manifests = std::move(manifests),
+            });
+        }
+
+        auto table_id = validate_table(ctx.db.local(), keyspace, table);
+        auto task_id = co_await sst_loader.local().restore_tablets(table_id, keyspace, table, snapshot, std::move(restore_locations));
+        co_return json::json_return_type(fmt::to_string(task_id));
+    });
 }
 
 void unset_sstables_loader(http_context& ctx, routes& r) {
     ss::load_new_ss_tables.unset(r);
+    ss::start_restore.unset(r);
+    ss::tablet_aware_restore.unset(r);
 }
 
-void set_view_builder(http_context& ctx, routes& r, sharded<db::view::view_builder>& vb) {
-    ss::view_build_statuses.set(r, [&ctx, &vb] (std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto view = req->param["view"];
-        return vb.local().view_build_statuses(std::move(keyspace), std::move(view)).then([] (std::unordered_map<sstring, sstring> status) {
-            std::vector<storage_service_json::mapper> res;
-            return make_ready_future<json::json_return_type>(map_to_key_value(std::move(status), res));
-        });
+void set_view_builder(http_context& ctx, routes& r, sharded<db::view::view_builder>& vb, sharded<gms::gossiper>& g) {
+    ss::view_build_statuses.set(r, [&ctx, &vb, &g] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto keyspace = validate_keyspace(ctx, req);
+        auto view = req->get_path_param("view");
+        co_return json::json_return_type(stream_range_as_array(co_await vb.local().view_build_statuses(std::move(keyspace), std::move(view), g.local()), [] (const auto& i) {
+            storage_service_json::mapper res;
+            res.key = i.first;
+            res.value = i.second;
+            return res;
+        }));
+    });
+
+    cf::get_built_indexes.set(r, [&vb](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto [ks, cf_name] = parse_fully_qualified_cf_name(req->get_path_param("name"));
+        // Use of load_built_views() as filtering table should be in sync with
+        // built_indexes_virtual_reader filtering with BUILT_VIEWS table
+        std::vector<db::system_keyspace::view_name> vn = co_await vb.local().get_sys_ks().load_built_views();
+        std::set<sstring> vp;
+        for (auto b : vn) {
+            if (b.first == ks) {
+                vp.insert(b.second);
+            }
+        }
+        replica::database& db = vb.local().get_db();
+        auto uuid = validate_table(db, ks, cf_name);
+        replica::column_family& cf = db.find_column_family(uuid);
+        co_return cf.get_index_manager().list_indexes()
+                | std::views::transform([] (const auto& i) { return i.metadata().name(); })
+                | std::views::filter([&vp] (const auto& n) { return vp.contains(secondary_index::index_table_name(n)); })
+                | std::ranges::to<std::vector>();
     });
 
 }
 
 void unset_view_builder(http_context& ctx, routes& r) {
     ss::view_build_statuses.unset(r);
+    cf::get_built_indexes.unset(r);
 }
 
-static future<json::json_return_type> describe_ring_as_json(sharded<service::storage_service>& ss, sstring keyspace) {
-    co_return json::json_return_type(stream_range_as_array(co_await ss.local().describe_ring(keyspace), token_range_endpoints_to_json));
+namespace {
+template <typename Key, typename Value>
+storage_service_json::mapper map_to_json(const std::pair<Key, Value>& i) {
+    storage_service_json::mapper val;
+    val.key = fmt::to_string(i.first);
+    val.value = fmt::to_string(i.second);
+    return val;
+}
 }
 
-void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_service>& ss, gms::gossiper& g, sharded<cdc::generation_service>& cdc_gs) {
-    ss::local_hostid.set(r, [](std::unique_ptr<request> req) {
-        return db::system_keyspace::load_local_host_id().then([](const utils::UUID& id) {
-            return make_ready_future<json::json_return_type>(id.to_sstring());
-        });
-    });
+static
+future<json::json_return_type>
+rest_get_token_endpoint(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        const auto keyspace_name = req->get_query_param("keyspace");
+        const auto table_name = req->get_query_param("cf");
 
-    ss::get_tokens.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return make_ready_future<json::json_return_type>(stream_range_as_array(ctx.get_token_metadata().sorted_tokens(), [](const dht::token& i) {
-           return boost::lexical_cast<std::string>(i);
-        }));
-    });
-
-    ss::get_node_tokens.set(r, [&ctx] (std::unique_ptr<request> req) {
-        gms::inet_address addr(req->param["endpoint"]);
-        return make_ready_future<json::json_return_type>(stream_range_as_array(ctx.get_token_metadata().get_tokens(addr), [](const dht::token& i) {
-           return boost::lexical_cast<std::string>(i);
-       }));
-    });
-
-    ss::get_commitlog.set(r, [&ctx](const_req req) {
-        return ctx.db.local().commitlog()->active_config().commit_log_location;
-    });
-
-    ss::get_token_endpoint.set(r, [&ss] (std::unique_ptr<request> req) {
-        return make_ready_future<json::json_return_type>(stream_range_as_array(ss.local().get_token_to_endpoint_map(), [](const auto& i) {
-            storage_service_json::mapper val;
-            val.key = boost::lexical_cast<std::string>(i.first);
-            val.value = boost::lexical_cast<std::string>(i.second);
-            return val;
-        }));
-    });
-
-    ss::toppartitions_generic.set(r, [&ctx] (std::unique_ptr<request> req) {
-        bool filters_provided = false;
-
-        std::unordered_set<std::tuple<sstring, sstring>, utils::tuple_hash> table_filters {};
-        if (req->query_parameters.contains("table_filters")) {
-            filters_provided = true;
-            auto filters = req->get_query_param("table_filters");
-            std::stringstream ss { filters };
-            std::string filter;
-            while (!filters.empty() && ss.good()) {
-                std::getline(ss, filter, ',');
-                table_filters.emplace(parse_fully_qualified_cf_name(filter));
+        std::map<dht::token, gms::inet_address> token_endpoints;
+        if (!keyspace_name.empty() && !table_name.empty()) {
+            auto& db = ctx.db.local();
+            auto tid = validate_table(db, keyspace_name, table_name);
+            // Vnode tables have no tablet map, so they get the vnode ring.
+            if (db.find_column_family(tid).uses_tablets()) {
+                token_endpoints = co_await ss.local().get_tablet_to_endpoint_map(tid);
+            } else {
+                token_endpoints = ss.local().get_token_to_endpoint_map();
             }
+        } else if (!keyspace_name.empty()) {
+            validate_keyspace(ctx, keyspace_name);
+            ensure_tablets_disabled(ctx, keyspace_name, "storage_service/tokens_endpoint");
+            token_endpoints = ss.local().get_token_to_endpoint_map();
+        } else if (!table_name.empty()) {
+            throw bad_param_exception("The 'cf' parameter requires the 'keyspace' parameter");
+        } else {
+            token_endpoints = ss.local().get_token_to_endpoint_map();
         }
 
-        std::unordered_set<sstring> keyspace_filters {};
-        if (req->query_parameters.contains("keyspace_filters")) {
-            filters_provided = true;
-            auto filters = req->get_query_param("keyspace_filters");
-            std::stringstream ss { filters };
-            std::string filter;
-            while (!filters.empty() && ss.good()) {
-                std::getline(ss, filter, ',');
-                keyspace_filters.emplace(std::move(filter));
-            }
-        }
+        co_return json::json_return_type(stream_range_as_array(token_endpoints, &map_to_json<dht::token, gms::inet_address>));
+}
 
-        // when the query is empty return immediately
-        if (filters_provided && table_filters.empty() && keyspace_filters.empty()) {
-            apilog.debug("toppartitions query: processing results");
-            httpd::column_family_json::toppartitions_query_results results;
-
-            results.read_cardinality = 0;
-            results.write_cardinality = 0;
-
-            return make_ready_future<json::json_return_type>(results);
-        }
-
-        api::req_param<std::chrono::milliseconds, unsigned> duration{*req, "duration", 1000ms};
-        api::req_param<unsigned> capacity(*req, "capacity", 256);
-        api::req_param<unsigned> list_size(*req, "list_size", 10);
-
-        apilog.info("toppartitions query: #table_filters={} #keyspace_filters={} duration={} list_size={} capacity={}",
-            !table_filters.empty() ? std::to_string(table_filters.size()) : "all", !keyspace_filters.empty() ? std::to_string(keyspace_filters.size()) : "all", duration.param, list_size.param, capacity.param);
-
-        return seastar::do_with(db::toppartitions_query(ctx.db, std::move(table_filters), std::move(keyspace_filters), duration.value, list_size, capacity), [&ctx] (db::toppartitions_query& q) {
-            return run_toppartitions_query(q, ctx);
-        });
-    });
-
-    ss::get_leaving_nodes.set(r, [&ctx](const_req req) {
-        return container_to_vec(ctx.get_token_metadata().get_leaving_endpoints());
-    });
-
-    ss::get_moving_nodes.set(r, [](const_req req) {
-        std::unordered_set<sstring> addr;
-        return container_to_vec(addr);
-    });
-
-    ss::get_joining_nodes.set(r, [&ctx](const_req req) {
-        auto points = ctx.get_token_metadata().get_bootstrap_tokens();
-        std::unordered_set<sstring> addr;
-        for (auto i: points) {
-            addr.insert(boost::lexical_cast<std::string>(i.second));
-        }
-        return container_to_vec(addr);
-    });
-
-    ss::get_release_version.set(r, [&ss](const_req req) {
+static
+json::json_return_type
+rest_get_release_version(sharded<service::storage_service>& ss, const_req& req) {
         return ss.local().get_release_version();
-    });
+}
 
-    ss::get_scylla_release_version.set(r, [](const_req req) {
+static
+json::json_return_type
+rest_get_scylla_release_version(sharded<service::storage_service>& ss, const_req& req) {
         return scylla_version();
-    });
-    ss::get_schema_version.set(r, [&ss](const_req req) {
+}
+
+static
+json::json_return_type
+rest_get_schema_version(sharded<service::storage_service>& ss, const_req& req) {
         return ss.local().get_schema_version();
-    });
+}
 
-    ss::get_all_data_file_locations.set(r, [&ctx](const_req req) {
-        return container_to_vec(ctx.db.local().get_config().data_file_directories());
-    });
+static
+future<json::json_return_type>
+rest_get_range_to_endpoint_map(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto keyspace = validate_keyspace(ctx, req);
+        auto table = req->get_query_param("cf");
+        std::optional<table_id> table_id;
 
-    ss::get_saved_caches_location.set(r, [&ctx](const_req req) {
-        return ctx.db.local().get_config().saved_caches_directory();
-    });
+        if (table.empty()) {
+            ensure_tablets_disabled(ctx, keyspace, "storage_service/range_to_endpoint_map");
+        } else {
+            table_id = validate_table(ctx.db.local(), keyspace, table);
+        }
 
-    ss::get_range_to_endpoint_map.set(r, [&ctx, &ss](std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        std::vector<ss::maplist_mapper> res;
-        return make_ready_future<json::json_return_type>(stream_range_as_array(ss.local().get_range_to_address_map(keyspace),
+        co_return stream_range_as_array(co_await ss.local().get_range_to_address_map(keyspace, table_id),
                 [](const std::pair<dht::token_range, inet_address_vector_replica_set>& entry){
             ss::maplist_mapper m;
             if (entry.first.start()) {
@@ -521,226 +640,204 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
                 m.key.push("");
             }
             for (const gms::inet_address& address : entry.second) {
-                m.value.push(address.to_sstring());
+                m.value.push(fmt::to_string(address));
             }
             return m;
-        }));
-    });
+        });
+}
 
-    ss::get_pending_range_to_endpoint_map.set(r, [&ctx](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_pending_range_to_endpoint_map(http_context& ctx, std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
-        auto keyspace = validate_keyspace(ctx, req->param);
+        auto keyspace = validate_keyspace(ctx, req);
         std::vector<ss::maplist_mapper> res;
         return make_ready_future<json::json_return_type>(res);
-    });
+}
 
-    ss::describe_any_ring.set(r, [&ctx, &ss](std::unique_ptr<request> req) {
-        return describe_ring_as_json(ss, "");
-    });
-
-    ss::describe_ring.set(r, [&ctx, &ss](std::unique_ptr<request> req) {
-        return describe_ring_as_json(ss, validate_keyspace(ctx, req->param));
-    });
-
-    ss::get_host_id_map.set(r, [&ctx](const_req req) {
-        std::vector<ss::mapper> res;
-        return map_to_key_value(ctx.get_token_metadata().get_endpoint_to_host_id_map_for_reading(), res);
-    });
-
-    ss::get_load.set(r, [&ctx](std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, &replica::column_family_stats::live_disk_space_used);
-    });
-
-    ss::get_load_map.set(r, [&ctx] (std::unique_ptr<request> req) {
-        return ctx.lmeter.get_load_map().then([] (auto&& load_map) {
-            std::vector<ss::map_string_double> res;
-            for (auto i : load_map) {
-                ss::map_string_double val;
-                val.key = i.first;
-                val.value = i.second;
-                res.push_back(val);
-            }
-            return make_ready_future<json::json_return_type>(res);
-        });
-    });
-
-    ss::get_current_generation_number.set(r, [&g](std::unique_ptr<request> req) {
-        gms::inet_address ep(utils::fb_utilities::get_broadcast_address());
-        return g.get_current_generation_number(ep).then([](int res) {
-            return make_ready_future<json::json_return_type>(res);
-        });
-    });
-
-    ss::get_natural_endpoints.set(r, [&ctx, &ss](const_req req) {
-        auto keyspace = validate_keyspace(ctx, req.param);
-        return container_to_vec(ss.local().get_natural_endpoints(keyspace, req.get_query_param("cf"),
-                req.get_query_param("key")));
-    });
-
-    ss::cdc_streams_check_and_repair.set(r, [&ctx, &cdc_gs] (std::unique_ptr<request> req) {
-        if (!cdc_gs.local_is_initialized()) {
-            throw std::runtime_error("get_cdc_generation_service: not initialized yet");
+static
+future<json::json_return_type>
+rest_describe_ring(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        if (!req->param.exists("keyspace")) {
+            throw bad_param_exception("The keyspace param is not provided");
         }
-        return cdc_gs.local().check_and_repair_cdc_streams().then([] {
+        auto keyspace = validate_keyspace(ctx, req);
+        auto table = req->get_query_param("table");
+        utils::chunked_vector<dht::token_range_endpoints> ranges;
+        if (!table.empty()) {
+            auto table_id = validate_table(ctx.db.local(), keyspace, table);
+            ranges = co_await ss.local().describe_ring_for_table(table_id);
+        } else {
+            ranges = co_await ss.local().describe_ring(keyspace);
+        }
+        co_return json::json_return_type(stream_range_as_array(std::move(ranges), token_range_endpoints_to_json));
+}
+
+static
+future<json::json_return_type>
+rest_get_current_generation_number(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto ep = ss.local().get_token_metadata().get_topology().my_host_id();
+        return ss.local().gossiper().get_current_generation_number(ep).then([](gms::generation_type res) {
+            return make_ready_future<json::json_return_type>(res.value());
+        });
+}
+
+static
+json::json_return_type
+rest_get_natural_endpoints(http_context& ctx, sharded<service::storage_service>& ss, const_req req) {
+        auto keyspace = validate_keyspace(ctx, req);
+        auto res = ss.local().get_natural_endpoints(keyspace, req.get_query_param("cf"), req.get_query_param("key"));
+        return res | std::views::transform([] (auto& ep) { return fmt::to_string(ep); }) | std::ranges::to<std::vector>();
+}
+
+static
+json::json_return_type
+rest_get_natural_endpoints_v2(http_context& ctx, sharded<service::storage_service>& ss, const_req req) {
+        auto keyspace = validate_keyspace(ctx, req);
+        auto res = ss.local().get_natural_endpoints(keyspace, req.get_query_param("cf"), req.get_query_param_array("key_component"));
+        return res | std::views::transform([] (auto& ep) { return fmt::to_string(ep); }) | std::ranges::to<std::vector>();
+}
+
+static
+future<json::json_return_type>
+rest_cdc_streams_check_and_repair(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        return ss.invoke_on(0, [] (service::storage_service& ss) {
+            return ss.check_and_repair_cdc_streams();
+        }).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::force_keyspace_compaction.set(r, [&ctx](std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_families = parse_tables(keyspace, ctx, req->query_parameters, "cf");
-        if (column_families.empty()) {
-            column_families = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
+static
+future<json::json_return_type>
+rest_cleanup_all(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        bool global = get_query_param<bool>(*req, "global", true);
+
+        apilog.info("cleanup_all global={}", global);
+
+        if (global) {
+            co_await ss.invoke_on(0, [] (service::storage_service& ss) -> future<> {
+                co_return co_await ss.do_clusterwide_vnodes_cleanup();
+            });
+            co_return json::json_return_type(0);
         }
-        return ctx.db.invoke_on_all([keyspace, column_families] (replica::database& db) -> future<> {
-            auto table_ids = boost::copy_range<std::vector<utils::UUID>>(column_families | boost::adaptors::transformed([&] (auto& cf_name) {
-                return db.find_uuid(keyspace, cf_name);
-            }));
-            // major compact smaller tables first, to increase chances of success if low on space.
-            std::ranges::sort(table_ids, std::less<>(), [&] (const utils::UUID& id) {
-                return db.find_column_family(id).get_stats().live_disk_space_used;
-            });
-            // as a table can be dropped during loop below, let's find it before issuing major compaction request.
-            for (auto& id : table_ids) {
-                co_await db.find_column_family(id).compact_all_sstables();
-            }
-            co_return;
-        }).then([]{
-                return make_ready_future<json::json_return_type>(json_void());
+        // fall back to the local cleanup if local cleanup is requested
+        auto& db = ctx.db;
+        auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
+        auto task = co_await compaction_module.start_global_cleanup_compaction(db);
+        co_await task->done();
+
+        // Mark this node as clean
+        co_await ss.invoke_on(0, [] (service::storage_service& ss) -> future<> {
+            co_await ss.reset_cleanup_needed();
         });
-    });
 
-    ss::force_keyspace_cleanup.set(r, [&ctx, &ss](std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_families = parse_tables(keyspace, ctx, req->query_parameters, "cf");
-        if (column_families.empty()) {
-            column_families = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
-        }
-        return ss.local().is_cleanup_allowed(keyspace).then([&ctx, keyspace,
-                column_families = std::move(column_families)] (bool is_cleanup_allowed) mutable {
-            if (!is_cleanup_allowed) {
-                return make_exception_future<json::json_return_type>(
-                        std::runtime_error("Can not perform cleanup operation when topology changes"));
-            }
-            return ctx.db.invoke_on_all([keyspace, column_families] (replica::database& db) -> future<> {
-                auto table_ids = boost::copy_range<std::vector<utils::UUID>>(column_families | boost::adaptors::transformed([&] (auto& table_name) {
-                    return db.find_uuid(keyspace, table_name);
-                }));
-                // cleanup smaller tables first, to increase chances of success if low on space.
-                std::ranges::sort(table_ids, std::less<>(), [&] (const utils::UUID& id) {
-                    return db.find_column_family(id).get_stats().live_disk_space_used;
-                });
-                auto& cm = db.get_compaction_manager();
-                // as a table can be dropped during loop below, let's find it before issuing the cleanup request.
-                for (auto& id : table_ids) {
-                    replica::table& t = db.find_column_family(id);
-                    co_await cm.perform_cleanup(db, &t);
-                }
-                co_return;
-            }).then([]{
-                return make_ready_future<json::json_return_type>(0);
-            });
+        co_return json::json_return_type(0);
+}
+
+static
+future<json::json_return_type>
+rest_reset_cleanup_needed(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        apilog.info("reset_cleanup_needed");
+        co_await ss.invoke_on(0, [] (service::storage_service& ss) {
+            return ss.reset_cleanup_needed();
         });
-    });
+        co_return json_void();
+}
 
-    ss::perform_keyspace_offstrategy_compaction.set(r, wrap_ks_cf(ctx, [] (http_context& ctx, std::unique_ptr<request> req, sstring keyspace, std::vector<sstring> tables) -> future<json::json_return_type> {
-        co_return co_await ctx.db.map_reduce0([&keyspace, &tables] (replica::database& db) -> future<bool> {
-            bool needed = false;
-            for (const auto& table : tables) {
-                auto& t = db.find_column_family(keyspace, table);
-                needed |= co_await t.perform_offstrategy_compaction();
-            }
-            co_return needed;
-        }, false, std::plus<bool>());
-    }));
-
-    ss::upgrade_sstables.set(r, wrap_ks_cf(ctx, [] (http_context& ctx, std::unique_ptr<request> req, sstring keyspace, std::vector<sstring> column_families) {
-        bool exclude_current_version = req_param<bool>(*req, "exclude_current_version", false);
-
-        return ctx.db.invoke_on_all([=] (replica::database& db) {
-            return do_for_each(column_families, [=, &db](sstring cfname) {
-                auto& cm = db.get_compaction_manager();
-                auto& cf = db.find_column_family(keyspace, cfname);
-                return cm.perform_sstable_upgrade(db, &cf, exclude_current_version);
-            });
-        }).then([]{
-            return make_ready_future<json::json_return_type>(0);
-        });
-    }));
-
-    ss::force_keyspace_flush.set(r, [&ctx](std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_families = parse_tables(keyspace, ctx, req->query_parameters, "cf");
-        if (column_families.empty()) {
-            column_families = map_keys(ctx.db.local().find_keyspace(keyspace).metadata().get()->cf_meta_data());
-        }
-        return ctx.db.invoke_on_all([keyspace, column_families] (replica::database& db) {
-            return parallel_for_each(column_families, [&db, keyspace](const sstring& cf) mutable {
-                return db.find_column_family(keyspace, cf).flush();
-            });
-        }).then([]{
-                return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-
-    ss::decommission.set(r, [&ss](std::unique_ptr<request> req) {
-        return ss.local().decommission().then([] {
+static
+future<json::json_return_type>
+rest_decommission(sharded<service::storage_service>& ss, sharded<db::snapshot_ctl>& ssc, std::unique_ptr<http::request> req) {
+        apilog.info("decommission");
+        return ss.local().decommission(ssc).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::move.set(r, [&ss] (std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_move(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
         auto new_token = req->get_query_param("new_token");
         return ss.local().move(new_token).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::remove_node.set(r, [&ss](std::unique_ptr<request> req) {
-        auto host_id = req->get_query_param("host_id");
-        std::vector<sstring> ignore_nodes_strs= split(req->get_query_param("ignore_nodes"), ",");
-        auto ignore_nodes = std::list<gms::inet_address>();
-        for (std::string n : ignore_nodes_strs) {
+static
+future<json::json_return_type>
+rest_remove_node(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto host_id = require_query_param<locator::host_id>(*req, "host_id");
+        std::vector<sstring> ignore_nodes_strs = utils::split_comma_separated_list(req->get_query_param("ignore_nodes"));
+        apilog.info("remove_node: host_id={} ignore_nodes={}", host_id, ignore_nodes_strs);
+        locator::host_id_or_endpoint_list ignore_nodes;
+        ignore_nodes.reserve(ignore_nodes_strs.size());
+        for (const sstring& n : ignore_nodes_strs) {
             try {
-                std::replace(n.begin(), n.end(), '\"', ' ');
-                std::replace(n.begin(), n.end(), '\'', ' ');
-                boost::trim_all(n);
-                if (!n.empty()) {
-                    auto node = gms::inet_address(n);
-                    ignore_nodes.push_back(node);
+                auto hoep = locator::host_id_or_endpoint(n);
+                if (!ignore_nodes.empty() && hoep.has_host_id() != ignore_nodes.front().has_host_id()) {
+                    throw std::runtime_error("All nodes should be identified using the same method: either Host IDs or ip addresses.");
                 }
+                ignore_nodes.push_back(std::move(hoep));
             } catch (...) {
-                throw std::runtime_error(format("Failed to parse ignore_nodes parameter: ignore_nodes={}, node={}", ignore_nodes_strs, n));
+                throw std::runtime_error(fmt::format("Failed to parse ignore_nodes parameter: ignore_nodes={}, node={}: {:t}", ignore_nodes_strs, n, std::current_exception()));
             }
         }
         return ss.local().removenode(host_id, std::move(ignore_nodes)).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::get_removal_status.set(r, [&ss](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_exclude_node(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    auto hosts = utils::split_comma_separated_list(req->get_query_param("hosts"))
+        | std::views::transform([] (const sstring& s) { return locator::host_id(parse_uuid_param("hosts", s)); })
+        | std::ranges::to<std::vector<locator::host_id>>();
+
+    auto& topo = ss.local().get_token_metadata().get_topology();
+    for (auto host : hosts) {
+        if (!topo.has_node(host)) {
+            throw bad_param_exception(fmt::format("Host ID {} does not belong to this cluster", host));
+        }
+    }
+
+    apilog.info("exclude_node: hosts={}", hosts);
+    co_await ss.local().run_with_no_api_lock([hosts = std::move(hosts)] (service::storage_service& ss) {
+        return ss.mark_excluded(hosts);
+    });
+    co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_get_removal_status(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
         return ss.local().get_removal_status().then([] (auto status) {
             return make_ready_future<json::json_return_type>(status);
         });
-    });
+}
 
-    ss::force_remove_completion.set(r, [&ss](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_force_remove_completion(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
         return ss.local().force_remove_completion().then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::set_logging_level.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_set_logging_level(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         auto class_qualifier = req->get_query_param("class_qualifier");
         auto level = req->get_query_param("level");
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::get_logging_levels.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_logging_levels(std::unique_ptr<http::request> req) {
         std::vector<ss::mapper> res;
         for (auto i : logging::logger_registry().get_all_logger_names()) {
             ss::mapper log;
@@ -749,640 +846,1022 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
             res.push_back(log);
         }
         return make_ready_future<json::json_return_type>(res);
-    });
+}
 
-    ss::get_operation_mode.set(r, [&ss](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_operation_mode(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
         return ss.local().get_operation_mode().then([] (auto mode) {
-            return make_ready_future<json::json_return_type>(mode);
+            return make_ready_future<json::json_return_type>(format("{}", mode));
         });
-    });
+}
 
-    ss::is_starting.set(r, [&ss](std::unique_ptr<request> req) {
-        return ss.local().is_starting().then([] (auto starting) {
-            return make_ready_future<json::json_return_type>(starting);
+static
+future<json::json_return_type>
+rest_is_starting(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        return ss.local().get_operation_mode().then([] (auto mode) {
+            return make_ready_future<json::json_return_type>(mode <= service::storage_service::mode::STARTING);
         });
-    });
+}
 
-    ss::get_drain_progress.set(r, [&ctx](std::unique_ptr<request> req) {
-        return ctx.db.map_reduce(adder<replica::database::drain_progress>(), [] (auto& db) {
-            return db.get_drain_progress();
+static
+future<json::json_return_type>
+rest_get_drain_progress(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        return ss.map_reduce(adder<replica::database::drain_progress>(), [] (auto& ss) {
+            return ss.get_database().get_drain_progress();
         }).then([] (auto&& progress) {
             auto progress_str = format("Drained {}/{} ColumnFamilies", progress.remaining_cfs, progress.total_cfs);
             return make_ready_future<json::json_return_type>(std::move(progress_str));
         });
-    });
+}
 
-    ss::drain.set(r, [&ss](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_drain(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        apilog.info("drain");
         return ss.local().drain().then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
-    ss::truncate.set(r, [&ctx](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto column_family = req->get_query_param("cf");
-        return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::get_keyspaces.set(r, [&ctx](const_req req) {
-        auto type = req.get_query_param("type");
-        if (type == "user") {
-            return ctx.db.local().get_non_system_keyspaces();
-        } else if (type == "non_local_strategy") {
-            return map_keys(ctx.db.local().get_keyspaces() | boost::adaptors::filtered([](const auto& p) {
-                return p.second.get_replication_strategy().get_type() != locator::replication_strategy_type::local;
-            }));
-        }
-        return map_keys(ctx.db.local().get_keyspaces());
-    });
-
-    ss::update_snitch.set(r, [](std::unique_ptr<request> req) {
-        auto ep_snitch_class_name = req->get_query_param("ep_snitch_class_name");
-        return locator::i_endpoint_snitch::reset_snitch(ep_snitch_class_name).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
-
-    ss::stop_gossiping.set(r, [&ss](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_stop_gossiping(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        apilog.info("stop_gossiping");
         return ss.local().stop_gossiping().then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::start_gossiping.set(r, [&ss](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_start_gossiping(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        apilog.info("start_gossiping");
         return ss.local().start_gossiping().then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::is_gossip_running.set(r, [&ss](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_is_gossip_running(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
         return ss.local().is_gossip_running().then([] (bool running){
             return make_ready_future<json::json_return_type>(running);
         });
-    });
+}
 
 
-    ss::stop_daemon.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_stop_daemon(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::is_initialized.set(r, [&ss](std::unique_ptr<request> req) {
-        return ss.local().is_initialized().then([] (bool initialized) {
-            return make_ready_future<json::json_return_type>(initialized);
-        });
-    });
-
-    ss::join_ring.set(r, [](std::unique_ptr<request> req) {
-        return make_ready_future<json::json_return_type>(json_void());
-    });
-
-    ss::is_joined.set(r, [&ss] (std::unique_ptr<request> req) {
-        return make_ready_future<json::json_return_type>(ss.local().is_joined());
-    });
-
-    ss::set_stream_throughput_mb_per_sec.set(r, [](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        auto value = req->get_query_param("value");
-        return make_ready_future<json::json_return_type>(json_void());
-    });
-
-    ss::get_stream_throughput_mb_per_sec.set(r, [](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        return make_ready_future<json::json_return_type>(0);
-    });
-
-    ss::get_compaction_throughput_mb_per_sec.set(r, [&ctx](std::unique_ptr<request> req) {
-        int value = ctx.db.local().get_config().compaction_throughput_mb_per_sec();
-        return make_ready_future<json::json_return_type>(value);
-    });
-
-    ss::set_compaction_throughput_mb_per_sec.set(r, [](std::unique_ptr<request> req) {
-        //TBD
-        unimplemented();
-        auto value = req->get_query_param("value");
-        return make_ready_future<json::json_return_type>(json_void());
-    });
-
-    ss::is_incremental_backups_enabled.set(r, [&ctx](std::unique_ptr<request> req) {
-        // If this is issued in parallel with an ongoing change, we may see values not agreeing.
-        // Reissuing is asking for trouble, so we will just return true upon seeing any true value.
-        return ctx.db.map_reduce(adder<bool>(), [] (replica::database& db) {
-            for (auto& pair: db.get_keyspaces()) {
-                auto& ks = pair.second;
-                if (ks.incremental_backups_enabled()) {
-                    return true;
-                }
+static
+future<json::json_return_type>
+rest_is_initialized(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        return ss.local().get_operation_mode().then([&ss] (auto mode) {
+            bool is_initialized = mode >= service::storage_service::mode::STARTING && mode != service::storage_service::mode::MAINTENANCE;
+            if (mode == service::storage_service::mode::NORMAL) {
+                is_initialized = ss.local().gossiper().is_enabled();
             }
-            return false;
-        }).then([] (bool val) {
-            return make_ready_future<json::json_return_type>(val);
+            return make_ready_future<json::json_return_type>(is_initialized);
         });
-    });
+}
 
-    ss::set_incremental_backups_enabled.set(r, [&ctx](std::unique_ptr<request> req) {
-        auto val_str = req->get_query_param("value");
-        bool value = (val_str == "True") || (val_str == "true") || (val_str == "1");
-        return ctx.db.invoke_on_all([value] (replica::database& db) {
-            db.set_enable_incremental_backups(value);
+static
+future<json::json_return_type>
+rest_join_ring(std::unique_ptr<http::request> req) {
+        return make_ready_future<json::json_return_type>(json_void());
+}
 
-            // Change both KS and CF, so they are in sync
-            for (auto& pair: db.get_keyspaces()) {
-                auto& ks = pair.second;
-                ks.set_incremental_backups(value);
-            }
-
-            for (auto& pair: db.get_column_families()) {
-                auto cf_ptr = pair.second;
-                cf_ptr->set_incremental_backups(value);
-            }
-        }).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
+static
+future<json::json_return_type>
+rest_is_joined(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        return ss.local().get_operation_mode().then([] (auto mode) {
+            return make_ready_future<json::json_return_type>(mode >= service::storage_service::mode::JOINING && mode != service::storage_service::mode::MAINTENANCE);
         });
-    });
+}
 
-    ss::rebuild.set(r, [&ss](std::unique_ptr<request> req) {
-        auto source_dc = req->get_query_param("source_dc");
+static
+future<json::json_return_type>
+rest_rebuild(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        utils::optional_param source_dc;
+        if (auto source_dc_str = req->get_query_param("source_dc"); !source_dc_str.empty()) {
+            source_dc.emplace(std::move(source_dc_str)).set_user_provided();
+        }
+        if (get_query_param<bool>(*req, "force")) {
+            if (!source_dc) {
+                throw bad_param_exception("The `source_dc` option must be provided for using the `force` option");
+            }
+            source_dc.set_force();
+        }
+        apilog.info("rebuild: source_dc={}", source_dc);
         return ss.local().rebuild(std::move(source_dc)).then([] {
             return make_ready_future<json::json_return_type>(json_void());
         });
-    });
+}
 
-    ss::bulk_load.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_bulk_load(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
-        auto path = req->param["path"];
+        auto path = req->get_path_param("path");
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::bulk_load_async.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_bulk_load_async(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
-        auto path = req->param["path"];
+        auto path = req->get_path_param("path");
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::reschedule_failed_deletions.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_reschedule_failed_deletions(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::sample_key_range.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_sample_key_range(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         std::vector<sstring> res;
         return make_ready_future<json::json_return_type>(res);
-    });
+}
 
-    ss::reset_local_schema.set(r, [](std::unique_ptr<request> req) {
-        // FIXME: We should truncate schema tables if more than one node in the cluster.
-        auto& sp = service::get_storage_proxy();
-        auto& fs = sp.local().features();
-        return db::schema_tables::recalculate_schema_version(sp, fs).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
-    });
+static
+future<json::json_return_type>
+rest_reset_local_schema(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        throw std::runtime_error("Schema version recalculation is no longer supported");
+}
 
-    ss::set_trace_probability.set(r, [](std::unique_ptr<request> req) {
-        auto probability = req->get_query_param("probability");
-        return futurize_invoke([probability] {
-            double real_prob = std::stod(probability.c_str());
-            return tracing::tracing::tracing_instance().invoke_on_all([real_prob] (auto& local_tracing) {
+static
+future<json::json_return_type>
+rest_set_trace_probability(std::unique_ptr<http::request> req) {
+        const auto real_prob = require_query_param<double>(*req, "probability");
+        apilog.info("set_trace_probability: probability={}", real_prob);
+        try {
+            co_await tracing::tracing::tracing_instance().invoke_on_all([real_prob] (auto& local_tracing) {
                 local_tracing.set_trace_probability(real_prob);
-            }).then([] {
-                return make_ready_future<json::json_return_type>(json_void());
             });
-        }).then_wrapped([probability] (auto&& f) {
-            try {
-                f.get();
-                return make_ready_future<json::json_return_type>(json_void());
-            } catch (std::out_of_range& e) {
-                throw httpd::bad_param_exception(e.what());
-            } catch (std::invalid_argument&){
-                throw httpd::bad_param_exception(format("Bad format in a probability value: \"{}\"", probability.c_str()));
-            }
-        });
-    });
+        } catch (std::out_of_range& e) {
+            throw httpd::bad_param_exception(e.what());
+        }
+        co_return json_void();
+}
 
-    ss::get_trace_probability.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_trace_probability(std::unique_ptr<http::request> req) {
         return make_ready_future<json::json_return_type>(tracing::tracing::get_local_tracing_instance().get_trace_probability());
-    });
+}
 
-    ss::get_slow_query_info.set(r, [](const_req req) {
+static
+json::json_return_type
+rest_get_slow_query_info(const_req req) {
         ss::slow_query_info res;
         res.enable = tracing::tracing::get_local_tracing_instance().slow_query_tracing_enabled();
         res.ttl = tracing::tracing::get_local_tracing_instance().slow_query_record_ttl().count() ;
         res.threshold = tracing::tracing::get_local_tracing_instance().slow_query_threshold().count();
         res.fast = tracing::tracing::get_local_tracing_instance().ignore_trace_events_enabled();
         return res;
-    });
+}
 
-    ss::set_slow_query.set(r, [](std::unique_ptr<request> req) {
-        auto enable = req->get_query_param("enable");
-        auto ttl = req->get_query_param("ttl");
-        auto threshold = req->get_query_param("threshold");
-        auto fast = req->get_query_param("fast");
-        try {
-            return tracing::tracing::tracing_instance().invoke_on_all([enable, ttl, threshold, fast] (auto& local_tracing) {
-                if (threshold != "") {
-                    local_tracing.set_slow_query_threshold(std::chrono::microseconds(std::stol(threshold.c_str())));
-                }
-                if (ttl != "") {
-                    local_tracing.set_slow_query_record_ttl(std::chrono::seconds(std::stol(ttl.c_str())));
-                }
-                if (enable != "") {
-                    local_tracing.set_slow_query_enabled(strcasecmp(enable.c_str(), "true") == 0);
-                }
-                if (fast != "") {
-                    local_tracing.set_ignore_trace_events(strcasecmp(fast.c_str(), "true") == 0);
-                }
-            }).then([] {
-                return make_ready_future<json::json_return_type>(json_void());
-            });
-        } catch (...) {
-            throw httpd::bad_param_exception(format("Bad format value: "));
-        }
-    });
+static
+future<json::json_return_type>
+rest_set_slow_query(std::unique_ptr<http::request> req) {
+        apilog.info("set_slow_query: {}", req->get_query_params());
+        const auto enable = try_get_query_param<bool>(*req, "enable");
+        const auto ttl = try_get_query_param<std::chrono::seconds>(*req, "ttl");
+        const auto threshold = try_get_query_param<std::chrono::microseconds>(*req, "threshold");
+        const auto fast = try_get_query_param<bool>(*req, "fast");
+        return tracing::tracing::tracing_instance().invoke_on_all([enable, ttl, threshold, fast] (auto& local_tracing) {
+            if (threshold) {
+                local_tracing.set_slow_query_threshold(*threshold);
+            }
+            if (ttl) {
+                local_tracing.set_slow_query_record_ttl(*ttl);
+            }
+            if (enable) {
+                local_tracing.set_slow_query_enabled(*enable);
+            }
+            if (fast) {
+                local_tracing.set_ignore_trace_events(*fast);
+            }
+        }).then([] {
+            return make_ready_future<json::json_return_type>(json_void());
+        });
+}
 
-    ss::enable_auto_compaction.set(r, [&ctx, &ss](std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto tables = parse_tables(keyspace, ctx, req->query_parameters, "cf");
-
-        return set_tables_autocompaction(ctx, ss.local(), keyspace, tables, true);
-    });
-
-    ss::disable_auto_compaction.set(r, [&ctx, &ss](std::unique_ptr<request> req) {
-        auto keyspace = validate_keyspace(ctx, req->param);
-        auto tables = parse_tables(keyspace, ctx, req->query_parameters, "cf");
-
-        return set_tables_autocompaction(ctx, ss.local(), keyspace, tables, false);
-    });
-
-    ss::deliver_hints.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_deliver_hints(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         auto host = req->get_query_param("host");
         return make_ready_future<json::json_return_type>(json_void());
-      });
+}
 
-    ss::get_cluster_name.set(r, [&g](const_req req) {
-        return g.get_cluster_name();
-    });
+static
+json::json_return_type
+rest_get_cluster_name(sharded<service::storage_service>& ss, const_req req) {
+        return ss.local().gossiper().get_cluster_name();
+}
 
-    ss::get_partitioner_name.set(r, [&g](const_req req) {
-        return g.get_partitioner_name();
-    });
+static
+json::json_return_type
+rest_get_partitioner_name(sharded<service::storage_service>& ss, const_req req) {
+        return ss.local().gossiper().get_partitioner_name();
+}
 
-    ss::get_tombstone_warn_threshold.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_tombstone_warn_threshold(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(0);
-    });
+}
 
-    ss::set_tombstone_warn_threshold.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_set_tombstone_warn_threshold(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         auto debug_threshold = req->get_query_param("debug_threshold");
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::get_tombstone_failure_threshold.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_tombstone_failure_threshold(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(0);
-    });
+}
 
-    ss::set_tombstone_failure_threshold.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_set_tombstone_failure_threshold(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         auto debug_threshold = req->get_query_param("debug_threshold");
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::get_batch_size_failure_threshold.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_batch_size_failure_threshold(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(0);
-    });
+}
 
-    ss::set_batch_size_failure_threshold.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_set_batch_size_failure_threshold(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         auto threshold = req->get_query_param("threshold");
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::set_hinted_handoff_throttle_in_kb.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_set_hinted_handoff_throttle_in_kb(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         auto debug_threshold = req->get_query_param("throttle");
         return make_ready_future<json::json_return_type>(json_void());
-    });
+}
 
-    ss::get_metrics_load.set(r, [&ctx](std::unique_ptr<request> req) {
-        return get_cf_stats(ctx, &replica::column_family_stats::live_disk_space_used);
-    });
-
-    ss::get_exceptions.set(r, [&ss](const_req req) {
+static
+json::json_return_type
+rest_get_exceptions(sharded<service::storage_service>& ss, const_req req) {
         return ss.local().get_exception_count();
-    });
+}
 
-    ss::get_total_hints_in_progress.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_total_hints_in_progress(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(0);
-    });
+}
 
-    ss::get_total_hints.set(r, [](std::unique_ptr<request> req) {
+static
+future<json::json_return_type>
+rest_get_total_hints(std::unique_ptr<http::request> req) {
         //TBD
         unimplemented();
         return make_ready_future<json::json_return_type>(0);
+}
+
+static
+future<json::json_return_type>
+rest_get_ownership(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        if (any_of_keyspaces_use_tablets(ctx)) {
+            throw httpd::bad_param_exception("storage_service/ownership cannot be used when a keyspace uses tablets");
+        }
+
+        co_return json::json_return_type(stream_range_as_array(co_await ss.local().get_ownership(), &map_to_json<gms::inet_address, float>));
+}
+
+static
+future<json::json_return_type>
+rest_get_effective_ownership(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto keyspace_name = req->get_path_param("keyspace") == "null" ? "" : validate_keyspace(ctx, req);
+        auto table_name = req->get_query_param("cf");
+
+        if (!keyspace_name.empty()) {
+            if (table_name.empty()) {
+                ensure_tablets_disabled(ctx, keyspace_name, "storage_service/ownership");
+            } else {
+                validate_table(ctx.db.local(), keyspace_name, table_name);
+            }
+        }
+
+        co_return json::json_return_type(stream_range_as_array(co_await ss.local().effective_ownership(keyspace_name, table_name), &map_to_json<gms::inet_address, float>));
+}
+
+static
+future<json::json_return_type>
+rest_reload_raft_topology_state(sharded<service::storage_service>& ss, service::raft_group0_client& group0_client, std::unique_ptr<http::request> req) {
+        co_await ss.invoke_on(0, [&group0_client] (service::storage_service& ss) -> future<> {
+            return ss.reload_raft_topology_state(group0_client);
+        });
+        co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_upgrade_to_raft_topology(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        apilog.info("Requested to schedule upgrade to raft topology, but this version does not need it since it uses raft topology by default.");
+        co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_raft_topology_upgrade_status(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        co_return sstring("done");
+}
+
+static
+future<json::json_return_type>
+rest_raft_topology_get_cmd_status(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        const auto status = co_await ss.invoke_on(0, [] (auto& ss) {
+            return ss.get_topology_cmd_status();
+        });
+        if (status.active_dst.empty()) {
+            co_return sstring("none");
+        }
+        co_return sstring(fmt::format("{}[{}]: {}", status.current, status.index, fmt::join(status.active_dst, ",")));
+}
+
+static
+future<json::json_return_type>
+rest_move_tablet(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto src_host_id = require_query_param<locator::host_id>(*req, "src_host");
+        auto src_shard_id = require_query_param<shard_id>(*req, "src_shard");
+        auto dst_host_id = require_query_param<locator::host_id>(*req, "dst_host");
+        auto dst_shard_id = require_query_param<shard_id>(*req, "dst_shard");
+        auto token = dht::token::from_int64(require_query_param<int64_t>(*req, "token"));
+        auto ks = req->get_query_param("ks");
+        auto table = req->get_query_param("table");
+        auto table_id = validate_table(ctx.db.local(), ks, table);
+        auto force = get_query_param<service::loosen_constraints>(*req, "force");
+
+        co_await ss.local().move_tablet(table_id, token,
+            locator::tablet_replica{src_host_id, src_shard_id},
+            locator::tablet_replica{dst_host_id, dst_shard_id},
+            force);
+
+        co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_add_tablet_replica(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto dst_host_id = require_query_param<locator::host_id>(*req, "dst_host");
+        auto dst_shard_id = require_query_param<shard_id>(*req, "dst_shard");
+        auto token = dht::token::from_int64(require_query_param<int64_t>(*req, "token"));
+        auto ks = req->get_query_param("ks");
+        auto table = req->get_query_param("table");
+        auto table_id = validate_table(ctx.db.local(), ks, table);
+        auto force = get_query_param<service::loosen_constraints>(*req, "force");
+
+        co_await ss.local().add_tablet_replica(table_id, token,
+            locator::tablet_replica{dst_host_id, dst_shard_id},
+            force);
+
+        co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_del_tablet_replica(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto dst_host_id = require_query_param<locator::host_id>(*req, "host");
+        auto dst_shard_id = require_query_param<shard_id>(*req, "shard");
+        auto token = dht::token::from_int64(require_query_param<int64_t>(*req, "token"));
+        auto ks = req->get_query_param("ks");
+        auto table = req->get_query_param("table");
+        auto table_id = validate_table(ctx.db.local(), ks, table);
+        auto force = get_query_param<service::loosen_constraints>(*req, "force");
+
+        co_await ss.local().del_tablet_replica(table_id, token,
+            locator::tablet_replica{dst_host_id, dst_shard_id},
+            force);
+
+        co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_repair_tablet(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto tokens_param = split(req->get_query_param("tokens"), ",");
+        utils::chunked_vector<dht::token> tokens;
+        bool all_tokens = tokens_param.size() == 1 && tokens_param.front() == "all";
+        if (!all_tokens) {
+            tokens.reserve(tokens_param.size());
+            for (auto& t : tokens_param) {
+                auto token = dht::token::from_int64(parse_number_param<int64_t>("tokens", t));
+                tokens.push_back(token);
+            }
+        }
+        auto ks = req->get_query_param("ks");
+        auto table = req->get_query_param("table");
+        bool await_completion = get_query_param<bool>(*req, "await_completion");
+
+        // Use regular mode if the incremental_mode option is not provided by user.
+        auto incremental = req->get_query_param("incremental_mode");
+        auto incremental_mode = incremental.empty() ? locator::default_tablet_repair_incremental_mode : locator::tablet_repair_incremental_mode_from_string(incremental);
+        auto table_id = validate_table(ctx.db.local(), ks, table);
+        std::variant<utils::chunked_vector<dht::token>, service::storage_service::all_tokens_tag> tokens_variant;
+        if (all_tokens) {
+            tokens_variant = service::storage_service::all_tokens_tag();
+        } else {
+            tokens_variant = tokens;
+        }
+        auto hosts = req->get_query_param("hosts_filter");
+        auto dcs = req->get_query_param("dcs_filter");
+
+        std::unordered_set<locator::host_id> hosts_filter;
+        if (!hosts.empty()) {
+            std::string delim = ",";
+            hosts_filter = std::ranges::views::split(hosts, delim) | std::views::transform([](auto&& h) {
+                return locator::host_id(parse_uuid_param("hosts_filter", std::string_view{h}));
+            }) | std::ranges::to<std::unordered_set>();
+        }
+        auto dcs_filter = locator::tablet_task_info::deserialize_repair_dcs_filter(dcs);
+        try {
+            auto res = co_await ss.local().add_repair_tablet_request(table_id, tokens_variant, hosts_filter, dcs_filter, await_completion, incremental_mode);
+            co_return json::json_return_type(res);
+        } catch (std::invalid_argument& e) {
+            throw httpd::bad_param_exception(e.what());
+        }
+}
+
+static
+future<json::json_return_type>
+rest_tablet_balancing_enable(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        auto enabled = require_query_param<bool>(*req, "enabled");
+        auto grace_period = try_get_query_param<std::chrono::seconds>(*req, "grace_period_in_seconds");
+        // Capped so that lowres_clock::now() + grace_period can't overflow.
+        constexpr auto max_grace_period = std::chrono::seconds(7 * 24 * 60 * 60);
+        if (grace_period && (*grace_period < std::chrono::seconds::zero() || *grace_period > max_grace_period)) {
+            throw bad_param_exception(fmt::format("grace_period_in_seconds: must be between 0 and {}, got '{}'",
+                    max_grace_period.count(), grace_period->count()));
+        }
+        co_await ss.local().set_tablet_balancing_enabled(enabled, grace_period);
+        co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_create_vnode_tablet_migration(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    if (!ss.local().get_feature_service().vnodes_to_tablets_migrations) {
+        apilog.warn("create_vnode_tablet_migration: called before the cluster feature was enabled");
+        throw std::runtime_error("vnodes-to-tablets migration requires all nodes to support the VNODES_TO_TABLETS_MIGRATIONS cluster feature");
+    }
+    auto keyspace = validate_keyspace(ctx, req);
+    co_await ss.local().run_with_no_api_lock([keyspace] (service::storage_service& ss) {
+        return ss.prepare_for_tablets_migration(keyspace);
+    });
+    co_return json_void();
+}
+
+static
+future<json::json_return_type>
+rest_get_vnode_tablet_migration(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    if (!ss.local().get_feature_service().vnodes_to_tablets_migrations) {
+        apilog.warn("get_vnode_tablet_migration: called before the cluster feature was enabled");
+        throw std::runtime_error("vnodes-to-tablets migration requires all nodes to support the VNODES_TO_TABLETS_MIGRATIONS cluster feature");
+    }
+    auto keyspace = validate_keyspace(ctx, req);
+    auto include = req->get_query_param("include");
+    auto with_tablet_status = include == "tablet_status";
+    auto status = co_await ss.local().run_with_no_api_lock([keyspace] (service::storage_service& ss) {
+        return ss.get_tablets_migration_status_with_node_details(keyspace);
     });
 
-    ss::get_ownership.set(r, [&ss] (std::unique_ptr<request> req) {
-        return ss.local().get_ownership().then([] (auto&& ownership) {
-            std::vector<storage_service_json::mapper> res;
-            return make_ready_future<json::json_return_type>(map_to_key_value(ownership, res));
-        });
+    ss::vnode_tablet_migration_status result;
+    result.keyspace = status.keyspace;
+    result.status = fmt::format("{}", status.status);
+    result.nodes._set = true;
+    for (const auto& node : status.nodes) {
+        ss::vnode_tablet_migration_node_status n;
+        n.host_id = fmt::to_string(node.host_id);
+        n.endpoint = node.endpoint;
+        n.current_mode = node.current_mode;
+        n.intended_mode = node.intended_mode;
+        result.nodes.push(n);
+    }
+
+    if (with_tablet_status && status.status == service::storage_service::migration_status::tablets) {
+        auto pow2_status = ss.local().get_tablets_pow2_convergence_status(keyspace);
+
+        ss::tablets_pow2_convergence_status pow2_result;
+        pow2_result.status = pow2_status.tables_converging == 0 ? "complete" : "in_progress";
+        pow2_result.tables_converging = pow2_status.tables_converging;
+        pow2_result.tables_total = pow2_status.tables_total;
+        pow2_result.tables._set = true;
+        for (const auto& t : pow2_status.tables) {
+            ss::table_pow2_convergence_info info;
+            info.table = t.table_name;
+            info.converging = t.converging;
+            info.current_tablet_count = t.current_tablet_count;
+            info.target_pow2_tablet_count = t.target_pow2_tablet_count;
+            pow2_result.tables.push(info);
+        }
+
+        ss::tablet_status tablets;
+        tablets.pow2_convergence = pow2_result;
+        result.tablets = tablets;
+    }
+
+    co_return result;
+}
+
+static
+future<json::json_return_type>
+rest_set_vnode_tablet_migration_node_storage_mode(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    if (!ss.local().get_feature_service().vnodes_to_tablets_migrations) {
+        apilog.warn("set_vnode_tablet_migration_node_storage_mode: called before the cluster feature was enabled");
+        throw std::runtime_error("vnodes-to-tablets migration requires all nodes to support the VNODES_TO_TABLETS_MIGRATIONS cluster feature");
+    }
+    auto mode_str = req->get_query_param("intended_mode");
+    auto mode = service::storage_mode_from_string(mode_str);
+    co_await ss.local().run_with_no_api_lock([mode] (service::storage_service& ss) {
+        return ss.set_node_intended_storage_mode(mode);
     });
+    co_return json_void();
+}
 
-    ss::get_effective_ownership.set(r, [&ctx, &ss] (std::unique_ptr<request> req) {
-        auto keyspace_name = req->param["keyspace"] == "null" ? "" : validate_keyspace(ctx, req->param);
-        return ss.local().effective_ownership(keyspace_name).then([] (auto&& ownership) {
-            std::vector<storage_service_json::mapper> res;
-            return make_ready_future<json::json_return_type>(map_to_key_value(ownership, res));
-        });
+static
+future<json::json_return_type>
+rest_finalize_vnode_tablet_migration(http_context& ctx, sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+    if (!ss.local().get_feature_service().vnodes_to_tablets_migrations) {
+        apilog.warn("finalize_vnode_tablet_migration: called before the cluster feature was enabled");
+        throw std::runtime_error("vnodes-to-tablets migration requires all nodes to support the VNODES_TO_TABLETS_MIGRATIONS cluster feature");
+    }
+    auto keyspace = validate_keyspace(ctx, req);
+    validate_keyspace(ctx, keyspace);
+
+    co_await ss.local().run_with_no_api_lock([keyspace] (service::storage_service& ss) {
+        return ss.finalize_tablets_migration(keyspace);
     });
+    co_return json_void();
+}
 
-    ss::sstable_info.set(r, [&ctx] (std::unique_ptr<request> req) {
-        auto ks = api::req_param<sstring>(*req, "keyspace", {}).value;
-        auto cf = api::req_param<sstring>(*req, "cf", {}).value;
+static
+future<json::json_return_type>
+rest_quiesce_topology(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        co_await ss.local().await_topology_quiesced();
+        co_return json_void();
+}
 
-        // The size of this vector is bound by ks::cf. I.e. it is as most Nks + Ncf long
-        // which is not small, but not huge either. 
-        using table_sstables_list = std::vector<ss::table_sstables>;
-
-        return do_with(table_sstables_list{}, [ks, cf, &ctx](table_sstables_list& dst) {
-            return ctx.db.map_reduce([&dst](table_sstables_list&& res) {
-                for (auto&& t : res) {
-                    auto i = std::find_if(dst.begin(), dst.end(), [&t](const ss::table_sstables& t2) {
-                        return t.keyspace() == t2.keyspace() && t.table() == t2.table();
-                    });
-                    if (i == dst.end()) {
-                        dst.emplace_back(std::move(t));
-                        continue;
-                    }
-                    auto& ssd = i->sstables; 
-                    for (auto&& sd : t.sstables._elements) {
-                        auto j = std::find_if(ssd._elements.begin(), ssd._elements.end(), [&sd](const ss::sstable& s) {
-                            return s.generation() == sd.generation();
-                        });
-                        if (j == ssd._elements.end()) {
-                            i->sstables.push(std::move(sd));
-                        }
-                    }
-                }
-            }, [ks, cf](const replica::database& db) {
-                // see above
-                table_sstables_list res;
-
-                auto& ext = db.get_config().extensions();
-
-                for (auto& t : db.get_column_families() | boost::adaptors::map_values) {
-                    auto& schema = t->schema();
-                    if ((ks.empty() || ks == schema->ks_name()) && (cf.empty() || cf == schema->cf_name())) {
-                        // at most Nsstables long
-                        ss::table_sstables tst;
-                        tst.keyspace = schema->ks_name();
-                        tst.table = schema->cf_name();
-
-                        for (auto sstables = t->get_sstables_including_compacted_undeleted(); auto sstable : *sstables) {
-                            auto ts = db_clock::to_time_t(sstable->data_file_write_time());
-                            ::tm t;
-                            ::gmtime_r(&ts, &t);
-
-                            ss::sstable info;
-
-                            info.timestamp = t;
-                            info.generation = sstable->generation();
-                            info.level = sstable->get_sstable_level();
-                            info.size = sstable->bytes_on_disk();
-                            info.data_size = sstable->ondisk_data_size();
-                            info.index_size = sstable->index_size();
-                            info.filter_size = sstable->filter_size();
-                            info.version = sstable->get_version();
-
-                            if (sstable->has_component(sstables::component_type::CompressionInfo)) {
-                                auto& c = sstable->get_compression();
-                                auto cp = sstables::get_sstable_compressor(c);
-
-                                ss::named_maps nm;
-                                nm.group = "compression_parameters";
-                                for (auto& p : cp->options()) {
-                                    ss::mapper e;
-                                    e.key = p.first;
-                                    e.value = p.second;
-                                    nm.attributes.push(std::move(e));
-                                }
-                                if (!cp->options().contains(compression_parameters::SSTABLE_COMPRESSION)) {
-                                    ss::mapper e;
-                                    e.key = compression_parameters::SSTABLE_COMPRESSION;
-                                    e.value = cp->name();
-                                    nm.attributes.push(std::move(e));
-                                }
-                                info.extended_properties.push(std::move(nm));
-                            }
-
-                            sstables::file_io_extension::attr_value_map map;
-
-                            for (auto* ep : ext.sstable_file_io_extensions()) {
-                                map.merge(ep->get_attributes(*sstable));
-                            }
-
-                            for (auto& p : map) {
-                                struct {
-                                    const sstring& key; 
-                                    ss::sstable& info;
-                                    void operator()(const std::map<sstring, sstring>& map) const {
-                                        ss::named_maps nm;
-                                        nm.group = key;
-                                        for (auto& p : map) {
-                                            ss::mapper e;
-                                            e.key = p.first;
-                                            e.value = p.second;
-                                            nm.attributes.push(std::move(e));
-                                        }
-                                        info.extended_properties.push(std::move(nm));
-                                    }
-                                    void operator()(const sstring& value) const {
-                                        ss::mapper e;
-                                        e.key = key;
-                                        e.value = value;
-                                        info.properties.push(std::move(e));                                        
-                                    }
-                                } v{p.first, info};
-
-                                std::visit(v, p.second);
-                            }
-
-                            tst.sstables.push(std::move(info));
-                        }
-                        res.emplace_back(std::move(tst));
-                    }
-                }
-                std::sort(res.begin(), res.end(), [](const ss::table_sstables& t1, const ss::table_sstables& t2) {
-                    return t1.keyspace() < t2.keyspace() || (t1.keyspace() == t2.keyspace() && t1.table() < t2.table());
-                });
-                return res;
-            }).then([&dst] {
-                return make_ready_future<json::json_return_type>(stream_object(dst));
-            });
+static
+future<json::json_return_type>
+rest_get_schema_versions(sharded<service::storage_service>& ss, std::unique_ptr<http::request> req) {
+        return ss.local().describe_schema_versions().then([] (auto result) {
+            std::vector<sp::mapper_list> res;
+            res.reserve(result.size());
+            for (auto e : result) {
+                sp::mapper_list entry;
+                entry.key = std::move(e.first);
+                entry.value = std::move(e.second);
+                res.emplace_back(std::move(entry));
+            }
+            return make_ready_future<json::json_return_type>(std::move(res));
         });
+}
+
+// Disambiguate between a function that returns a future and a function that returns a plain value, also
+// add std::ref() as a courtesy. Also handles ks_cf_func signatures.
+template <typename FuncType, typename... BindArgs>
+requires std::invocable<FuncType, BindArgs&..., const_req>
+    && std::same_as<seastar::json::json_return_type, std::invoke_result_t<FuncType, BindArgs&..., const_req&>>
+static
+seastar::httpd::json_request_function
+rest_bind(FuncType func, BindArgs&... args) {
+    return std::bind_front(func, std::ref(args)...);
+}
+
+template <typename FuncType, typename... BindArgs>
+requires std::invocable<FuncType, BindArgs&..., std::unique_ptr<seastar::http::request>>
+    && std::same_as<future<seastar::json::json_return_type>, std::invoke_result_t<FuncType, BindArgs&..., std::unique_ptr<seastar::http::request>>>
+static
+seastar::httpd::future_json_function
+rest_bind(FuncType func, BindArgs&... args) {
+    return std::bind_front(func, std::ref(args)...);
+}
+
+// Hold the storage_service async gate for the duration of async REST
+// handlers so stop() drains in-flight requests before teardown.
+// Synchronous handlers don't yield and need no gate.
+static seastar::httpd::future_json_function
+gated(sharded<service::storage_service>& ss, seastar::httpd::future_json_function fn) {
+    return [fn = std::move(fn), &ss](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto holder = ss.local().hold_async_gate();
+        co_return co_await fn(std::move(req));
+    };
+}
+
+static seastar::httpd::json_request_function
+gated(sharded<service::storage_service>&, seastar::httpd::json_request_function fn) {
+    return fn;
+}
+
+void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_service>& ss, sharded<db::snapshot_ctl>& ssc, service::raft_group0_client& group0_client) {
+    ss::get_token_endpoint.set(r, gated(ss, rest_bind(rest_get_token_endpoint, ctx, ss)));
+    ss::get_release_version.set(r, gated(ss, rest_bind(rest_get_release_version, ss)));
+    ss::get_scylla_release_version.set(r, gated(ss, rest_bind(rest_get_scylla_release_version, ss)));
+    ss::get_schema_version.set(r, gated(ss, rest_bind(rest_get_schema_version, ss)));
+    ss::get_range_to_endpoint_map.set(r, gated(ss, rest_bind(rest_get_range_to_endpoint_map, ctx, ss)));
+    ss::get_pending_range_to_endpoint_map.set(r, gated(ss, rest_bind(rest_get_pending_range_to_endpoint_map, ctx)));
+    ss::describe_ring.set(r, gated(ss, rest_bind(rest_describe_ring, ctx, ss)));
+    ss::get_current_generation_number.set(r, gated(ss, rest_bind(rest_get_current_generation_number, ss)));
+    ss::get_natural_endpoints.set(r, gated(ss, rest_bind(rest_get_natural_endpoints, ctx, ss)));
+    ss::get_natural_endpoints_v2.set(r, gated(ss, rest_bind(rest_get_natural_endpoints_v2, ctx, ss)));
+    ss::cdc_streams_check_and_repair.set(r, gated(ss, rest_bind(rest_cdc_streams_check_and_repair, ss)));
+    ss::cleanup_all.set(r, gated(ss, rest_bind(rest_cleanup_all, ctx, ss)));
+    ss::reset_cleanup_needed.set(r, gated(ss, rest_bind(rest_reset_cleanup_needed, ctx, ss)));
+    ss::decommission.set(r, gated(ss, rest_bind(rest_decommission, ss, ssc)));
+    ss::move.set(r, gated(ss, rest_bind(rest_move, ss)));
+    ss::remove_node.set(r, gated(ss, rest_bind(rest_remove_node, ss)));
+    ss::exclude_node.set(r, gated(ss, rest_bind(rest_exclude_node, ss)));
+    ss::get_removal_status.set(r, gated(ss, rest_bind(rest_get_removal_status, ss)));
+    ss::force_remove_completion.set(r, gated(ss, rest_bind(rest_force_remove_completion, ss)));
+    ss::set_logging_level.set(r, gated(ss, rest_bind(rest_set_logging_level)));
+    ss::get_logging_levels.set(r, gated(ss, rest_bind(rest_get_logging_levels)));
+    ss::get_operation_mode.set(r, gated(ss, rest_bind(rest_get_operation_mode, ss)));
+    ss::is_starting.set(r, gated(ss, rest_bind(rest_is_starting, ss)));
+    ss::get_drain_progress.set(r, gated(ss, rest_bind(rest_get_drain_progress, ss)));
+    ss::drain.set(r, gated(ss, rest_bind(rest_drain, ss)));
+    ss::stop_gossiping.set(r, gated(ss, rest_bind(rest_stop_gossiping, ss)));
+    ss::start_gossiping.set(r, gated(ss, rest_bind(rest_start_gossiping, ss)));
+    ss::is_gossip_running.set(r, gated(ss, rest_bind(rest_is_gossip_running, ss)));
+    ss::stop_daemon.set(r, gated(ss, rest_bind(rest_stop_daemon)));
+    ss::is_initialized.set(r, gated(ss, rest_bind(rest_is_initialized, ss)));
+    ss::join_ring.set(r, gated(ss, rest_bind(rest_join_ring)));
+    ss::is_joined.set(r, gated(ss, rest_bind(rest_is_joined, ss)));
+    ss::rebuild.set(r, gated(ss, rest_bind(rest_rebuild, ss)));
+    ss::bulk_load.set(r, gated(ss, rest_bind(rest_bulk_load)));
+    ss::bulk_load_async.set(r, gated(ss, rest_bind(rest_bulk_load_async)));
+    ss::reschedule_failed_deletions.set(r, gated(ss, rest_bind(rest_reschedule_failed_deletions)));
+    ss::sample_key_range.set(r, gated(ss, rest_bind(rest_sample_key_range)));
+    ss::reset_local_schema.set(r, gated(ss, rest_bind(rest_reset_local_schema, ss)));
+    ss::set_trace_probability.set(r, gated(ss, rest_bind(rest_set_trace_probability)));
+    ss::get_trace_probability.set(r, gated(ss, rest_bind(rest_get_trace_probability)));
+    ss::get_slow_query_info.set(r, gated(ss, rest_bind(rest_get_slow_query_info)));
+    ss::set_slow_query.set(r, gated(ss, rest_bind(rest_set_slow_query)));
+    ss::deliver_hints.set(r, gated(ss, rest_bind(rest_deliver_hints)));
+    ss::get_cluster_name.set(r, gated(ss, rest_bind(rest_get_cluster_name, ss)));
+    ss::get_partitioner_name.set(r, gated(ss, rest_bind(rest_get_partitioner_name, ss)));
+    ss::get_tombstone_warn_threshold.set(r, gated(ss, rest_bind(rest_get_tombstone_warn_threshold)));
+    ss::set_tombstone_warn_threshold.set(r, gated(ss, rest_bind(rest_set_tombstone_warn_threshold)));
+    ss::get_tombstone_failure_threshold.set(r, gated(ss, rest_bind(rest_get_tombstone_failure_threshold)));
+    ss::set_tombstone_failure_threshold.set(r, gated(ss, rest_bind(rest_set_tombstone_failure_threshold)));
+    ss::get_batch_size_failure_threshold.set(r, gated(ss, rest_bind(rest_get_batch_size_failure_threshold)));
+    ss::set_batch_size_failure_threshold.set(r, gated(ss, rest_bind(rest_set_batch_size_failure_threshold)));
+    ss::set_hinted_handoff_throttle_in_kb.set(r, gated(ss, rest_bind(rest_set_hinted_handoff_throttle_in_kb)));
+    ss::get_exceptions.set(r, gated(ss, rest_bind(rest_get_exceptions, ss)));
+    ss::get_total_hints_in_progress.set(r, gated(ss, rest_bind(rest_get_total_hints_in_progress)));
+    ss::get_total_hints.set(r, gated(ss, rest_bind(rest_get_total_hints)));
+    ss::get_ownership.set(r, gated(ss, rest_bind(rest_get_ownership, ctx, ss)));
+    ss::get_effective_ownership.set(r, gated(ss, rest_bind(rest_get_effective_ownership, ctx, ss)));
+    ss::reload_raft_topology_state.set(r, gated(ss, rest_bind(rest_reload_raft_topology_state, ss, group0_client)));
+    ss::upgrade_to_raft_topology.set(r, gated(ss, rest_bind(rest_upgrade_to_raft_topology, ss)));
+    ss::raft_topology_upgrade_status.set(r, gated(ss, rest_bind(rest_raft_topology_upgrade_status, ss)));
+    ss::raft_topology_get_cmd_status.set(r, gated(ss, rest_bind(rest_raft_topology_get_cmd_status, ss)));
+    ss::move_tablet.set(r, gated(ss, rest_bind(rest_move_tablet, ctx, ss)));
+    ss::add_tablet_replica.set(r, gated(ss, rest_bind(rest_add_tablet_replica, ctx, ss)));
+    ss::del_tablet_replica.set(r, gated(ss, rest_bind(rest_del_tablet_replica, ctx, ss)));
+    ss::repair_tablet.set(r, gated(ss, rest_bind(rest_repair_tablet, ctx, ss)));
+    ss::tablet_balancing_enable.set(r, gated(ss, rest_bind(rest_tablet_balancing_enable, ss)));
+    ss::create_vnode_tablet_migration.set(r, gated(ss, rest_bind(rest_create_vnode_tablet_migration, ctx, ss)));
+    ss::get_vnode_tablet_migration.set(r, gated(ss, rest_bind(rest_get_vnode_tablet_migration, ctx, ss)));
+    ss::set_vnode_tablet_migration_node_storage_mode.set(r, gated(ss, rest_bind(rest_set_vnode_tablet_migration_node_storage_mode, ctx, ss)));
+    ss::finalize_vnode_tablet_migration.set(r, gated(ss, rest_bind(rest_finalize_vnode_tablet_migration, ctx, ss)));
+    ss::quiesce_topology.set(r, gated(ss, rest_bind(rest_quiesce_topology, ss)));
+    sp::get_schema_versions.set(r, gated(ss, rest_bind(rest_get_schema_versions, ss)));
+}
+
+void unset_storage_service(http_context& ctx, routes& r) {
+    ss::get_token_endpoint.unset(r);
+    ss::get_release_version.unset(r);
+    ss::get_scylla_release_version.unset(r);
+    ss::get_schema_version.unset(r);
+    ss::get_range_to_endpoint_map.unset(r);
+    ss::get_pending_range_to_endpoint_map.unset(r);
+    ss::describe_ring.unset(r);
+    ss::get_current_generation_number.unset(r);
+    ss::get_natural_endpoints.unset(r);
+    ss::cdc_streams_check_and_repair.unset(r);
+    ss::cleanup_all.unset(r);
+    ss::reset_cleanup_needed.unset(r);
+    ss::decommission.unset(r);
+    ss::move.unset(r);
+    ss::remove_node.unset(r);
+    ss::exclude_node.unset(r);
+    ss::get_removal_status.unset(r);
+    ss::force_remove_completion.unset(r);
+    ss::set_logging_level.unset(r);
+    ss::get_logging_levels.unset(r);
+    ss::get_operation_mode.unset(r);
+    ss::is_starting.unset(r);
+    ss::get_drain_progress.unset(r);
+    ss::drain.unset(r);
+    ss::stop_gossiping.unset(r);
+    ss::start_gossiping.unset(r);
+    ss::is_gossip_running.unset(r);
+    ss::stop_daemon.unset(r);
+    ss::is_initialized.unset(r);
+    ss::join_ring.unset(r);
+    ss::is_joined.unset(r);
+    ss::rebuild.unset(r);
+    ss::bulk_load.unset(r);
+    ss::bulk_load_async.unset(r);
+    ss::reschedule_failed_deletions.unset(r);
+    ss::sample_key_range.unset(r);
+    ss::reset_local_schema.unset(r);
+    ss::set_trace_probability.unset(r);
+    ss::get_trace_probability.unset(r);
+    ss::get_slow_query_info.unset(r);
+    ss::set_slow_query.unset(r);
+    ss::deliver_hints.unset(r);
+    ss::get_cluster_name.unset(r);
+    ss::get_partitioner_name.unset(r);
+    ss::get_tombstone_warn_threshold.unset(r);
+    ss::set_tombstone_warn_threshold.unset(r);
+    ss::get_tombstone_failure_threshold.unset(r);
+    ss::set_tombstone_failure_threshold.unset(r);
+    ss::get_batch_size_failure_threshold.unset(r);
+    ss::set_batch_size_failure_threshold.unset(r);
+    ss::set_hinted_handoff_throttle_in_kb.unset(r);
+    ss::get_exceptions.unset(r);
+    ss::get_total_hints_in_progress.unset(r);
+    ss::get_total_hints.unset(r);
+    ss::get_ownership.unset(r);
+    ss::get_effective_ownership.unset(r);
+    ss::reload_raft_topology_state.unset(r);
+    ss::upgrade_to_raft_topology.unset(r);
+    ss::raft_topology_upgrade_status.unset(r);
+    ss::raft_topology_get_cmd_status.unset(r);
+    ss::move_tablet.unset(r);
+    ss::add_tablet_replica.unset(r);
+    ss::del_tablet_replica.unset(r);
+    ss::repair_tablet.unset(r);
+    ss::tablet_balancing_enable.unset(r);
+    ss::create_vnode_tablet_migration.unset(r);
+    ss::get_vnode_tablet_migration.unset(r);
+    ss::set_vnode_tablet_migration_node_storage_mode.unset(r);
+    ss::finalize_vnode_tablet_migration.unset(r);
+    ss::quiesce_topology.unset(r);
+    sp::get_schema_versions.unset(r);
+}
+
+void set_load_meter(http_context& ctx, routes& r, service::load_meter& lm) {
+    ss::get_load_map.set(r, [&lm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto load_map = co_await lm.get_load_map();
+        std::vector<ss::map_string_double> res;
+        for (auto i : load_map) {
+            ss::map_string_double val;
+            val.key = i.first;
+            val.value = i.second;
+            res.push_back(val);
+        }
+        co_return res;
     });
 }
 
-void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_ctl) {
-    ss::get_snapshot_details.set(r, [&snap_ctl](std::unique_ptr<request> req) {
-        return snap_ctl.local().get_snapshot_details().then([] (std::unordered_map<sstring, std::vector<db::snapshot_ctl::snapshot_details>>&& result) {
-            std::function<future<>(output_stream<char>&&)> f = [result = std::move(result)](output_stream<char>&& s) {
-                return do_with(output_stream<char>(std::move(s)), true, [&result] (output_stream<char>& s, bool& first){
-                    return s.write("[").then([&s, &first, &result] {
-                        return do_for_each(result, [&s, &first](std::tuple<sstring, std::vector<db::snapshot_ctl::snapshot_details>>&& map){
-                            return do_with(ss::snapshots(), [&s, &first, &map](ss::snapshots& all_snapshots) {
-                                all_snapshots.key = std::get<0>(map);
-                                future<> f = first ? make_ready_future<>() : s.write(", ");
-                                first = false;
-                                std::vector<ss::snapshot> snapshot;
-                                for (auto& cf: std::get<1>(map)) {
-                                    ss::snapshot snp;
-                                    snp.ks = cf.ks;
-                                    snp.cf = cf.cf;
-                                    snp.live = cf.live;
-                                    snp.total = cf.total;
-                                    snapshot.push_back(std::move(snp));
-                                }
-                                all_snapshots.value = std::move(snapshot);
-                                return f.then([&s, &all_snapshots] {
-                                    return all_snapshots.write(s);
-                                });
-                            });
-                        });
-                    }).then([&s] {
-                        return s.write("]").then([&s] {
-                            return s.close();
-                        });
-                    });
-                });
-            };
+void unset_load_meter(http_context& ctx, routes& r) {
+    ss::get_load_map.unset(r);
+}
 
-            return make_ready_future<json::json_return_type>(std::move(f));
+future<> get_snapshot_details(std::unordered_map<sstring, db::snapshot_ctl::db_snapshot_details> result, output_stream<char>&& o) {
+    std::exception_ptr ex;
+    output_stream<char> out = std::move(o);
+    try {
+        bool first = true;
+
+        co_await out.write("[");
+        for (auto& [name, details] : result) {
+            if (!first) {
+                co_await out.write(", ");
+            }
+            json::json_chunked_list<ss::snapshot> snapshot;
+            for (auto& cf : details) {
+                ss::snapshot snp;
+                snp.ks = cf.ks;
+                snp.cf = cf.cf;
+                snp.live = cf.details.live;
+                snp.total = cf.details.total;
+                snapshot.push(std::move(snp));
+            }
+            ss::snapshots all_snapshots;
+            all_snapshots.key = name;
+            all_snapshots.value = std::move(snapshot);
+            co_await all_snapshots.write(out);
+            first = false;
+        }
+        co_await out.write("]");
+        co_await out.flush();
+    } catch (...) {
+      ex = std::current_exception();
+    }
+    co_await out.close();
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+}
+
+void set_snapshot(http_context& ctx, routes& r, sharded<db::snapshot_ctl>& snap_ctl) {
+    ss::get_snapshot_details.set(r, [&snap_ctl](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto result = co_await snap_ctl.local().get_snapshot_details();
+        co_return noncopyable_function<future<> (output_stream<char>&&)>([res = std::move(result)] (output_stream<char>&& o) mutable {
+            return get_snapshot_details(std::move(res), std::move(o));
         });
     });
 
-    ss::take_snapshot.set(r, [&snap_ctl](std::unique_ptr<request> req) {
-        apilog.debug("take_snapshot: {}", req->query_parameters);
+    ss::take_snapshot.set(r, [&snap_ctl](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        apilog.info("take_snapshot: {}", req->get_query_params());
         auto tag = req->get_query_param("tag");
         auto column_families = split(req->get_query_param("cf"), ",");
-        auto sfopt = req->get_query_param("sf");
-        auto sf = db::snapshot_ctl::skip_flush(strcasecmp(sfopt.c_str(), "true") == 0);
+        auto tcopt = req->get_query_param("tc");
+
+        db::snapshot_options opts = {
+            .skip_flush = get_query_param<bool>(*req, "sf"),
+        };
+        auto ttl = validate_ttl(req->get_query_param("ttl"));
+        if (ttl && *ttl > 0s) {
+            opts.expires_at = opts.created_at + *ttl;
+        }
 
         std::vector<sstring> keynames = split(req->get_query_param("kn"), ",");
-
-        auto resp = make_ready_future<>();
-        if (column_families.empty()) {
-            resp = snap_ctl.local().take_snapshot(tag, keynames, sf);
-        } else {
-            if (keynames.empty()) {
-                throw httpd::bad_param_exception("The keyspace of column families must be specified");
+        try {
+            if (column_families.empty()) {
+                co_await snap_ctl.local().take_snapshot(tag, keynames, opts);
+            } else {
+                if (keynames.empty()) {
+                    throw httpd::bad_param_exception("The keyspace of column families must be specified");
+                }
+                if (keynames.size() > 1) {
+                    throw httpd::bad_param_exception("Only one keyspace allowed when specifying a column family");
+                }
+                co_await snap_ctl.local().take_column_family_snapshot(keynames[0], column_families, tag, opts);
             }
-            if (keynames.size() > 1) {
-                throw httpd::bad_param_exception("Only one keyspace allowed when specifying a column family");
-            }
-            resp = snap_ctl.local().take_column_family_snapshot(keynames[0], column_families, tag, sf);
+            co_return json_void();
+        } catch (const data_dictionary::no_such_column_family& e) {
+            throw httpd::bad_param_exception(e.what());
+        } catch (...) {
+            apilog.error("take_snapshot failed: {:t}", std::current_exception());
+            throw;
         }
-        return resp.then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
     });
 
-    ss::del_snapshot.set(r, [&snap_ctl](std::unique_ptr<request> req) {
+    ss::take_cluster_snapshot.set(r, [&snap_ctl](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        apilog.info("take_cluster_snapshot: {}", req->get_query_params());
+        auto tag = req->get_query_param("tag");
+        auto column_families = split(req->get_query_param("table"), ",");
+        db::snapshot_options opts = {
+            // Note: not published/active. Retain as internal option, but...
+            .skip_flush = get_query_param<bool>(*req, "skip_flush"),
+        };
+
+        std::vector<sstring> keynames = split(req->get_query_param("keyspace"), ",");
+        try {
+            co_await snap_ctl.local().take_cluster_column_family_snapshot(keynames, column_families, tag, opts);
+            co_return json_void();
+        } catch (...) {
+            apilog.error("take_cluster_snapshot failed: {:t}", std::current_exception());
+            throw;
+        }
+    });
+
+    ss::del_snapshot.set(r, [&snap_ctl](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        apilog.info("del_snapshot: {}", req->get_query_params());
         auto tag = req->get_query_param("tag");
         auto column_family = req->get_query_param("cf");
 
         std::vector<sstring> keynames = split(req->get_query_param("kn"), ",");
-        return snap_ctl.local().clear_snapshot(tag, keynames, column_family).then([] {
-            return make_ready_future<json::json_return_type>(json_void());
-        });
+        try {
+            co_await snap_ctl.local().clear_snapshot(tag, keynames, column_family);
+            co_return json_void();
+        } catch (const data_dictionary::no_such_column_family& e) {
+            throw httpd::bad_param_exception(e.what());
+        } catch (...) {
+            apilog.error("del_snapshot failed: {:t}", std::current_exception());
+            throw;
+        }
     });
 
-    ss::true_snapshots_size.set(r, [&snap_ctl](std::unique_ptr<request> req) {
+    ss::true_snapshots_size.set(r, [&snap_ctl](std::unique_ptr<http::request> req) {
         return snap_ctl.local().true_snapshots_size().then([] (int64_t size) {
             return make_ready_future<json::json_return_type>(size);
         });
     });
 
-    ss::scrub.set(r, wrap_ks_cf(ctx, [&snap_ctl] (http_context& ctx, std::unique_ptr<request> req, sstring keyspace, std::vector<sstring> column_families) {
-        auto scrub_mode = sstables::compaction_type_options::scrub::mode::abort;
+    ss::start_backup.set(r, [&snap_ctl] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto endpoint = req->get_query_param("endpoint");
+        auto keyspace = req->get_query_param("keyspace");
+        auto table = req->get_query_param("table");
+        auto bucket = req->get_query_param("bucket");
+        auto prefix = req->get_query_param("prefix");
+        auto snapshot_name = req->get_query_param("snapshot");
+        auto move_files = get_query_param<bool>(*req, "move_files");
+        if (snapshot_name.empty()) {
+            // TODO: If missing, snapshot should be taken by scylla, then removed
+            throw httpd::bad_param_exception("The snapshot name must be specified");
+        }
 
-        const sstring scrub_mode_str = req_param<sstring>(*req, "scrub_mode", "");
-        if (scrub_mode_str == "") {
-            const auto skip_corrupted = req_param<bool>(*req, "skip_corrupted", false);
+        auto& ctl = snap_ctl.local();
+        auto task_id = co_await ctl.start_backup(std::move(endpoint), std::move(bucket), std::move(prefix), std::move(keyspace), std::move(table), std::move(snapshot_name), move_files);
+        co_return json::json_return_type(fmt::to_string(task_id));
+    });
 
-            if (skip_corrupted) {
-                scrub_mode = sstables::compaction_type_options::scrub::mode::skip;
+    ss::start_global_backup.set(r, [&snap_ctl] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto column_families = split(req->get_query_param("table"), ",");
+        std::vector<sstring> keynames = split(req->get_query_param("keyspace"), ",");
+        auto snapshot_name = req->get_query_param("snapshot");
+        auto move_files = get_query_param<bool>(*req, "move_files");
+
+        rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
+        rjson::value parsed = rjson::parse(std::move(content));
+        if (!parsed.IsArray()) {
+            throw httpd::bad_param_exception("backup locations (in body) must be a JSON array");
+        }
+
+        std::unordered_map<sstring, db::snapshot_dc_location> dclocs;
+
+        const auto& locations = parsed.GetArray();
+        for (auto& location : locations) {
+            if (!location.IsObject()) {
+                throw httpd::bad_param_exception("backup location (in body) must be a JSON object");
             }
-        } else {
-            if (scrub_mode_str == "ABORT") {
-                scrub_mode = sstables::compaction_type_options::scrub::mode::abort;
-            } else if (scrub_mode_str == "SKIP") {
-                scrub_mode = sstables::compaction_type_options::scrub::mode::skip;
-            } else if (scrub_mode_str == "SEGREGATE") {
-                scrub_mode = sstables::compaction_type_options::scrub::mode::segregate;
-            } else if (scrub_mode_str == "VALIDATE") {
-                scrub_mode = sstables::compaction_type_options::scrub::mode::validate;
-            } else {
-                throw std::invalid_argument(fmt::format("Unknown argument for 'scrub_mode' parameter: {}", scrub_mode_str));
+            if (location.HasMember("manifests")) {
+                throw httpd::bad_param_exception("backup location 'manifests' must not be set for backup");
             }
+
+            auto endpoint = rjson::to_string(location["endpoint"]);
+            auto bucket = rjson::to_string(location["bucket"]);
+            auto prefix = rjson::to_string(location["prefix"]);
+            auto dc = rjson::to_string(location["datacenter"]);
+
+            dclocs[dc] = db::snapshot_dc_location {
+                .endpoint = endpoint,
+                .bucket = bucket,
+                .prefix = prefix,
+            };
         }
 
-        auto f = make_ready_future<>();
-        if (!req_param<bool>(*req, "disable_snapshot", false)) {
-            auto tag = format("pre-scrub-{:d}", db_clock::now().time_since_epoch().count());
-            f = parallel_for_each(column_families, [&snap_ctl, keyspace, tag](sstring cf) {
-                return snap_ctl.local().take_column_family_snapshot(keyspace, cf, tag);
-            });
-        }
+        auto& ctl = snap_ctl.local();
+        auto task_id = co_await ctl.start_global_backup(std::move(dclocs), std::move(keynames), std::move(column_families), std::move(snapshot_name), move_files);
+        co_return json::json_return_type(fmt::to_string(task_id));
+    });
 
-        sstables::compaction_type_options::scrub opts = {
-            .operation_mode = scrub_mode,
-        };
-        const sstring quarantine_mode_str = req_param<sstring>(*req, "quarantine_mode", "INCLUDE");
-        if (quarantine_mode_str == "INCLUDE") {
-            opts.quarantine_operation_mode = sstables::compaction_type_options::scrub::quarantine_mode::include;
-        } else if (quarantine_mode_str == "EXCLUDE") {
-            opts.quarantine_operation_mode = sstables::compaction_type_options::scrub::quarantine_mode::exclude;
-        } else if (quarantine_mode_str == "ONLY") {
-            opts.quarantine_operation_mode = sstables::compaction_type_options::scrub::quarantine_mode::only;
-        } else {
-            throw std::invalid_argument(fmt::format("Unknown argument for 'quarantine_mode' parameter: {}", quarantine_mode_str));
-        }
-        return f.then([&ctx, keyspace, column_families, opts] {
-            return ctx.db.invoke_on_all([=] (replica::database& db) {
-                return do_for_each(column_families, [=, &db](sstring cfname) {
-                    auto& cm = db.get_compaction_manager();
-                    auto& cf = db.find_column_family(keyspace, cfname);
-                    return cm.perform_sstable_scrub(&cf, opts);
-                });
-            });
-        }).then([]{
-            return make_ready_future<json::json_return_type>(0);
+    cf::get_true_snapshots_size.set(r, [&snap_ctl] (std::unique_ptr<http::request> req) {
+        auto [ks, cf] = parse_fully_qualified_cf_name(req->get_path_param("name"));
+        return snap_ctl.local().true_snapshots_size(std::move(ks), std::move(cf)).then([] (int64_t res) {
+            return make_ready_future<json::json_return_type>(res);
         });
-    }));
+    });
+
+    cf::get_all_true_snapshots_size.set(r, [] (std::unique_ptr<http::request> req) {
+        //TBD
+        unimplemented();
+        return make_ready_future<json::json_return_type>(0);
+    });
+
 }
 
 void unset_snapshot(http_context& ctx, routes& r) {
@@ -1390,7 +1869,10 @@ void unset_snapshot(http_context& ctx, routes& r) {
     ss::take_snapshot.unset(r);
     ss::del_snapshot.unset(r);
     ss::true_snapshots_size.unset(r);
-    ss::scrub.unset(r);
+    ss::start_backup.unset(r);
+    cf::get_true_snapshots_size.unset(r);
+    cf::get_all_true_snapshots_size.unset(r);
+    ss::decommission.unset(r);
 }
 
 }

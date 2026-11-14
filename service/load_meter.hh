@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#pragma  once
+#pragma once
 
-#include <seastar/core/shared_ptr.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "service/load_broadcaster.hh"
 
 using namespace seastar;
@@ -28,12 +27,11 @@ private:
 
     /** raw load value */
     double get_load() const;
-    sstring get_load_string() const;
 
 public:
     future<std::map<sstring, double>> get_load_map();
 
-    future<> init(distributed<replica::database>& db, gms::gossiper& gossiper);
+    future<> init(sharded<replica::database>& db, gms::gossiper& gossiper);
     future<> exit();
 };
 

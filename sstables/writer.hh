@@ -3,90 +3,28 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <seastar/core/iostream.hh>
 #include <seastar/core/fstream.hh>
-#include "types.hh"
+#include "sstables/types.hh"
+#include "sstables/component_type.hh"
 #include "checksum_utils.hh"
-#include "progress_monitor.hh"
 #include "vint-serialization.hh"
 #include <seastar/core/byteorder.hh>
 #include "version.hh"
-#include "counters.hh"
-#include "utils/bit_cast.hh"
-
-namespace db {
-
-class config;
-
-} // namespace db
+#include "mutation/counters.hh"
+#include "dht/i_partitioner_fwd.hh"
+#include <set>
 
 namespace sstables {
 
 class index_sampling_state;
 class compression;
 class metadata_collector;
-
-class file_writer {
-    output_stream<char> _out;
-    writer_offset_tracker _offset;
-    std::optional<sstring> _filename;
-    bool _closed = false;
-public:
-    // Closes the file if file_writer creation fails
-    static future<file_writer> make(file f, file_output_stream_options options, sstring filename) noexcept;
-
-    file_writer(output_stream<char>&& out, sstring filename) noexcept
-        : _out(std::move(out))
-        , _filename(std::move(filename))
-    {}
-
-    file_writer(output_stream<char>&& out) noexcept
-        : _out(std::move(out))
-    {}
-
-    // Must be called in a seastar thread.
-    virtual ~file_writer();
-    file_writer(const file_writer&) = delete;
-    file_writer(file_writer&& x) noexcept
-        : _out(std::move(x._out))
-        , _offset(std::move(x._offset))
-        , _filename(std::move(x._filename))
-        , _closed(x._closed)
-    {
-        x._closed = true;   // don't auto-close in destructor
-    }
-    // Must be called in a seastar thread.
-    void write(const char* buf, size_t n) {
-        _offset.offset += n;
-        _out.write(buf, n).get();
-    }
-    // Must be called in a seastar thread.
-    void write(bytes_view s) {
-        _offset.offset += s.size();
-        _out.write(reinterpret_cast<const char*>(s.begin()), s.size()).get();
-    }
-    // Must be called in a seastar thread.
-    void flush() {
-        _out.flush().get();
-    }
-    // Must be called in a seastar thread.
-    void close();
-
-    uint64_t offset() const {
-        return _offset.offset;
-    }
-
-    const writer_offset_tracker& offset_tracker() const {
-        return _offset;
-    }
-
-    const char* get_filename() const noexcept;
-};
 
 
 class sizing_data_sink : public data_sink_impl {
@@ -98,16 +36,8 @@ public:
     virtual temporary_buffer<char> allocate_buffer(size_t size) override {
         return temporary_buffer<char>(size);
     }
-    virtual future<> put(net::packet data) override {
-        _size += data.len();
-        return make_ready_future<>();
-    }
-    virtual future<> put(std::vector<temporary_buffer<char>> data) override {
-        _size += boost::accumulate(data | boost::adaptors::transformed(std::mem_fn(&temporary_buffer<char>::size)), 0);
-        return make_ready_future<>();
-    }
-    virtual future<> put(temporary_buffer<char> buf) override {
-        _size += buf.size();
+    virtual future<> put(std::span<temporary_buffer<char>> data) override {
+        _size += std::ranges::fold_left(data | std::views::transform(std::mem_fn(&temporary_buffer<char>::size)), 0, std::plus{});
         return make_ready_future<>();
     }
     virtual future<> flush() override {
@@ -131,12 +61,37 @@ serialized_size(sstable_version_types v, const T& object) {
     uint64_t size = 0;
     auto writer = file_writer(make_sizing_output_stream(size));
     write(v, writer, object);
-    writer.flush();
     writer.close();
     return size;
 }
 
-template <typename ChecksumType>
+class null_data_sink : public data_sink_impl {
+private:
+    size_t _bs;
+public:
+    null_data_sink(size_t bs) : _bs(bs) {}
+    virtual temporary_buffer<char> allocate_buffer(size_t size) override {
+        return temporary_buffer<char>(size);
+    }
+    virtual future<> put(std::span<temporary_buffer<char>> data) override {
+        return make_ready_future<>();
+    }
+    virtual future<> flush() override {
+        return make_ready_future<>();
+    }
+    virtual future<> close() override {
+        return make_ready_future<>();
+    }
+    virtual size_t buffer_size() const noexcept override {
+        return _bs;
+    }
+};
+
+inline data_sink make_null_data_sink(size_t bs) {
+    return data_sink(std::make_unique<null_data_sink>(bs));
+}
+
+template <typename ChecksumType, bool calculate_chunk_checksums>
 requires ChecksumUtils<ChecksumType>
 class checksummed_file_data_sink_impl : public data_sink_impl {
     data_sink _out;
@@ -152,20 +107,27 @@ public:
     virtual temporary_buffer<char> allocate_buffer(size_t size) override {
         return _out.allocate_buffer(size); // preserve alignment requirements
     }
-    virtual future<> put(net::packet data) override { abort(); }
-    virtual future<> put(temporary_buffer<char> buf) override {
+    virtual future<> put(std::span<temporary_buffer<char>> bufs) override {
         // bufs will usually be a multiple of chunk size, but this won't be the case for
         // the last buffer being flushed.
 
-        for (size_t offset = 0; offset < buf.size(); offset += _c.chunk_size) {
-            size_t size = std::min(size_t(_c.chunk_size), buf.size() - offset);
-            uint32_t per_chunk_checksum = ChecksumType::init_checksum();
+        for (auto& buf : bufs) {
+            for (size_t offset = 0; offset < buf.size(); offset += _c.chunk_size) {
+                size_t size = std::min(size_t(_c.chunk_size), buf.size() - offset);
+                uint32_t per_chunk_checksum = ChecksumType::init_checksum();
 
-            per_chunk_checksum = ChecksumType::checksum(per_chunk_checksum, buf.begin() + offset, size);
-            _full_checksum = checksum_combine_or_feed<ChecksumType>(_full_checksum, per_chunk_checksum, buf.begin() + offset, size);
-            _c.checksums.push_back(per_chunk_checksum);
+                per_chunk_checksum = ChecksumType::checksum(per_chunk_checksum, buf.begin() + offset, size);
+                _full_checksum = checksum_combine_or_feed<ChecksumType>(_full_checksum, per_chunk_checksum, buf.begin() + offset, size);
+                if constexpr (calculate_chunk_checksums) {
+                    _c.checksums.push_back(per_chunk_checksum);
+                }
+            }
         }
-        return _out.put(std::move(buf));
+        return _out.put(std::move(bufs));
+    }
+
+    virtual future<> flush() override {
+        return _out.flush();
     }
 
     virtual future<> close() override {
@@ -178,31 +140,36 @@ public:
     }
 };
 
-template <typename ChecksumType>
+template <typename ChecksumType, bool calculate_chunk_checksums>
 requires ChecksumUtils<ChecksumType>
 class checksummed_file_data_sink : public data_sink {
 public:
     checksummed_file_data_sink(data_sink out, struct checksum& cinfo, uint32_t& full_file_checksum)
-        : data_sink(std::make_unique<checksummed_file_data_sink_impl<ChecksumType>>(std::move(out), cinfo, full_file_checksum)) {}
+        : data_sink(std::make_unique<checksummed_file_data_sink_impl<ChecksumType, calculate_chunk_checksums>>(std::move(out), cinfo, full_file_checksum)) {}
 };
 
-template <typename ChecksumType>
+template <typename ChecksumType, bool calculate_chunk_checksums>
 requires ChecksumUtils<ChecksumType>
 inline
 output_stream<char> make_checksummed_file_output_stream(data_sink out, struct checksum& cinfo, uint32_t& full_file_checksum) {
-    return output_stream<char>(checksummed_file_data_sink<ChecksumType>(std::move(out), cinfo, full_file_checksum));
+    return output_stream<char>(checksummed_file_data_sink<ChecksumType, calculate_chunk_checksums>(std::move(out), cinfo, full_file_checksum));
 }
 
-template <typename ChecksumType>
+template <typename ChecksumType, bool calculate_chunk_checksums>
 requires ChecksumUtils<ChecksumType>
 class checksummed_file_writer : public file_writer {
     checksum _c;
     uint32_t _full_checksum;
 public:
-    checksummed_file_writer(data_sink out, size_t buffer_size, sstring filename)
-            : file_writer(make_checksummed_file_output_stream<ChecksumType>(std::move(out), _c, _full_checksum), std::move(filename))
-            , _c({uint32_t(std::min(size_t(DEFAULT_CHUNK_SIZE), buffer_size))})
+    checksummed_file_writer(data_sink out, size_t buffer_size, component_name c)
+            : file_writer(make_checksummed_file_output_stream<ChecksumType, calculate_chunk_checksums>(std::move(out), _c, _full_checksum), std::move(c))
+            , _c(uint32_t(std::min(size_t(DEFAULT_CHUNK_SIZE), buffer_size)), {})
             , _full_checksum(ChecksumType::init_checksum()) {}
+
+    checksummed_file_writer(data_sink out, size_t buffer_size)
+        : file_writer(make_checksummed_file_output_stream<ChecksumType, calculate_chunk_checksums>(std::move(out), _c, _full_checksum))
+        , _c(uint32_t(std::min(size_t(DEFAULT_CHUNK_SIZE), buffer_size)), {})
+        , _full_checksum(ChecksumType::init_checksum()) {}
 
     // Since we are exposing a reference to _full_checksum, we delete the move
     // constructor.  If it is moved, the reference will refer to the old
@@ -218,8 +185,10 @@ public:
     }
 };
 
-using adler32_checksummed_file_writer = checksummed_file_writer<adler32_utils>;
-using crc32_checksummed_file_writer = checksummed_file_writer<crc32_utils>;
+using adler32_checksummed_file_writer = checksummed_file_writer<adler32_utils, true>;
+using crc32_checksummed_file_writer = checksummed_file_writer<crc32_utils, true>;
+
+using crc32_digest_file_writer = checksummed_file_writer<crc32_utils, false>;
 
 template <typename T, typename W>
 requires Writer<W>
@@ -270,10 +239,18 @@ inline void write(sstable_version_types v, W& out, bool i) {
 }
 
 inline void write(sstable_version_types v, file_writer& out, double d) {
-    unsigned long tmp = net::hton(bit_cast<unsigned long>(d));
+    unsigned long tmp = net::hton(std::bit_cast<unsigned long>(d));
     out.write(reinterpret_cast<const char*>(&tmp), sizeof(unsigned long));
 }
 
+inline void write(sstable_version_types v, file_writer& out, const utils::UUID& uuid) {
+    out.write(uuid.serialize());
+}
+
+template <typename Tag>
+inline void write(sstable_version_types v, file_writer& out, const utils::tagged_uuid<Tag>& id) {
+    write(v, out, id.uuid());
+}
 
 template <typename W>
 requires Writer<W>
@@ -295,7 +272,7 @@ inline void write(sstable_version_types v, W& out, managed_bytes_view s) {
     }
 }
 
-inline void write(sstable_version_types v, file_writer& out, bytes_ostream s) {
+inline void write(sstable_version_types v, file_writer& out, const bytes_ostream& s) {
     for (bytes_view fragment : s) {
         write(v, out, fragment);
     }
@@ -306,7 +283,8 @@ template<typename W, typename First, typename Second, typename... Rest>
 requires Writer<W>
 inline void write(sstable_version_types v, W& out, const First& first, const Second& second, Rest&&... rest) {
     write(v, out, first);
-    write(v, out, second, std::forward<Rest>(rest)...);
+    write(v, out, second);
+    (..., write(v, out, std::forward<Rest>(rest)));
 }
 
 template <class T, typename W>
@@ -390,6 +368,14 @@ write(sstable_version_types v, file_writer& out, const utils::chunked_vector<Mem
         auto bytes = now * sizeof(Members);
         out.write(p, bytes);
         idx += now;
+    }
+}
+
+template <typename Contents>
+inline void write(sstable_version_types v, file_writer& out, const std::optional<Contents>& opt) {
+    write(v, out, bool(opt));
+    if (bool(opt)) {
+        write(v, out, *opt);
     }
 }
 
@@ -573,7 +559,7 @@ void write_counter_value(counter_cell_view ccv, W& out, sstable_version_types v,
         write<int16_t>(v, out, std::numeric_limits<int16_t>::min() + i);
     }
     auto write_shard = [&] (auto&& s) {
-        auto uuid = s.id().to_uuid();
+        auto uuid = s.id().uuid();
         write(v, out, int64_t(uuid.get_most_significant_bits()),
             int64_t(uuid.get_least_significant_bits()),
             int64_t(s.logical_clock()), int64_t(s.value()));
@@ -586,10 +572,6 @@ void write_counter_value(counter_cell_view ccv, W& out, sstable_version_types v,
 void maybe_add_summary_entry(summary&, const dht::token&, bytes_view key, uint64_t data_offset,
     uint64_t index_offset, index_sampling_state&);
 
-// Get the currently loaded configuration, or the default configuration in
-// case none has been loaded (this happens, for example, in unit tests).
-const db::config& get_config();
-
 void prepare_summary(summary& s, uint64_t expected_partition_count, uint32_t min_index_interval);
 
 future<> seal_summary(summary& s,
@@ -597,9 +579,10 @@ future<> seal_summary(summary& s,
     std::optional<key>&& last_key,
     const index_sampling_state& state);
 
-void seal_statistics(sstable_version_types, statistics&, metadata_collector&, const std::set<int>& _compaction_ancestors,
+void seal_statistics(sstable_version_types, statistics&, metadata_collector&,
     const sstring partitioner, double bloom_filter_fp_chance, schema_ptr,
-    const dht::decorated_key& first_key, const dht::decorated_key& last_key, const encoding_stats& enc_stats = {});
+    const dht::decorated_key& first_key, const dht::decorated_key& last_key,
+    const encoding_stats& enc_stats = {}, const std::set<int>& compaction_ancestors = {});
 
 void write(sstable_version_types, file_writer&, const utils::estimated_histogram&);
 void write(sstable_version_types, file_writer&, const utils::streaming_histogram&);

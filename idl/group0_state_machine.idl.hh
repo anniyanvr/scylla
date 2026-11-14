@@ -3,17 +3,43 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+
+#include "raft/raft.hh"
+#include "gms/inet_address_serializer.hh"
+#include "utils/chunked_vector.hh"
+
+#include "idl/frozen_schema.idl.hh"
+#include "idl/uuid.idl.hh"
+#include "idl/raft_storage.idl.hh"
 
 namespace service {
 
 struct schema_change {
-    std::vector<canonical_mutation> mutations;
+    utils::chunked_vector<canonical_mutation> mutations;
+};
+
+// Keep this placeholder at its original variant position for wire compatibility
+// with group0 commands written before the experimental broadcast table support was removed.
+struct unused {
+    utils::chunked_vector<canonical_mutation> mutations;
+};
+
+struct topology_change {
+    utils::chunked_vector<canonical_mutation> mutations;
+};
+
+struct mixed_change {
+    utils::chunked_vector<canonical_mutation> mutations;
+};
+
+struct write_mutations {
+    utils::chunked_vector<canonical_mutation> mutations;
 };
 
 struct group0_command {
-    std::variant<service::schema_change> change;
+    std::variant<service::schema_change, service::unused, service::topology_change, service::write_mutations, service::mixed_change> change;
     canonical_mutation history_append;
 
     std::optional<utils::UUID> prev_state_id;

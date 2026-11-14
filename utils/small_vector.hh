@@ -3,20 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include <compare>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <new>
 #include <utility>
+#include <ranges>
 #include <algorithm>
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
+#include <malloc.h>
+#include <iostream>
+#include <fmt/ostream.h>
 
 namespace utils {
 
@@ -41,12 +46,8 @@ namespace utils {
 /// Unless otherwise specified (e.g. move ctor and assignment) small_vector
 /// provides guarantees at least as strong as those of std::vector<>.
 template<typename T, size_t N>
+requires std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T> && std::is_nothrow_destructible_v<T> && (N > 0)
 class small_vector {
-    static_assert(N > 0);
-    static_assert(std::is_nothrow_move_constructible_v<T>);
-    static_assert(std::is_nothrow_move_assignable_v<T>);
-    static_assert(std::is_nothrow_destructible_v<T>);
-
 private:
     T* _begin;
     T* _end;
@@ -105,13 +106,13 @@ private:
     }
 
     void reserve_at_least(size_t n) {
-        if (__builtin_expect(_begin + n > _capacity_end, false)) {
+        if (n > capacity()) [[unlikely]] {
             expand(std::max(n, capacity() * 2));
         }
     }
 
     [[noreturn]] [[gnu::cold]] [[gnu::noinline]]
-    void throw_out_of_range() {
+    void throw_out_of_range() const {
         throw std::out_of_range("out of range small vector access");
     }
 
@@ -141,6 +142,19 @@ public:
             _end = std::uninitialized_copy(first, last, _end);
         } else {
             std::copy(first, last, std::back_inserter(*this));
+        }
+    }
+
+    // This constructor supports converting ranges to small vectors via
+    // std::range::to<utils::small_vector<T, N>>().
+    small_vector(std::from_range_t, std::ranges::range auto&& range) : small_vector() {
+        using Range = decltype(range);
+        if constexpr (std::ranges::sized_range<Range> || std::ranges::forward_range<Range>) {
+            auto n = std::ranges::distance(range);
+            reserve(n);
+            _end = std::ranges::uninitialized_copy(range, std::ranges::subrange(_end, _end + n)).out;
+        } else {
+            std::ranges::copy(range, std::back_inserter(*this));
         }
     }
 
@@ -188,7 +202,7 @@ public:
     small_vector& operator=(small_vector&& other) noexcept {
         clear();
         if (other.uses_internal_storage()) {
-            if (__builtin_expect(!uses_internal_storage(), false)) {
+            if (!uses_internal_storage()) [[unlikely]] {
                 std::free(_begin);
                 _begin = _internal.storage;
             }
@@ -208,7 +222,7 @@ public:
             }
             other._end = other._internal.storage;
         } else {
-            if (__builtin_expect(!uses_internal_storage(), false)) {
+            if (!uses_internal_storage()) [[unlikely]] {
                 std::free(_begin);
             }
             _begin = std::exchange(other._begin, other._internal.storage);
@@ -232,13 +246,24 @@ public:
 
     ~small_vector() {
         clear();
-        if (__builtin_expect(!uses_internal_storage(), false)) {
+        if (!uses_internal_storage()) [[unlikely]] {
             std::free(_begin);
         }
     }
 
+    static constexpr size_t internal_capacity() noexcept {
+        return N;
+    }
+
+    size_t external_memory_usage() const {
+        if (uses_internal_storage()) {
+            return 0;
+        }
+        return ::malloc_usable_size(_begin);
+    }
+
     void reserve(size_t n) {
-        if (__builtin_expect(_begin + n > _capacity_end, false)) {
+        if (n > capacity()) [[unlikely]] {
             expand(n);
         }
     }
@@ -277,13 +302,13 @@ public:
     const T& operator[](size_t idx) const noexcept { return data()[idx]; }
 
     T& at(size_t idx) {
-        if (__builtin_expect(idx >= size(), false)) {
+        if (idx >= size()) [[unlikely]] {
             throw_out_of_range();
         }
         return operator[](idx);
     }
     const T& at(size_t idx) const {
-        if (__builtin_expect(idx >= size(), false)) {
+        if (idx >= size()) [[unlikely]] {
             throw_out_of_range();
         }
         return operator[](idx);
@@ -295,7 +320,7 @@ public:
 
     template<typename... Args>
     T& emplace_back(Args&&... args) {
-        if (__builtin_expect(_end == _capacity_end, false)) {
+        if (_end == _capacity_end) [[unlikely]] {
             expand(std::max<size_t>(capacity() * 2, 1));
         }
         auto& ref = *new (_end) T(std::forward<Args>(args)...);
@@ -322,7 +347,7 @@ public:
             reserve_at_least(size() + new_count);
             auto pos = _begin + idx;
             auto after = std::distance(pos, end());
-            if (__builtin_expect(pos == end(), true)) {
+            if (pos == end()) [[likely]] {
                 _end = std::uninitialized_copy(first, last, end());
                 return pos;
             } else if (after > new_count) {
@@ -446,27 +471,19 @@ public:
         std::swap(*this, other);
     }
 
-    bool operator==(const small_vector& other) const noexcept {
-        return size() == other.size() && std::equal(_begin, _end, other.begin());
+    auto operator<=>(const small_vector& other) const noexcept requires std::three_way_comparable<T> {
+        return std::lexicographical_compare_three_way(this->begin(), this->end(),
+                                                      other.begin(), other.end());
     }
 
-    bool operator!=(const small_vector& other) const noexcept {
-        return !(*this == other);
+    bool operator==(const small_vector& other) const noexcept {
+        return size() == other.size() && std::equal(_begin, _end, other.begin());
     }
 };
 
 template <typename T, size_t N>
 std::ostream& operator<<(std::ostream& os, const utils::small_vector<T, N>& v) {
-    os << "{";
-    bool first = true;
-    for (auto&& e : v) {
-        if (!first) {
-            os << ", ";
-        }
-        first = false;
-        os << e;
-    }
-    os << "}";
+    fmt::print(os, "{}", v);
     return os;
 }
 

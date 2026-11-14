@@ -1,16 +1,27 @@
-FROM docker.io/fedora:34
-ADD ./install-dependencies.sh ./
-ADD ./seastar/install-dependencies.sh ./seastar/
-ADD ./tools/jmx/install-dependencies.sh ./tools/jmx/
-ADD ./tools/java/install-dependencies.sh ./tools/java/
-ADD ./tools/toolchain/system-auth ./
-RUN dnf -y install 'dnf-command(copr)' \
-    && dnf -y install ccache \
+FROM registry.fedoraproject.org/fedora:44
+
+ARG CLANG_BUILD="SKIP"
+ARG CLANG_ARCHIVES
+
+WORKDIR /mnt
+RUN echo install_weak_deps=False >> /etc/dnf/dnf.conf
+RUN dnf -y update \
+    && dnf -y install 'dnf-command(copr)' \
+    && dnf -y install sccache \
     && dnf -y install devscripts debhelper fakeroot file rpm-build \
-    && ./install-dependencies.sh && dnf -y update && dnf clean all \
+    && ./install-dependencies.sh && dnf clean all \
+    && rm -rf /root/.cache /root/.cargo \
     && echo 'ALL ALL=(ALL:ALL) NOPASSWD: ALL' >> /etc/sudoers \
-    && cp system-auth /etc/pam.d \
+    && cp ./tools/toolchain/system-auth /etc/pam.d \
     && echo 'Defaults !requiretty' >> /etc/sudoers
 RUN mkdir -p /root/.m2/repository
-ENV JAVA8_HOME=/usr/lib/jvm/java-1.8.0-openjdk
+RUN ./tools/toolchain/optimized_clang.sh && rm -rf /root/.cache /root/.cargo
+# Detection alone accepts compiler versions missing from Conan's settings.yml.
+RUN CONAN_HOME=$(mktemp -d) \
+    && export CONAN_HOME CC=clang CXX=clang++ \
+    && conan profile detect \
+    && conan profile show \
+    && CC=gcc CXX=g++ conan profile detect --force \
+    && conan profile show \
+    && rm -rf "$CONAN_HOME"
 CMD /bin/bash

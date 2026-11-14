@@ -3,16 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include <filesystem>
 #include <fmt/format.h>
-
-#include <seastar/util/std-compat.hh>
-
-#include "utils/UUID.hh"
 
 namespace fs = std::filesystem;
 
@@ -20,9 +17,17 @@ namespace fs = std::filesystem;
 // automatically when tmpdir object goes out of scope.
 class tmpdir {
     fs::path _path;
+    bool _preserve_on_exception = false;
 
 private:
     void remove() noexcept;
+
+    class sweeper {
+        const tmpdir& _tmpd;
+    public:
+        sweeper(const tmpdir& t) noexcept : _tmpd(t) {}
+        ~sweeper();
+    };
 
 public:
     tmpdir();
@@ -35,4 +40,6 @@ public:
     ~tmpdir();
 
     const fs::path& path() const noexcept { return _path; }
+    sweeper make_sweeper() const noexcept { return sweeper(*this); }
+    void preserve_on_exception(bool p) { _preserve_on_exception = p; }
 };

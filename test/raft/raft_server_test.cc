@@ -1,0 +1,2456 @@
+#include <seastar/core/with_timeout.hh>
+#include <fmt/std.h>
+#include "raft/raft.hh"
+#include "replication.hh"
+#include "utils/error_injection.hh"
+#include "test/lib/error_injection.hh"
+#include <seastar/util/defer.hh>
+#include <seastar/core/when_all.hh>
+
+#ifdef SEASTAR_DEBUG
+// Increase tick time to allow debug to process messages
+ const auto tick_delay = 200ms;
+#else
+const auto tick_delay = 100ms;
+#endif
+
+// The word "default" means "usually used by the tests here".
+template <typename clock_type = std::chrono::steady_clock>
+static raft_cluster<clock_type> get_default_cluster(test_case test_config) {
+    return raft_cluster<clock_type>{
+        std::move(test_config),
+        ::apply_changes,
+        0,
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+}
+
+// Builds a state machine apply function which resolves `applied` as soon as
+// node 0 (the leader in the tests using this) applies the entry carrying
+// `value`. Entries added on a follower are forwarded to the leader
+// asynchronously, so a test that must act only after the leader applied such
+// an entry needs an explicit signal like this one.
+//
+// The value is expected to be added exactly once, so seeing it applied more
+// than once means the test does something it didn't intend to and the check
+// below fails it.
+static auto signal_when_leader_applies(int value, seastar::promise<>& applied) {
+    return [value, &applied, signalled = false] (raft::server_id id, const raft::log_entry_ptr_list& commands,
+            lw_shared_ptr<hasher_int> hasher) mutable {
+        if (id == to_raft_id(0)) {
+            for (auto& entry : commands) {
+                auto is = ser::as_input_stream(std::get<raft::command>(entry->data));
+                if (ser::deserialize(is, std::type_identity<int>()) == value) {
+                    BOOST_REQUIRE(!std::exchange(signalled, true));
+                    applied.set_value();
+                }
+            }
+        }
+        return apply_changes(id, commands, hasher);
+    };
+}
+
+// Makes the only server of a cluster receive a snapshot from a leader of a
+// later term, which the fsm accepts, so the applier fiber goes on to load it.
+// The returned future resolves once the fsm has accepted the snapshot.
+template <typename Clock>
+static future<raft::snapshot_reply> receive_snapshot_from_new_leader(raft_cluster<Clock>& cluster) {
+    // The fsm rejects a snapshot while it has commits it hasn't reported yet,
+    // like the commit of the dummy entry appended on election, which the io
+    // fiber may not have reported right after wait_for_leader(). Everything
+    // committed so far is reported once it's applied.
+    co_await cluster.get_server(0).read_barrier(nullptr);
+
+    raft::configuration config;
+    config.current.emplace(config_member_from_id(to_raft_id(0)));
+    const auto term = raft::term_t{cluster.get_server(0).get_current_term().value() + 1};
+    raft::install_snapshot snp {
+        .current_term = term,
+        .snp = {
+            .idx = raft::index_t{100},
+            .term = term,
+            .config = std::move(config),
+            .id = raft::snapshot_id::create_random_id(),
+        },
+    };
+    co_return co_await cluster.receive_snapshot(0, to_raft_id(1), std::move(snp));
+}
+
+template <typename Clock>
+static void stop_server_within_time(raft_cluster<Clock>& cluster, size_t id, std::chrono::seconds timeout) {
+    const auto start = std::chrono::steady_clock::now();
+    cluster.stop_server(id, "test abort").get();
+    const auto end = std::chrono::steady_clock::now();
+    BOOST_CHECK_LT(end - start, timeout);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_check_abort_on_client_api) {
+    raft_cluster<std::chrono::steady_clock> cluster(
+            test_case { .nodes = 1 },
+            [](raft::server_id id, const raft::log_entry_ptr_list& commands, lw_shared_ptr<hasher_int> hasher) {
+                return 0;
+            },
+            0,
+            0,
+            0, false, tick_delay, rpc_config{});
+    cluster.start_all().get();
+
+    cluster.stop_server(0, "test crash").get();
+
+    auto check_error = [](const raft::stopped_error& e) {
+        return sstring(e.what()) == sstring("Raft instance is stopped, reason: \"test crash\"");
+    };
+    BOOST_CHECK_EXCEPTION(cluster.add_entries(1, 0).get(), raft::stopped_error, check_error);
+    BOOST_CHECK_EXCEPTION(cluster.get_server(0).modify_config({}, {to_raft_id(0)}, nullptr).get(), raft::stopped_error, check_error);
+    BOOST_CHECK_EXCEPTION(cluster.get_server(0).read_barrier(nullptr).get(), raft::stopped_error, check_error);
+    BOOST_CHECK_EXCEPTION(cluster.get_server(0).wait_for_apply(raft::index_t{1}, nullptr).get(), raft::stopped_error, check_error);
+    BOOST_CHECK_EXCEPTION(cluster.get_server(0).set_configuration({}, nullptr).get(), raft::stopped_error, check_error);
+}
+
+// The applier fiber takes its input from the mailbox and may suspend before it
+// calls the state machine, so abort() may happen in between. The injection
+// puts the fiber in that window.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_state_machine_not_used_after_abort_before_load_snapshot) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    auto cluster = get_default_cluster(test_case { .nodes = 1 });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+
+    std::optional<future<>> aborted;
+    std::optional<future<raft::snapshot_reply>> received;
+
+    {
+        constexpr std::string_view block_applier = "block_raft_applier_fiber_before_load_snapshot";
+        scoped_error_injection blocked_applier{block_applier};
+
+        received = receive_snapshot_from_new_leader(cluster);
+        wait_for_injection_enter(block_applier).get();
+
+        stop.cancel();
+        aborted = cluster.stop_server(0, "test abort");
+        // The test is only meaningful if the state machine is aborted before
+        // the applier fiber is released; otherwise it would pass no matter
+        // what the fiber does next.
+        BOOST_CHECK(eventually_true([&] { return cluster.sm_aborted(0); }));
+    }
+
+    // stop_server() checks that the state machine was not used after its abort.
+    aborted->get();
+    received->get();
+#endif
+}
+
+// A state machine may complete apply() after it's aborted, finishing what it
+// cannot interrupt. The applier fiber then must not go on to take a snapshot,
+// which it would do right away with a snapshot threshold of 1.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_state_machine_not_used_after_abort_after_apply) {
+    auto cfg = raft::server::configuration { .snapshot_threshold = 1 };
+    auto cluster = get_default_cluster(test_case {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>({std::move(cfg)})
+    });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+    // Let the snapshot after the dummy entry appended on election be taken
+    // before the state machine is aborted.
+    cluster.get_server(0).read_barrier(nullptr).get();
+
+    // Unlike the injections above, the hold doesn't end when the state
+    // machine is aborted.
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.get_server(0).add_entry(
+            create_command(1000), raft::wait_type::committed, nullptr).get();
+    apply_entered.wait().get();
+
+    stop.cancel();
+    auto aborted = cluster.stop_server(0, "test abort");
+    // The test is only meaningful if the state machine is aborted before
+    // apply() returns; otherwise it would pass no matter what the applier
+    // fiber does next.
+    BOOST_CHECK(eventually_true([&] { return cluster.sm_aborted(0); }));
+
+    apply_release.signal();
+    // stop_server() checks that the state machine was not used after its abort.
+    aborted.get();
+}
+
+// Like test_state_machine_not_used_after_abort_after_apply, but with a snapshot
+// requested by trigger_snapshot(), which the applier fiber takes once it has
+// applied what it was given.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_state_machine_not_used_after_abort_on_triggered_snapshot) {
+    auto cluster = get_default_cluster(test_case { .nodes = 1 });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+    cluster.get_server(0).read_barrier(nullptr).get();
+
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.get_server(0).add_entry(
+            create_command(1000), raft::wait_type::committed, nullptr).get();
+    apply_entered.wait().get();
+
+    auto triggered = cluster.get_server(0).trigger_snapshot(nullptr);
+
+    stop.cancel();
+    auto aborted = cluster.stop_server(0, "test abort");
+    // The test is only meaningful if the state machine is aborted before
+    // apply() returns; otherwise it would pass no matter what the applier
+    // fiber does next.
+    BOOST_CHECK(eventually_true([&] { return cluster.sm_aborted(0); }));
+
+    apply_release.signal();
+    // stop_server() checks that the state machine was not used after its abort.
+    aborted.get();
+    BOOST_CHECK_THROW(triggered.get(), raft::request_aborted);
+}
+
+// The io fiber drops the snapshots replaced by a new one after it persists the
+// new one, so abort() may happen in between. The injection puts the fiber in
+// that window.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_state_machine_not_used_after_abort_on_dropping_snapshots) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    auto cluster = get_default_cluster(test_case { .nodes = 1 });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+    cluster.get_server(0).read_barrier(nullptr).get();
+
+    std::optional<future<>> aborted;
+    std::optional<future<bool>> triggered;
+
+    {
+        constexpr std::string_view block_store = "raft_test_persistence_block_store_snapshot_descriptor";
+        scoped_error_injection blocked_store{block_store};
+
+        // The batch carrying the new snapshot also carries the one it replaces
+        // to be dropped.
+        triggered = cluster.get_server(0).trigger_snapshot(nullptr);
+        wait_for_injection_enter(block_store).get();
+
+        stop.cancel();
+        aborted = cluster.stop_server(0, "test abort");
+        // The test is only meaningful if the state machine is aborted before
+        // the io fiber is released; otherwise it would pass no matter what the
+        // fiber does next.
+        BOOST_CHECK(eventually_true([&] { return cluster.sm_aborted(0); }));
+    }
+
+    // stop_server() checks that the state machine was not used after its abort.
+    aborted->get();
+    BOOST_CHECK_THROW(triggered->get(), raft::request_aborted);
+#endif
+}
+
+// abort() must not wait for a state machine which is stuck in one of its
+// methods: it aborts the state machine before joining the applier fiber, which
+// is the only way to interrupt an operation already in progress.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_abort_with_state_machine_stuck_in_apply) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    auto cluster = get_default_cluster(test_case { .nodes = 1 });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+
+    constexpr std::string_view block_sm_apply_injection = "raft_test_sm_block_apply";
+    scoped_error_injection blocked_apply{block_sm_apply_injection};
+
+    // Waiting for the entry to be committed doesn't get stuck: commit waiters
+    // are notified by the io fiber, not by the applier fiber.
+    cluster.get_server(0).add_entry(
+            create_command(1000), raft::wait_type::committed, nullptr).get();
+    wait_for_injection_enter(block_sm_apply_injection).get();
+
+    // Not applied before the server is stopped, as the applier fiber is stuck
+    // on the entry before it: the waiter must be failed, not resolved.
+    auto never_applied = cluster.get_server(0).add_entry(
+            create_command(1001), raft::wait_type::applied, nullptr);
+
+    stop.cancel();
+    stop_server_within_time(cluster, 0, std::chrono::seconds(15));
+
+    BOOST_CHECK_THROW(never_applied.get(), raft::stopped_error);
+#endif
+}
+
+// abort() must not wait for a state machine which is stuck in one of its
+// methods: it aborts the state machine before joining the applier fiber, which
+// is the only way to interrupt an operation already in progress.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_abort_with_state_machine_stuck_in_take_snapshot) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    // Enabled before starting: with a threshold of 1 the applier fiber takes a
+    // snapshot as soon as it applies what the leader commits on election.
+    constexpr std::string_view block_sm_take_snapshot_injection = "raft_test_sm_block_take_snapshot";
+    std::optional<scoped_error_injection> blocked_take_snapshot{block_sm_take_snapshot_injection};
+
+    auto cfg = raft::server::configuration { .snapshot_threshold = 1 };
+    auto cluster = get_default_cluster(test_case {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>({std::move(cfg)})
+    });
+    cluster.start_all().get();
+    auto stop = defer([&] noexcept {
+        // Turn off the injection so the node can stop without any trouble.
+        blocked_take_snapshot = std::nullopt;
+        cluster.stop_all().get();
+    });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+    wait_for_injection_enter(block_sm_take_snapshot_injection).get();
+
+    stop.cancel();
+    stop_server_within_time(cluster, 0, std::chrono::seconds(15));
+#endif
+}
+
+// abort() must not wait for a state machine which is stuck in one of its
+// methods: it aborts the state machine before joining the applier fiber, which
+// is the only way to interrupt an operation already in progress.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_abort_with_state_machine_stuck_in_load_snapshot) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    auto cluster = get_default_cluster(test_case { .nodes = 1 });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+
+    constexpr std::string_view block_sm_load_snapshot_injection = "raft_test_sm_block_load_snapshot";
+    scoped_error_injection blocked_load_snapshot{block_sm_load_snapshot_injection};
+
+    auto received = receive_snapshot_from_new_leader(cluster);
+    wait_for_injection_enter(block_sm_load_snapshot_injection).get();
+
+    stop.cancel();
+    stop_server_within_time(cluster, 0, std::chrono::seconds(15));
+    received.get();
+#endif
+}
+
+// A state machine call interrupted by the abort fails with
+// abort_requested_exception, which is expected while aborting. Any other error
+// means that the state machine broke, so it must still reach
+// on_background_error.
+// Refs: SCYLLADB-1056.
+SEASTAR_THREAD_TEST_CASE(test_unexpected_background_error_while_aborting_reported) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    bool background_error = false;
+    auto cfg = raft::server::configuration {
+        .on_background_error = [&background_error] (std::exception_ptr) { background_error = true; },
+    };
+    auto cluster = get_default_cluster(test_case {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>({std::move(cfg)})
+    });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.get_server(0).wait_for_leader(nullptr).get();
+    cluster.get_server(0).read_barrier(nullptr).get();
+
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.get_server(0).add_entry(
+            create_command(1000), raft::wait_type::committed, nullptr).get();
+    apply_entered.wait().get();
+
+    stop.cancel();
+    auto aborted = cluster.stop_server(0, "test abort");
+    BOOST_CHECK(eventually_true([&] { return cluster.sm_aborted(0); }));
+
+    // Not an abort_requested_exception: an error the abort doesn't explain.
+    scoped_error_injection failing_apply{"raft_test_sm_apply_failure"};
+    apply_release.signal();
+    aborted.get();
+    BOOST_CHECK(background_error);
+#endif
+}
+
+SEASTAR_THREAD_TEST_CASE(test_release_memory_if_add_entry_throws) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    const size_t command_size = sizeof(size_t);
+    test_case test_config {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>({
+            raft::server::configuration {
+                .snapshot_threshold_log_size = 0,
+                .snapshot_trailing_size = 0,
+                .max_log_size = command_size,
+                .max_command_size = command_size
+            }
+        })
+    };
+    auto cluster = get_default_cluster(std::move(test_config));
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    utils::get_local_injector().enable("fsm::add_entry/test-failure", true);
+    auto check_error = [](const std::runtime_error& e) {
+        return sstring(e.what()) == sstring("fsm::add_entry/test-failure");
+    };
+    BOOST_CHECK_EXCEPTION(cluster.add_entries(1, 0).get(), std::runtime_error, check_error);
+
+    // we would block forever if the memory wasn't released
+    // when the exception was thrown from the first add_entry
+    cluster.add_entries(1, 0).get();
+    cluster.read(read_value{0, 1}).get();
+#endif
+}
+
+// Servers sharing a stats object accumulate their counters into it, so a
+// whole set of servers can be exported as one metric series.
+SEASTAR_THREAD_TEST_CASE(test_shared_stats) {
+    auto shared = make_lw_shared<raft::server_stats>();
+    const size_t node_count = 3;
+    test_case test_config {
+        .nodes = node_count,
+        .stats = shared
+    };
+    // apply_entries must exceed the entries added below, or the state
+    // machine's done promise fires prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    const size_t entries = 10;
+    cluster.add_entries(entries, 0).get();
+    cluster.read(read_value{0, entries}).get();
+
+    BOOST_CHECK_GE(shared->add_command, entries);
+    BOOST_CHECK_GE(shared->applied_entries, entries);
+    // Every node persists what the leader adds, so all of them count here.
+    BOOST_CHECK_GE(shared->persisted_log_entries, node_count * entries);
+}
+
+// Entries queued behind one waiting for log memory are counted as waiters,
+// but add to the waits only if they still have to wait once their turn comes.
+SEASTAR_THREAD_TEST_CASE(test_log_limiter_stats) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    auto shared = make_lw_shared<raft::server_stats>();
+    // The log holds exactly one command, so the second has to wait until the
+    // first is applied and snapshotted, and the third waits behind the second.
+    const size_t command_size = sizeof(size_t);
+    test_case test_config {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>({
+            raft::server::configuration {
+                .snapshot_threshold_log_size = 0,
+                .snapshot_trailing_size = 0,
+                .max_log_size = command_size,
+                // The path strongly consistent tables take, and the only one on
+                // which submission order is append order, as the read below assumes.
+                .enable_forwarding = false,
+                .max_command_size = command_size
+            }
+        }),
+        .stats = shared
+    };
+    // apply_entries must exceed the entries added below, or the state
+    // machine's done promise fires prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    // Keep the first entry uncommitted, so its memory is still in use.
+    utils::get_local_injector().enable("poll_fsm_output/pause");
+    // abort() cannot interrupt the pause loop in the io fiber, so anything
+    // below throwing would leave stop_all() waiting for it forever.
+    auto resume = defer([] noexcept { utils::get_local_injector().disable("poll_fsm_output/pause"); });
+    auto entries = cluster.add_entries_concurrent(3, 0);
+    auto& leader = cluster.get_server(0);
+    // Not BOOST_REQUIRE: throwing here would abandon the writes below, and
+    // the checks that follow report the timeout just as well.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (leader.get_status().log_limiter_waiters == 0 && std::chrono::steady_clock::now() < deadline) {
+        seastar::sleep(10ms).get();
+    }
+    BOOST_CHECK_EQUAL(shared->log_limiter_waits, 1u);
+    BOOST_CHECK_EQUAL(leader.get_status().log_limiter_waiters, 2u);
+
+    utils::get_local_injector().disable("poll_fsm_output/pause");
+    entries.get();
+    cluster.read(read_value{0, 3}).get();
+    // The third is counted only if the second is still in the log when its turn comes.
+    BOOST_CHECK_GE(shared->log_limiter_waits, 1u);
+    BOOST_CHECK_LE(shared->log_limiter_waits, 2u);
+    BOOST_CHECK_EQUAL(leader.get_status().log_limiter_waiters, 0u);
+#endif
+}
+
+// An entry added while the leader transfers its leadership away waits for the
+// transfer, not for the log to shrink, so the wait is not counted.
+SEASTAR_THREAD_TEST_CASE(test_log_limiter_stats_during_stepdown) {
+    auto shared = make_lw_shared<raft::server_stats>();
+    const size_t node_count = 3;
+    test_case test_config {
+        .nodes = node_count,
+        .stats = shared
+    };
+    // apply_entries must exceed the entries added below, or the state
+    // machine's done promise fires prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    // The target of the transfer cannot answer it, so the transfer stays in
+    // progress and the entry added below keeps waiting for the memory it took.
+    cluster.disconnect(1);
+    auto transfer = cluster.get_server(0).stepdown(raft::logical_clock::duration(1000), to_raft_id(1));
+    auto entry = cluster.add_entries_concurrent(1, 0);
+    seastar::sleep(3 * tick_delay).get();
+
+    BOOST_CHECK(!entry.available());
+    BOOST_CHECK_EQUAL(shared->log_limiter_waits, 0u);
+    BOOST_CHECK_EQUAL(cluster.get_server(0).get_status().log_limiter_waiters, 0u);
+
+    // Letting the transfer complete releases the entry, which the new leader
+    // admits without waiting.
+    cluster.connect_all();
+    transfer.get();
+    entry.get();
+    BOOST_CHECK_EQUAL(shared->log_limiter_waits, 0u);
+    BOOST_CHECK_EQUAL(cluster.get_server(0).get_status().log_limiter_waiters, 0u);
+}
+
+// A simple test verifying the most basic properties of `wait_for_state_change`:
+// * Triggering the passed abort_source will abort the operation.
+//   The future will be resolved.
+// * The future will contain an exception, and its type will be `raft::request_aborted`.
+// Reproduces SCYLLADB-665.
+SEASTAR_THREAD_TEST_CASE(test_aborting_wait_for_state_change) {
+    auto cluster = get_default_cluster(test_case{ .nodes = 1 });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server = cluster.get_server(0);
+    server.wait_for_leader(nullptr).get();
+
+    abort_source as;
+    // Note that this future cannot resolve immediately.
+    // In particular, the leader election we awaited above cannot
+    // influence it since the promises corresponding to
+    // waiting for a leader and state change are resolved
+    // within the same call, one after the other
+    // (cf. server_impl::process_fsm_output).
+    future<> fut_default_ex = server.wait_for_state_change(&as);
+    as.request_abort();
+    BOOST_CHECK_THROW((void) fut_default_ex.get(), raft::request_aborted);
+}
+
+// If a step of raft::server::abort() fails, the remaining steps must still run
+// because the caller destroys the server as soon as the future resolves.
+// The failed future must still carry the original error.
+//
+// We make the state machine's abort() fail on a follower and check that a pending
+// wait_for_leader(), which is only resolved by a later step, is completed with
+// raft::stopped_error. We also keep an add_entry() suspended in
+// do_on_leader_with_retries(), which holds _do_on_leader_gate, and check that it
+// has finished by the time abort() reports the error, i.e. that the gate was drained.
+//
+// Reproducer of SCYLLADB-5085.
+SEASTAR_THREAD_TEST_CASE(test_abort_completes_teardown_if_step_fails) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+#else
+    constexpr size_t node_count = 3;
+
+    auto cluster = get_default_cluster(test_case{ .nodes = node_count });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept {
+        for (size_t i = 0; i < node_count; ++i) {
+            if (cluster.get_server(i).is_alive()) {
+                cluster.stop_server(i).get();
+            }
+        }
+    });
+
+    auto& follower = cluster.get_server(1);
+    follower.wait_for_leader(nullptr).get();
+
+    // Constructing the injection can yield, so do it before the section below.
+    constexpr std::string_view injection_name = "raft_test_state_machine_abort_failure";
+    scoped_error_injection injection{injection_name};
+
+    // Cut the follower off so that no leader can make contact, and make it
+    // forget the leader. Nothing yields until the server is aborted below, and
+    // stop_server() cancels the ticker first, so the wait cannot be satisfied.
+    cluster.disconnect(1);
+    auto wait = follower.wait_for_leader(nullptr, true);
+    BOOST_REQUIRE(!wait.available());
+
+    // With no known leader, forwarding makes add_entry() wait for one while
+    // holding _do_on_leader_gate.
+    auto add = follower.add_entry(
+            create_command(42), raft::wait_type::committed, nullptr);
+    BOOST_REQUIRE(!add.available());
+
+    BOOST_CHECK_EXCEPTION(cluster.stop_server(1, "test abort").get(), std::runtime_error,
+            [&] (const std::runtime_error& e) {
+        return std::string_view(e.what()) == injection_name;
+    });
+
+    BOOST_REQUIRE(eventually_true([&wait] { return wait.available(); }));
+    BOOST_REQUIRE(eventually_true([&add] { return add.available(); }));
+    BOOST_CHECK_THROW(wait.get(), raft::stopped_error);
+    BOOST_CHECK_THROW(add.get(), raft::stopped_error);
+#endif
+}
+
+static void test_func_on_aborted_server_aux(
+    std::function<future<>(raft::server&, abort_source*)> func,
+    const raft::server::configuration& config = raft::server::configuration{})
+{
+    const size_t node_count = 2;
+    auto test_config = test_case {
+        .nodes = node_count,
+        .config = std::vector<raft::server::configuration>(node_count, config)
+    };
+    auto cluster = get_default_cluster(std::move(test_config));
+
+    constexpr std::string_view error_message = "some unfunny error message";
+    auto check_default_message = [] (const raft::stopped_error& e) {
+        return std::string_view(e.what()) == "Raft instance is stopped";
+    };
+    auto check_error_message = [&error_message] (const raft::stopped_error& e) {
+        return std::string_view(e.what()) == fmt::format("Raft instance is stopped, reason: \"{}\"", error_message);
+    };
+
+    /* Case 1. Default error message */ {
+        auto& s1 = cluster.get_server(0);
+        s1.start().get();
+        s1.abort().get();
+
+        abort_source as;
+
+        // Regardless of the state of the passed abort_source, we should get raft::stopped_error.
+        BOOST_CHECK_EXCEPTION((void) func(s1, nullptr).get(), raft::stopped_error, check_default_message);
+        BOOST_CHECK_EXCEPTION((void) func(s1, &as).get(), raft::stopped_error, check_default_message);
+        as.request_abort();
+        BOOST_CHECK_EXCEPTION((void) func(s1, &as).get(), raft::stopped_error, check_default_message);
+    }
+
+    /* Case 2. Custom error message */ {
+        auto& s2 = cluster.get_server(1);
+        s2.start().get();
+        s2.abort(sstring(error_message)).get();
+
+        abort_source as;
+
+        // The same checks as above: we just verify that the error message is what we want.
+        BOOST_CHECK_EXCEPTION((void) func(s2, nullptr).get(), raft::stopped_error, check_error_message);
+        BOOST_CHECK_EXCEPTION((void) func(s2, &as).get(), raft::stopped_error, check_error_message);
+        as.request_abort();
+        BOOST_CHECK_EXCEPTION((void) func(s2, &as).get(), raft::stopped_error, check_error_message);
+    }
+}
+
+static void test_add_entry_on_aborted_server_aux(const bool enable_forwarding) {
+    raft::server::configuration config { .enable_forwarding = enable_forwarding };
+    int val = 0;
+    auto add_entry = [&val] (raft::server& server, abort_source* as) {
+        return server.add_entry(create_command(val++), raft::wait_type::committed, as);
+    };
+    test_func_on_aborted_server_aux(add_entry, config);
+}
+
+static void test_modify_config_on_aborted_server_aux(const bool enable_forwarding) {
+    raft::server::configuration config { .enable_forwarding = enable_forwarding };
+    auto modify_config = [] (raft::server& server, abort_source* as) {
+        return server.modify_config({}, {}, as);
+    };
+    test_func_on_aborted_server_aux(modify_config, config);
+}
+
+// Reproducers of SCYLLADB-841: After raft::server had been aborted, both
+// add_entry and modify_config used to return raft::not_a_leader with
+// a null ID when forwarding was disabled.
+//
+// We verify that that's not the case. Furthermore, we check that
+// raft::stopped_error is preferred over raft::request_aborted
+// if both exceptions apply. That's a more natural choice.
+SEASTAR_THREAD_TEST_CASE(test_add_entry_on_aborted_server_disabled_forwarding) {
+    test_add_entry_on_aborted_server_aux(false);
+}
+SEASTAR_THREAD_TEST_CASE(test_add_entry_on_aborted_server_enabled_forwarding) {
+    test_add_entry_on_aborted_server_aux(true);
+}
+SEASTAR_THREAD_TEST_CASE(test_modify_config_on_aborted_server_disabled_forwarding) {
+    test_modify_config_on_aborted_server_aux(false);
+}
+SEASTAR_THREAD_TEST_CASE(test_modify_config_on_aborted_server_enabled_forwarding) {
+    test_modify_config_on_aborted_server_aux(true);
+}
+
+// A call to raft::server::wait_for_leader should complete with
+// raft::stopped_error if the server has been aborted, regardless
+// of the state of the passed abort_source.
+// Reproducer of SCYLLADB-841.
+SEASTAR_THREAD_TEST_CASE(test_wait_for_leader_on_aborted_server) {
+    test_func_on_aborted_server_aux([] (raft::server& server, abort_source* as) {
+        return server.wait_for_leader(as);
+    });
+}
+
+// wait_for_leader() with `reset` makes a follower forget the leader it knows of, so the
+// wait resolves only once a leader contacts it again. It is for a caller which knows from
+// outside of raft that the leader current_leader() names is gone - removed from the
+// configuration - while this follower hasn't heard from the new one yet.
+SEASTAR_THREAD_TEST_CASE(test_wait_for_leader_with_reset) {
+    auto cluster = get_default_cluster(test_case{ .nodes = 3 });
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    // start_all() elects node 0; the follower learns of it from the first heartbeat.
+    auto& leader = cluster.get_server(0);
+    auto& follower = cluster.get_server(1);
+    follower.wait_for_leader(nullptr).get();
+    BOOST_REQUIRE(follower.current_leader() == to_raft_id(0));
+
+    // Reset does nothing on the leader: there is no leader for it to forget.
+    BOOST_CHECK(leader.wait_for_leader(nullptr, true).available());
+    BOOST_CHECK(leader.current_leader() == to_raft_id(0));
+
+    // Cut the follower off first, so that no heartbeat can bring the leader back
+    // before the checks below run; nothing yields between disconnect() and them.
+    cluster.disconnect(1);
+
+    // Without reset the follower goes on trusting the leader it last heard from,
+    // and the wait is satisfied at once.
+    BOOST_CHECK(follower.wait_for_leader(nullptr).available());
+    BOOST_CHECK(follower.current_leader() == to_raft_id(0));
+
+    // With reset it forgets that leader, and the wait is for the next one to make
+    // contact.
+    abort_source as;
+    future<> wait = follower.wait_for_leader(&as, true);
+    BOOST_CHECK(follower.current_leader() == raft::server_id{});
+    BOOST_CHECK(!wait.available());
+
+    // Once messages flow again the follower hears from a leader: node 0 still, or
+    // whoever wins the election the follower's own timeout may have started meanwhile.
+    cluster.connect_all();
+    wait.get();
+    BOOST_CHECK(follower.current_leader() != raft::server_id{});
+}
+
+// A call to raft::server::wait_for_state_change should complete with
+// raft::stopped_error if the server has been aborted, regardless
+// of the state of the passed abort_source.
+// Reproducer of SCYLLADB-841.
+SEASTAR_THREAD_TEST_CASE(test_wait_for_state_change_on_aborted_server) {
+    test_func_on_aborted_server_aux(&raft::server::wait_for_state_change);
+}
+
+// Auxiliary function for testing add_entry behavior when a snapshot that
+// includes the entry being added is taken before wait_for_entry runs.
+//
+// Uses a 1-node cluster with aggressive snapshotting and an error injection
+// point that pauses add_entry after the entry is added to the log but before
+// wait_for_entry checks its status. During the pause, the entry is committed,
+// applied, and a snapshot is taken.
+//
+// If `advance_snapshot_past_entry` is true, a second entry is added so the
+// snapshot moves past the first entry's index, fully truncating it from the
+// log (term_for returns nullopt). Otherwise the snapshot is taken at the
+// entry's index (term_for returns the snapshot's term).
+//
+// In both cases, wait_for_entry should succeed for both wait types, since
+// the snapshot's term matching the entry's term proves the entry was committed
+// and included in the snapshot.
+static void test_add_entry_load_snapshot_before_wait_aux(raft::wait_type type, bool advance_snapshot_past_entry) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+    return;
+#endif
+    const size_t command_size = sizeof(size_t);
+    test_case test_config {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>({
+            raft::server::configuration {
+                // Snapshot after every entry; truncate aggressively.
+                .snapshot_threshold = 1,
+                .snapshot_threshold_log_size = 1,
+                .snapshot_trailing = 0,
+                .snapshot_trailing_size = 0,
+                .max_log_size = 10 * (command_size + sizeof(raft::log_entry)),
+                .enable_forwarding = false,
+                .max_command_size = command_size
+            }
+         })
+    };
+    // apply_entries must be greater than the number of entries added
+    // during the test, otherwise the state machine's done promise fires
+    // prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    cluster.add_entries(5, 0).get();
+
+    // one_shot: only the first add_entry is paused; the second one
+    // (if used) bypasses the injection.
+    utils::get_local_injector().enable("block_raft_add_entry_before_wait_for_entry", true);
+
+    auto& server = cluster.get_server(0);
+    auto fut = server.add_entry(create_command(42), type, nullptr);
+
+    // Wait for add_entry(42) to reach the injection point.
+    wait_for_injection_enter("block_raft_add_entry_before_wait_for_entry").get();
+
+    // Wait for the entry to be applied.
+    server.read_barrier(nullptr).get();
+
+    if (advance_snapshot_past_entry) {
+        // Add another entry so the snapshot moves past the first entry,
+        // fully truncating it from the log (term_for returns nullopt).
+        // The injection is one-shot and already consumed, so this goes through.
+        server.add_entry(create_command(43), raft::wait_type::applied, nullptr).get();
+    }
+
+    // Take a snapshot, truncating the entry from the log.
+    server.trigger_snapshot(nullptr).get();
+
+    // Unblock wait_for_entry.
+    utils::get_local_injector().receive_message("block_raft_add_entry_before_wait_for_entry");
+
+    // Both wait types should succeed: the snapshot's term matches the entry's
+    // term, proving the entry was committed and included in the snapshot.
+    BOOST_CHECK_NO_THROW(fut.get());
+}
+
+// Snapshot at the entry's index: term_for(eid.idx) returns the snapshot's term.
+// Tests wait_for_entry site where the removed `applied` check used to throw
+// commit_status_unknown.
+SEASTAR_THREAD_TEST_CASE(test_add_entry_applied_load_snapshot_at_entry) {
+    test_add_entry_load_snapshot_before_wait_aux(raft::wait_type::applied, false);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_add_entry_committed_load_snapshot_at_entry) {
+    test_add_entry_load_snapshot_before_wait_aux(raft::wait_type::committed, false);
+}
+
+// Snapshot past the entry's index: term_for(eid.idx) returns nullopt.
+// Tests the `!term` branch in wait_for_entry where `snap_term == eid.term`
+// now succeeds for both wait types.
+SEASTAR_THREAD_TEST_CASE(test_add_entry_applied_load_snapshot_past_entry) {
+    test_add_entry_load_snapshot_before_wait_aux(raft::wait_type::applied, true);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_add_entry_committed_load_snapshot_past_entry) {
+    test_add_entry_load_snapshot_before_wait_aux(raft::wait_type::committed, true);
+}
+
+// Auxiliary function for testing add_entry behavior when a follower receives
+// the entry via a snapshot (load_snapshot) instead of applying it locally.
+//
+// Setup: 3-node cluster. Node 1 (follower) is blocked from receiving
+// messages from the leader (node 0), but can still send to it. Node 1
+// forwards add_entry to the leader, which commits the entry (with node 2),
+// applies it, and takes a snapshot. When node 1 is reconnected, the leader
+// sends a snapshot (since the log entries are truncated). Node 1 loads the
+// snapshot via load_snapshot(), which calls drop_waiters(). The pending
+// waiter for the forwarded entry is resolved successfully because the
+// snapshot's term matches the entry's term.
+static void test_add_entry_wait_resolved_via_drop_waiters_aux(raft::wait_type type) {
+    const size_t command_size = sizeof(size_t);
+    raft::server::configuration srv_config {
+        .snapshot_threshold = 1,
+        .snapshot_threshold_log_size = 1,
+        .snapshot_trailing = 0,
+        .snapshot_trailing_size = 0,
+        .max_log_size = 10 * (command_size + sizeof(raft::log_entry)),
+        .max_command_size = command_size
+    };
+    test_case test_config {
+        .nodes = 3,
+        .config = std::vector<raft::server::configuration>({srv_config, srv_config, srv_config})
+    };
+    // Resolved when node 0 (the leader) applies the entry with command 42
+    // added below.
+    seastar::promise<> leader_applied_42;
+    // apply_entries must be greater than the number of entries added
+    // during the test, otherwise the state machine's done promise fires
+    // prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        signal_when_leader_applies(42, leader_applied_42),
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    // Add a few entries so all nodes are caught up.
+    cluster.add_entries(5, 0).get();
+
+    // Block node 1 from receiving messages from node 0 (leader).
+    // Node 1 can still send to node 0 (forwarding works).
+    cluster.block_receive(1, 0);
+
+    // Node 1 forwards add_entry to node 0. Node 0 commits (with node 2),
+    // applies, and takes a snapshot. Node 1 registers a waiter but never
+    // receives the entry via append entries.
+    auto& follower = cluster.get_server(1);
+    auto fut = follower.add_entry(create_command(42), type, nullptr);
+
+    // The snapshot must cover the entry, otherwise node 1, once reconnected,
+    // catches up by append entries and drop_waiters() is never exercised.
+    //
+    // The signal fires inside apply(), before the applied index the snapshot is
+    // taken at is assigned, so the barrier is what puts the entry under that
+    // index. The barrier alone wouldn't do: it only waits for entries committed
+    // when it registers, and the forwarded entry may not have reached the
+    // leader yet.
+    //
+    // trigger_snapshot() waits for a persisted snapshot at or above the applied
+    // index; false means automatic snapshotting (snapshot_threshold = 1 above)
+    // already took it.
+    auto& leader = cluster.get_server(0);
+    leader_applied_42.get_future().get();
+    leader.read_barrier(nullptr).get();
+    leader.trigger_snapshot(nullptr).get();
+
+    // Reconnect node 1. The leader will send a snapshot since the log
+    // entries are truncated (snapshot_trailing = 0).
+    cluster.connect_all();
+
+    // drop_waiters resolves the waiter successfully since the snapshot's
+    // term matches the entry's term, proving it was committed.
+    BOOST_CHECK_NO_THROW(fut.get());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_add_entry_applied_wait_resolved_via_drop_waiters) {
+    test_add_entry_wait_resolved_via_drop_waiters_aux(raft::wait_type::applied);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_add_entry_committed_wait_resolved_via_drop_waiters) {
+    test_add_entry_wait_resolved_via_drop_waiters_aux(raft::wait_type::committed);
+}
+
+// Reproducer of the race originally fixed by 88a6e2446d: commit waiters must be
+// resolved in index order, otherwise the ordering assert in notify_waiters()
+// (entry_idx >= first_idx) trips. A waiter covered by a snapshot received from
+// the leader must therefore be dropped before the entries committed above that
+// snapshot's index are notified.
+//
+// Setup: 3-node cluster. Node 1 (follower) is blocked from receiving messages
+// from the leader (node 0), but can still send to it, so its add_entry is
+// forwarded to the leader and a commit waiter is registered locally, while the
+// entry itself never arrives via append entries. The leader commits the entry
+// (with node 2), applies it and takes a snapshot; trigger_snapshot leaves no
+// trailing entries, so once node 1 is reconnected the only way for it to catch
+// up is a snapshot transfer.
+//
+// Node 1's applier fiber is then held before load_snapshot() and another entry,
+// whose index is above the snapshot index, is committed. Node 1's io_fiber
+// notifies the commit waiters for that entry while the snapshot is still not
+// applied. If the waiter for the first entry were dropped only by the applier
+// fiber (as it used to be, when the snapshot was processed), it would still sit
+// in _awaited_commits below the first index of the committed batch and trip the
+// assert. io_fiber drops it when it processes the snapshot, so the order holds.
+SEASTAR_THREAD_TEST_CASE(test_commit_waiter_dropped_before_notifying_above_snapshot) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+    return;
+#else
+    // The default snapshot thresholds are high enough that no snapshot is taken
+    // automatically during the test: the only snapshot is the one triggered
+    // explicitly below.
+    // Resolved when node 0 (the leader) applies the entry with command 42
+    // added below.
+    seastar::promise<> leader_applied_42;
+    // apply_entries must be greater than the number of entries added during the
+    // test, otherwise the state machine's done promise fires prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        test_case { .nodes = 3 },
+        signal_when_leader_applies(42, leader_applied_42),
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& leader = cluster.get_server(0);
+    auto& follower = cluster.get_server(1);
+
+    // A server learns who the leader is from the messages the leader sends it,
+    // so node 1 must observe the leader before it stops receiving from node 0.
+    // Otherwise the forwarding below has nowhere to forward the entry to and
+    // blocks until node 1 is reconnected.
+    follower.wait_for_leader(nullptr).get();
+
+    // Block node 1 from receiving messages from node 0 (leader).
+    // Node 1 can still send to node 0 (forwarding works).
+    cluster.block_receive(1, 0);
+
+    // Node 1 forwards the entry to node 0, which commits it with node 2.
+    // Node 1 registers a commit waiter but never receives the entry via
+    // append entries.
+    auto fut = follower.add_entry(create_command(42), raft::wait_type::committed, nullptr);
+
+    // The snapshot must cover the entry, otherwise node 1, once reconnected,
+    // catches up by append entries instead of a snapshot transfer. As in
+    // test_add_entry_wait_resolved_via_drop_waiters_aux, the signal fires inside
+    // apply(), before the applied index the snapshot is taken at is assigned, so
+    // the barrier is what puts the entry under that index. The thresholds here
+    // are the default ones, so nothing snapshots automatically and
+    // trigger_snapshot() must take the snapshot itself.
+    leader_applied_42.get_future().get();
+    leader.read_barrier(nullptr).get();
+    BOOST_REQUIRE(leader.trigger_snapshot(nullptr).get());
+
+    // Hold the applier fiber before it loads the snapshot node 1 is about to
+    // receive. Node 1 is the only server that can reach this injection point:
+    // it only fires for snapshots received from the leader, node 0 is the
+    // leader and node 2 is up to date. The injection is not one-shot, so it is
+    // not consumed by a single server: whoever reaches it waits for the message
+    // sent below. It is disabled when this scope ends, which both releases
+    // anything still waiting and keeps a later snapshot transfer, if any,
+    // from stalling the cluster shutdown.
+    constexpr auto block_applier = "block_raft_applier_fiber_before_load_snapshot";
+    scoped_error_injection blocked_applier{block_applier};
+
+    // Reconnect node 1. The leader sends a snapshot since the entry is no
+    // longer in its log.
+    cluster.connect_all();
+    wait_for_injection_enter(block_applier).get();
+
+    // Commit an entry above the snapshot index while node 1 still hasn't
+    // applied the snapshot. Waiting for it on node 1 guarantees that node 1's
+    // io_fiber notified the commit waiters for a batch starting above the
+    // snapshot index, which is the notification that used to trip the assert.
+    follower.add_entry(create_command(43), raft::wait_type::committed, nullptr).get();
+
+    // Let the applier fiber load the snapshot.
+    utils::get_local_injector().receive_message(block_applier);
+
+    // The waiter for the first entry is resolved successfully: the snapshot's
+    // term matches the entry's term, which proves the entry was committed and
+    // included in the snapshot.
+    BOOST_CHECK_NO_THROW(fut.get());
+#endif
+}
+
+// Concurrent add_entry() calls on a leader must be appended to the log - and
+// therefore applied - in the order in which the calls entered add_entry().
+//
+// This discriminates only where the reactor shuffles its task queue: Debug, Sanitize and Fuzz
+// builds. That shuffling is what lets the submissions below reach the memory permit out of order.
+// Elsewhere they reach it in order anyway, a seastar semaphore handing its units out strictly
+// first-come-first-served, so the test passes with or without the admission.
+SEASTAR_THREAD_TEST_CASE(test_add_entry_preserves_submission_order) {
+    constexpr int n = 100;
+    const size_t command_size = sizeof(size_t);
+    auto applied = make_lw_shared<std::vector<int>>();
+    test_case test_config {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>({
+            raft::server::configuration {
+                // Room for a couple of entries at a time - the commands are serialized ints, so
+                // two of them fit in max_log_size - with a snapshot after every entry so that the
+                // room comes back. Without this the limiter has 4MB and every one of the hundred
+                // submissions gets its memory permit synchronously, which orders the appends by
+                // construction and leaves the admission below untested.
+                .snapshot_threshold = 1,
+                .snapshot_threshold_log_size = 1,
+                .snapshot_trailing = 0,
+                .snapshot_trailing_size = 0,
+                .max_log_size = command_size,
+                // The path strongly consistent tables take, and the only one the ordering is
+                // kept on.
+                .enable_forwarding = false,
+                .max_command_size = command_size
+            }
+        })
+    };
+    raft_cluster<std::chrono::steady_clock> cluster(
+            std::move(test_config),
+            [applied](raft::server_id id, const raft::log_entry_ptr_list& commands, lw_shared_ptr<hasher_int> hasher) {
+                for (auto&& entry : commands) {
+                    auto&& d = std::get<raft::command>(entry->data);
+                    auto is = ser::as_input_stream(d);
+                    applied->push_back(ser::deserialize(is, std::type_identity<int>()));
+                }
+                return commands.size();
+            },
+            n, 0, 0, false, tick_delay, rpc_config{});
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    // Submitted without awaiting in between, so that the submission order is the order
+    // of the loop. Waited for as applied, since the check below reads what was applied.
+    auto& server = cluster.get_server(0);
+    std::vector<future<>> futures;
+    futures.reserve(n);
+    for (int v = 0; v < n; ++v) {
+        futures.push_back(server.add_entry(create_command(v), raft::wait_type::applied, nullptr));
+    }
+    seastar::when_all_succeed(futures.begin(), futures.end()).get();
+
+    BOOST_REQUIRE_EQUAL(applied->size(), size_t(n));
+    for (int v = 0; v < n; ++v) {
+        BOOST_REQUIRE_EQUAL((*applied)[v], v);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_add_entry_append_succeeds_only_in_current_term) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+    return;
+#else
+    raft::server::configuration srv_config {
+        .enable_forwarding = false,
+    };
+    test_case test_config {
+        .nodes = 2,
+        .config = std::vector<raft::server::configuration>(2, srv_config),
+    };
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        100, // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server0 = cluster.get_server(0);
+    auto& server1 = cluster.get_server(1);
+    server0.wait_for_leader(nullptr).get();
+
+    const auto first_term = server0.log_last_idx_term().second;
+
+    // Initiate add_entry but block it in the middle
+    constexpr auto block_add_entry = "block_raft_add_entry_before_waiting_for_memory";
+    std::optional<scoped_error_injection> blocked_add_entry{block_add_entry};
+    auto f_add_entry = server0.add_entry(create_command(42), raft::wait_type::committed, nullptr);
+
+    // Move leadership away and back
+    BOOST_REQUIRE(server0.is_leader());
+    server0.stepdown(raft::logical_clock::duration{5}, server1.id()).get();
+    server0.wait_for_leader(nullptr).get();
+    BOOST_REQUIRE(server1.is_leader());
+    server1.stepdown(raft::logical_clock::duration{5}, server0.id()).get();
+    server1.wait_for_leader(nullptr).get();
+    BOOST_REQUIRE(server0.is_leader());
+
+    // Newly elected leaders append a dummy entry, so read the index once again
+    auto [before_idx, term] = server0.log_last_idx_term();
+    BOOST_CHECK_EQUAL(term, raft::term_t{first_term.value() + 2});
+
+    // add_entry should fail after unblocking the error injection and nothing
+    // should be appended to the log. The term should have changed twice.
+    blocked_add_entry.reset();
+    BOOST_REQUIRE_THROW(f_add_entry.get(), raft::not_a_leader);
+    BOOST_REQUIRE_EQUAL(server0.log_last_idx_term().first, before_idx);
+    BOOST_REQUIRE_EQUAL(server0.log_last_idx_term().second, term);
+
+    // Append the entry again, this time without changing the term. It should succeed.
+    std::tie(before_idx, term) = server0.log_last_idx_term();
+    server0.add_entry(create_command(42), raft::wait_type::committed, nullptr).get();
+    BOOST_REQUIRE_EQUAL(server0.log_last_idx_term().first, raft::index_t{before_idx.value() + 1});
+    BOOST_REQUIRE_EQUAL(server0.log_last_idx_term().second, term);
+#endif
+}
+
+// An abort requested while add_entry() is held before the append keeps the entry out
+// of the log, even though the memory permit wait that follows doesn't need to block.
+// Refs: SCYLLADB-6160.
+SEASTAR_THREAD_TEST_CASE(test_add_entry_aborted_before_append_is_not_appended) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+    return;
+#else
+    raft::server::configuration srv_config {
+        .enable_forwarding = false,
+    };
+    test_case test_config {
+        .nodes = 1,
+        .config = std::vector<raft::server::configuration>(1, srv_config),
+    };
+    auto cluster = get_default_cluster(std::move(test_config));
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server = cluster.get_server(0);
+    server.wait_for_leader(nullptr).get();
+    const auto [before_idx, term] = server.log_last_idx_term();
+
+    constexpr auto block_add_entry = "block_raft_add_entry_before_waiting_for_memory";
+    std::optional<scoped_error_injection> blocked_add_entry{block_add_entry};
+    seastar::abort_source as;
+    auto f_add_entry = server.add_entry(create_command(42), raft::wait_type::committed, &as);
+    wait_for_injection_enter(block_add_entry).get();
+
+    as.request_abort();
+    blocked_add_entry.reset();
+    BOOST_REQUIRE_THROW(f_add_entry.get(), raft::request_aborted);
+    BOOST_REQUIRE_EQUAL(server.log_last_idx_term().first, before_idx);
+    BOOST_REQUIRE_EQUAL(server.log_last_idx_term().second, term);
+#endif
+}
+
+// A configuration change completes even when the entry that completes it is
+// gone from the log before this server reports it committed.
+//
+// set_configuration() appends the joint configuration, waits for it to commit,
+// and then waits for the non-joint C_new entry the fsm appends once the joint
+// one is committed. That second wait is resolved from a committed batch and
+// from nowhere else, so if the C_new entry is replaced by a snapshot before
+// this server ever reports it -- which is what happens when the server loses
+// leadership before C_new commits and rejoins behind a snapshot that covers it
+// -- the caller waits for a batch that will never come. The snapshot's own
+// configuration is the sign that the change went through.
+// A snapshot that does not reach the joint configuration entry says nothing
+// about the configuration change waiting for it.
+//
+// set_configuration() engages the promise before it knows the joint entry is
+// committed, so a snapshot can arrive while that first wait is still pending.
+// Such a snapshot is accepted as long as its index is above the commit index,
+// which is still below the joint entry, and the configuration it carries is
+// the one committed at its own index -- the configuration the change is
+// replacing, not its result. Taking that for the change having gone through
+// would complete a change that never committed.
+SEASTAR_THREAD_TEST_CASE(test_conf_change_not_completed_by_an_earlier_snapshot) {
+    test_case test_config {
+        .nodes = 3,
+        // No forwarding, so that the change fails with the old leader instead
+        // of being retried against the new one, which would complete it for
+        // real and hide what is under test here.
+        .config = std::vector<raft::server::configuration>(3,
+                raft::server::configuration { .enable_forwarding = false })
+    };
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& leader = cluster.get_server(0);
+    cluster.get_server(1).wait_for_leader(nullptr).get();
+
+    // Cut the leader off first, so that everything it appends from here on
+    // stays uncommitted and the configuration change never gets past its
+    // first wait.
+    cluster.disconnect(0);
+
+    // Entries below the joint one, so that the snapshot the others take lands
+    // strictly between this server's commit index and the joint entry. They
+    // stay uncommitted: committing them would carry the commit index up to
+    // just below the joint entry and leave no index for such a snapshot.
+    constexpr int below = 4;
+    const auto base = leader.log_last_idx_term().first;
+    std::vector<future<>> orphaned;
+    for (int i = 0; i < below; ++i) {
+        orphaned.push_back(leader.add_entry(create_command(i), raft::wait_type::committed, nullptr));
+    }
+    auto observe = defer([&orphaned] noexcept {
+        for (auto& f : orphaned) {
+            (void)std::move(f).handle_exception([] (std::exception_ptr) {});
+        }
+    });
+    // add_entry() suspends before it appends, so wait for the entries to be in
+    // the log rather than assume the joint entry lands above them. Bounded
+    // because they may never arrive: the calls are pending on a leader that
+    // has just been cut off, and add_entry() refuses to append once the term
+    // has moved on, so losing leadership here leaves the log short. Fail
+    // rather than spin.
+    const auto append_deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (leader.log_last_idx_term().first < base + raft::index_t{below}) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < append_deadline);
+        seastar::yield().get();
+    }
+
+    auto change = leader.modify_config({}, {to_raft_id(2)}, nullptr);
+
+    // The other two elect a leader between themselves, node 0 being isolated;
+    // which of them wins does not matter. Waited for rather than driven with
+    // elect_new_leader(), which reconnects the old leader for a moment so it
+    // can vote -- long enough for the entries above to escape.
+    const auto elect_deadline = std::chrono::steady_clock::now() + tick_delay * 400;
+    size_t new_leader_id = 0;
+    while (new_leader_id == 0) {
+        for (size_t n = 1; n < 3; ++n) {
+            if (cluster.get_server(n).is_leader()) {
+                new_leader_id = n;
+            }
+        }
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < elect_deadline);
+        seastar::yield().get();
+    }
+    auto& new_leader = cluster.get_server(new_leader_id);
+
+    // It snapshots at the dummy entry it appended on election, four indexes
+    // below the joint entry. Keeping no trailing entries puts the start of its
+    // log above the index where the old leader's log diverges, so the old
+    // leader has to be sent the snapshot rather than caught up with
+    // append_entries. Retried because the dummy has to be applied before there
+    // is anything to snapshot.
+    const auto snap_deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (!new_leader.trigger_snapshot(nullptr).get()) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < snap_deadline);
+        seastar::yield().get();
+    }
+    BOOST_REQUIRE(!new_leader.get_configuration().is_joint());
+
+    cluster.connect_all();
+
+    // Wait for the old leader to take the snapshot. Its commit index can only
+    // reach the snapshot index this way: the entry it holds there is its own,
+    // at a stale term, and the new leader cannot append over it because it is
+    // inside the snapshot it took. So the waiter for the entry at the snapshot
+    // index is resolved exactly when the snapshot is processed -- and by
+    // drop_commit_waiters(), which runs just ahead of the branch under test.
+    const auto deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (!orphaned[0].available()) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < deadline);
+        seastar::yield().get();
+    }
+
+    // The change is still pending: the snapshot the old leader just took
+    // carries the configuration its own joint entry was meant to replace, and
+    // must not be read as the change having gone through.
+    BOOST_REQUIRE(!change.available());
+
+    // Now commit past the joint entry's index, so the change learns what
+    // became of it instead of waiting for a commit that never comes.
+    for (int i = 0; i < 6; ++i) {
+        new_leader.add_entry(create_command(100 + i), raft::wait_type::applied, nullptr).get();
+    }
+
+    // And it fails, its joint entry having been replaced. With forwarding
+    // disabled modify_config() reports whatever went wrong under the entry as
+    // not_a_leader, which by then it is.
+    try {
+        seastar::with_timeout(std::chrono::steady_clock::now() + tick_delay * 200, std::move(change)).get();
+        BOOST_ERROR("configuration change reported success");
+    } catch (const raft::not_a_leader&) {
+    } catch (...) {
+        BOOST_ERROR(fmt::format("unexpected exception: {}", std::current_exception()));
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_conf_change_completed_by_a_snapshot) {
+#ifndef SCYLLA_ENABLE_ERROR_INJECTION
+    std::cerr << "Skipping test as it depends on error injection. Please run in mode where it's enabled (debug,dev).\n";
+    return;
+#else
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        // Five nodes, and the change drops one of them, so that a majority of
+        // C_new is three of {0,1,2,3} and the rest can carry the change through
+        // without node 0. Removing a node from a three-node cluster would leave
+        // C_new = {0,1}, whose majority needs node 0 itself, and cutting it off
+        // would stall the change rather than orphan it.
+        test_case { .nodes = 5 },
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& leader = cluster.get_server(0);
+    cluster.get_server(1).wait_for_leader(nullptr).get();
+    BOOST_REQUIRE(!leader.get_configuration().is_joint());
+
+    // Two hooks on node 0, which drive it into the window under test. A
+    // partition alone cannot: the joint entry commits under a majority of
+    // C_new as well, so whoever can commit the joint entry can commit its
+    // non-joint successor a round trip later, and node 0 would learn the
+    // change went through the ordinary way.
+    constexpr auto block_io_fiber = "block_raft_io_fiber_at_non_joint_conf";
+    constexpr auto block_before_non_joint = "block_raft_set_configuration_before_non_joint";
+    scoped_error_injection blocked_io{block_io_fiber};
+    scoped_error_injection blocked_caller{block_before_non_joint};
+
+    auto change = leader.modify_config({}, {to_raft_id(4)}, nullptr);
+
+    // The first hook stops node 0's io fiber on the batch that appends the
+    // non-joint entry, so that entry is never replicated and can never commit
+    // here. The batch also carries the joint entry's commit, so the caller is
+    // still on its first wait.
+    wait_for_injection_enter(block_io_fiber).get();
+
+    // Cut node 0 off and let the others finish the change and snapshot past
+    // it. trigger_snapshot() keeps no trailing entries, so node 0's log tail
+    // ends up below the new leader's first log index and it has to be sent the
+    // snapshot rather than caught up with append_entries.
+    //
+    // The new leader has to be a member of C_new which has the joint entry.
+    // Node 0 committed that entry with a majority which needn't include all of
+    // them, and a member without it can never get it now that node 0 is cut
+    // off. The others reject its votes, as its log is behind theirs, while its
+    // vote requests keep resetting their election timers, so nobody would ever
+    // be elected. The committing majority guarantees at least one member of
+    // C_new other than node 0 has the entry.
+    cluster.disconnect(0);
+    const auto has_joint_entry = [&cluster] (size_t i) { return cluster.get_server(i).get_configuration().is_joint(); };
+    const size_t new_leader_idx = *std::ranges::find_if(std::views::iota(size_t(1), size_t(4)), has_joint_entry);
+    cluster.elect_new_leader(new_leader_idx).get();
+    auto& new_leader = cluster.get_server(new_leader_idx);
+    new_leader.add_entry(create_command(42), raft::wait_type::applied, nullptr).get();
+    BOOST_REQUIRE(!new_leader.get_configuration().is_joint());
+    BOOST_REQUIRE(new_leader.trigger_snapshot(nullptr).get());
+
+    // Release the io fiber while node 0 is still isolated: it notifies the
+    // joint entry's commit, so the caller reaches the second hook, and sends
+    // the non-joint entry into the void. Waiting for that hook to be entered
+    // is what makes the ordering exact -- the commit waiter for the joint
+    // entry is resolved before the snapshot arrives, so the snapshot cannot
+    // drop it as commit_status_unknown instead.
+    utils::get_local_injector().receive_message(block_io_fiber);
+    wait_for_injection_enter(block_before_non_joint).get();
+
+    cluster.connect_all();
+    utils::get_local_injector().receive_message(block_before_non_joint);
+
+    // The snapshot node 0 is now sent carries a non-joint configuration, and
+    // that is the only thing left that can complete the change: the entry the
+    // caller would otherwise have waited for went with the log the snapshot
+    // replaced.
+    try {
+        seastar::with_timeout(std::chrono::steady_clock::now() + tick_delay * 200, std::move(change)).get();
+    } catch (...) {
+        BOOST_FAIL(fmt::format("configuration change did not complete: {}", std::current_exception()));
+    }
+#endif
+}
+
+// A committed entry that a snapshot replaces in the raft log before the
+// applier fiber gets to apply it still has its effect in the state machine
+// once that snapshot is loaded, so a waiter for it must be resolved
+// successfully rather than dropped.
+//
+// The applier fiber of node 0 is held inside apply(), so its io_fiber goes on
+// committing entries it cannot apply. A new leader is then elected, which
+// makes everything committed afterwards carry a higher term than the held
+// entries, and node 0 is disconnected while the new leader commits, applies
+// and snapshots past them. The snapshot's term therefore differs from the
+// held entries' term, so the snapshot term rule of drop_waiters() cannot
+// resolve their waiters; what does is op_status::committed, which io_fiber
+// recorded when it reported the entry committed and its term was still known.
+// The applier fiber stops when the server is aborted instead of working
+// through what it has not applied yet.
+//
+// abort() stops the mailbox and then waits for the applier fiber, and only
+// aborts the state machine afterwards -- so nothing interrupts an apply()
+// already under way, and the fiber must not start another. The backlog it
+// could otherwise chew through is unbounded: io_fiber is never throttled by
+// the applier, which is the point of the mailbox, so on a slow state machine
+// shutdown would wait for the whole committed log.
+SEASTAR_THREAD_TEST_CASE(test_applier_stops_on_abort) {
+    constexpr int backlog = 50;
+    auto applied = make_lw_shared<std::vector<int>>();
+    raft_cluster<std::chrono::steady_clock> cluster(
+            test_case { .nodes = 1 },
+            [applied](raft::server_id id, const raft::log_entry_ptr_list& commands, lw_shared_ptr<hasher_int> hasher) {
+                for (auto&& entry : commands) {
+                    auto&& d = std::get<raft::command>(entry->data);
+                    auto is = ser::as_input_stream(d);
+                    applied->push_back(ser::deserialize(is, std::type_identity<int>()));
+                }
+                return commands.size();
+            },
+            // Greater than the number of entries added, so the state machine's
+            // done promise does not fire during the test.
+            backlog * 10, 0, 0, false, tick_delay, rpc_config{});
+    cluster.start_all().get();
+
+    auto& server = cluster.get_server(0);
+
+    // Hold the applier fiber inside apply() and pile committed entries up
+    // behind it. A single server commits on its own, so the backlog grows
+    // while nothing is applied.
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    for (int i = 0; i < backlog; ++i) {
+        server.add_entry(create_command(i), raft::wait_type::committed, nullptr).get();
+    }
+    // Only the entry the applier fiber is held on has reached the state
+    // machine; add_entries() numbers it from the count it was given.
+    BOOST_REQUIRE_EQUAL(applied->size(), 0);
+
+    // Abort with the backlog unapplied, then let the held apply() return.
+    auto abort_f = server.abort("stopping with a backlog");
+    apply_release.signal();
+    abort_f.get();
+
+    // The held batch finishes -- abort() cannot take that back -- but nothing
+    // after it is applied.
+    BOOST_CHECK_LE(applied->size(), 1);
+}
+
+// wait_for_apply() waits for the given entry to be applied without contacting
+// other servers, so it works without a quorum.
+SEASTAR_THREAD_TEST_CASE(test_wait_for_apply_without_quorum) {
+    // apply_entries must be greater than the number of entries added during
+    // the test, otherwise the state machine's done promise fires prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        test_case { .nodes = 3 },
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& leader = cluster.get_server(0);
+    auto& follower = cluster.get_server(1);
+
+    // Hold the follower's applier fiber, so that the entries committed below
+    // stay unapplied on the follower.
+    delay_apply = to_raft_id(1);
+    auto release_apply = defer([] noexcept {
+        // A failed check below may leave the applier fiber waiting here, and
+        // stop_all() would then wait for it forever.
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    leader.add_entry(create_command(42), raft::wait_type::committed, nullptr).get();
+    const auto committed_idx = leader.get_status().commit_idx;
+
+    // Wait until the follower learns that the last entry is committed, so that
+    // it can apply the entry after being cut off below.
+    const auto commit_deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (follower.get_status().commit_idx < committed_idx) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < commit_deadline);
+        seastar::sleep(tick_delay).get();
+    }
+    BOOST_REQUIRE_LT(follower.get_status().applied_idx, committed_idx);
+
+    // Cut the follower off, so it has no quorum.
+    cluster.disconnect(1);
+
+    auto fut = follower.wait_for_apply(committed_idx, nullptr);
+    seastar::sleep(3 * tick_delay).get();
+    BOOST_CHECK(!fut.available());
+
+    apply_release.signal();
+    fut.get();
+    BOOST_CHECK_GE(follower.get_status().applied_idx, committed_idx);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_apply_waiter_resolved_when_snapshot_subsumes_committed_entry) {
+    // The default snapshot thresholds are high enough that the only snapshot
+    // in this test is the one triggered explicitly below, which is taken with
+    // no trailing entries and so drops the whole log.
+    // apply_entries must be greater than the number of entries added during
+    // the test, otherwise the state machine's done promise fires prematurely.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        test_case {
+            .nodes = 3,
+            // Forwarding off, so that add_entry() takes _add_entry_admission.
+            // That semaphore is what makes the order of the calls below the
+            // order of their entries in the log, and it is only taken on the
+            // non-forwarding path: with forwarding on, the two adds race and
+            // can land either way round, whereupon the committed-wait proves
+            // nothing about the entry under test.
+            .config = std::vector<raft::server::configuration>(3,
+                    raft::server::configuration { .enable_forwarding = false })
+        },
+        ::apply_changes,
+        100,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server = cluster.get_server(0);
+
+    // Entries are added on node 0, the initial leader, so that they get their
+    // indexes here and, forwarding being off, in the order of the calls.
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        // A failed check below may leave the applier fiber waiting here, and
+        // stop_all() would then wait for it forever.
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    // The waiter under test: committed while the applier fiber is held, so it
+    // is marked committed and left for that fiber to resolve.
+    auto fut = server.add_entry(create_command(42), raft::wait_type::applied, nullptr);
+    // Commit waiters are notified in index order, so this one returning means
+    // node 0 saw the entry above committed as well.
+    server.add_entry(create_command(43), raft::wait_type::committed, nullptr).get();
+
+    // From here on entries are committed with a higher term, so the snapshot
+    // taken below has a different term than the two entries above.
+    cluster.elect_new_leader(1).get();
+    auto& leader = cluster.get_server(1);
+
+    // Cut node 0 off, so the entries the new leader commits, applies and then
+    // snapshots away never reach it as log entries.
+    cluster.disconnect(0);
+    leader.add_entry(create_command(44), raft::wait_type::applied, nullptr).get();
+    BOOST_REQUIRE(leader.trigger_snapshot(nullptr).get());
+
+    // Reconnect node 0. Its log tail is below the leader's first log index by
+    // now, so the leader transfers the snapshot instead of appending entries.
+    notify_snapshot_received = to_raft_id(0);
+    auto clear_notify = defer([] noexcept { notify_snapshot_received.reset(); });
+    cluster.connect_all();
+
+    // Once node 0 has replied, its fsm has dropped the entries the waiter is
+    // for and its io_fiber has handed the snapshot to its applier fiber -- all
+    // while that fiber is still held inside apply(). Waiting for that is what
+    // makes the test deterministic: released any earlier, the snapshot would
+    // not be in play at all.
+    snapshot_received.wait().get();
+
+    apply_release.signal();
+
+    // The waiter is resolved successfully, whichever side of the applier
+    // fiber does it. While that fiber still takes the entries from a queue
+    // that owns them, it applies them and resolves the waiter itself, even
+    // though the fsm log no longer holds them; once it reads them from the
+    // log instead, they are gone with it and loading the snapshot is what
+    // resolves the waiter. The contract is the same either way and is what
+    // this pins down.
+    try {
+        fut.get();
+    } catch (...) {
+        BOOST_FAIL(fmt::format("the apply waiter was not resolved successfully: {}",
+                std::current_exception()));
+    }
+}
+
+// A snapshot published to the applier fiber does not stop io_fiber from
+// publishing the entries committed after it, so when the applier fiber comes
+// back from apply() it can find the fsm log's snapshot sitting in the middle
+// of the range it was told to apply: below the snapshot the entries are gone,
+// above it they are there and committed. It has to go and load the snapshot
+// then, not conclude that the snapshot covers everything left.
+//
+// Node 0's applier fiber is held inside apply() for the whole setup, so its
+// io_fiber runs unimpeded: it takes the snapshot the new leader transfers and,
+// once that has landed, the commit of a further entry on top of it. Only then
+// is the fiber released, with the fsm log's snapshot index strictly between
+// its applied index and the index the mailbox says to apply up to.
+SEASTAR_THREAD_TEST_CASE(test_applier_handles_commits_published_above_a_pending_snapshot) {
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        test_case {
+            .nodes = 3,
+            // Forwarding off, so that add_entry() takes _add_entry_admission
+            // and the entries below land in the log in the order of the calls.
+            .config = std::vector<raft::server::configuration>(3,
+                    raft::server::configuration { .enable_forwarding = false })
+        },
+        ::apply_changes,
+        100,  // apply_entries, greater than the number of entries added below
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server = cluster.get_server(0);
+
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        // A failed check below may leave the applier fiber waiting here, and
+        // stop_all() would then wait for it forever.
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    // The waiter that proves the fiber got through the snapshot in the end:
+    // its entry is one of those the snapshot below subsumes.
+    auto fut = server.add_entry(create_command(42), raft::wait_type::applied, nullptr);
+    // Commit waiters are notified in index order, so this one returning means
+    // node 0 saw the entry above committed as well.
+    server.add_entry(create_command(43), raft::wait_type::committed, nullptr).get();
+
+    cluster.elect_new_leader(1).get();
+    auto& leader = cluster.get_server(1);
+
+    // Cut node 0 off, so the entries the new leader commits, applies and then
+    // snapshots away never reach it as log entries.
+    cluster.disconnect(0);
+    leader.add_entry(create_command(44), raft::wait_type::applied, nullptr).get();
+    BOOST_REQUIRE(leader.trigger_snapshot(nullptr).get());
+    // The snapshot is taken with no trailing entries, so it is at the leader's
+    // last log index, and that is the index node 0 will end up with.
+    const auto snapshot_idx = leader.log_last_idx_term().first;
+
+    // Follow how far node 0's io_fiber gets while its applier fiber is held.
+    stored_commit_idx = raft::index_t{0};
+    track_stored_commit_idx = to_raft_id(0);
+    auto clear_track = defer([] noexcept { track_stored_commit_idx.reset(); });
+
+    notify_snapshot_received = to_raft_id(0);
+    auto clear_notify = defer([] noexcept { notify_snapshot_received.reset(); });
+    cluster.connect_all();
+    // Node 0's log tail is below the leader's first log index by now, so the
+    // leader transfers the snapshot instead of appending entries. Once node 0
+    // has replied, that snapshot is waiting for its applier fiber.
+    snapshot_received.wait().get();
+
+    // Now put a commit on top of it, still with the applier fiber held, so
+    // that node 0's mailbox points above the snapshot index.
+    leader.add_entry(create_command(45), raft::wait_type::committed, nullptr).get();
+    stored_commit_idx_changed.wait(std::chrono::steady_clock::now() + tick_delay * 100,
+            [snapshot_idx] { return stored_commit_idx > snapshot_idx; }).get();
+
+    apply_release.signal();
+
+    // The applier fiber loads the snapshot rather than tripping over the part
+    // of its range the snapshot removed, and resolves the waiter on the way.
+    try {
+        fut.get();
+    } catch (...) {
+        BOOST_FAIL(fmt::format("the apply waiter was not resolved successfully: {}",
+                std::current_exception()));
+    }
+}
+
+// The applier fiber suspended inside load_snapshot() is the widest window
+// io_fiber has to move the mailbox under it: a whole snapshot load, with the
+// state machine free to take as long as it likes. This drives that window --
+// while node 0 is inside the load of a snapshot S1 received from the leader,
+// its io_fiber publishes entries committed above S1 and then a second
+// snapshot S2 -- and requires the round to come out of it intact: the waiter
+// of an entry S1 subsumes resolved successfully, and the node caught up with
+// S2 afterwards. The test below covers the same window for a waiter that has
+// to be failed instead.
+SEASTAR_THREAD_TEST_CASE(test_applier_survives_io_progress_during_load_snapshot) {
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        test_case {
+            .nodes = 3,
+            // Forwarding off, so that add_entry() takes _add_entry_admission
+            // and the entries below land in the log in the order of the calls.
+            .config = std::vector<raft::server::configuration>(3,
+                    raft::server::configuration { .enable_forwarding = false })
+        },
+        ::apply_changes,
+        100,  // apply_entries, greater than the number of entries added below
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server = cluster.get_server(0);
+
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        // A failed check below may leave the applier fiber waiting at either
+        // hold point, and stop_all() would then wait for it forever.
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    auto release_load_snapshot = defer([] noexcept {
+        delay_load_snapshot.reset();
+        if (load_snapshot_release.waiters()) {
+            load_snapshot_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    // The waiter under test: committed while the applier fiber is held, so it
+    // is marked committed and left for that fiber, and then subsumed by S1.
+    auto fut = server.add_entry(create_command(42), raft::wait_type::applied, nullptr);
+    // Commit waiters are notified in index order, so this one returning means
+    // node 0 saw the entry above committed as well.
+    server.add_entry(create_command(43), raft::wait_type::committed, nullptr).get();
+
+    // From here on entries are committed with a higher term, so neither
+    // snapshot below has the term of the two entries above and the snapshot
+    // term rule of resolve_waiters() cannot be what resolves them.
+    cluster.elect_new_leader(1).get();
+    auto& leader = cluster.get_server(1);
+
+    // Cut node 0 off, so the entries the new leader commits, applies and then
+    // snapshots away never reach it as log entries.
+    cluster.disconnect(0);
+    leader.add_entry(create_command(44), raft::wait_type::applied, nullptr).get();
+    BOOST_REQUIRE(leader.trigger_snapshot(nullptr).get());
+    // Taken with no trailing entries, so the snapshot is at the leader's last
+    // log index.
+    const auto s1_idx = leader.log_last_idx_term().first;
+
+    notify_snapshot_received = to_raft_id(0);
+    auto clear_notify = defer([] noexcept { notify_snapshot_received.reset(); });
+    // Hold node 0's applier fiber inside the load of whatever snapshot it
+    // gets next, which is S1: it is still held inside apply() right now, so
+    // it cannot get there before it is released below.
+    delay_load_snapshot = to_raft_id(0);
+    cluster.connect_all();
+    // Node 0's log tail is below the leader's first log index by now, so the
+    // leader transfers S1 instead of appending entries. Once node 0 has
+    // replied, S1 is waiting for its applier fiber.
+    snapshot_received.wait().get();
+
+    // Let the held apply() finish; the fiber then picks S1 up and stops
+    // inside the load.
+    apply_release.signal();
+    load_snapshot_entered.wait().get();
+
+    // io_fiber keeps going, all the while the fiber is inside the load.
+    // First, entries committed above S1.
+    stored_commit_idx = raft::index_t{0};
+    track_stored_commit_idx = to_raft_id(0);
+    auto clear_track = defer([] noexcept { track_stored_commit_idx.reset(); });
+    leader.add_entry(create_command(45), raft::wait_type::committed, nullptr).get();
+    stored_commit_idx_changed.wait(std::chrono::steady_clock::now() + tick_delay * 100,
+            [s1_idx] { return stored_commit_idx > s1_idx; }).get();
+
+    // Then a second snapshot, which node 0 has to be behind again to be sent.
+    cluster.disconnect(0);
+    leader.add_entry(create_command(46), raft::wait_type::applied, nullptr).get();
+    BOOST_REQUIRE(leader.trigger_snapshot(nullptr).get());
+    cluster.connect_all();
+    snapshot_received.wait().get();
+
+    load_snapshot_release.signal();
+
+    // S1 resolves the waiter of the entry it subsumes, io_fiber having moved
+    // on or not.
+    try {
+        fut.get();
+    } catch (...) {
+        BOOST_FAIL(fmt::format("the apply waiter was not resolved successfully: {}",
+                std::current_exception()));
+    }
+
+    // And the fiber goes on to load S2 and catch up: a read barrier on node 0
+    // waits for its applied index to reach the leader's commit index.
+    try {
+        seastar::with_timeout(std::chrono::steady_clock::now() + tick_delay * 500,
+                server.read_barrier(nullptr)).get();
+    } catch (...) {
+        BOOST_FAIL(fmt::format("node 0 did not catch up after the snapshots: {}",
+                std::current_exception()));
+    }
+}
+
+// What the bound travelling with a pending snapshot is for.
+//
+// Node 0 appends an entry as leader while isolated, so it never sees it
+// committed and never compares its term; the others elect a new leader, which
+// puts a different entry at that index and snapshots past it. When node 0 is
+// sent that snapshot, the entry is gone from its log and the snapshot's term
+// differs, so nothing can say the entry committed here: its waiter has to be
+// failed with commit_status_unknown.
+//
+// The window is the same as above: io_fiber publishes commits above the
+// snapshot while the applier fiber is inside the load, dragging the live
+// _committed_apply_waiters_idx past the entry. Resolving against the bound
+// captured with the snapshot is what keeps the waiter from being told the
+// state machine holds an effect a different leader's command replaced.
+SEASTAR_THREAD_TEST_CASE(test_apply_waiter_dropped_when_a_snapshot_replaces_an_uncommitted_entry) {
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        test_case {
+            .nodes = 3,
+            .config = std::vector<raft::server::configuration>(3,
+                    raft::server::configuration { .enable_forwarding = false })
+        },
+        ::apply_changes,
+        100,  // apply_entries, greater than the number of entries added below
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server = cluster.get_server(0);
+    server.wait_for_leader(nullptr).get();
+    auto release_load_snapshot = defer([] noexcept {
+        delay_load_snapshot.reset();
+        if (load_snapshot_release.waiters()) {
+            load_snapshot_release.signal();
+        }
+    });
+
+    // Isolate node 0 while it still believes it is the leader, then have it
+    // append an entry no one else will ever see. It cannot commit, so node 0
+    // never learns its fate and never term-checks its waiter.
+    cluster.disconnect(0);
+    const auto base = server.log_last_idx_term().first;
+    auto fut = server.add_entry(create_command(99), raft::wait_type::applied, nullptr);
+    const auto append_deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (server.log_last_idx_term().first <= base) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < append_deadline);
+        seastar::yield().get();
+    }
+    const auto orphan_idx = server.log_last_idx_term().first;
+
+    // The other two elect a leader between themselves. Waited for rather than
+    // driven with elect_new_leader(), which reconnects node 0 for a moment so
+    // it can vote -- long enough for the entry above to escape.
+    const auto elect_deadline = std::chrono::steady_clock::now() + tick_delay * 400;
+    size_t new_leader_id = 0;
+    while (new_leader_id == 0) {
+        for (size_t n = 1; n < 3; ++n) {
+            if (cluster.get_server(n).is_leader()) {
+                new_leader_id = n;
+            }
+        }
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < elect_deadline);
+        seastar::yield().get();
+    }
+    auto& leader = cluster.get_server(new_leader_id);
+
+    // The new leader puts its own entries at and above that index and
+    // snapshots past them, keeping no trailing entries: its log then starts
+    // above the index where node 0's diverges, so node 0 has to be sent the
+    // snapshot rather than caught up with append_entries.
+    leader.add_entry(create_command(44), raft::wait_type::applied, nullptr).get();
+    leader.add_entry(create_command(45), raft::wait_type::applied, nullptr).get();
+    const auto snap_deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (!leader.trigger_snapshot(nullptr).get()) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < snap_deadline);
+        seastar::yield().get();
+    }
+    const auto snapshot_idx = leader.log_last_idx_term().first;
+    BOOST_REQUIRE_GT(snapshot_idx, orphan_idx);
+
+    notify_snapshot_received = to_raft_id(0);
+    auto clear_notify = defer([] noexcept { notify_snapshot_received.reset(); });
+    delay_load_snapshot = to_raft_id(0);
+    cluster.connect_all();
+    snapshot_received.wait().get();
+    load_snapshot_entered.wait().get();
+
+    // Still inside the load: let io_fiber report commits above the snapshot,
+    // which is what moves the live bound past the orphaned entry.
+    stored_commit_idx = raft::index_t{0};
+    track_stored_commit_idx = to_raft_id(0);
+    auto clear_track = defer([] noexcept { track_stored_commit_idx.reset(); });
+    leader.add_entry(create_command(46), raft::wait_type::committed, nullptr).get();
+    stored_commit_idx_changed.wait(std::chrono::steady_clock::now() + tick_delay * 100,
+            [snapshot_idx] { return stored_commit_idx > snapshot_idx; }).get();
+
+    load_snapshot_release.signal();
+
+    BOOST_CHECK_THROW(fut.get(), raft::commit_status_unknown);
+}
+
+// A second snapshot published behind a pending one carries the same
+// obligations for the range the first one covered. Node 0's applier fiber is
+// held inside apply() for the whole setup, so S1 is published, commits above
+// it are marked, and S2 is published, all before the fiber takes anything. The
+// orphaned entry below S1 was never committed here and has a term neither
+// snapshot carries, so its waiter has to be failed with commit_status_unknown
+// when the fiber finally loads S2.
+SEASTAR_THREAD_TEST_CASE(test_apply_waiter_dropped_when_a_replaced_snapshot_covers_an_uncommitted_entry) {
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        test_case {
+            .nodes = 3,
+            .config = std::vector<raft::server::configuration>(3,
+                    raft::server::configuration { .enable_forwarding = false })
+        },
+        ::apply_changes,
+        100,  // apply_entries, greater than the number of entries added below
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& server = cluster.get_server(0);
+    server.wait_for_leader(nullptr).get();
+
+    // Hold node 0's applier fiber inside apply() until the very end.
+    delay_apply = to_raft_id(0);
+    auto release_apply = defer([] noexcept {
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    // Isolate node 0 while it still believes it is the leader and have it
+    // append an entry no one else will ever see.
+    cluster.disconnect(0);
+    const auto base = server.log_last_idx_term().first;
+    auto orphan = server.add_entry(create_command(99), raft::wait_type::applied, nullptr);
+    const auto append_deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (server.log_last_idx_term().first <= base) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < append_deadline);
+        seastar::yield().get();
+    }
+    const auto orphan_idx = server.log_last_idx_term().first;
+
+    // The other two elect a leader between themselves.
+    const auto elect_deadline = std::chrono::steady_clock::now() + tick_delay * 400;
+    size_t new_leader_id = 0;
+    while (new_leader_id == 0) {
+        for (size_t n = 1; n < 3; ++n) {
+            if (cluster.get_server(n).is_leader()) {
+                new_leader_id = n;
+            }
+        }
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < elect_deadline);
+        seastar::yield().get();
+    }
+    auto& leader = cluster.get_server(new_leader_id);
+
+    // S1: past the orphaned entry, with no trailing entries, so node 0 has to
+    // be sent it.
+    leader.add_entry(create_command(44), raft::wait_type::applied, nullptr).get();
+    leader.add_entry(create_command(45), raft::wait_type::applied, nullptr).get();
+    const auto snap_deadline = std::chrono::steady_clock::now() + tick_delay * 200;
+    while (!leader.trigger_snapshot(nullptr).get()) {
+        BOOST_REQUIRE(std::chrono::steady_clock::now() < snap_deadline);
+        seastar::yield().get();
+    }
+    const auto s1_idx = leader.log_last_idx_term().first;
+    BOOST_REQUIRE_GT(s1_idx, orphan_idx);
+
+    notify_snapshot_received = to_raft_id(0);
+    auto clear_notify = defer([] noexcept { notify_snapshot_received.reset(); });
+    cluster.connect_all();
+    snapshot_received.wait().get();
+
+    // Commits above S1, marked by node 0's io_fiber while the applier fiber is
+    // still held.
+    stored_commit_idx = raft::index_t{0};
+    track_stored_commit_idx = to_raft_id(0);
+    auto clear_track = defer([] noexcept { track_stored_commit_idx.reset(); });
+    leader.add_entry(create_command(46), raft::wait_type::committed, nullptr).get();
+    stored_commit_idx_changed.wait(std::chrono::steady_clock::now() + tick_delay * 100,
+            [s1_idx] { return stored_commit_idx > s1_idx; }).get();
+
+    // S2, published behind S1.
+    cluster.disconnect(0);
+    leader.add_entry(create_command(47), raft::wait_type::applied, nullptr).get();
+    BOOST_REQUIRE(leader.trigger_snapshot(nullptr).get());
+    cluster.connect_all();
+    snapshot_received.wait().get();
+
+    apply_release.signal();
+
+    BOOST_CHECK_THROW(orphan.get(), raft::commit_status_unknown);
+}
+
+// A follower bounds its in-memory raft log at max_log_size +
+// snapshot_trailing_size and reports when it is full, so a node whose state
+// machine is slow stops absorbing entries into memory. The bound is what holds
+// it: such a follower applies nothing, so it never snapshots and never
+// truncates, and the reply path does not slow the leader down - io_fiber
+// publishes to the applier mailbox without blocking.
+SEASTAR_THREAD_TEST_CASE(test_follower_log_is_bounded_when_apply_is_slow) {
+    const size_t command_size = sizeof(size_t);
+    const size_t max_log_size = 10 * command_size;
+    const size_t snapshot_trailing_size = command_size;
+    // The bound enforced by the follower, see fsm_config::max_follower_log_size.
+    const size_t bound = max_log_size + snapshot_trailing_size;
+
+    test_case test_config {
+        .nodes = 3,
+        .config = std::vector<raft::server::configuration>(3,
+            raft::server::configuration {
+                .snapshot_threshold = 5,
+                .snapshot_threshold_log_size = 5 * command_size,
+                .snapshot_trailing = 1,
+                .snapshot_trailing_size = snapshot_trailing_size,
+                .max_log_size = max_log_size,
+                // Keep add_entry on the node we call it on, so the test drives
+                // the leader directly.
+                .enable_forwarding = false,
+                .max_command_size = command_size,
+            })
+    };
+    // Must exceed the number of entries added below, or the state machine's
+    // done promise fires early.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        1000,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    const auto slow_id = to_raft_id(1);
+    auto& slow = cluster.get_server(1);
+
+    // Hold node 1's applier fiber inside apply(). Nodes 0 and 2 are a majority,
+    // so the cluster keeps committing and node 0 keeps replicating to node 1.
+    delay_apply = slow_id;
+    auto release_apply = defer([] noexcept {
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    // Enough entries that an unbounded log would grow well past the bound.
+    cluster.add_entries(199, 0).get();
+
+    BOOST_TEST_MESSAGE(fmt::format("slow follower log memory usage: {} (bound {})",
+            slow.get_status().log_memory_usage, bound));
+    // The bound holds whether or not the escape hatch in fsm::append_entries()
+    // is open; here it is closed, the follower having committed entries it has
+    // not applied, so can_shrink_log() holds and it refuses at the limit.
+    BOOST_CHECK_LE(slow.get_status().log_memory_usage, bound);
+    // Entries reached the follower. Its log may be empty: a follower that falls
+    // far enough behind for the leader to truncate past its next_idx is repaired
+    // by a snapshot transfer, which drops its log.
+    BOOST_CHECK_GT(slow.log_last_idx_term().first, raft::index_t{0});
+
+    // The leader stays within its own limit.
+    BOOST_CHECK_LE(cluster.get_server(0).get_status().log_memory_usage, max_log_size);
+
+    // Released, the follower drains its log, snapshots, reports room and catches
+    // up.
+    apply_release.signal();
+    cluster.wait_log_all().get();
+    slow.read_barrier(nullptr).get();
+    BOOST_CHECK_LE(slow.get_status().log_memory_usage, bound);
+}
+
+// A follower whose applier is held fills its log up to max_follower_log_size and
+// refuses the next entry. It has to report the log full whatever the entry size,
+// including when the entries do not divide the bound and the refused entry
+// leaves usage short of it.
+SEASTAR_THREAD_TEST_CASE(test_follower_reports_full_log_when_entries_do_not_fill_the_bound) {
+    const size_t command_size = sizeof(size_t);
+    // One byte above a multiple of any entry size, so the follower stops short of
+    // the bound.
+    const size_t max_log_size = 10 * command_size + 1;
+    const size_t snapshot_trailing_size = command_size;
+
+    const auto follower_config = raft::server::configuration {
+        .snapshot_threshold = 5,
+        .snapshot_threshold_log_size = 5 * command_size,
+        .snapshot_trailing = 1,
+        .snapshot_trailing_size = snapshot_trailing_size,
+        .max_log_size = max_log_size,
+        .enable_forwarding = false,
+        .max_command_size = command_size,
+    };
+    // The other two nodes neither snapshot nor block admission while the test
+    // runs, so the leader's log keeps every entry the follower lacks and
+    // replicates to it from its log.
+    const auto healthy_config = raft::server::configuration {
+        .snapshot_threshold = 10000,
+        .snapshot_threshold_log_size = 1000 * command_size,
+        .snapshot_trailing = 1,
+        .snapshot_trailing_size = snapshot_trailing_size,
+        .max_log_size = 1000 * command_size,
+        .enable_forwarding = false,
+        .max_command_size = command_size,
+    };
+    test_case test_config {
+        .nodes = 3,
+        .config = {healthy_config, follower_config, healthy_config},
+    };
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        1000,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    const auto slow_id = to_raft_id(1);
+    auto& slow = cluster.get_server(1);
+    auto& leader = cluster.get_server(0);
+
+    delay_apply = slow_id;
+    auto release_apply = defer([] noexcept {
+        delay_apply.reset();
+        if (apply_release.waiters()) {
+            apply_release.signal();
+        }
+    });
+    cluster.add_entries(1, 0).get();
+    apply_entered.wait().get();
+
+    // Several times what the follower can hold.
+    cluster.add_entries(49, 0).get();
+
+    const auto bound = max_log_size + snapshot_trailing_size;
+    BOOST_TEST_MESSAGE(fmt::format("slow follower log memory usage: {} (bound {})",
+            slow.get_status().log_memory_usage, bound));
+    BOOST_CHECK_LE(slow.get_status().log_memory_usage, bound);
+    BOOST_CHECK(eventually_true([&] { return slow.get_status().log_full; }));
+    BOOST_CHECK(eventually_true([&] { return leader.get_status().blocked.log_full == 1; }));
+
+    // Released, the follower drains, snapshots, reports room and catches up.
+    apply_release.signal();
+    cluster.wait_log_all().get();
+    slow.read_barrier(nullptr).get();
+    BOOST_CHECK(eventually_true([&] { return !slow.get_status().log_full; }));
+    BOOST_CHECK(eventually_true([&] { return leader.get_status().blocked.log_full == 0; }));
+}
+
+// A follower refuses an entry which does not fit into its log on the promise
+// that its applier fiber takes a snapshot to make room. With commands larger
+// than the gap between max_follower_log_size and snapshot_threshold_log_size,
+// the log is below the threshold when that happens, so the thresholds never
+// call for the snapshot. Node 2 is disconnected, so the leader needs the
+// follower to commit, and the entry commits only once the follower takes the
+// snapshot because its log is full.
+SEASTAR_THREAD_TEST_CASE(test_full_follower_below_snapshot_threshold_does_not_deadlock) {
+    const size_t small_size = sizeof(size_t);
+    const size_t max_log_size = 10 * small_size;
+    const size_t snapshot_trailing_size = small_size;
+    // The largest the configuration allows.
+    const size_t max_command_size = max_log_size - snapshot_trailing_size;
+
+    const auto follower_config = raft::server::configuration {
+        .snapshot_threshold = 1000,
+        .snapshot_threshold_log_size = 5 * small_size,
+        .snapshot_trailing = 1,
+        .snapshot_trailing_size = snapshot_trailing_size,
+        .max_log_size = max_log_size,
+        .enable_forwarding = false,
+        .max_command_size = max_command_size,
+    };
+    // The leader admits the large entry right away and takes no snapshot.
+    const auto leader_config = raft::server::configuration {
+        .snapshot_threshold = 10000,
+        .snapshot_threshold_log_size = 1000 * small_size,
+        .snapshot_trailing = 1,
+        .snapshot_trailing_size = snapshot_trailing_size,
+        .max_log_size = 1000 * small_size,
+        .enable_forwarding = false,
+        .max_command_size = max_command_size,
+    };
+    test_case test_config {
+        .nodes = 3,
+        .config = {leader_config, follower_config, leader_config},
+    };
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        1000,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& leader = cluster.get_server(0);
+    auto& follower = cluster.get_server(1);
+
+    // The follower applies a few small entries, too few for a snapshot, so
+    // they are committed above its snapshot index.
+    cluster.add_entries(3, 0).get();
+    follower.read_barrier(nullptr).get();
+    const size_t usage = follower.get_status().log_memory_usage;
+    const size_t bound = max_log_size + snapshot_trailing_size;
+    BOOST_TEST_MESSAGE(fmt::format("follower log memory usage: {} (bound {}, threshold {})",
+            usage, bound, follower_config.snapshot_threshold_log_size));
+    BOOST_REQUIRE_LT(usage, follower_config.snapshot_threshold_log_size);
+    BOOST_REQUIRE_GT(usage + max_command_size, bound);
+
+    cluster.disconnect(2);
+    auto large = create_command(size_t(100));
+    const std::string padding(max_command_size - large.size(), '\0');
+    large.write(padding.data(), padding.size());
+    with_timeout(std::chrono::steady_clock::now() + tick_delay * 200,
+            leader.add_entry(std::move(large), raft::wait_type::committed, nullptr)).get();
+
+    cluster.connect_all();
+}
+
+// A follower whose applier fiber has applied everything committed, and whose
+// log then fills up with uncommitted entries, takes the snapshot which makes
+// room: the thresholds are evaluated only when entries are applied, and none
+// are, since the leader needs the follower for a quorum to commit anything.
+//
+// The uncommitted entries have to be from an earlier term, which the leader
+// cannot commit by counting replicas: it needs an entry of its own term
+// accepted above them. So node 0 adds entries which node 1 receives but cannot
+// acknowledge, and is then re-elected in a new term.
+//
+// Reproduces SCYLLADB-5634.
+SEASTAR_THREAD_TEST_CASE(test_full_follower_with_everything_applied_does_not_deadlock) {
+    const size_t command_size = sizeof(size_t);
+    const size_t max_log_size = 10 * command_size;
+
+    test_case test_config {
+        .nodes = 3,
+        .config = std::vector<raft::server::configuration>(3,
+            raft::server::configuration {
+                // Only the byte threshold triggers a snapshot here.
+                .snapshot_threshold = 1000,
+                .snapshot_threshold_log_size = 5 * command_size,
+                .snapshot_trailing = 1,
+                .snapshot_trailing_size = command_size,
+                .max_log_size = max_log_size,
+                .enable_forwarding = false,
+                .max_command_size = command_size,
+            })
+    };
+    // Must exceed the number of entries added below, or the state machine's
+    // done promise fires early.
+    auto cluster = raft_cluster<std::chrono::steady_clock>{
+        std::move(test_config),
+        ::apply_changes,
+        1000,  // apply_entries
+        0,
+        0, false, tick_delay, rpc_config{}
+    };
+    cluster.start_all().get();
+    auto stop = defer([&cluster] noexcept { cluster.stop_all().get(); });
+
+    auto& leader = cluster.get_server(0);
+    auto& follower = cluster.get_server(1);
+
+    // Node 1 applies a few entries, too few for a snapshot, so they are
+    // committed above its snapshot index.
+    cluster.add_entries(3, 0).get();
+    follower.read_barrier(nullptr).get();
+    const auto [follower_last_idx, follower_last_term] = follower.log_last_idx_term();
+
+    // Empty the leader's log, so that it admits max_log_size worth of new
+    // entries, more than node 1 has room for on top of the entries it keeps.
+    leader.trigger_snapshot(nullptr).get();
+
+    // Node 0 can reach only node 1, and hears nothing back from it, so the
+    // entries added below are not committed. Node 0 stays the leader, since
+    // its failure detector sees node 1 alive.
+    cluster.disconnect(2);
+    cluster.block_receive(0, 1);
+    std::vector<future<>> added;
+    for (size_t i = 0; i < max_log_size / command_size; ++i) {
+        added.push_back(leader.add_entry(create_command(100 + i), raft::wait_type::committed, nullptr));
+    }
+    // All of them are in the leader's log before it steps down: add_entry()
+    // refuses to append in a term other than the one it was called in.
+    const auto max_entries = raft::index_t{max_log_size / command_size};
+    leader.wait_log_idx_term({follower_last_idx + max_entries, follower_last_term}).get();
+    // Node 1 has room for 8 of them without a snapshot: max_log_size +
+    // snapshot_trailing_size is 11 commands, and it holds 3.
+    follower.wait_log_idx_term({follower_last_idx + raft::index_t{8}, follower_last_term}).get();
+
+    // Re-elect node 0 in a new term, with node 1's vote: node 0 has the longer
+    // log. Node 2 stays disconnected, so node 0 needs node 1 for a quorum.
+    cluster.pause_tickers();
+    cluster.disconnect(0);
+    leader.elapse_election();
+    // Step down: an election timeout has passed without a live quorum.
+    leader.tick();
+    leader.wait_until_candidate();
+    cluster.connect_all();
+    cluster.disconnect(2);
+    cluster.restart_tickers().get();
+    // Node 1 has a shorter log and node 2 is disconnected, so node 0 is the
+    // only node which can win an election.
+    leader.wait_for_leader(nullptr).get();
+    BOOST_REQUIRE(leader.is_leader());
+
+    // The leader commits an entry of its new term, and with it everything
+    // added above.
+    with_timeout(std::chrono::steady_clock::now() + tick_delay * 200,
+            leader.read_barrier(nullptr)).get();
+    when_all_succeed(added.begin(), added.end()).get();
+
+    cluster.connect_all();
+}

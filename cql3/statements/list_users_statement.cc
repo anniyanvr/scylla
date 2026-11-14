@@ -1,29 +1,32 @@
 /*
- */
-
-/*
  * Copyright 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
+#include <seastar/core/when_all.hh>
 #include "list_users_statement.hh"
 #include "cql3/query_processor.hh"
 #include "cql3/query_options.hh"
-#include "cql3/column_identifier.hh"
 #include "auth/common.hh"
+#include "db/system_keyspace.hh"
 #include "transport/messages/result_message.hh"
+#include "service/raft/raft_group0_client.hh"
 
-std::unique_ptr<cql3::statements::prepared_statement> cql3::statements::list_users_statement::prepare(
-                data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(::make_shared<list_users_statement>(*this));
+shared_ptr<const cql3::metadata> cql3::statements::list_users_statement::get_result_metadata() const {
+    return ::make_shared<cql3::metadata>(
+        std::vector<lw_shared_ptr<cql3::column_specification>>{
+                cql3::make_column_spec(db::system_keyspace::NAME, "users", "name", utf8_type),
+                cql3::make_column_spec(db::system_keyspace::NAME, "users", "super", boolean_type)});
 }
 
-void cql3::statements::list_users_statement::validate(query_processor& qp, const service::client_state& state) const {
+std::unique_ptr<cql3::statements::prepared_statement> cql3::statements::list_users_statement::prepare(
+                data_dictionary::database db, cql_stats& stats, const cql_config& cfg) {
+    return std::make_unique<prepared_statement>(audit_info(), ::make_shared<list_users_statement>(*this));
 }
 
 future<> cql3::statements::list_users_statement::check_access(query_processor& qp, const service::client_state& state) const {
@@ -32,26 +35,13 @@ future<> cql3::statements::list_users_statement::check_access(query_processor& q
 }
 
 future<::shared_ptr<cql_transport::messages::result_message>>
-cql3::statements::list_users_statement::execute(query_processor& qp, service::query_state& state, const query_options& options) const {
-    static const sstring virtual_table_name("users");
+cql3::statements::list_users_statement::execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const {
+    auto metadata = ::make_shared<cql3::metadata>(*get_result_metadata());
 
-    static const auto make_column_spec = [](const sstring& name, const ::shared_ptr<const abstract_type>& ty) {
-        return make_lw_shared<column_specification>(
-            auth::meta::AUTH_KS,
-            virtual_table_name,
-            ::make_shared<column_identifier>(name, true),
-            ty);
-    };
-
-    static thread_local const auto metadata = ::make_shared<cql3::metadata>(
-        std::vector<lw_shared_ptr<column_specification>>{
-                make_column_spec("name", utf8_type),
-                make_column_spec("super", boolean_type)});
-
-    static const auto make_results = [](const auth::service& as, std::unordered_set<sstring>&& roles) {
+    auto make_results = [metadata = std::move(metadata)](const auth::service& as, std::unordered_set<sstring>&& roles) mutable {
         using cql_transport::messages::result_message;
 
-        auto results = std::make_unique<result_set>(metadata);
+        auto results = std::make_unique<result_set>(std::move(metadata));
 
         std::vector<sstring> sorted_roles(roles.cbegin(), roles.cend());
         std::sort(sorted_roles.begin(), sorted_roles.end());
@@ -79,14 +69,14 @@ cql3::statements::list_users_statement::execute(query_processor& qp, service::qu
     const auto& cs = state.get_client_state();
     const auto& as = *cs.get_auth_service();
 
-    return auth::has_superuser(as, *cs.user()).then([&cs, &as](bool has_superuser) {
+    return cs.has_superuser().then([&cs, &as, make_results = std::move(make_results)](bool has_superuser) mutable {
         if (has_superuser) {
-            return as.underlying_role_manager().query_all().then([&as](std::unordered_set<sstring> roles) {
+            return as.underlying_role_manager().query_all().then([&as, make_results = std::move(make_results)](std::unordered_set<sstring> roles) mutable {
                 return make_results(as, std::move(roles));
             });
         }
 
-        return auth::get_roles(as, *cs.user()).then([&as](std::unordered_set<sstring> granted_roles) {
+        return auth::get_roles(as, *cs.user()).then([&as, make_results = std::move(make_results)](std::unordered_set<sstring> granted_roles) mutable {
             return make_results(as, std::move(granted_roles));
         });
     });

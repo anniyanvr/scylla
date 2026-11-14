@@ -1,22 +1,17 @@
 /*
- */
-
-/*
  * Copyright (C) 2014-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include "column_specification.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include <memory>
-#include <vector>
 
 namespace cql3 {
 
@@ -30,35 +25,17 @@ public:
         NOT_ASSIGNABLE,
     };
 
+    struct vector_test_result {
+        test_result result;
+        std::optional<vector_dimension_t> dimension_opt;
+    };
+
     static bool is_assignable(test_result tr) {
         return tr != test_result::NOT_ASSIGNABLE;
     }
 
     static bool is_exact_match(test_result tr) {
-        return tr != test_result::EXACT_MATCH;
-    }
-
-    // Test all elements of toTest for assignment. If all are exact match, return exact match. If any is not assignable,
-    // return not assignable. Otherwise, return weakly assignable.
-    template <typename AssignmentTestablePtrRange>
-    static test_result test_all(data_dictionary::database db, const sstring& keyspace, const column_specification& receiver,
-                AssignmentTestablePtrRange&& to_test) {
-        test_result res = test_result::EXACT_MATCH;
-        for (auto&& rt : to_test) {
-            if (rt == nullptr) {
-                res = test_result::WEAKLY_ASSIGNABLE;
-                continue;
-            }
-
-            test_result t = rt->test_assignment(db, keyspace, receiver);
-            if (t == test_result::NOT_ASSIGNABLE) {
-                return test_result::NOT_ASSIGNABLE;
-            }
-            if (t == test_result::WEAKLY_ASSIGNABLE) {
-                res = test_result::WEAKLY_ASSIGNABLE;
-            }
-        }
-        return res;
+        return tr == test_result::EXACT_MATCH;
     }
 
     /**
@@ -70,7 +47,11 @@ public:
      * Most caller should just call the isAssignable() method on the result, though functions have a use for
      * testing "strong" equality to decide the most precise overload to pick when multiple could match.
      */
-    virtual test_result test_assignment(data_dictionary::database db, const sstring& keyspace, const column_specification& receiver) const = 0;
+    virtual test_result test_assignment(data_dictionary::database db, const sstring& keyspace, const schema* schema_opt, const column_specification& receiver) const = 0;
+
+    virtual vector_test_result test_assignment_any_size_float_vector() const = 0;
+
+    virtual std::optional<data_type> assignment_testable_type_opt() const = 0;
 
     // for error reporting
     virtual sstring assignment_testable_source_context() const = 0;
@@ -84,10 +65,12 @@ inline bool is_exact_match(assignment_testable::test_result tr) {
     return assignment_testable::is_exact_match(tr);
 }
 
-inline
-std::ostream&
-operator<<(std::ostream& os, const assignment_testable& at) {
-    return os << at.assignment_testable_source_context();
 }
 
-}
+template <>
+struct fmt::formatter<cql3::assignment_testable> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const cql3::assignment_testable& at, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", at.assignment_testable_source_context());
+    }
+};

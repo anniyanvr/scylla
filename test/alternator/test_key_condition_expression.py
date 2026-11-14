@@ -1,15 +1,17 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the KeyConditionExpression parameter of the Query operation.
 # KeyConditionExpression is a newer version of the older "KeyConditions"
 # syntax. That older syntax is tested in test_query.py and test_key_conditions.py.
 
 import pytest
+from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
-import random
-from util import random_string, full_query, multiset
+
+from test.alternator.util import random_string, full_query, multiset
+
 
 # The test_table_{sn,ss,sb}_with_sorted_partition fixtures are the regular
 # test_table_{sn,ss,sb} fixture with a partition inserted with many items.
@@ -31,14 +33,14 @@ def test_table_sn_with_sorted_partition(test_table_sn):
     yield test_table_sn, p, items
 
 @pytest.fixture(scope="module")
-def test_table_ss_with_sorted_partition(test_table):
+def test_table_ss_with_sorted_partition(test_table_ss):
     p = random_string()
     items = [{'p': p, 'c': str(i).zfill(3), 'a': random_string()} for i in range(12)]
-    with test_table.batch_writer() as batch:
+    with test_table_ss.batch_writer() as batch:
         for item in items:
             batch.put_item(item)
         batch.put_item({'p': random_string(), 'c': '123', 'a': random_string()})
-    yield test_table, p, items
+    yield test_table_ss, p, items
 
 @pytest.fixture(scope="module")
 def test_table_sb_with_sorted_partition(test_table_sb):
@@ -196,7 +198,7 @@ def test_key_condition_expression_unknown(test_table_sn_with_sorted_partition):
     with pytest.raises(ClientError, match='ValidationException.*dog'):
         full_query(table, KeyConditionExpression='p=:p AND dog(c, :c)',
             ExpressionAttributeValues={':p': p, ':c': 3})
-    with pytest.raises(ClientError, match='ValidationException.*attribute_exists'):
+    with pytest.raises(ClientError, match='ValidationException.*KeyConditionExpression'):
         full_query(table, KeyConditionExpression='p=:p AND attribute_exists(c)',
             ExpressionAttributeValues={':p': p})
 
@@ -233,10 +235,10 @@ def test_key_condition_expression_parser(test_table_sn_with_sorted_partition):
         full_query(table, KeyConditionExpression='p=:p AND c IN (:c)',
             ExpressionAttributeValues={':p': p, ':c': 5})
     # The "OR" or "NOT" operators are parsed, but not allowed:
-    with pytest.raises(ClientError, match='ValidationException.*OR'):
+    with pytest.raises(ClientError, match='ValidationException.*KeyConditionExpression'):
         full_query(table, KeyConditionExpression='c=:c OR p=:p',
             ExpressionAttributeValues={':p': p, ':c': 3})
-    with pytest.raises(ClientError, match='ValidationException.*NOT'):
+    with pytest.raises(ClientError, match='ValidationException.*KeyConditionExpression'):
         full_query(table, KeyConditionExpression='NOT c=:c AND p=:p',
             ExpressionAttributeValues={':p': p, ':c': 3})
     # Unnecessary parentheses are allowed around the entire expression,
@@ -245,7 +247,7 @@ def test_key_condition_expression_parser(test_table_sn_with_sorted_partition):
         ExpressionAttributeValues={':p': p, ':c': 3})
     expected_items = [item for item in items if item['c'] == 3]
     assert(got_items == expected_items)
-    # Strangely, although one pair of unnecesary parentheses are allowed
+    # Strangely, although one pair of unnecessary parentheses are allowed
     # in each level, DynamoDB forbids more than one - it refuses to accept
     # the expression ((c=:c) AND ((p=:p))) with one too many redundant levels
     # of parentheses. However, we chose not to implement this extra check
@@ -480,6 +482,26 @@ def test_key_condition_expression_bytes_begins(test_table_sb_with_sorted_partiti
     expected_items = [item for item in items if item['c'].startswith(bytearray('00', 'ascii'))]
     assert(got_items == expected_items)
 
+# begins_with() where the prefix consists entirely of 0xFF bytes. This is the
+# one prefix that has no "successor" - there is no byte to increment - so
+# get_clustering_range_for_begins_with() cannot build the usual half-open
+# range and has to leave the range open at the top instead. That is correct
+# because 0xFF is the largest byte, so every string larger than such a prefix
+# necessarily begins with it.
+@pytest.mark.parametrize("prefix", [b'\xff', b'\xff\xff'])
+def test_key_condition_expression_bytes_begins_all_ff(test_table_sb, prefix):
+    p = random_string()
+    # Sorted ascending, which is the order Query returns them in.
+    values = [b'\x00', b'\xfe\xff', b'\xff', b'\xff\x00', b'\xff\xff', b'\xff\xff\x00']
+    items = [{'p': p, 'c': bytearray(v), 'a': random_string()} for v in values]
+    with test_table_sb.batch_writer() as batch:
+        for item in items:
+            batch.put_item(item)
+    got_items = full_query(test_table_sb, KeyConditionExpression='p=:p AND begins_with(c,:c)',
+        ExpressionAttributeValues={':p': p, ':c': bytearray(prefix)})
+    expected_items = [item for item in items if bytes(item['c']).startswith(prefix)]
+    assert(got_items == expected_items)
+
 # Query and KeyConditionExpression works also on a table with just a partition
 # key and no sort key, although obviously it isn't very useful (for such
 # tables, Query is just an elaborate way to do a GetItem).
@@ -544,7 +566,6 @@ def test_key_condition_expression_unsigned_bytes(test_table_sb):
 # the KeyConditionExpression string, it uses boto3's "Key" condition builder.
 # That shouldn't make any difference, however - that builder also builds a
 # string.
-from boto3.dynamodb.conditions import Key
 def test_query_key_condition_expression(dynamodb, filled_test_table):
     test_table, items = filled_test_table
     paginator = dynamodb.meta.client.get_paginator('query')

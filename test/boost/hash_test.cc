@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
@@ -11,7 +11,7 @@
 #include <seastar/core/future.hh>
 
 #include "seastarx.hh"
-#include <seastar/testing/test_case.hh>
+#include "test/lib/scylla_test_case.hh"
 #include "utils/hash.hh"
 
 SEASTAR_TEST_CASE(test_pair_hash){

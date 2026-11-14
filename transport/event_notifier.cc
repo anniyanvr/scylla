@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "transport/server.hh"
 #include <seastar/core/gate.hh>
-#include "service/migration_listener.hh"
 #include "transport/response.hh"
 #include "gms/gossiper.hh"
 
@@ -28,6 +27,9 @@ void cql_server::event_notifier::register_event(event::event_type et, cql_server
     case event::event_type::SCHEMA_CHANGE:
         _schema_change_listeners.emplace(conn);
         break;
+    case event::event_type::CLIENT_ROUTES_CHANGE:
+        _client_routes_change_listeners.emplace(conn);
+        break;
     }
 }
 
@@ -36,6 +38,7 @@ void cql_server::event_notifier::unregister_connection(cql_server::connection* c
     _topology_change_listeners.erase(conn);
     _status_change_listeners.erase(conn);
     _schema_change_listeners.erase(conn);
+    _client_routes_change_listeners.erase(conn);
 }
 
 void cql_server::event_notifier::on_create_keyspace(const sstring& ks_name)
@@ -148,12 +151,12 @@ void cql_server::event_notifier::on_update_view(const sstring& ks_name, const ss
 
 void cql_server::event_notifier::on_update_function(const sstring& ks_name, const sstring& function_name)
 {
-    elogger.warn("%s event ignored", __func__);
+    elogger.warn("{} event ignored", __func__);
 }
 
 void cql_server::event_notifier::on_update_aggregate(const sstring& ks_name, const sstring& aggregate_name)
 {
-    elogger.warn("%s event ignored", __func__);
+    elogger.warn("{} event ignored", __func__);
 }
 
 void cql_server::event_notifier::on_drop_keyspace(const sstring& ks_name)
@@ -207,17 +210,33 @@ void cql_server::event_notifier::on_drop_view(const sstring& ks_name, const sstr
 
 void cql_server::event_notifier::on_drop_function(const sstring& ks_name, const sstring& function_name)
 {
-    elogger.warn("%s event ignored", __func__);
+    elogger.warn("{} event ignored", __func__);
 }
 
 void cql_server::event_notifier::on_drop_aggregate(const sstring& ks_name, const sstring& aggregate_name)
 {
-    elogger.warn("%s event ignored", __func__);
+    elogger.warn("{} event ignored", __func__);
 }
 
-void cql_server::event_notifier::on_join_cluster(const gms::inet_address& endpoint)
+future<> cql_server::event_notifier::on_before_service_level_add(qos::service_level_options, qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_after_service_level_remove(qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_before_service_level_change(qos::service_level_options slo_before, qos::service_level_options slo_after, qos::service_level_info sl_info) {
+    co_return;
+}
+
+future<> cql_server::event_notifier::on_effective_service_levels_cache_reloaded() {
+    return _server.update_connections_service_level_params();
+}
+
+void cql_server::event_notifier::on_join_cluster(const gms::inet_address& endpoint, locator::host_id hid)
 {
-    if (!_server._gossiper.is_cql_ready(endpoint)) {
+    if (!_server._gossiper.is_cql_ready(hid)) {
         _endpoints_pending_joined_notification.insert(endpoint);
         return;
     }
@@ -235,7 +254,7 @@ void cql_server::event_notifier::send_join_cluster(const gms::inet_address& endp
     }
 }
 
-void cql_server::event_notifier::on_leave_cluster(const gms::inet_address& endpoint)
+void cql_server::event_notifier::on_leave_cluster(const gms::inet_address& endpoint, const locator::host_id& hid)
 {
     for (auto&& conn : _topology_change_listeners) {
         using namespace cql_transport;
@@ -245,7 +264,7 @@ void cql_server::event_notifier::on_leave_cluster(const gms::inet_address& endpo
     }
 }
 
-void cql_server::event_notifier::on_up(const gms::inet_address& endpoint)
+void cql_server::event_notifier::on_up(const gms::inet_address& endpoint, locator::host_id hid)
 {
     if (_endpoints_pending_joined_notification.erase(endpoint)) {
         send_join_cluster(endpoint);
@@ -263,7 +282,7 @@ void cql_server::event_notifier::on_up(const gms::inet_address& endpoint)
     }
 }
 
-void cql_server::event_notifier::on_down(const gms::inet_address& endpoint)
+void cql_server::event_notifier::on_down(const gms::inet_address& endpoint, locator::host_id hid)
 {
     bool was_down = _last_status_change.contains(endpoint) && _last_status_change.at(endpoint) == event::status_change::status_type::DOWN;
     _last_status_change[endpoint] = event::status_change::status_type::DOWN;
@@ -274,6 +293,16 @@ void cql_server::event_notifier::on_down(const gms::inet_address& endpoint)
                 conn->write_response(conn->make_status_change_event(event::status_change::node_down(endpoint, conn->_server_addr.port())));
             };
         }
+    }
+}
+
+void cql_server::event_notifier::on_client_routes_change(const service::client_routes_service::client_route_keys& client_route_keys)
+{
+    for (auto&& conn : _client_routes_change_listeners) {
+        using namespace cql_transport;
+        if (!conn->_pending_requests_gate.is_closed()) {
+            conn->write_response(conn->make_client_routes_change_event(event::client_routes_change{client_route_keys}));
+        };
     }
 }
 

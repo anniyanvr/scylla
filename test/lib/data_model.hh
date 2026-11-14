@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "mutation.hh"
+#include "mutation/mutation.hh"
 #include "cql3/cql3_type.hh"
-#include "schema.hh"
+#include "schema/schema.hh"
 
 namespace tests::data_model {
 
@@ -64,7 +64,7 @@ public:
         row cells;
     };
     struct range_tombstone {
-        nonwrapping_range<key> range;
+        interval<key> range;
         tombstone tomb;
     };
 
@@ -95,7 +95,7 @@ public:
     // range-tombstone is created with start <= end.
     void add_range_tombstone(const key& start, const key& end,
             tombstone tomb = tombstone(previously_removed_column_timestamp, gc_clock::time_point()));
-    void add_range_tombstone(nonwrapping_range<key> range,
+    void add_range_tombstone(interval<key> range,
             tombstone tomb = tombstone(previously_removed_column_timestamp, gc_clock::time_point()));
 
     mutation build(schema_ptr s) const;
@@ -118,7 +118,7 @@ private:
 
     std::vector<removed_column> _removed_columns;
 
-    std::vector<mutation_description> _mutations;
+    utils::chunked_vector<mutation_description> _mutations;
 
     std::vector<sstring> _change_log;
 
@@ -131,7 +131,7 @@ private:
 
     schema_ptr build_schema() const;
 
-    std::vector<mutation> build_mutations(schema_ptr s) const;
+    utils::chunked_vector<mutation> build_mutations(schema_ptr s) const;
 public:
     explicit table_description(std::vector<column> partition_key, std::vector<column> clustering_key);
 
@@ -153,13 +153,13 @@ public:
     void rename_partition_column(const sstring& from, const sstring& to);
     void rename_clustering_column(const sstring& from, const sstring& to);
 
-    std::vector<mutation_description>& unordered_mutations() { return _mutations; }
-    const std::vector<mutation_description>& unordered_mutations() const { return _mutations; }
+    utils::chunked_vector<mutation_description>& unordered_mutations() { return _mutations; }
+    const utils::chunked_vector<mutation_description>& unordered_mutations() const { return _mutations; }
 
     struct table {
         sstring schema_changes_log;
         schema_ptr schema;
-        std::vector<mutation> mutations;
+        utils::chunked_vector<mutation> mutations;
     };
     table build() const;
 };

@@ -3,17 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "db/timeout_clock.hh"
 
-#include <seastar/testing/test_case.hh>
+#include <seastar/util/closeable.hh>
+#include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
-#include "hashers.hh"
-#include "xx_hasher.hh"
+#include "utils/hashers.hh"
+#include "utils/xx_hasher.hh"
+#include "utils/simple_hashers.hh"
 #include "gc_clock.hh"
 #include "test/lib/simple_schema.hh"
+#include "test/lib/random_utils.hh"
+#include "reader_concurrency_semaphore.hh"
+#include "tracing/trace_state.hh"
 
 bytes text_part1("sanity");
 bytes text_part2("check");
@@ -46,13 +51,37 @@ BOOST_AUTO_TEST_CASE(sha256_hasher_sanity_check) {
     BOOST_REQUIRE_EQUAL(hash, expected);
 }
 
-BOOST_AUTO_TEST_CASE(bytes_view_hasher_sanity_check) {
-    bytes_view_hasher hasher1;
+template <typename Hasher>
+void fragmented_hash_test() {
+    const auto random_buffer = tests::random::get_bytes(512 * 1024);
+    const auto random_buffer_fragmented = managed_bytes(random_buffer);
+
+    // Sanity check that the buffer is actually fragmented, so we are testing what we intend to test.
+    BOOST_REQUIRE(!is_single_fragment(managed_bytes_view(random_buffer_fragmented)));
+
+    const auto fragmented_hash = Hasher::calculate(random_buffer_fragmented);
+    const auto linearized_hash = Hasher::calculate(std::string_view(reinterpret_cast<const char*>(random_buffer.data()), random_buffer.size()));
+
+    BOOST_CHECK_EQUAL(fragmented_hash, linearized_hash);
+}
+
+SEASTAR_TEST_CASE(md5_hasher_fragmented_buffer_hash) {
+    fragmented_hash_test<md5_hasher>();
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(sha256_hasher_fragmented_buffer_hash) {
+    fragmented_hash_test<sha256_hasher>();
+    return make_ready_future<>();
+}
+
+BOOST_AUTO_TEST_CASE(basic_xx_hasher_sanity_check) {
+    simple_xx_hasher hasher1;
     hasher1.update(reinterpret_cast<const char*>(std::data(text_part1)), std::size(text_part1));
     hasher1.update(reinterpret_cast<const char*>(std::data(text_part2)), std::size(text_part2));
     size_t hash1 = hasher1.finalize();
 
-    bytes_view_hasher hasher2;
+    simple_xx_hasher hasher2;
     hasher2.update(reinterpret_cast<const char*>(std::data(text_full)), std::size(text_full));
     size_t hash2 = hasher2.finalize();
 
@@ -60,10 +89,10 @@ BOOST_AUTO_TEST_CASE(bytes_view_hasher_sanity_check) {
 }
 
 SEASTAR_THREAD_TEST_CASE(mutation_fragment_sanity_check) {
-    reader_concurrency_semaphore semaphore(reader_concurrency_semaphore::no_limits{}, __FILE__);
+    reader_concurrency_semaphore semaphore(reader_concurrency_semaphore::no_limits{}, __FILE__, reader_concurrency_semaphore::register_metrics::no);
     auto stop_semaphore = deferred_stop(semaphore);
     simple_schema s;
-    auto permit = semaphore.make_tracking_only_permit(s.schema().get(), "test", db::no_timeout);
+    auto permit = semaphore.make_tracking_only_permit(s.schema(), "test", db::no_timeout, {});
     gc_clock::time_point ts(gc_clock::duration(1234567890000));
 
     auto check_hash = [&] (const mutation_fragment& mf, uint64_t expected) {

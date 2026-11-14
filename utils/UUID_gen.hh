@@ -6,18 +6,19 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include <stdint.h>
 #include <assert.h>
 
-#include <memory>
 #include <chrono>
 #include <random>
 #include <limits>
 
 #include "UUID.hh"
+#include "on_internal_error.hh"
 #include "db_clock.hh"
 
 namespace utils {
@@ -40,6 +41,7 @@ public:
     // UUID timestamp time component is represented in intervals
     // of 1/10 of a microsecond since the beginning of GMT epoch.
     using decimicroseconds = std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>;
+    using microseconds = std::chrono::microseconds;
     using milliseconds = std::chrono::milliseconds;
 private:
     // A grand day! millis at 00:00:00.000 15 Oct 1582.
@@ -47,6 +49,8 @@ private:
     // UUID time must fit in 60 bits
     static constexpr milliseconds UUID_UNIXTIME_MAX = duration_cast<milliseconds>(
         decimicroseconds{0x0fffffffffffffffL} + START_EPOCH);
+    static constexpr milliseconds UUID_UNIXTIME_MIN = duration_cast<milliseconds>(
+        -decimicroseconds{0x0fffffffffffffffL} + START_EPOCH);
 
     // A random mac address for use in timeuuids
     // where we can not use clockseq to randomize the physical
@@ -56,7 +60,9 @@ private:
     // avoid timeuuid duplicates when multiple nodes run on the
     // same host and share the physical MAC address.
     static thread_local const int64_t spoof_node;
-    static thread_local const int64_t clock_seq_and_node;
+    // Not const only because reset_last_used_time() changes its clock
+    // sequence.
+    static thread_local int64_t clock_seq_and_node;
 
     /*
      * The min and max possible lsb for a UUID.
@@ -81,7 +87,7 @@ private:
     UUID_gen()
     {
         // make sure someone didn't whack the clockSeqAndNode by changing the order of instantiation.
-        assert(clock_seq_and_node != 0);
+        SCYLLA_ASSERT(clock_seq_and_node != 0);
     }
 
     // Return decimicrosecond time based on the system time,
@@ -93,8 +99,7 @@ private:
     // need monotonicity between time UUIDs created at different
     // shards and UUID code uses thread local state on each shard.
     int64_t create_time_safe() {
-        using std::chrono::system_clock;
-        auto millis = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
+        auto millis = duration_cast<milliseconds>(db_clock::now().time_since_epoch());
         decimicroseconds when = from_unix_timestamp(millis);
         if (when > _last_used_time) {
             _last_used_time = when;
@@ -105,6 +110,29 @@ private:
     }
 
 public:
+    // Set this shard's last generated time to the current time, so the next
+    // time UUIDs follow the clock even if it moved backward. Only for the
+    // test-only clocks offset (see set_clocks_offset()), whose changes would
+    // otherwise leave the time UUIDs in the future after a test undoes a
+    // forward jump.
+    // Time UUIDs are unique only because their time never goes backward, so
+    // if the clock is now behind _last_used_time - which is never earlier
+    // than the time of a UUID generated with the current clock sequence -
+    // the time of a new UUID may repeat that of an earlier one. In that case,
+    // as RFC 4122 prescribes when the clock moves backward, this also changes
+    // the clock sequence - the 14 bits of clock_seq_and_node after its 2
+    // variant bits - to keep the new UUIDs different from earlier ones. The
+    // clock sequence is incremented, so it repeats only after 16,384 such
+    // changes, and tests move the clocks back far fewer times than that.
+    static void reset_last_used_time() {
+        auto now = from_unix_timestamp(duration_cast<milliseconds>(db_clock::now().time_since_epoch()));
+        if (now < _instance._last_used_time) {
+            constexpr int64_t clock_seq_mask = int64_t(0x3FFF) << 48;
+            clock_seq_and_node = (clock_seq_and_node & ~clock_seq_mask) | ((clock_seq_and_node + (int64_t(1) << 48)) & clock_seq_mask);
+        }
+        _instance._last_used_time = now;
+    }
+
     // We have only 17 timeuuid bits available to store this
     // value.
     static constexpr int SUBMICRO_LIMIT = (1<<17);
@@ -116,7 +144,7 @@ public:
     static UUID get_time_UUID()
     {
         auto uuid = UUID(_instance.create_time_safe(), clock_seq_and_node);
-        assert(uuid.is_timestamp());
+        SCYLLA_ASSERT(uuid.is_timestamp());
         return uuid;
     }
 
@@ -128,7 +156,7 @@ public:
     static UUID get_time_UUID(std::chrono::system_clock::time_point tp)
     {
         auto uuid = UUID(create_time(from_unix_timestamp(tp.time_since_epoch())), clock_seq_and_node);
-        assert(uuid.is_timestamp());
+        SCYLLA_ASSERT(uuid.is_timestamp());
         return uuid;
     }
 
@@ -140,14 +168,14 @@ public:
     static UUID get_time_UUID(milliseconds when, int64_t clock_seq_and_node = UUID_gen::clock_seq_and_node)
     {
         auto uuid = UUID(create_time(from_unix_timestamp(when)), clock_seq_and_node);
-        assert(uuid.is_timestamp());
+        SCYLLA_ASSERT(uuid.is_timestamp());
         return uuid;
     }
 
     static UUID get_time_UUID_raw(decimicroseconds when, int64_t clock_seq_and_node)
     {
         auto uuid = UUID(create_time(when), clock_seq_and_node);
-        assert(uuid.is_timestamp());
+        SCYLLA_ASSERT(uuid.is_timestamp());
         return uuid;
     }
 
@@ -166,8 +194,11 @@ public:
         static thread_local std::mt19937_64 rand_gen(std::random_device().operator()());
         static thread_local std::uniform_int_distribution<int64_t> rand_dist(std::numeric_limits<int64_t>::min());
 
-        auto uuid = UUID(create_time(from_unix_timestamp(when_in_micros)), rand_dist(rand_gen));
-        assert(uuid.is_timestamp());
+        auto lsb = rand_dist(rand_gen);
+        lsb &= ~0xC000000000000000L; // clear variant bits
+        lsb |= 0x8000000000000000L; // set variant to IETF variant
+        auto uuid = UUID(create_time(from_unix_timestamp(when_in_micros)), lsb);
+        SCYLLA_ASSERT(uuid.is_timestamp());
         return uuid;
     }
     // Generate a time-based (Version 1) UUID using
@@ -228,12 +259,12 @@ public:
 
     /** creates uuid from raw bytes. */
     static UUID get_UUID(bytes raw) {
-        assert(raw.size() == 16);
+        SCYLLA_ASSERT(raw.size() == 16);
         return get_UUID(raw.begin());
     }
 
     /** creates uuid from raw bytes. src must point to a region of 16 bytes*/
-    static UUID get_UUID(int8_t* src) {
+    static UUID get_UUID(const int8_t* src) {
         struct tmp { uint64_t msb, lsb; } t;
         std::copy(src, src + 16, reinterpret_cast<char*>(&t));
         return UUID(net::ntoh(t.msb), net::ntoh(t.lsb));
@@ -243,7 +274,7 @@ public:
      * Creates a type 3 (name based) UUID based on the specified byte array.
      */
     static UUID get_name_UUID(bytes_view b);
-    static UUID get_name_UUID(sstring_view str);
+    static UUID get_name_UUID(std::string_view str);
     static UUID get_name_UUID(const unsigned char* s, size_t len);
 
     /** decomposes a uuid into raw bytes. */
@@ -289,10 +320,10 @@ public:
      * <b>Warning:</b> this method should only be used for querying as this
      * doesn't at all guarantee the uniqueness of the resulting UUID.
      */
-    static UUID min_time_UUID(milliseconds timestamp = milliseconds{0})
+    static UUID min_time_UUID(decimicroseconds timestamp = decimicroseconds{0})
     {
         auto uuid = UUID(create_time(from_unix_timestamp(timestamp)), MIN_CLOCK_SEQ_AND_NODE);
-        assert(uuid.is_timestamp());
+        SCYLLA_ASSERT(uuid.is_timestamp());
         return uuid;
     }
 
@@ -310,8 +341,26 @@ public:
         // precision by taking 10000, but rather 19999.
         decimicroseconds uuid_tstamp = from_unix_timestamp(timestamp + milliseconds(1)) - decimicroseconds(1);
         auto uuid = UUID(create_time(uuid_tstamp), MAX_CLOCK_SEQ_AND_NODE);
-        assert(uuid.is_timestamp());
+        SCYLLA_ASSERT(uuid.is_timestamp());
         return uuid;
+    }
+
+    /**
+     * @param uuid
+     * @return decimicroseconds since Unix epoch
+     */
+    static decimicroseconds unix_timestamp_decimicros(UUID uuid)
+    {
+        return decimicroseconds(uuid.timestamp()) + START_EPOCH;
+    }
+
+    /**
+     * @param uuid
+     * @return microseconds since Unix epoch
+     */
+    static microseconds unix_timestamp_micros(UUID uuid)
+    {
+        return duration_cast<microseconds>(unix_timestamp_decimicros(uuid));
     }
 
     /**
@@ -320,7 +369,7 @@ public:
      */
     static milliseconds unix_timestamp(UUID uuid)
     {
-        return duration_cast<milliseconds>(decimicroseconds(uuid.timestamp()) + START_EPOCH);
+        return duration_cast<milliseconds>(unix_timestamp_decimicros(uuid));
     }
 
     /**
@@ -344,7 +393,8 @@ public:
 
     template <std::intmax_t N, std::intmax_t D>
     static bool is_valid_unix_timestamp(std::chrono::duration<int64_t, std::ratio<N, D>> d) {
-        return duration_cast<milliseconds>(d) < UUID_UNIXTIME_MAX;
+        milliseconds dms = duration_cast<milliseconds>(d);
+        return dms > UUID_UNIXTIME_MIN && dms < UUID_UNIXTIME_MAX;
     }
 
     template <std::intmax_t N, std::intmax_t D>
@@ -363,7 +413,11 @@ public:
         auto dmc = duration_cast<decimicroseconds>(d);
         uint64_t msb = dmc.count();
         // timeuuid time must fit in 60 bits
-        assert(!(0xf000000000000000UL & msb));
+        if ((0xf000000000000000UL & msb)) {
+            // We hope callers would try to avoid this case, but they don't
+            // always do, so SCYLLA_ASSERT() would be bad here - and caused #17035.
+            utils::on_internal_error("timeuuid time must fit in 60 bits");
+        }
         return ((0x00000000ffffffffL & msb) << 32 |
                (0x0000ffff00000000UL & msb) >> 16 |
                (0x0fff000000000000UL & msb) >> 48 |
@@ -376,8 +430,8 @@ public:
     //
     //      auto original_uuid = UUID_gen::get_time_UUID();
     //      auto negated_uuid = UUID_gen::negate(original_uuid);
-    //      assert(original_uuid != negated_uuid);
-    //      assert(original_uuid == UUID_gen::negate(negated_uuid));
+    //      SCYLLA_ASSERT(original_uuid != negated_uuid);
+    //      SCYLLA_ASSERT(original_uuid == UUID_gen::negate(negated_uuid));
     static UUID negate(UUID);
 };
 

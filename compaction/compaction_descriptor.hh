@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -12,18 +12,20 @@
 #include <functional>
 #include <optional>
 #include <variant>
-#include <seastar/core/smp.hh>
-#include <seastar/core/file.hh>
-#include "sstables/shared_sstable.hh"
+#include "sstables/component_type.hh"
+#include "sstables/types_fwd.hh"
 #include "sstables/sstable_set.hh"
-#include "utils/UUID.hh"
-#include "dht/i_partitioner.hh"
-#include "compaction_weight_registration.hh"
+#include "compaction_fwd.hh"
+#include "enum_set.hh"
+#include "mutation_writer/token_group_based_splitting_writer.hh"
+#include "utils/chunked_vector.hh"
+#include "tombstone_gc.hh"
+#include "schema/schema_fwd.hh"
 
-namespace sstables {
+namespace compaction {
 
 enum class compaction_type {
-    Compaction = 0,
+    Compaction = 0, // Used only for regular compactions
     Cleanup = 1,
     Validation = 2, // Origin uses this for a compaction that is used exclusively for repair
     Scrub = 3,
@@ -31,21 +33,56 @@ enum class compaction_type {
     Reshard = 5,
     Upgrade = 6,
     Reshape = 7,
+    Split = 8,
+    Major = 9,
+    RewriteComponent = 10,
 };
 
-std::ostream& operator<<(std::ostream& os, compaction_type type);
+using compaction_type_set = enum_set<super_enum<compaction_type,
+        compaction_type::Compaction,
+        compaction_type::Cleanup,
+        compaction_type::Validation,
+        compaction_type::Scrub,
+        compaction_type::Index_build,
+        compaction_type::Reshard,
+        compaction_type::Upgrade,
+        compaction_type::Reshape,
+        compaction_type::Split,
+        compaction_type::Major,
+        compaction_type::RewriteComponent
+        >>;
 
 struct compaction_completion_desc {
     // Old, existing SSTables that should be deleted and removed from the SSTable set.
-    std::vector<shared_sstable> old_sstables;
+    std::vector<sstables::shared_sstable> old_sstables;
     // New, fresh SSTables that should be added to SSTable set, replacing the old ones.
-    std::vector<shared_sstable> new_sstables;
+    std::vector<sstables::shared_sstable> new_sstables;
+    // New, fresh GCed-data SSTables that should be added to SSTable set.
+    std::vector<sstables::shared_sstable> new_gc_sstables;
     // Set of compacted partition ranges that should be invalidated in the cache.
-    dht::partition_range_vector ranges_for_cache_invalidation;
+    utils::chunked_vector<dht::partition_range> ranges_for_cache_invalidation;
+
+    // Everything this replacement adds to the SSTable set, the regular outputs
+    // followed by the GCed-data ones.
+    //
+    // The two are kept in separate vectors only because
+    // sstable_list_updater::prepare() has to pin the GCed-data SSTables to the
+    // compaction group the compaction runs on, instead of routing them through
+    // the live tablet map like the regular outputs. Every other consumer wants
+    // both, and one that reads new_sstables alone ends up seeing a removal it
+    // was never told to expect, since GCed-data SSTables come back as
+    // old_sstables when they are released.
+    std::vector<sstables::shared_sstable> all_new_sstables() const {
+        std::vector<sstables::shared_sstable> ret;
+        ret.reserve(new_sstables.size() + new_gc_sstables.size());
+        ret.insert(ret.end(), new_sstables.begin(), new_sstables.end());
+        ret.insert(ret.end(), new_gc_sstables.begin(), new_gc_sstables.end());
+        return ret;
+    }
 };
 
 // creates a new SSTable for a given shard
-using compaction_sstable_creator_fn = std::function<shared_sstable(shard_id shard)>;
+using compaction_sstable_creator_fn = std::function<sstables::shared_sstable(shard_id shard)>;
 // Replaces old sstable(s) by new one(s) which contain all non-expired data.
 using compaction_sstable_replacer_fn = std::function<void(compaction_completion_desc)>;
 
@@ -53,11 +90,11 @@ class compaction_type_options {
 public:
     struct regular {
     };
+    struct major {
+    };
     struct cleanup {
-        dht::token_range_vector owned_ranges;
     };
     struct upgrade {
-        dht::token_range_vector owned_ranges;
     };
     struct scrub {
         enum class mode {
@@ -74,13 +111,48 @@ public:
             only, // scrub only quarantined sstables
         };
         quarantine_mode quarantine_operation_mode = quarantine_mode::include;
+
+        using quarantine_invalid_sstables = bool_class<class quarantine_invalid_sstables_tag>;
+
+        // Should invalid sstables be moved into quarantine.
+        // Only applies to validate-mode.
+        quarantine_invalid_sstables quarantine_sstables = quarantine_invalid_sstables::yes;
+
+        using drop_unfixable_sstables = bool_class<class drop_unfixable_sstables_tag>;
+        // Drop sstables that cannot be fixed.
+        // Only applies to segregate-mode.
+        drop_unfixable_sstables drop_unfixable = drop_unfixable_sstables::no;
+
+        using update_scrub_time = bool_class<class update_scrub_time_tag>;
+        // May update the scrub time by rewriting the scylla-metadata component.
+        // Only applies to validate-mode.
+        // Can only be used if sstables have the Scylla component.
+        update_scrub_time update_timestamp = update_scrub_time::no;
+
+        using is_automatic_scrub = bool_class<class is_automatic_scrub_tag>;
+        // Marks the scrub as being run by an automatic, background process
+        // rather than on behalf of an explicit user request.
+        // Currently, ignored by all modes other than validate, where it
+        // reduces the level of the logged messages.
+        is_automatic_scrub is_automatic = is_automatic_scrub::no;
     };
     struct reshard {
+        // If set, resharding compaction will apply the owned_ranges to segregate sstables in vnode boundaries.
+        bool vnodes_resharding = false;
     };
     struct reshape {
     };
+    struct split {
+        mutation_writer::classify_by_token_group classifier;
+    };
+    struct component_rewrite {
+        sstables::component_type component_to_rewrite;
+        std::function<void(sstables::sstable&)> modifier;
+
+        sstables::update_sstable_id update_id = sstables::update_sstable_id::yes;
+    };
 private:
-    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape>;
+    using options_variant = std::variant<regular, cleanup, upgrade, scrub, reshard, reshape, split, major, component_rewrite>;
 
 private:
     options_variant _options;
@@ -94,29 +166,46 @@ public:
         return compaction_type_options(reshape{});
     }
 
-    static compaction_type_options make_reshard() {
-        return compaction_type_options(reshard{});
+    static compaction_type_options make_reshard(bool vnodes_resharding = false) {
+        return compaction_type_options(reshard{.vnodes_resharding = vnodes_resharding});
     }
 
     static compaction_type_options make_regular() {
         return compaction_type_options(regular{});
     }
 
-    static compaction_type_options make_cleanup(dht::token_range_vector&& owned_ranges) {
-        return compaction_type_options(cleanup{std::move(owned_ranges)});
+    static compaction_type_options make_major() {
+        return compaction_type_options(major{});
     }
 
-    static compaction_type_options make_upgrade(dht::token_range_vector&& owned_ranges) {
-        return compaction_type_options(upgrade{std::move(owned_ranges)});
+    static compaction_type_options make_cleanup() {
+        return compaction_type_options(cleanup{});
     }
 
-    static compaction_type_options make_scrub(scrub::mode mode) {
-        return compaction_type_options(scrub{mode});
+    static compaction_type_options make_upgrade() {
+        return compaction_type_options(upgrade{});
+    }
+
+    static compaction_type_options make_scrub(scrub::mode mode, scrub::quarantine_invalid_sstables quarantine_sstables = scrub::quarantine_invalid_sstables::yes, scrub::drop_unfixable_sstables drop_unfixable_sstables = scrub::drop_unfixable_sstables::no, scrub::update_scrub_time update_timestamp = scrub::update_scrub_time::no, scrub::is_automatic_scrub is_automatic = scrub::is_automatic_scrub::no) {
+        return compaction_type_options(scrub{.operation_mode = mode, .quarantine_sstables = quarantine_sstables, .drop_unfixable = drop_unfixable_sstables, .update_timestamp = update_timestamp, .is_automatic = is_automatic});
+    }
+
+    static compaction_type_options make_component_rewrite(component_type component, std::function<void(sstables::sstable&)> modifier, sstables::update_sstable_id update_id = sstables::update_sstable_id::yes) {
+        return compaction_type_options(component_rewrite{.component_to_rewrite = component, .modifier = std::move(modifier), .update_id = update_id});
+    }
+
+    static compaction_type_options make_split(mutation_writer::classify_by_token_group classifier) {
+        return compaction_type_options(split{std::move(classifier)});
     }
 
     template <typename... Visitor>
     auto visit(Visitor&&... visitor) const {
         return std::visit(std::forward<Visitor>(visitor)..., _options);
+    }
+
+    template <typename OptionType>
+    const auto& as() const {
+        return std::get<OptionType>(_options);
     }
 
     const options_variant& options() const { return _options; }
@@ -125,10 +214,72 @@ public:
 };
 
 std::string_view to_string(compaction_type_options::scrub::mode);
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::mode scrub_mode);
 
 std::string_view to_string(compaction_type_options::scrub::quarantine_mode);
-std::ostream& operator<<(std::ostream& os, compaction_type_options::scrub::quarantine_mode quarantine_mode);
+
+// A tombstone can only be collected once nothing is left that it might still shadow.
+// Besides the sstables being compacted, the data that could shadow it lives in the
+// memtables, in the uncompacting sstables and in the commitlog, and compaction
+// consults all three by default.
+//
+// Note that these checks are not perfect. W.r.to memtables and uncompacting sstables,
+// if their minimum timestamp is less than that of the tombstone and they contain the
+// key, the tombstone will not be collected. No row-level, cell-level check takes place.
+// W.r.to the commitlog, there is currently no way to check if the key exists; only the
+// minimum timestamp comparison, similar to memtables, is performed.
+//
+// Some compactions can prove that consulting a given source is unnecessary and narrow
+// the scope. The values are ordered from most to least conservative, so two independent
+// requirements combine with std::max().
+//
+// A compaction with a narrowed scope is given a snapshot of the gc state, taken before its
+// snapshot of the sstable set, see compaction_descriptor::gc_state. Narrowing is only safe for
+// tombstones that were already GC-eligible when the snapshot was taken. With a live gc state, a
+// repair completing mid-compaction could make more tombstones GC-eligible, including ones that
+// shadow data the compaction ignores.
+enum class tombstone_gc_scope : uint8_t {
+    // Consult the memtables, the uncompacting sstables and the commitlog.
+    all = 0,
+
+    // Skip the memtables; still consult the uncompacting sstables and the commitlog.
+    //
+    // Used when the tombstone's GC eligibility is already ordered after the delivery of
+    // anything it could shadow, which holds in two cases, both requiring
+    // tombstone_gc = {'mode': 'repair'} so that gc_before is derived from a repair time:
+    //
+    //  - a major compaction *that flushed the memtables first*, and so takes every
+    //    sstable of the compaction group as input. Everything resident at flush time is
+    //    merged with the tombstones covering it rather than decided by a purge check, so
+    //    the memtables can only hold writes that arrived after the flush. The repair time
+    //    is the time at which repair flushed hints -- including view hints, see
+    //    repair_service::flush_hints() and storage_proxy::create_hint_sync_point() -- so
+    //    anything a GC-eligible tombstone covers was delivered and reconciled before
+    //    gc_before could advance past it. The flush is a precondition, not a detail: a
+    //    major run with flush_memtables=false can leave data delivered *before*
+    //    repair_time sitting in a memtable, never merged with the tombstone that shadows
+    //    it, and purging that tombstone would resurrect the row. For the same reason the
+    //    gc state is snapshotted before the flush, not when the compaction starts. RF=1
+    //    tables are excluded: they are never repaired, and repair mode collects their
+    //    tombstones immediately;
+    //
+    //  - a repaired sstable view, i.e. incremental repair on tablets, where unrepaired
+    //    data is always newer than any GC-eligible tombstone. That one is a property of
+    //    the table rather than of the compaction, see
+    //    compaction_group_view::skip_memtable_for_tombstone_gc().
+    //
+    // Both arguments assume that every write, or the base write a view update derives from,
+    // reaches every replica within tombstone_gc's propagation_delay_in_seconds of being
+    // issued: a bound on wall-clock delivery latency, not on timestamps, which view updates do
+    // carry out of order. This assumption is a core part of the repair-mode tombstone-gc
+    // contract.
+    skip_memtable = 1,
+
+    // Consult only the sstables being compacted, skipping the memtables, the uncompacting
+    // sstables and the commitlog alike. Requested explicitly by the operator via
+    // major compaction's consider_only_existing_data, which trades the guarantee for
+    // reclaiming space now.
+    compacting_sstables_only = 2,
+};
 
 class dummy_tag {};
 using has_only_fully_expired = seastar::bool_class<dummy_tag>;
@@ -143,21 +294,47 @@ struct compaction_descriptor {
     int level;
     // Threshold size for sstable(s) to be created.
     uint64_t max_sstable_bytes;
+    // Can split large partitions at clustering boundary.
+    bool can_split_large_partition = false;
     // Run identifier of output sstables.
-    utils::UUID run_identifier;
-    // Calls compaction manager's task for this compaction to release reference to exhausted sstables.
-    std::function<void(const std::vector<shared_sstable>& exhausted_sstables)> release_exhausted;
+    sstables::run_id run_identifier;
     // The options passed down to the compaction code.
     // This also selects the kind of compaction to do.
     compaction_type_options options = compaction_type_options::make_regular();
+    // If engaged, compaction will cleanup the input sstables by skipping non-owned ranges.
+    compaction::owned_ranges_ptr owned_ranges;
+    // Required for reshard compaction.
+    const dht::sharder* sharder;
 
     compaction_sstable_creator_fn creator;
     compaction_sstable_replacer_fn replacer;
 
-    ::io_priority_class io_priority = default_priority_class();
-
     // Denotes if this compaction task is comprised solely of completely expired SSTables
-    sstables::has_only_fully_expired has_only_fully_expired = has_only_fully_expired::no;
+    has_only_fully_expired has_only_fully_expired = has_only_fully_expired::no;
+
+    // How much data outside the sstables being compacted is consulted when deciding
+    // whether a tombstone can be collected. See tombstone_gc_scope.
+    //
+    // The compaction takes it as is. It is up to the caller to narrow it by the table's own
+    // property too, see effective_gc_scope(), decided from the schema the compaction runs
+    // with, like its sstable set for tombstone gc, so the two cannot disagree if the table's
+    // tombstone_gc mode changes in the meantime.
+    tombstone_gc_scope gc_scope = tombstone_gc_scope::all;
+
+    // The schema the compaction runs with, the table's current one if null. Everything the
+    // compaction decides by the tombstone_gc mode (gc_before, the sstable set for tombstone gc,
+    // whether the memtables are consulted) is decided from this one schema, so that a mode
+    // change while the compaction runs cannot make it purge tombstones without consulting the
+    // data the mode it started with requires it to.
+    schema_ptr schema;
+
+    // The gc state the compaction decides tombstone collection with. It is up to the caller to
+    // provide it, usually the table's (compaction_group_view::get_tombstone_gc_state()); the
+    // default collects no tombstones.
+    //
+    // A compaction whose scope is narrower than tombstone_gc_scope::all is given a snapshot,
+    // taken before all_sstables_snapshot, see tombstone_gc_scope.
+    tombstone_gc_state gc_state = tombstone_gc_state::no_gc();
 
     compaction_descriptor() = default;
 
@@ -165,37 +342,48 @@ struct compaction_descriptor {
     static constexpr uint64_t default_max_sstable_bytes = std::numeric_limits<uint64_t>::max();
 
     explicit compaction_descriptor(std::vector<sstables::shared_sstable> sstables,
-                                   std::optional<sstables::sstable_set> all_sstables_snapshot,
-                                   ::io_priority_class io_priority,
                                    int level = default_level,
                                    uint64_t max_sstable_bytes = default_max_sstable_bytes,
-                                   utils::UUID run_identifier = utils::make_random_uuid(),
-                                   compaction_type_options options = compaction_type_options::make_regular())
+                                   sstables::run_id run_identifier = sstables::run_id::create_random_id(),
+                                   compaction_type_options options = compaction_type_options::make_regular(),
+                                   compaction::owned_ranges_ptr owned_ranges_ = {})
         : sstables(std::move(sstables))
-        , all_sstables_snapshot(std::move(all_sstables_snapshot))
         , level(level)
         , max_sstable_bytes(max_sstable_bytes)
         , run_identifier(run_identifier)
         , options(options)
-        , io_priority(io_priority)
+        , owned_ranges(std::move(owned_ranges_))
     {}
 
-    explicit compaction_descriptor(sstables::has_only_fully_expired has_only_fully_expired,
-                                   std::vector<sstables::shared_sstable> sstables,
-                                   std::optional<sstables::sstable_set> all_sstables_snapshot,
-                                   ::io_priority_class io_priority)
+    explicit compaction_descriptor(::compaction::has_only_fully_expired has_only_fully_expired,
+                                   std::vector<sstables::shared_sstable> sstables)
         : sstables(std::move(sstables))
-        , all_sstables_snapshot(std::move(all_sstables_snapshot))
         , level(default_level)
         , max_sstable_bytes(default_max_sstable_bytes)
-        , run_identifier(utils::make_random_uuid())
+        , run_identifier(sstables::run_id::create_random_id())
         , options(compaction_type_options::make_regular())
-        , io_priority(io_priority)
         , has_only_fully_expired(has_only_fully_expired)
     {}
 
     // Return fan-in of this job, which is equal to its number of runs.
     unsigned fan_in() const;
+    // Enables garbage collection for this descriptor, meaning that compaction will be able to purge expired data
+    void enable_garbage_collection(sstables::sstable_set snapshot) { all_sstables_snapshot = std::move(snapshot); }
+    // Returns total size of all sstables contained in this descriptor
+    uint64_t sstables_size() const;
 };
 
 }
+
+template <>
+struct fmt::formatter<compaction::compaction_type> : fmt::formatter<string_view> {
+    auto format(compaction::compaction_type, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <>
+struct fmt::formatter<compaction::compaction_type_options::scrub::mode> : fmt::formatter<string_view> {
+    auto format(compaction::compaction_type_options::scrub::mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <>
+struct fmt::formatter<compaction::compaction_type_options::scrub::quarantine_mode> : fmt::formatter<string_view> {
+    auto format(compaction::compaction_type_options::scrub::quarantine_mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

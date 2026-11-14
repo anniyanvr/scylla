@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -19,13 +16,14 @@
 
 #include <seastar/core/shared_ptr.hh>
 
-#include <optional>
 #include <vector>
+#include "audit/audit.hh"
 
 namespace cql3 {
 
 class column_identifier;
 class cql_stats;
+class cql_config;
 
 namespace statements {
 
@@ -43,9 +41,13 @@ public:
     prepare_context& get_prepare_context();
     const prepare_context& get_prepare_context() const;
 
-    void set_bound_variables(const std::vector<::shared_ptr<column_identifier>>& bound_names);
+    void set_bound_variables(const std::vector<::shared_ptr<column_identifier>>& bound_names, dialect d);
 
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) = 0;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) = 0;
+
+protected:
+    virtual audit::statement_category category() const = 0;
+    virtual audit::audit_info_ptr audit_info() const = 0;
 };
 
 }

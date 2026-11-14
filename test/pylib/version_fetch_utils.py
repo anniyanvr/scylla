@@ -1,0 +1,377 @@
+#
+# Copyright (C) 2026-present ScyllaDB
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+#
+
+import boto3
+import urllib.error
+import urllib.request
+from botocore import UNSIGNED
+from botocore.config import Config
+from packaging.version import Version
+from pathlib import Path
+import time
+import re
+import subprocess
+import fcntl
+import shutil
+import tarfile
+import os
+from contextlib import contextmanager
+
+from typing import Optional, List, Iterator
+
+DOWNLOADS_BUCKET = "downloads.scylladb.com"
+
+def _list_scylla_release_entries(bucket: str, prefix: str, pack: str = "") -> list[str]:
+    """
+    List Scylla release entries directly under an S3 prefix.
+    The S3 listing is paginated and limited to one prefix level. Returned entries
+    have the requested prefix and trailing slash removed, and are filtered to
+    Scylla/ScyllaDB release names matching the requested package type (`pack`).
+    """
+    if not prefix.endswith("/"):
+        prefix = f"{prefix}/"
+
+    pack_part = rf"{re.escape(pack)}-" if pack else ""    
+    pattern = re.compile(rf"^scylla(?:db)?-{pack_part}\d{{4}}\.\d+(?:\.\d+)?(?:/|$|[~.-])")
+
+    s3 = boto3.client("s3", region_name="us-east-1", config=Config(
+        signature_version=UNSIGNED,
+        connect_timeout=60,
+        read_timeout=60,
+        retries={"max_attempts": 10, "mode": "adaptive"},
+    ))
+
+    files = []
+    folders = []
+    continuation_token = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix, "Delimiter": "/"}
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+        resp = s3.list_objects_v2(**kwargs)
+        files += resp.get("Contents", [])
+        folders += resp.get("CommonPrefixes", [])
+        if not resp.get("IsTruncated"):
+            break
+        continuation_token = resp.get("NextContinuationToken")
+        if not continuation_token:
+            break
+
+    objs = [f["Key"].removeprefix(prefix) for f in files] if files else [f["Prefix"].removeprefix(prefix) for f in folders]
+    return [o.rstrip("/") for o in objs if pattern.match(o)]
+
+
+def _version_key(v: str, pack: str = "") -> str:
+    """
+    Extract the sortable version component from a Scylla release entry or archive name.
+    The `pack` argument identifies the archive-name structure, so the function knows
+    where to find the version component: after `scylla-` for default archives, or
+    after `scylla-<pack>-` for package variants such as `dev` and `debug`.
+    For example:
+    `scylla-2026.1.0-...` with `pack=""` returns `2026.1.0-...`.
+    `scylla-dev-2026.1.0-...` with `pack="dev"` returns `2026.1.0-...`.
+    `scylla-debug-2026.1.0-...` with `pack="debug"` returns `2026.1.0-...`.
+    The returned version is normalized for `packaging.version.Version` sorting by
+    converting release-candidate versions from `~rc` to `rc`.
+    """
+    if not pack:
+        v = v.rstrip("/").split("-", 2)[1]  # name-version-postfix or name-version
+    else:
+        v = v.rstrip("/").split("-", 3)[2]  # name-pack-postfix    
+    v = v.replace("~rc", "rc")
+    return v
+
+
+def _version_matches(v: str, match_pattern: str) -> bool:
+    return v == match_pattern or v.startswith(f"{match_pattern}.") or v.startswith(f"{match_pattern}rc")
+
+
+def _get_latest_ver(objs: List[str], match_pattern: Optional[str] = None, pack: str = None) -> Optional[str]:
+    sorted_vers = [_version_key(o, pack) for o in objs]
+    if match_pattern:
+        sorted_vers = [v for v in sorted_vers if _version_matches(v, match_pattern)]
+    sorted_vers.sort(key=Version)
+    return sorted_vers[-1] if sorted_vers else None
+
+
+def _get_version_url(major: Optional[int] = None, minor: Optional[int] = None,
+                     patch: Optional[int] = None, rc: Optional[int] = None, 
+                     arch: str = "x86_64", pack: str = "") -> Optional[str]:
+    """
+    Resolve the download URL for a Scylla relocatable package.
+    The lookup walks the Scylla downloads S3 bucket in two stages: first selecting
+    the matching release directory from `major` and `minor`, then selecting the
+    matching package artifact from `patch`, `rc`, `arch`, and `pack`. Missing version
+    components are resolved to the latest available match. Returns the full HTTPS URL
+    for the selected artifact, or `None` if no matching package is found.
+    """
+
+    bucket_url = DOWNLOADS_BUCKET
+    prefix_url = "downloads/scylla/relocatable"
+
+    if major is None:
+        ver = _get_latest_ver(_list_scylla_release_entries(bucket_url, prefix_url))
+    elif minor is None:
+        ver = _get_latest_ver(_list_scylla_release_entries(bucket_url, prefix_url), f"{major}")
+    else:
+        ver = f"{major}.{minor}"
+
+    if ver is None:
+        return None
+
+    prefix_url = f"{prefix_url}/scylladb-{ver}/"
+    objs = _list_scylla_release_entries(bucket_url, prefix_url, pack)
+    if patch is None:
+        ver = _get_latest_ver(objs, ver, pack)
+    elif rc is None:
+        ver = _get_latest_ver(objs, f"{ver}.{patch}", pack)
+    else:
+        ver = f"{ver}.{patch}rc{rc}"
+
+    if ver is None:
+        return None
+
+    filtered = [o for o in objs if _version_key(o, pack) == ver and f".{arch}." in o]
+
+    return f"https://{bucket_url}/{prefix_url}{filtered[0]}" if filtered else None
+
+
+def _find_package_url(url: str, arch: str = "x86_64") -> Optional[str]:
+    """
+    Return `url` unchanged, unless it is a shortcut (SCT/ccm naming) for a unified
+    package for `arch`. Returns `None` if there is no such package.
+    - `latest` (same as `master:latest`), `branch-2026.3:latest`: the latest build of that branch.
+    - `release:2026.1`, `release:2026.1.9`: the newest matching release.
+    """
+    if url == "latest":
+        url = "master:latest"
+    if m := re.fullmatch(r"(master|branch-\d{4}\.\d+):latest", url):
+        prefix = f"unstable/scylla/{m[1]}/relocatable/latest"
+        entries = [e for e in _list_scylla_release_entries(DOWNLOADS_BUCKET, prefix, pack="unified") if f".{arch}." in e]
+        return f"https://{DOWNLOADS_BUCKET}/{prefix}/{entries[0]}" if entries else None
+    if m := re.fullmatch(r"release:(\d{4})(?:\.(\d+)(?:\.(\d+)(?:~?rc(\d+))?)?)?", url):
+        major, minor, patch, rc = (int(g) if g else None for g in m.groups())
+        return _get_version_url(major, minor, patch, rc, arch, pack="unified")
+    return url
+
+
+def get_file_name_and_url_from_url(major: Optional[int] = None, minor: Optional[int] = None,
+                                   patch: Optional[int] = None, rc: Optional[int] = None, 
+                                   arch: str = "x86_64", pack: str = "", url: str = None):
+    """
+    Resolve the download URL and file name for a Scylla package.
+    If `url` is provided, it is used directly. Otherwise, the URL is resolved from
+    the requested `major`, `minor`, `patch`, `rc`, `arch`, and `pack` values, using
+    the latest available value for any missing version component. If `rc` is
+    provided, `patch` is treated as 0. Returns `(url, file_name)` on success, or
+    `(None, None)` if no matching URL can be resolved.
+    Args:
+        major: ScyllaDB major version to fetch.
+        minor: ScyllaDB minor version to fetch.
+        patch: ScyllaDB patch version to fetch.
+        rc: Release-candidate number, if fetching an RC build.
+        arch: Target architecture of the archive.
+        pack: Package/build variant to resolve. Use an empty string for the default
+              archive name (`scylla-<version>-...`), or a variant such as `"dev"` or
+              `"debug"` for archive names like `scylla-dev-<version>-...` and
+              `scylla-debug-<version>-...`.
+        url: Direct archive URL to fetch instead of resolving one from version parts.
+             If `url` is provided, it is downloaded directly. Otherwise, the version URL is
+             resolved from the requested `major`, `minor`, `patch`, `rc`, `arch`, and `pack`
+             components, using the latest available value for any missing component.
+             `url` may also be a shortcut such as `latest`, see `_find_package_url()`.
+    """
+
+    if rc is not None:
+        patch = 0
+
+    if url:
+        url = _find_package_url(url, arch)
+    else:
+        url = _get_version_url(major, minor, patch, rc, arch, pack)
+    
+    return (url, url.rsplit("/", 1)[-1]) if url else (None, None)
+
+
+def download_scylla_version(major: Optional[int] = None, minor: Optional[int] = None,
+                            patch: Optional[int] = None, rc: Optional[int] = None,
+                            arch: str = "x86_64", pack: str = "", 
+                            output_dir: str | Path = ".", url: str = None, 
+                            retry: int = 1) -> Optional[Path]:
+    """
+    Download a Scylla package matching the requested version components.
+    If `url` is provided, it is downloaded directly. Otherwise, the version URL is
+    resolved from the requested `major`, `minor`, `patch`, and `rc` components,
+    using the latest available value for any missing component. If `rc` is provided,
+    `patch` is treated as 0. Returns the path to the downloaded file on success, or
+    `None` if no matching version is found or the download fails after all retries.
+    Args:
+        major: ScyllaDB major version to fetch.
+        minor: ScyllaDB minor version to fetch.
+        patch: ScyllaDB patch version to fetch.
+        rc: Release-candidate number, if fetching an RC build.
+        arch: Target architecture of the archive.
+        pack: Package/build variant to resolve. Use an empty string for the default
+              archive name (`scylla-<version>-...`), or a variant such as `"dev"` or
+              `"debug"` for archive names like `scylla-dev-<version>-...` and
+              `scylla-debug-<version>-...`.
+        url: Direct archive URL to fetch instead of resolving one from version parts.
+             If `url` is provided, it is downloaded directly. Otherwise, the version URL is
+             resolved from the requested `major`, `minor`, `patch`, `rc`, `arch`, and `pack`
+             components, using the latest available value for any missing component.
+    """
+
+    KB = 1024 * 1024
+
+    if rc is not None:
+        patch = 0
+
+    if not url:
+        url = _get_version_url(major, minor, patch, rc, arch, pack)
+        if url is None:
+            return None
+
+    output_path = Path(output_dir) / url.rsplit("/", 1)[-1]
+
+    for i in range(retry):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                if response.status == 200:
+                    with output_path.open("wb") as f:
+                        while chunk := response.read(KB):
+                            f.write(chunk)
+                    return output_path
+                if i == retry - 1:
+                    return None
+                time.sleep(1)
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+            if i == retry - 1:
+                return None
+            time.sleep(1)
+    return None
+
+
+@contextmanager
+def with_file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def extract_tar_no_same_owner(archive_path: Path, unpack_dir: Path) -> None:
+    with tarfile.open(archive_path, "r:*") as archive:
+        archive.extractall(path=unpack_dir, filter="data")            
+
+
+CACHE_MAX_UNUSED_DAYS = 7
+
+
+def prune_unused_cache(cache_root: Path, max_unused_days: int = CACHE_MAX_UNUSED_DAYS) -> None:
+    """Delete cached archives that no caller used in the last `max_unused_days`.
+    Each use touches `installed.success`. An entry with no such marker (a partial
+    download) is aged by its directory mtime. Entries whose lock is held, i.e.
+    being downloaded or installed right now, are skipped. The lock is
+    `<entry>.lock` next to the entry, so it survives the entry's deletion and a
+    caller waiting on it recreates the entry under the lock.
+    """
+    cutoff = time.time() - max_unused_days * 24 * 3600
+
+    def stale(entry: Path) -> bool:
+        marker = entry / "installed.success"
+        return (marker if marker.exists() else entry).stat().st_mtime <= cutoff
+
+    for entry in cache_root.iterdir():
+        # Another caller may be pruning the same entry, so it can vanish under us.
+        try:
+            if not entry.is_dir() or not stale(entry):
+                continue
+            with (cache_root / f"{entry.name}.lock").open("a") as f:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # A caller may have used it between the check above and the lock.
+                if stale(entry):
+                    shutil.rmtree(entry, ignore_errors=True)
+        except OSError:  # gone already, or locked (BlockingIOError)
+            continue
+
+
+def fetch_and_install_scylla_version(major: Optional[int] = None, minor: Optional[int] = None,
+                                     patch: Optional[int] = None, rc: Optional[int] = None,
+                                     arch: str = "x86_64", pack: str = "", 
+                                     url: str = None) -> Path:
+    """Fetch, cache, unpack, and install a ScyllaDB release archive.
+    The archive is resolved from either the supplied version components or a direct
+    URL, then cached under XDG_CACHE_HOME, or ~/.cache if XDG_CACHE_HOME is unset.
+    Download, unpack, and install steps are guarded by marker files so repeated
+    calls reuse the existing installation. A file lock prevents concurrent callers
+    from modifying the same cached archive directory at the same time. Cached
+    archives unused for CACHE_MAX_UNUSED_DAYS are deleted, see `prune_unused_cache()`.
+    Args:
+        major: ScyllaDB major version to fetch.
+        minor: ScyllaDB minor version to fetch.
+        patch: ScyllaDB patch version to fetch.
+        rc: Release-candidate number, if fetching an RC build.
+        arch: Target architecture of the archive.
+        pack: Package/build variant to resolve. Use an empty string for the default
+              archive name (`scylla-<version>-...`), or a variant such as `"dev"` or
+              `"debug"` for archive names like `scylla-dev-<version>-...` and
+              `scylla-debug-<version>-...`.
+        url: Direct archive URL to fetch instead of resolving one from version parts.
+             If `url` is provided, it is downloaded directly. Otherwise, the version URL is
+             resolved from the requested `major`, `minor`, `patch`, `rc`, `arch`, and `pack`
+             components, using the latest available value for any missing component.
+    Returns:
+        Path to the installed ScyllaDB binary.
+    Raises:
+        RuntimeError: If the archive name cannot be resolved or the archive cannot be downloaded.
+        subprocess.CalledProcessError: If the ScyllaDB install script fails.
+    """
+    xdg_cache_dir = Path(os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    archive_url, archive_name = get_file_name_and_url_from_url(major, minor, patch, rc, arch, pack, url)
+    if not archive_name: 
+        raise RuntimeError(f"couldnt get archive name for major: {major}, minor: {minor}," 
+                           f" patch: {patch}, rc: {rc}, arch: {arch}, pack: {pack}, url: {url}")
+    cache_dir = (xdg_cache_dir / "scylladb" / "test.py" / archive_name)
+
+    archive_path = cache_dir/archive_name
+    unpack_dir = cache_dir/"unpacked"
+    install_dir = cache_dir/"installed"
+
+    # Outside cache_dir, so prune_unused_cache() can delete cache_dir under it.
+    lock_file = cache_dir.parent / f"{archive_name}.lock"
+    downloaded_marker = cache_dir / "downloaded.success"
+    unpacked_marker = cache_dir / "unpacked.success"
+    installed_marker = cache_dir / "installed.success"
+
+    with with_file_lock(lock_file):
+        cache_dir.mkdir(exist_ok=True)
+        if not installed_marker.exists():
+            if not unpacked_marker.exists():
+                if not downloaded_marker.exists():
+                    archive_path.unlink(missing_ok=True)
+                    archive_path = download_scylla_version(url=archive_url, output_dir=cache_dir, retry=40)
+                    if archive_path is None:
+                        raise RuntimeError(f"Couldnt download Scylla archive: {archive_url}")
+                    downloaded_marker.touch()
+                shutil.rmtree(unpack_dir, ignore_errors=True)
+                unpack_dir.mkdir(exist_ok=True, parents=True)
+                extract_tar_no_same_owner(archive_path, unpack_dir)
+                unpacked_marker.touch()
+            shutil.rmtree(install_dir, ignore_errors=True)
+            install_dir.mkdir(exist_ok=True, parents=True)
+            # The server archive unpacks to scylla/, the unified one to scylla-<version>/.
+            install_script = next(unpack_dir.glob("*/install.sh"), None)
+            if install_script is None:
+                raise RuntimeError(f"No install.sh found in {archive_name}")
+            install_src = install_script.parent
+            subprocess.run(["bash", "./install.sh", "--without-systemd", "--nonroot", "--prefix", str(install_dir)], cwd=install_src, check=True)
+        installed_marker.touch()
+
+    prune_unused_cache(cache_dir.parent)
+    return install_dir/"bin"/"scylla"

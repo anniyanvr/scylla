@@ -3,18 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <boost/date_time/gregorian/greg_date.hpp>
+#include <boost/date_time/posix_time/posix_time.hpp>
+#include <random>
+#include <ranges>
 #include "lua.hh"
+#include "lang/lua_scylla_types.hh"
 #include "exceptions/exceptions.hh"
-#include "concrete_types.hh"
+#include "types/concrete_types.hh"
+#include "utils/assert.hh"
 #include "utils/utf8.hh"
 #include "utils/ascii.hh"
 #include "utils/date.h"
 #include <seastar/core/align.hh>
 #include <lua.hpp>
-#include "db/config.hh"
+#include "seastarx.hh"
 
 // Lua 5.4 added an extra parameter to lua_resume
 
@@ -24,7 +30,16 @@
 #    define LUA_504_PLUS(x...)
 #endif
 
+// Lua 5.5 added a seed parameter to lua_newstate
+
+#if LUA_VERSION_NUM >= 505
+#    define LUA_505_PLUS(x...) x
+#else
+#    define LUA_505_PLUS(x...)
+#endif
+
 using namespace seastar;
+using namespace lua;
 
 static logging::logger lua_logger("lua");
 
@@ -37,7 +52,7 @@ struct alloc_state {
         : max(max)
         , max_contiguous(max_contiguous) {
         // The max and max_contiguous limits are responsible for avoiding overflows.
-        assert(max + max_contiguous >= max);
+        SCYLLA_ASSERT(max + max_contiguous >= max);
     }
 };
 
@@ -75,14 +90,14 @@ static void* lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
     size_t next = s->allocated + nsize;
 
     // The max and max_contiguous limits should be small enough to avoid overflows.
-    assert(next >= s->allocated);
+    SCYLLA_ASSERT(next >= s->allocated);
 
     if (ptr) {
         next -= osize;
     }
 
     if (next > s->max) {
-        lua_logger.info("allocation failed. alread allocated = {}, next total = {}, max = {}", s->allocated, next, s->max);
+        lua_logger.info("allocation failed. already allocated = {}, next total = {}, max = {}", s->allocated, next, s->max);
         return nullptr;
     }
 
@@ -98,7 +113,7 @@ static void* lua_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
 
 static const luaL_Reg loadedlibs[] = {
     {"_G", luaopen_base},
-    {LUA_COLIBNAME, luaopen_string},
+    {LUA_STRLIBNAME, luaopen_string},
     {LUA_COLIBNAME, luaopen_coroutine},
     {LUA_TABLIBNAME, luaopen_table},
     {NULL, NULL},
@@ -115,13 +130,17 @@ static void debug_hook(lua_State* l, lua_Debug* ar) {
         return;
     }
     if (lua_yield(l, 0)) {
-        assert(0 && "lua_yield failed");
+        SCYLLA_ASSERT(0 && "lua_yield failed");
     }
 }
 
 static lua_slice_state new_lua(const lua::runtime_config& cfg) {
     auto a_state = std::make_unique<alloc_state>(cfg.max_bytes, cfg.max_contiguous);
-    std::unique_ptr<lua_State, lua_closer> l{lua_newstate(lua_alloc, a_state.get())};
+#if LUA_VERSION_NUM >= 505
+    static thread_local std::default_random_engine rng{std::random_device{}()};
+    auto seed = rng();
+#endif
+    std::unique_ptr<lua_State, lua_closer> l{lua_newstate(lua_alloc, a_state.get() LUA_505_PLUS(, seed))};
     if (!l) {
         throw std::runtime_error("could not create lua state");
     }
@@ -189,20 +208,8 @@ static big_decimal* get_decimal(lua_State* l, int arg) {
     return nullptr;
 }
 
-template <typename T>
-static T* aligned_used_data(lua_State* l) {
-    constexpr size_t alignment = alignof(T);
-    // We know lua_newuserdata aligns allocations to 8, so we need a
-    // padding of at most alignment - 8 to find a sufficiently aligned
-    // address.
-    static_assert(alignment>= 8);
-    constexpr size_t pad = alignment - 8;
-    char* p = reinterpret_cast<char*>(lua_newuserdata(l, sizeof(T) + pad));
-    return reinterpret_cast<T*>(align_up(p, alignment));
-}
-
 static void push_big_decimal(lua_State* l, const big_decimal& v) {
-    auto* p = aligned_used_data<big_decimal>(l);
+    auto* p = aligned_user_data<big_decimal>(l);
     new (p) big_decimal(v);
     luaL_setmetatable(l, scylla_decimal_metatable_name);
 }
@@ -231,7 +238,7 @@ requires CanHandleRawLuaTypes<Func>
 static auto visit_lua_raw_value(lua_State* l, int index, Func&& f) {
     switch (lua_type(l, index)) {
     case LUA_TNONE:
-        assert(0 && "Invalid index");
+        SCYLLA_ASSERT(0 && "Invalid index");
     case LUA_TNUMBER:
         if (lua_isinteger(l, index)) {
             return f(lua_tointeger(l, index));
@@ -252,9 +259,9 @@ static auto visit_lua_raw_value(lua_State* l, int index, Func&& f) {
         return f(*get_decimal(l, index));
     case LUA_TTHREAD:
     case LUA_TLIGHTUSERDATA:
-        assert(0 && "We never make thread or light user data visible to scripts");
+        SCYLLA_ASSERT(0 && "We never make thread or light user data visible to scripts");
     }
-    assert(0 && "invalid lua type");
+    SCYLLA_ASSERT(0 && "invalid lua type");
 }
 
 template <typename Func>
@@ -277,17 +284,6 @@ concept CanHandleLuaTypes = requires(Func f) {
     { f(*static_cast<const lua_table*>(nullptr)) }                      -> std::same_as<lua_visit_ret_type<Func>>;
 };
 
-// This is used to test if a double fits in a long long, so
-// we expect overflows. Prevent the sanitizer from complaining.
-#ifdef __clang__
-[[clang::no_sanitize("undefined")]]
-#endif
-static
-long long
-cast_to_long_long_allow_overflow(double v) {
-    return (long long)v;
-}
-
 template <typename Func>
 requires CanHandleLuaTypes<Func>
 static auto visit_lua_value(lua_State* l, int index, Func&& f) {
@@ -298,9 +294,10 @@ static auto visit_lua_value(lua_State* l, int index, Func&& f) {
         auto operator()(const long long& v) { return f(utils::multiprecision_int(v)); }
         auto operator()(const utils::multiprecision_int& v) { return f(v); }
         auto operator()(const double& v) {
-            long long v2 = cast_to_long_long_allow_overflow(v);
-            if (v2 == v) {
-                return (*this)(v2);
+            auto min = double(std::numeric_limits<long long>::min());
+            auto max = double(std::numeric_limits<long long>::max());
+            if (min <= v && v <= max && std::trunc(v) == v) {
+                return (*this)((long long)v);
             }
             // FIXME: We could use frexp to produce a decimal instead of a double
             return f(v);
@@ -370,7 +367,7 @@ static const big_decimal& get_decimal_in_binary_op(lua_State* l) {
     if (a == nullptr) {
         lua_insert(l, 1);
         a = get_decimal(l, 1);
-        assert(a);
+        SCYLLA_ASSERT(a);
     }
     return *a;
 }
@@ -419,16 +416,29 @@ static int load_script_l(lua_State* l) {
         lua_pop(l, 1);
     }
 
-    luaL_newmetatable(l, scylla_decimal_metatable_name);
-    lua_pushvalue(l, -1);
-    lua_setfield(l, -2, "__index");
-    luaL_setfuncs(l, decimal_methods, 0);
+    lua::register_metatables(l);
 
     if (luaL_loadbufferx(l, binary.data(), binary.size(), "<internal>", "b")) {
         lua_error(l);
     }
 
     return 1;
+}
+
+// Returns the error value at the top of the stack, raised by a script (e.g.,
+// by error()), as a string. The error value may be any Lua value, and
+// lua_tostring() returns NULL for a value which isn't a string or a number,
+// so such a value is described by its type, as the standalone Lua
+// interpreter does. We don't use luaL_tolstring(), because it may call a
+// __tostring metamethod defined by the script, which may itself raise an
+// error - outside a protected call.
+static std::string error_message(lua_State* l) {
+    size_t len;
+    const char* s = lua_tolstring(l, -1, &len);
+    if (s) {
+        return std::string(s, len);
+    }
+    return fmt::format("(error object is a {} value)", luaL_typename(l, -1));
 }
 
 static lua_slice_state load_script(const lua::runtime_config& cfg, lua::bitcode_view binary) {
@@ -467,11 +477,11 @@ static sstring get_string(lua_State *l, int index) {
             return sstring(p.str());
         },
         [] (const auto& v) {
-            return format("{}", v);
+            return seastar::format("{}", v);
         }));
 }
 
-static data_value convert_from_lua(lua_slice_state &l, const data_type& type);
+static data_value convert_from_lua(lua_State* l, const data_type& type);
 
 namespace {
 struct lua_date_table {
@@ -507,17 +517,17 @@ static lua_date_table get_lua_date_table(lua_State* l, int index) {
         if (k == "month") {
             month = (unsigned char)v;
             if (*month != v) {
-                throw exceptions::invalid_request_exception(format("month is too large: '{}'", v.str()));
+                throw exceptions::invalid_request_exception(seastar::format("month is too large: '{}'", v.str()));
             }
         } else if (k == "day") {
             day = (unsigned char)v;
             if (*day != v) {
-                throw exceptions::invalid_request_exception(format("day is too large: '{}'", v.str()));
+                throw exceptions::invalid_request_exception(seastar::format("day is too large: '{}'", v.str()));
             }
         } else {
             int32_t vint(v);
             if (vint != v) {
-                throw exceptions::invalid_request_exception(format("{} is too large: '{}'", k, v.str()));
+                throw exceptions::invalid_request_exception(seastar::format("{} is too large: '{}'", k, v.str()));
             }
             if (k == "year") {
                 year = vint;
@@ -539,7 +549,7 @@ static lua_date_table get_lua_date_table(lua_State* l, int index) {
 }
 
 struct simple_date_return_visitor {
-    lua_slice_state& l;
+    lua_State* l;
     template <typename T>
     uint32_t operator()(const T&) {
         throw exceptions::invalid_request_exception("date must be a string, integer or date table");
@@ -551,13 +561,13 @@ struct simple_date_return_visitor {
         return uint32_t(v);
     }
     uint32_t operator()(const std::string_view& v) {
-        return simple_date_type_impl::from_sstring(v);
+        return simple_date_type_impl::from_string_view(v);
     }
     uint32_t operator()(const lua_table&);
 };
 
 struct timestamp_return_visitor {
-    lua_slice_state& l;
+    lua_State* l;
     template <typename T>
     db_clock::time_point operator()(const T&) {
         throw exceptions::invalid_request_exception("timestamp must be a string, integer or date table");
@@ -570,13 +580,13 @@ struct timestamp_return_visitor {
         throw exceptions::invalid_request_exception("timestamp value must fit in signed 64 bits");
     }
     db_clock::time_point operator()(const std::string_view& v) {
-        return timestamp_type_impl::from_sstring(v);
+        return timestamp_type_impl::from_string_view(v);
     }
     db_clock::time_point operator()(const lua_table&);
 };
 
 struct from_lua_visitor {
-    lua_slice_state& l;
+    lua_State* l;
 
     data_value operator()(const reversed_type_impl& t) {
         // This is unreachable since reversed_type_impl is used only
@@ -625,17 +635,17 @@ struct from_lua_visitor {
                     if (k == "months") {
                         months = int32_t(v);
                         if (v != months) {
-                            throw exceptions::invalid_request_exception(format("{} months doesn't fit in a 32 bit integer", v.str()));
+                            throw exceptions::invalid_request_exception(seastar::format("{} months doesn't fit in a 32 bit integer", v.str()));
                         }
                     } else if (k == "days") {
                         days = int32_t(v);
                         if (v != days) {
-                            throw exceptions::invalid_request_exception(format("{} days doesn't fit in a 32 bit integer", v.str()));
+                            throw exceptions::invalid_request_exception(seastar::format("{} days doesn't fit in a 32 bit integer", v.str()));
                         }
                     } else if (k == "nanoseconds") {
                         nanoseconds = int64_t(v);
                         if (v != nanoseconds) {
-                            throw exceptions::invalid_request_exception(format("{} nanoseconds doesn't fit in a 64 bit integer", v.str()));
+                            throw exceptions::invalid_request_exception(seastar::format("{} nanoseconds doesn't fit in a 64 bit integer", v.str()));
                         }
                     } else {
                         throw exceptions::invalid_request_exception(format("invalid duration field: '{}'", k));
@@ -718,30 +728,61 @@ struct from_lua_visitor {
         }
 
         size_t num_elements = t.size();
-        std::vector<std::optional<data_value>> opt_elements(num_elements);
+        // A Lua table can't hold a nil value, so a tuple component which is
+        // missing from the table is null.
+        auto elements = t.all_types()
+                | std::views::transform(data_value::make_null)
+                | std::ranges::to<std::vector>();
 
         lua_pushnil(l);
         while (lua_next(l, -2) != 0) {
             auto k_varint = get_varint(l, -2);
             if (k_varint > num_elements || k_varint < 1) {
                 throw exceptions::invalid_request_exception(
-                        format("key {} is not valid for a sequence of size {}", k_varint.str(), num_elements));
+                        seastar::format("key {} is not valid for a sequence of size {}", k_varint.str(), num_elements));
             }
             size_t k = size_t(k_varint);
-            opt_elements[k - 1] = convert_from_lua(l, t.type(k - 1));
+            elements[k - 1] = convert_from_lua(l, t.type(k - 1));
             lua_pop(l, 1);
         }
+        return make_tuple_value(t.shared_from_this(), std::move(elements));
+    }
+
+    data_value operator()(const vector_type_impl& t) {
+        if (!lua_istable(l, -1)) {
+            throw exceptions::invalid_request_exception("value is not a table");
+        }
+
+        const data_type& elements_type = t.get_elements_type();
+        vector_dimension_t num_elements = t.get_dimension();
+
+        using table_pair = std::pair<utils::multiprecision_int, data_value>;
+        std::vector<table_pair> pairs;
+        lua_pushnil(l);
+        while (lua_next(l, -2) != 0) {
+            auto v = convert_from_lua(l, elements_type);
+            lua_pop(l, 1);
+            auto k = get_varint(l, -1);
+            if (k > num_elements || k < 1) {
+                throw exceptions::invalid_request_exception(
+                        seastar::format("key {} is not valid for a sequence of size {}", k.str(), num_elements));
+            }
+            pairs.push_back({k, v});
+        }
+
+        std::sort(pairs.begin(), pairs.end(), [] (const table_pair& a, const table_pair& b) {
+            return a.first < b.first;
+        });
 
         std::vector<data_value> elements;
-        elements.reserve(num_elements);
         for (size_t i = 0; i < num_elements; ++i) {
-            if (!opt_elements[i]) {
+            if (utils::multiprecision_int(i + 1) != pairs[i].first) {
                 throw exceptions::invalid_request_exception(
                         format("key {} missing in sequence of size {}", i + 1, num_elements));
             }
-            elements.push_back(*opt_elements[i]);
+            elements.push_back(pairs[i].second);
         }
-        return make_tuple_value(t.shared_from_this(), std::move(elements));
+        return make_vector_value(t.shared_from_this(), std::move(elements));
     }
 
     data_value operator()(const user_type_impl& t) {
@@ -753,7 +794,11 @@ struct from_lua_visitor {
             field_types.insert({t.field_name_as_string(i), {i, t.field_type(i)}});
         }
 
-        std::vector<std::optional<data_value>> opt_elements(num_fields);
+        // A Lua table can't hold a nil value, so a field which is missing
+        // from the table is null.
+        auto elements = t.field_types()
+                | std::views::transform(data_value::make_null)
+                | std::ranges::to<std::vector>();
         lua_pushnil(l);
         while (lua_next(l, -2) != 0) {
             auto s = get_string(l, -2);
@@ -766,32 +811,22 @@ struct from_lua_visitor {
             auto v = convert_from_lua(l, p.second);
             lua_pop(l, 1);
 
-            opt_elements[p.first] = std::move(v);
-        }
-
-        std::vector<data_value> elements;
-        elements.reserve(num_fields);
-        for (size_t i = 0; i < num_fields; ++i) {
-            if (!opt_elements[i]) {
-                throw exceptions::invalid_request_exception(
-                        format("key {} missing in udt {}", t.field_name_as_string(i), t.get_name_as_string()));
-            }
-            elements.push_back(*opt_elements[i]);
+            elements[p.first] = std::move(v);
         }
 
         return make_user_value(t.shared_from_this(), std::move(elements));
     }
 
     data_value operator()(const inet_addr_type_impl& t) {
-        return t.from_sstring(get_string(l, -1));
+        return t.from_string_view(get_string(l, -1));
     }
 
     data_value operator()(const uuid_type_impl&) {
-        return uuid_type_impl::from_sstring(get_string(l, -1));
+        return uuid_type_impl::from_string_view(get_string(l, -1));
     }
 
     data_value operator()(const timeuuid_type_impl&) {
-        return timeuuid_native_type{timeuuid_type_impl::from_sstring(get_string(l, -1))};
+        return timeuuid_native_type{timeuuid_type_impl::from_string_view(get_string(l, -1))};
     }
 
     data_value operator()(const bytes_type_impl& t) {
@@ -805,7 +840,7 @@ struct from_lua_visitor {
         if (error_pos) {
             throw exceptions::invalid_request_exception(format("value is not valid utf8, invalid character at byte offset {}", *error_pos));
         }
-        return std::move(s);
+        return s;
     }
 
     data_value operator()(const ascii_type_impl& t) {
@@ -848,7 +883,7 @@ struct from_lua_visitor {
                        throw exceptions::invalid_request_exception("time value must fit in signed 64 bits");
                    },
                    [] (const std::string_view& v) {
-                       return time_type_impl::from_sstring(v);
+                       return time_type_impl::from_string_view(v);
                    }
                ))};
     }
@@ -888,7 +923,7 @@ db_clock::time_point timestamp_return_visitor::operator()(const lua_table&) {
 }
 }
 
-static data_value convert_from_lua(lua_slice_state &l, const data_type& type) {
+static data_value convert_from_lua(lua_State* l, const data_type& type) {
     if (lua_isnil(l, -1)) {
         return data_value::make_null(type);
     }
@@ -908,15 +943,15 @@ static bytes_opt convert_return(lua_slice_state &l, const data_type& return_type
     return convert_from_lua(l, return_type).serialize();
 }
 
-static void push_sstring(lua_slice_state& l, const sstring& v) {
+void lua::push_sstring(lua_State* l, const sstring& v) {
     lua_pushlstring(l, v.c_str(), v.size());
 }
 
-static void push_argument(lua_slice_state& l, const data_value& arg);
+static void push_argument(lua_State* l, const data_value& arg);
 
 namespace {
 struct to_lua_visitor {
-    lua_slice_state& l;
+    lua_State* l;
 
     void operator()(const varint_type_impl& t, const emptyable<utils::multiprecision_int>* v) {
         push_cpp_int(l, *v);
@@ -1041,31 +1076,23 @@ struct to_lua_visitor {
 
     void operator()(const inet_addr_type_impl& t, const emptyable<seastar::net::inet_address>* v) {
         // returns a string
-        sstring s = inet_addr_type_impl::to_sstring(v->get());
+        sstring s = fmt::to_string(v->get());
         push_sstring(l, s);
     }
 
     void operator()(const concrete_type<utils::UUID>&, const emptyable<utils::UUID>* v) {
         // returns a string
-        push_sstring(l, v->get().to_sstring());
+        push_sstring(l, fmt::to_string(v->get())) ;
     }
 };
 }
 
-static void push_argument(lua_slice_state& l, const data_value& arg) {
+static void push_argument(lua_State* l, const data_value& arg) {
     if (arg.is_null()) {
         lua_pushnil(l);
         return;
     }
     ::visit(arg, to_lua_visitor{l});
-}
-
-lua::runtime_config lua::make_runtime_config(const db::config& config) {
-    utils::updateable_value<unsigned> max_bytes(config.user_defined_function_allocation_limit_bytes);
-    utils::updateable_value<unsigned> max_contiguous(config.user_defined_function_contiguous_allocation_limit_bytes());
-    utils::updateable_value<unsigned> timeout_in_ms(config.user_defined_function_time_limit_ms());
-
-    return lua::runtime_config{std::move(timeout_in_ms), std::move(max_bytes), std::move(max_contiguous)};
 }
 
 // run the script for at most max_instructions
@@ -1104,8 +1131,27 @@ future<bytes_opt> lua::run_script(lua::bitcode_view bitcode, const std::vector<d
             return make_ready_future<std::optional<bytes_opt>>(std::nullopt);
         }
         default:
-            throw exceptions::invalid_request_exception(std::string("lua execution failed: ") +
-                                                        lua_tostring(l, -1));
+            throw exceptions::invalid_request_exception(std::string("lua execution failed: ") + error_message(l));
         }
     });
+}
+
+namespace lua {
+
+void register_metatables(lua_State* l) {
+    luaL_newmetatable(l, scylla_decimal_metatable_name);
+    lua_pushvalue(l, -1);
+    lua_setfield(l, -2, "__index");
+    luaL_setfuncs(l, decimal_methods, 0);
+    lua_pop(l, 1);
+}
+
+void push_data_value(lua_State* l, const data_value& value) {
+    push_argument(l, value);
+}
+
+data_value pop_data_value(lua_State* l, const data_type& type) {
+    return convert_from_lua(l, type);
+}
+
 }

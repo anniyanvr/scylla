@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -42,6 +42,6 @@ public:
 };
 
 template <typename Iterator>
-static range_assert<Iterator> assert_that_range(Iterator begin, Iterator end) {
+range_assert<Iterator> assert_that_range(Iterator begin, Iterator end) {
     return { begin, end };
 }

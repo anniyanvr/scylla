@@ -3,33 +3,38 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
 #pragma once
 
 #include <vector>
-#include "range.hh"
-#include "dht/i_partitioner.hh"
-#include "query-request.hh"
+#include "utils/interval.hh"
+#include "dht/ring_position.hh"
 
 namespace compat {
 
-using wrapping_partition_range = wrapping_range<dht::ring_position>;
+using wrapping_partition_range = wrapping_interval<dht::ring_position>;
 
 
 // unwraps a vector of wrapping ranges into a vector of nonwrapping ranges
 // if the vector happens to be sorted by the left bound, it remains sorted
-template <typename T, typename Comparator>
-std::vector<nonwrapping_range<T>>
-unwrap(std::vector<wrapping_range<T>>&& v, Comparator&& cmp) {
-    std::vector<nonwrapping_range<T>> ret;
+template <template <typename> class Container, typename T, typename Comparator>
+requires std::ranges::range<Container<interval<T>>>
+        && requires (Container<interval<T>> c, size_t s, interval<T> i) {
+    { c.reserve(s) };
+    { c.emplace_back(std::move(i)) };
+    { c.insert(c.begin(), std::move(i)) };
+}
+Container<interval<T>>
+unwrap(Container<wrapping_interval<T>>&& v, Comparator&& cmp) {
+    Container<interval<T>> ret;
     ret.reserve(v.size() + 1);
     for (auto&& wr : v) {
         if (wr.is_wrap_around(cmp)) {
             auto&& p = std::move(wr).unwrap();
-            ret.insert(ret.begin(), nonwrapping_range<T>(std::move(p.first)));
+            ret.insert(ret.begin(), interval<T>(std::move(p.first)));
             ret.emplace_back(std::move(p.second));
         } else {
             ret.emplace_back(std::move(wr));
@@ -40,15 +45,21 @@ unwrap(std::vector<wrapping_range<T>>&& v, Comparator&& cmp) {
 
 // unwraps a vector of wrapping ranges into a vector of nonwrapping ranges
 // if the vector happens to be sorted by the left bound, it remains sorted
-template <typename T, typename Comparator>
-std::vector<nonwrapping_range<T>>
-unwrap(const std::vector<wrapping_range<T>>& v, Comparator&& cmp) {
-    std::vector<nonwrapping_range<T>> ret;
+template <template <typename> class Container, typename T, typename Comparator>
+requires std::ranges::range<Container<interval<T>>>
+        && requires (Container<interval<T>> c, size_t s, interval<T> i) {
+    { c.reserve(s) };
+    { c.emplace_back(std::move(i)) };
+    { c.insert(c.begin(), std::move(i)) };
+}
+Container<interval<T>>
+unwrap(const Container<wrapping_interval<T>>& v, Comparator&& cmp) {
+    Container<interval<T>> ret;
     ret.reserve(v.size() + 1);
     for (auto&& wr : v) {
         if (wr.is_wrap_around(cmp)) {
             auto&& p = wr.unwrap();
-            ret.insert(ret.begin(), nonwrapping_range<T>(p.first));
+            ret.insert(ret.begin(), interval<T>(p.first));
             ret.emplace_back(p.second);
         } else {
             ret.emplace_back(wr);
@@ -57,44 +68,55 @@ unwrap(const std::vector<wrapping_range<T>>& v, Comparator&& cmp) {
     return ret;
 }
 
-template <typename T>
-std::vector<wrapping_range<T>>
-wrap(const std::vector<nonwrapping_range<T>>& v) {
+template <template <typename> class Container, typename T>
+requires std::ranges::range<Container<wrapping_interval<T>>>
+        && requires (Container<wrapping_interval<T>> c, size_t s, wrapping_interval<T> i) {
+    { c.reserve(s) };
+    { c.emplace_back(std::move(i)) };
+    { c.push_back(std::move(i)) };
+}
+Container<wrapping_interval<T>>
+wrap(const Container<interval<T>>& v) {
     // re-wrap (-inf,x) ... (y, +inf) into (y, x):
     if (v.size() >= 2 && !v.front().start() && !v.back().end()) {
-        auto ret = std::vector<wrapping_range<T>>();
+        auto ret = Container<wrapping_interval<T>>();
         ret.reserve(v.size() - 1);
         std::copy(v.begin() + 1, v.end() - 1, std::back_inserter(ret));
         ret.emplace_back(v.back().start(), v.front().end());
         return ret;
     }
-    return boost::copy_range<std::vector<wrapping_range<T>>>(v);
+    return v | std::ranges::to<Container<wrapping_interval<T>>>();
 }
 
-template <typename T>
-std::vector<wrapping_range<T>>
-wrap(std::vector<nonwrapping_range<T>>&& v) {
+template <template <typename> class Container, typename T>
+requires std::ranges::range<Container<wrapping_interval<T>>>
+        && requires (Container<wrapping_interval<T>> c, size_t s, wrapping_interval<T> i) {
+    { c.reserve(s) };
+    { c.emplace_back(std::move(i)) };
+    { c.push_back(std::move(i)) };
+}
+Container<wrapping_interval<T>>
+wrap(Container<interval<T>>&& v) {
     // re-wrap (-inf,x) ... (y, +inf) into (y, x):
     if (v.size() >= 2 && !v.front().start() && !v.back().end()) {
-        auto ret = std::vector<wrapping_range<T>>();
+        auto ret = std::vector<wrapping_interval<T>>();
         ret.reserve(v.size() - 1);
         std::move(v.begin() + 1, v.end() - 1, std::back_inserter(ret));
         ret.emplace_back(std::move(v.back()).start(), std::move(v.front()).end());
         return ret;
     }
-    // want boost::adaptor::moved ...
-    return boost::copy_range<std::vector<wrapping_range<T>>>(v);
+    return std::ranges::owning_view(std::move(v)) | std::ranges::to<Container>();
 }
 
 inline
 dht::token_range_vector
-unwrap(const std::vector<wrapping_range<dht::token>>& v) {
+unwrap(const utils::chunked_vector<wrapping_interval<dht::token>>& v) {
     return unwrap(v, dht::token_comparator());
 }
 
 inline
 dht::token_range_vector
-unwrap(std::vector<wrapping_range<dht::token>>&& v) {
+unwrap(utils::chunked_vector<wrapping_interval<dht::token>>&& v) {
     return unwrap(std::move(v), dht::token_comparator());
 }
 
@@ -146,14 +168,14 @@ unwrap(wrapping_partition_range pr, const schema& s) {
 // range type, as a parameter (once or twice)
 template <typename T, typename Comparator, typename Func>
 void
-unwrap_into(wrapping_range<T>&& range, const Comparator& cmp, Func&& func) {
+unwrap_into(wrapping_interval<T>&& range, const Comparator& cmp, Func&& func) {
     if (range.is_wrap_around(cmp)) {
         auto&& unw = range.unwrap();
         // Preserve ring order
-        func(nonwrapping_range<T>(std::move(unw.second)));
-        func(nonwrapping_range<T>(std::move(unw.first)));
+        func(interval<T>(std::move(unw.second)));
+        func(interval<T>(std::move(unw.first)));
     } else {
-        func(nonwrapping_range<T>(std::move(range)));
+        func(interval<T>(std::move(range)));
     }
 }
 

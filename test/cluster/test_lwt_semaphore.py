@@ -1,0 +1,71 @@
+#
+# Copyright (C) 2024-present ScyllaDB
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+#
+
+import asyncio
+import time
+from test import DEBUG_MODES
+from test.pylib.rest_client import inject_error
+from test.pylib.util import wait_for_cql
+import pytest
+from cassandra.protocol import WriteTimeout
+from test.cluster.util import new_test_keyspace
+
+
+@pytest.mark.skip_mode(mode=DEBUG_MODES, reason='aarch64/debug is unpredictably slow', platform_key='aarch64')
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_cas_semaphore(manager):
+    """ This is a regression test for scylladb/scylladb#19698 """
+    servers = await manager.servers_add(1, cmdline=['--smp', '1'])
+
+    await wait_for_cql(manager.cql, time.time() + 60)
+
+    async with new_test_keyspace(manager, "WITH REPLICATION = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as ks:
+        table = f"{ks}.test"
+        await manager.cql.run_async(f"CREATE TABLE {table} (a int PRIMARY KEY, b int)")
+
+        # The paxos state table is created by the first LWT on the table,
+        # through raft, with that LWT's timeout as the raft timeout. Run one
+        # LWT, on a key not used below, with the default timeout, so that
+        # the table creation doesn't happen in the CAS phase below with its
+        # lowered timeout.
+        await manager.cql.run_async(f'INSERT INTO {table} (a) VALUES (1) IF NOT EXISTS')
+
+        # Lower write timeout only for the CAS phase, after paxos state table
+        # creation (which goes through raft) has completed with the default
+        # timeout.
+        #
+        # write_request_timeout_in_ms is only read when a CQL connection is
+        # established (it's snapshotted into that connection's client_state),
+        # so a fresh, exclusive connection is required for the new value to
+        # actually apply: manager.cql's existing connection would keep using
+        # whatever timeout was in effect when it first connected.
+        await manager.server_update_config(servers[0].server_id, 'write_request_timeout_in_ms', 500)
+        cql = await manager.get_cql_exclusive(servers[0])
+
+        async with inject_error(manager.api, servers[0].ip_addr, 'cas_timeout_after_lock'):
+            res = [cql.run_async(f"INSERT INTO {table} (a) VALUES (0) IF NOT EXISTS") for r in range(10)]
+            try:
+                await asyncio.gather(*res)
+            except WriteTimeout:
+                pass
+
+        # Restore a generous timeout for the second batch: its 10 LWTs on the
+        # same key are serialized by the CAS lock, which each LWT waits for
+        # with its write timeout, so the last one has to wait for all the
+        # others to finish - which could take longer than 500ms, especially
+        # in debug mode.
+        # Again requires a fresh connection to take effect, for the same
+        # reason as above.
+        await manager.server_update_config(servers[0].server_id, 'write_request_timeout_in_ms', 10000)
+        cql = await manager.get_cql_exclusive(servers[0])
+
+        res = [cql.run_async(f"INSERT INTO {table} (a) VALUES (0) IF NOT EXISTS") for r in range(10)]
+        await asyncio.gather(*res)
+
+        metrics = await manager.metrics.query(servers[0].ip_addr)
+        contention = metrics.get(name="scylla_storage_proxy_coordinator_cas_write_contention_count")
+
+        assert contention == None

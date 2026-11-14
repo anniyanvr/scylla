@@ -3,27 +3,37 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+#include "utils/assert.hh"
 #include "log.hh"
 
 namespace raft {
 
 log_entry_ptr& log::get_entry(index_t i) {
-    return _log[i - _first_idx];
+    return _log[(i - _first_idx).value()];
 }
 
 const log_entry_ptr& log::get_entry(index_t i) const {
-    return _log[i - _first_idx];
+    return _log[(i - _first_idx).value()];
+}
+
+size_t log::range_memory_usage(log_entries::iterator first, log_entries::iterator last) const {
+    size_t result = 0;
+    for (auto it = first; it != last; ++it) {
+        result += memory_usage_of(**it, _max_command_size);
+    }
+    return result;
 }
 
 log_entry_ptr& log::operator[](size_t i) {
-    assert(!_log.empty() && index_t(i) >= _first_idx);
+    SCYLLA_ASSERT(!_log.empty() && index_t(i) >= _first_idx);
     return get_entry(index_t(i));
 }
 
 void log::emplace_back(log_entry_ptr&& e) {
     _log.emplace_back(std::move(e));
+    _memory_usage += memory_usage_of(*_log.back(), _max_command_size);
     if (std::holds_alternative<configuration>(_log.back()->data)) {
         _prev_conf_idx = _last_conf_idx;
         _last_conf_idx = last_idx();
@@ -53,17 +63,30 @@ index_t log::next_idx() const {
 }
 
 void log::truncate_uncommitted(index_t idx) {
-    assert(idx >= _first_idx);
-    auto it = _log.begin() + (idx - _first_idx);
+    SCYLLA_ASSERT(idx >= _first_idx);
+    auto it = _log.begin() + (idx - _first_idx).value();
+    const auto released_memory = range_memory_usage(it, _log.end());
     _log.erase(it, _log.end());
+    _log.shrink_to_fit();
+    _memory_usage -= released_memory;
     stable_to(std::min(_stable_idx, last_idx()));
     if (_last_conf_idx > last_idx()) {
-        // If _prev_conf_idx is 0, this log does not contain any
-        // other configuration changes, since no two uncommitted
-        // configuration changes can be in progress.
-        assert(_prev_conf_idx < _last_conf_idx);
-        _last_conf_idx = _prev_conf_idx;
-        _prev_conf_idx = index_t{0};
+        // The last configuration entry was truncated. In a legal raft
+        // history it is the only one that can be: a leader appends a new
+        // configuration entry only after the previous one is committed, and
+        // a committed entry can never conflict with any leader's log, so
+        // the entry at _prev_conf_idx must have survived the truncation.
+        // If this assert fires, some node went through a history raft does
+        // not allow, e.g. lost persisted state while keeping its identity.
+        SCYLLA_ASSERT(_prev_conf_idx <= last_idx());
+        // Re-derive the tracked configuration indices from the entries that
+        // remain in the log, as the constructor does. Rolling _last_conf_idx
+        // back to _prev_conf_idx and zeroing _prev_conf_idx would lose track
+        // of an older configuration entry that may still be in the log:
+        // get_prev_configuration() and last_conf_for() would then wrongly
+        // fall back to the snapshot configuration.
+        _last_conf_idx = _prev_conf_idx = index_t{0};
+        init_last_conf_idx();
     }
 }
 
@@ -88,12 +111,12 @@ term_t log::last_term() const {
 }
 
 void log::stable_to(index_t idx) {
-    assert(idx <= last_idx());
+    SCYLLA_ASSERT(idx <= last_idx());
     _stable_idx = idx;
 }
 
 std::pair<bool, term_t> log::match_term(index_t idx, term_t term) const {
-    if (idx == 0) {
+    if (idx == index_t{0}) {
         // Special case of empty log on leader,
         // TLA+ line 324.
         return std::make_pair(true, term_t(0));
@@ -112,12 +135,12 @@ std::pair<bool, term_t> log::match_term(index_t idx, term_t term) const {
     } else {
         auto i = idx - _first_idx;
 
-        if (i >= _log.size()) {
+        if (i.value() >= _log.size()) {
             // We have a gap between the follower and the leader.
             return std::make_pair(false, term_t(0));
         }
 
-        my_term =  _log[i]->term;
+        my_term =  _log[i.value()]->term;
     }
 
     return my_term == term ? std::make_pair(true, term_t(0)) : std::make_pair(false, my_term);
@@ -125,7 +148,7 @@ std::pair<bool, term_t> log::match_term(index_t idx, term_t term) const {
 
 std::optional<term_t> log::term_for(index_t idx) const {
     if (!_log.empty() && idx >= _first_idx) {
-        return _log[idx - _first_idx]->term;
+        return _log[(idx - _first_idx).value()]->term;
     }
     if (idx == _snapshot.idx) {
         return _snapshot.term;
@@ -134,15 +157,15 @@ std::optional<term_t> log::term_for(index_t idx) const {
 }
 
 const configuration& log::get_configuration() const {
-    return _last_conf_idx ? std::get<configuration>(_log[_last_conf_idx - _first_idx]->data) : _snapshot.config;
+    return _last_conf_idx ? std::get<configuration>(_log[(_last_conf_idx - _first_idx).value()]->data) : _snapshot.config;
 }
 
 const configuration& log::last_conf_for(index_t idx) const {
-    assert(last_idx() >= idx);
-    assert(idx >= _snapshot.idx);
+    SCYLLA_ASSERT(last_idx() >= idx);
+    SCYLLA_ASSERT(idx >= _snapshot.idx);
 
     if (!_last_conf_idx) {
-        assert(!_prev_conf_idx);
+        SCYLLA_ASSERT(!_prev_conf_idx);
         return _snapshot.config;
     }
 
@@ -168,10 +191,11 @@ const configuration& log::last_conf_for(index_t idx) const {
     return _snapshot.config;
 }
 
-index_t log::maybe_append(std::vector<log_entry_ptr>&& entries) {
-    assert(!entries.empty());
+log::append_result log::maybe_append(log_entry_ptr_list&& entries, size_t max_memory_usage,
+                                     bool force_at_least_one) {
+    SCYLLA_ASSERT(!entries.empty());
 
-    index_t last_new_idx = entries.back()->idx;
+    index_t last_new_idx{0};
 
     // We must scan through all entries if the log already
     // contains them to ensure the terms match.
@@ -180,10 +204,13 @@ index_t log::maybe_append(std::vector<log_entry_ptr>&& entries) {
             if (e->idx < _first_idx) {
                 logger.trace("append_entries: skipping entry with idx {} less than log start {}",
                     e->idx, _first_idx);
+                // Covered by the snapshot, so we do have this entry.
+                last_new_idx = e->idx;
                 continue;
             }
             if (e->term == get_entry(e->idx)->term) {
                 logger.trace("append_entries: entries with index {} has matching terms {}", e->idx, e->term);
+                last_new_idx = e->idx;
                 continue;
             }
             logger.trace("append_entries: entries with index {} has non matching terms e.term={}, _log[i].term = {}",
@@ -191,15 +218,28 @@ index_t log::maybe_append(std::vector<log_entry_ptr>&& entries) {
             // If an existing entry conflicts with a new one (same
             // index but different terms), delete the existing
             // entry and all that follow it (§5.3).
-            assert(e->idx > _snapshot.idx);
+            SCYLLA_ASSERT(e->idx > _snapshot.idx);
+            // This releases memory, so the limit below applies to genuinely
+            // new entries only: a conflicting entry shrinks the log.
             truncate_uncommitted(e->idx);
         }
+        const size_t entry_size = memory_usage_of(*e, _max_command_size);
+        if (max_memory_usage != 0 && !force_at_least_one &&
+                _memory_usage + entry_size > max_memory_usage) {
+            logger.trace("append_entries: not appending entry with idx {}, log memory usage {} would exceed the limit {}",
+                e->idx, _memory_usage, max_memory_usage);
+            // Stop here, so that the log stays contiguous.
+            return {last_new_idx, entry_size};
+        }
+        // The allowance is consumed by the first new entry.
+        force_at_least_one = false;
         // Assert log monotonicity
-        assert(e->idx == next_idx());
+        SCYLLA_ASSERT(e->idx == next_idx());
+        last_new_idx = e->idx;
         emplace_back(std::move(e));
     }
 
-    return last_new_idx;
+    return {last_new_idx, 0};
 }
 
 const configuration* log::get_prev_configuration() const {
@@ -215,24 +255,36 @@ const configuration* log::get_prev_configuration() const {
     return nullptr;
 }
 
-size_t log::apply_snapshot(snapshot_descriptor&& snp, size_t trailing) {
-    assert (snp.idx > _snapshot.idx);
+std::tuple<size_t, index_t> log::apply_snapshot(snapshot_descriptor&& snp, size_t max_trailing_entries,
+                                                size_t max_trailing_bytes) {
+    SCYLLA_ASSERT (snp.idx > _snapshot.idx);
 
-    size_t removed;
+    size_t released_memory;
     auto idx = snp.idx;
 
     if (idx > last_idx()) {
-        // Remove all entries ignoring the 'trailing' argument,
+        // Remove all entries ignoring 'trailing' arguments,
         // since otherwise there would be a gap between old
         // entries and the next entry index.
-        removed = _log.size();
+        released_memory = std::exchange(_memory_usage, 0);
         _log.clear();
+        _log.shrink_to_fit();
         _first_idx = idx + index_t{1};
     } else {
-        removed = _log.size() - (last_idx() - idx);
-        removed -= std::min(trailing, removed);
-        _log.erase(_log.begin(), _log.begin() + removed);
-        _first_idx = _first_idx + index_t{removed};
+        auto entries_to_remove = _log.size() - (last_idx() - idx).value();
+        size_t trailing_bytes = 0;
+        for (size_t i = 0; i < max_trailing_entries && entries_to_remove > 0; ++i) {
+            trailing_bytes += memory_usage_of(*_log[entries_to_remove - 1], _max_command_size);
+            if (trailing_bytes > max_trailing_bytes) {
+                break;
+            }
+            --entries_to_remove;
+        }
+        released_memory = range_memory_usage(_log.begin(), _log.begin() + entries_to_remove);
+        _log.erase(_log.begin(), _log.begin() + entries_to_remove);
+        _log.shrink_to_fit();
+        _memory_usage -= released_memory;
+        _first_idx = _first_idx + index_t{entries_to_remove};
     }
 
     _stable_idx = std::max(idx, _stable_idx);
@@ -250,16 +302,13 @@ size_t log::apply_snapshot(snapshot_descriptor&& snp, size_t trailing) {
 
     _snapshot = std::move(snp);
 
-    return removed;
-}
-
-std::ostream& operator<<(std::ostream& os, const log& l) {
-    os << "first idx: " << l._first_idx << ", ";
-    os << "last idx: " << l.last_idx() << ", ";
-    os << "next idx: " << l.next_idx() << ", ";
-    os << "stable idx: " << l.stable_idx() << ", ";
-    os << "last term: " << l.last_term();
-    return os;
+    return {released_memory, _first_idx};
 }
 
 } // end of namespace raft
+
+auto fmt::formatter<raft::log>::format(const raft::log& log, fmt::format_context& ctx) const
+    -> decltype(ctx.out()) {
+    return fmt::format_to(ctx.out(), "first idx: {}, last idx: {}, next idx: {}, stable idx: {}, last term: {}",
+                          log._first_idx, log.last_idx(), log.next_idx(), log.stable_idx(), log.last_term());
+}

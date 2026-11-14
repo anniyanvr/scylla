@@ -1,13 +1,16 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the ReturnValues parameter for the different update operations
 # (PutItem, UpdateItem, DeleteItem).
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string
+
+from test.alternator.util import random_string
+from test.pylib.skip_types import skip_env
+
 
 # Test trivial support for the ReturnValues parameter in PutItem, UpdateItem
 # and DeleteItem - test that "NONE" works (and changes nothing), while a
@@ -83,6 +86,48 @@ def test_put_item_returnvalues(test_table_s):
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.put_item(Item={'p': p, 'a': 'hello'}, ReturnValues='none')
 
+def skip_if_returnvalues_on_condition_check_failure_not_supported():
+    import botocore
+    from packaging.version import Version
+    # This release added support for ReturnValuesOnConditionCheckFailure
+    if (Version(botocore.__version__) < Version('1.29.164')):
+        skip_env("Botocore version 1.29.164 or above required to run this test")
+
+# Testing ReturnValuesOnConditionCheckFailure feature which returns values only
+# on failed condition expression.
+def test_put_item_returnvalues_on_condition_check_failure(test_table_s):
+    skip_if_returnvalues_on_condition_check_failure_not_supported()
+    p = random_string()
+    # Failed conditional on non existing item doesn't return values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.put_item(Item={'p': p, 's': 'cat'},
+            ReturnValuesOnConditionCheckFailure='ALL_OLD',
+            ConditionExpression='s = :v1',
+            ExpressionAttributeValues={':v1' : 'dog'})
+    assert not 'Item' in err.value.response # Field used for error responses not present.
+    test_table_s.put_item(Item={'p': p, 's': 'dog'})
+    # Successful conditional put doesn't return values.
+    ret=test_table_s.put_item(Item={'p': p, 's': 'cat'},
+        ReturnValuesOnConditionCheckFailure='ALL_OLD',
+        ConditionExpression='s = :v1',
+        ExpressionAttributeValues={':v1' : 'dog'})
+    assert not 'Attributes' in ret # Field used by ReturnValues parameter not present.
+    assert not 'Item' in ret # Field used by ReturnValuesOnConditionCheckFailure parameter not present.
+    # Failed conditional put returns old values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.put_item(Item={'p': p, 's': 'cow'},
+            ReturnValuesOnConditionCheckFailure='ALL_OLD',
+            ConditionExpression='s = :v1',
+            ExpressionAttributeValues={':v1' : 'dog'})
+    assert err.value.response['Item'] == {'p': {'S': p}, 's': {'S': 'cat'}}
+    # Failed conditional put without returning old values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.put_item(Item={'p': p, 's': 'cow'},
+            ReturnValuesOnConditionCheckFailure='NONE',
+            ConditionExpression='s = :v1',
+            ExpressionAttributeValues={':v1' : 'dog'})
+    assert not 'Item' in err.value.response
+
 # Test the ReturnValues parameter on a DeleteItem operation. Only two settings
 # are supported for this parameter for this operation: NONE (the default)
 # and ALL_OLD.
@@ -111,11 +156,11 @@ def test_delete_item_returnvalues(test_table_s):
     # Other ReturnValue options - UPDATED_OLD, ALL_NEW, UPDATED_NEW,
     # are supported by other operations but not by PutItem:
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_s.delete_item(Key={'p': p}, ReturnValues='UPDATE_OLD')
+        test_table_s.delete_item(Key={'p': p}, ReturnValues='UPDATED_OLD')
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.delete_item(Key={'p': p}, ReturnValues='ALL_NEW')
     with pytest.raises(ClientError, match='ValidationException'):
-        test_table_s.delete_item(Key={'p': p}, ReturnValues='UPDATE_NEW')
+        test_table_s.delete_item(Key={'p': p}, ReturnValues='UPDATED_NEW')
     # Also, obviously, a non-supported setting "DOG" also returns in error:
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.delete_item(Key={'p': p}, ReturnValues='DOG')
@@ -123,6 +168,42 @@ def test_delete_item_returnvalues(test_table_s):
     # (and tested above), "none" isn't:
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.delete_item(Key={'p': p}, ReturnValues='none')
+
+# Testing ReturnValuesOnConditionCheckFailure feature which returns values only
+# on failed condition expression.
+def test_delete_item_returnvalues_on_condition_check_failure(test_table_s):
+    skip_if_returnvalues_on_condition_check_failure_not_supported()
+    p = random_string()
+    # Delete of non existing item doesn't return values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.delete_item(Key={'p': p},
+            ReturnValuesOnConditionCheckFailure='ALL_OLD',
+            ConditionExpression='s = :v1',
+            ExpressionAttributeValues={':v1' : 'dog'})
+    assert not 'Item' in err.value.response # Field used by ReturnValuesOnConditionCheckFailure parameter not present.
+    test_table_s.put_item(Item={'p': p, 's': 'dog'})
+    # Successful delete doesn't return values.
+    ret=test_table_s.delete_item(Key={'p': p},
+        ReturnValuesOnConditionCheckFailure='ALL_OLD',
+        ConditionExpression='s = :v1',
+        ExpressionAttributeValues={':v1' : 'dog'})
+    assert not 'Attributes' in ret # Field used by ReturnValues parameter not present.
+    assert not 'Item' in ret # Field used by ReturnValuesOnConditionCheckFailure parameter not present.
+    # Failed conditional delete returns old values.
+    test_table_s.put_item(Item={'p': p, 's': 'dog'})
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.delete_item(Key={'p': p},
+            ReturnValuesOnConditionCheckFailure='ALL_OLD',
+            ConditionExpression='s = :v1',
+            ExpressionAttributeValues={':v1' : 'cat'})
+    assert err.value.response['Item'] == {'p': {'S': p}, 's': {'S': 'dog'}}
+    # Failed conditional delete without returning old values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.delete_item(Key={'p': p},
+            ReturnValuesOnConditionCheckFailure='NONE',
+            ConditionExpression='s = :v1',
+            ExpressionAttributeValues={':v1' : 'cat'})
+    assert not 'Item' in err.value.response
 
 # Test the ReturnValues parameter on a UpdateItem operation. All five
 # settings are supported for this parameter for this operation: NONE
@@ -177,6 +258,43 @@ def test_update_item_returnvalues_all_old(test_table_s):
         UpdateExpression='SET b = :val',
         ExpressionAttributeValues={':val': 'cat'})
     assert not 'Attributes' in ret
+
+# UpdateItem has a separate code path for the new-style UpdateExpression,
+# and for the old style AttributeUpdates. The above test was for the new-
+# style, Let's also test the old-style code path - it may have separate bugs.
+# Specifically we had bug #25894 in cases where both the AttributeUpdates
+# handling and the ReturnValues need the same old item, and this test
+# reproduces this bug.
+def test_update_item_returnvalues_all_old_attributeupdates(test_table_s):
+    # With ReturnValues=ALL_OLD, the entire old value of the item (even
+    # attributes we did not modify) is returned in an "Attributes" attribute:
+    p = random_string()
+    # The AttributeUpdates "ADD" operation is one of the operations that
+    # needs the value of the previous item, and ReturnValues='ALL_OLD'
+    # needs it too, so it reproduces #25894.
+    test_table_s.put_item(Item={'p': p, 'a': 3, 'b': 'dog'})
+    ret=test_table_s.update_item(Key={'p': p}, ReturnValues='ALL_OLD',
+        AttributeUpdates={'a': {'Action': 'ADD', 'Value': 2}})
+    assert ret['Attributes'] == {'p': p, 'a': 3, 'b': 'dog'}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {
+        'p': p, 'a': 5, 'b': 'dog'}
+    # The "DELETE" operation for sets is another operation that needs the
+    # value of the previous item, and reproduces #25894.
+    test_table_s.put_item(Item={'p': p, 'a': set([2, 4, 6, 7]), 'b': 'dog'})
+    ret=test_table_s.update_item(Key={'p': p}, ReturnValues='ALL_OLD',
+        AttributeUpdates={'a': {'Action': 'DELETE', 'Value': set([4, 5])}})
+    assert ret['Attributes'] == {'p': p, 'a': set([2, 4, 6, 7]), 'b': 'dog'}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {
+        'p': p, 'a': set([2, 6, 7]), 'b': 'dog'}
+    # The "PUT" operation doesn't need the value of the previous item,
+    # so does not reproduce #25894, but still ReturnValues requires the
+    # previous item, so we mustn't forget to fetch it in this case too.
+    test_table_s.put_item(Item={'p': p, 'a': 'hi', 'c': 7})
+    ret=test_table_s.update_item(Key={'p': p}, ReturnValues='ALL_OLD',
+        AttributeUpdates={'a': {'Action': 'PUT', 'Value': 17}})
+    assert ret['Attributes'] == {'p': p, 'a': 'hi', 'c': 7}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {
+            'p': p, 'a': 17, 'c': 7}
 
 def test_update_item_returnvalues_updated_old(test_table_s):
     # With ReturnValues=UPDATED_OLD, only the overwritten attributes of the
@@ -429,3 +547,77 @@ def test_update_item_returnvalues_all_new_remove_etc(test_table_s):
         UpdateExpression='REMOVE d SET s = :v',
         ExpressionAttributeValues={':v': 'cat'})
     assert ret['Attributes']['s'] == 'cat'
+
+# Test a combination of ADD to an existing attribute, and ALL_NEW.
+# Before commit 964500e47a6, the ALL_NEW moved the previous_item object,
+# which made ADD unable to read it, throwing a "JSON error: condition not
+# met: IsObject()."
+def test_update_item_returnvalues_all_new_add_existing(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'n': 3})
+    ret=test_table_s.update_item(Key={'p': p}, ReturnValues='ALL_NEW',
+        UpdateExpression='ADD n :inc',
+        ExpressionAttributeValues={':inc': 1})
+    assert ret['Attributes']['n'] == 4
+
+# Testing ReturnValuesOnConditionCheckFailure feature which returns values only
+# on failed condition expression.
+def test_update_item_returnvalues_on_condition_check_failure(test_table_s):
+    skip_if_returnvalues_on_condition_check_failure_not_supported()
+    p = random_string()
+    # Modification of non existing item doesn't return values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.update_item(Key={'p': p},
+            ReturnValuesOnConditionCheckFailure='ALL_OLD',
+            ConditionExpression='s = :v1',
+            UpdateExpression='SET s = :v2',
+            ExpressionAttributeValues={':v1' : 'dog', ':v2': 'cat'})
+    assert not 'Item' in err.value.response # Field used by ReturnValuesOnConditionCheckFailure parameter not present.
+    test_table_s.put_item(Item={'p': p, 's': 'dog'})
+    # Successful modification doesn't return values.
+    ret=test_table_s.update_item(Key={'p': p},
+        ReturnValuesOnConditionCheckFailure='ALL_OLD',
+        ConditionExpression='s = :v1',
+        UpdateExpression='SET s = :v2',
+        ExpressionAttributeValues={':v1' : 'dog', ':v2': 'cat'})
+    assert not 'Attributes' in ret # Field used by ReturnValues parameter not present.
+    assert not 'Item' in ret # Field used by ReturnValuesOnConditionCheckFailure parameter not present.
+    # Failed condition request returns old values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.update_item(Key={'p': p},
+            ReturnValuesOnConditionCheckFailure='ALL_OLD',
+            ConditionExpression='s = :v1',
+            UpdateExpression='SET s = :v2',
+            ExpressionAttributeValues={':v1' : 'rat', ':v2': 'cow'})
+    assert err.value.response['Item'] == {'p': {'S': p}, 's': {'S': 'cat'}}
+    # Failed condition without returning old values.
+    with pytest.raises(test_table_s.meta.client.exceptions.ConditionalCheckFailedException) as err:
+        test_table_s.update_item(Key={'p': p},
+            ReturnValuesOnConditionCheckFailure='NONE',
+            ConditionExpression='s = :v1',
+            UpdateExpression='SET s = :v2',
+            ExpressionAttributeValues={':v1' : 'rat', ':v2': 'cow'})
+    assert not 'Item' in err.value.response
+
+ # Checks if invalid ReturnValuesOnConditionCheckFailure value returns error.
+def test_validation_of_returnvalues_on_condition_check_failure(test_table_s):
+    skip_if_returnvalues_on_condition_check_failure_not_supported()
+    p = random_string()
+    invalid_options = ['DUMMY', 'UPDATED_OLD', 'ALL_NEW', 'UPDATED_NEW']
+    for opt in invalid_options:
+        with pytest.raises(ClientError, match='ValidationException'):
+            test_table_s.update_item(Key={'p': p},
+                ReturnValuesOnConditionCheckFailure=opt,
+                ConditionExpression='s = :v1',
+                UpdateExpression='SET s = :v2',
+                ExpressionAttributeValues={':v1' : 'rat', ':v2': 'cow'})
+        with pytest.raises(ClientError, match='ValidationException'):
+            test_table_s.put_item(Item={'p': p, 's': 'cow'},
+                ReturnValuesOnConditionCheckFailure=opt,
+                ConditionExpression='s = :v1',
+                ExpressionAttributeValues={':v1' : 'dog'})
+        with pytest.raises(ClientError, match='ValidationException'):
+            test_table_s.delete_item(Key={'p': p},
+                ReturnValuesOnConditionCheckFailure=opt,
+                ConditionExpression='s = :v1',
+                ExpressionAttributeValues={':v1' : 'rat'})

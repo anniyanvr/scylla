@@ -1,8 +1,18 @@
-#include "message/messaging_service.hh"
+// SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+// Copyright 2021-present ScyllaDB
+
+#pragma once
 
 #include <seastar/rpc/rpc.hh>
+#include "messaging_service.hh"
+#include "serializer.hh"
+#include "serializer_impl.hh"
+#include "seastarx.hh"
+#include "utils/exceptions.hh"
 
 namespace netw {
+
+struct serializer;
 
 // thunk from rpc serializers to generate serializers
 template <typename T, typename Output>
@@ -10,7 +20,7 @@ void write(serializer, Output& out, const T& data) {
     ser::serialize(out, data);
 }
 template <typename T, typename Input>
-T read(serializer, Input& in, boost::type<T> type) {
+T read(serializer, Input& in, std::type_identity<T> type) {
     return ser::deserialize(in, type);
 }
 
@@ -19,8 +29,8 @@ void write(serializer s, Output& out, const foreign_ptr<T>& v) {
     return write(s, out, *v);
 }
 template <typename Input, typename T>
-foreign_ptr<T> read(serializer s, Input& in, boost::type<foreign_ptr<T>>) {
-    return make_foreign(read(s, in, boost::type<T>()));
+foreign_ptr<T> read(serializer s, Input& in, std::type_identity<foreign_ptr<T>>) {
+    return make_foreign(read(s, in, std::type_identity<T>()));
 }
 
 template <typename Output, typename T>
@@ -28,8 +38,8 @@ void write(serializer s, Output& out, const lw_shared_ptr<T>& v) {
     return write(s, out, *v);
 }
 template <typename Input, typename T>
-lw_shared_ptr<T> read(serializer s, Input& in, boost::type<lw_shared_ptr<T>>) {
-    return make_lw_shared<T>(read(s, in, boost::type<T>()));
+lw_shared_ptr<T> read(serializer s, Input& in, std::type_identity<lw_shared_ptr<T>>) {
+    return make_lw_shared<T>(read(s, in, std::type_identity<T>()));
 }
 
 using rpc_protocol = rpc::protocol<serializer, messaging_verb>;
@@ -47,11 +57,6 @@ public:
     template<typename Func>
     auto register_handler(messaging_verb t, Func &&func) {
         return _impl.register_handler(t, std::forward<Func>(func));
-    }
-
-    template<typename Func>
-    auto register_handler(messaging_verb t, scheduling_group sg, Func &&func) {
-        return _impl.register_handler(t, sg, std::forward<Func>(func));
     }
 
     future<> unregister_handler(messaging_verb t) { return _impl.unregister_handler(t); }
@@ -108,63 +113,178 @@ public:
 // Register a handler (a callback lambda) for verb
 template<typename Func>
 void register_handler(messaging_service *ms, messaging_verb verb, Func &&func) {
-    ms->rpc()->register_handler(verb, ms->scheduling_group_for_verb(verb), std::move(func));
+    ms->rpc()->register_handler(verb, std::move(func));
 }
 
 // Send a message for verb
 template <typename MsgIn, typename... MsgOut>
-auto send_message(messaging_service* ms, messaging_verb verb, msg_addr id, MsgOut&&... msg) {
+auto send_message(messaging_service* ms, messaging_verb verb, std::optional<locator::host_id> host_id, msg_addr id, MsgOut&&... msg) {
     auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
+    using futurator = futurize<std::invoke_result_t<decltype(rpc_handler), rpc_protocol::client&, MsgOut...>>;
     if (ms->is_shutting_down()) {
-        using futurator = futurize<std::result_of_t<decltype(rpc_handler)(rpc_protocol::client&, MsgOut...)>>;
-        return futurator::make_exception_future(rpc::closed_error());
+        return futurator::make_exception_future(rpc::closed_error("local node is shutting down"));
     }
-    auto rpc_client_ptr = ms->get_rpc_client(verb, id);
+    auto rpc_client_ptr = ms->get_rpc_client(verb, id, host_id);
     auto& rpc_client = *rpc_client_ptr;
-    return rpc_handler(rpc_client, std::forward<MsgOut>(msg)...).then_wrapped([ms = ms->shared_from_this(), id, verb, rpc_client_ptr = std::move(rpc_client_ptr)] (auto&& f) {
-        try {
-            if (f.failed()) {
-                ms->increment_dropped_messages(verb);
-                f.get();
-                assert(false); // never reached
-            }
-            return std::move(f);
-        } catch (rpc::closed_error&) {
+    return rpc_handler(rpc_client, std::forward<MsgOut>(msg)...).handle_exception([ms = ms->shared_from_this(), id, host_id, verb, rpc_client_ptr = std::move(rpc_client_ptr)] (std::exception_ptr&& eptr) {
+        ms->increment_dropped_messages(verb);
+        if (const auto* exp = try_catch<rpc::closed_error>(eptr)) {
             // This is a transport error
-            ms->remove_error_rpc_client(verb, id);
-            throw;
-        } catch (...) {
+            if (host_id) {
+                ms->remove_error_rpc_client(verb, *host_id);
+            } else {
+                ms->remove_error_rpc_client(verb, id);
+            }
+            return futurator::make_exception_future(rpc::closed_error(fmt::format("got error from node {}/{}: {}",
+                    host_id.value_or(locator::host_id{}), id.addr, exp->what())));
+        } else {
             // This is expected to be a rpc server error, e.g., the rpc handler throws a std::runtime_error.
-            throw;
+            return futurator::make_exception_future(std::move(eptr));
         }
     });
 }
 
+template <typename MsgIn, typename... MsgOut>
+auto send_message(messaging_service* ms, messaging_verb verb, msg_addr id, MsgOut&&... msg) {
+    return send_message<MsgIn, MsgOut...>(ms, verb, std::nullopt, id, std::forward<MsgOut>(msg)...);
+}
+
+// Send a message for verb
+template <typename MsgIn, typename... MsgOut>
+auto send_message(messaging_service* ms, messaging_verb verb, locator::host_id hid, MsgOut&&... msg) {
+    return send_message<MsgIn, MsgOut...>(ms, verb, std::optional{hid}, ms->addr_for_host_id(hid), std::forward<MsgOut>(msg)...);
+}
+
 // TODO: Remove duplicated code in send_message
 template <typename MsgIn, typename Timeout, typename... MsgOut>
-auto send_message_timeout(messaging_service* ms, messaging_verb verb, msg_addr id, Timeout timeout, MsgOut&&... msg) {
+auto send_message_timeout(messaging_service* ms, messaging_verb verb, std::optional<locator::host_id> host_id, msg_addr id, Timeout timeout, MsgOut&&... msg) {
     auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
+    using futurator = futurize<std::invoke_result_t<decltype(rpc_handler), rpc_protocol::client&, MsgOut...>>;
     if (ms->is_shutting_down()) {
-        using futurator = futurize<std::result_of_t<decltype(rpc_handler)(rpc_protocol::client&, MsgOut...)>>;
-        return futurator::make_exception_future(rpc::closed_error());
+        return futurator::make_exception_future(rpc::closed_error("local node is shutting down"));
     }
-    auto rpc_client_ptr = ms->get_rpc_client(verb, id);
+    auto rpc_client_ptr = ms->get_rpc_client(verb, id, host_id);
     auto& rpc_client = *rpc_client_ptr;
-    return rpc_handler(rpc_client, timeout, std::forward<MsgOut>(msg)...).then_wrapped([ms = ms->shared_from_this(), id, verb, rpc_client_ptr = std::move(rpc_client_ptr)] (auto&& f) {
-        try {
-            if (f.failed()) {
-                ms->increment_dropped_messages(verb);
-                f.get();
-                assert(false); // never reached
-            }
-            return std::move(f);
-        } catch (rpc::closed_error&) {
+    return rpc_handler(rpc_client, timeout, std::forward<MsgOut>(msg)...).handle_exception([ms = ms->shared_from_this(), id, host_id, verb, rpc_client_ptr = std::move(rpc_client_ptr)] (std::exception_ptr&& eptr) {
+        ms->increment_dropped_messages(verb);
+        if (const auto* exp = try_catch<rpc::closed_error>(eptr)) {
             // This is a transport error
-            ms->remove_error_rpc_client(verb, id);
-            throw;
-        } catch (...) {
+            if (host_id) {
+                ms->remove_error_rpc_client(verb, *host_id);
+            } else {
+                ms->remove_error_rpc_client(verb, id);
+            }
+            return futurator::make_exception_future(rpc::closed_error(fmt::format("got error from node {}/{}: {}",
+                    host_id.value_or(locator::host_id{}), id.addr, exp->what())));
+        } else {
             // This is expected to be a rpc server error, e.g., the rpc handler throws a std::runtime_error.
-            throw;
+            return futurator::make_exception_future(std::move(eptr));
+        }
+    });
+}
+
+template <typename MsgIn, typename Timeout, typename... MsgOut>
+auto send_message_timeout(messaging_service* ms, messaging_verb verb, msg_addr id, Timeout timeout, MsgOut&&... msg) {
+    return send_message_timeout<MsgIn, Timeout, MsgOut...>(ms, verb, std::nullopt, id, timeout, std::forward<MsgOut>(msg)...);
+}
+
+
+// Send a message for verb
+template <typename MsgIn, typename... MsgOut>
+auto send_message_timeout(messaging_service* ms, messaging_verb verb, locator::host_id hid, MsgOut&&... msg) {
+    return send_message_timeout<MsgIn, MsgOut...>(ms, verb, std::optional{hid}, ms->addr_for_host_id(hid), std::forward<MsgOut>(msg)...);
+}
+
+// Requesting abort on the provided abort_source drops the message from the outgoing queue (if it's still there)
+// and causes the returned future to resolve exceptionally with `abort_requested_exception`.
+// TODO: Remove duplicated code in send_message
+template <typename MsgIn, typename... MsgOut>
+auto send_message_cancellable(messaging_service* ms, messaging_verb verb, std::optional<locator::host_id> host_id, msg_addr id, abort_source& as, MsgOut&&... msg) {
+    auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
+    using futurator = futurize<std::invoke_result_t<decltype(rpc_handler), rpc_protocol::client&, MsgOut...>>;
+    if (ms->is_shutting_down()) {
+        return futurator::make_exception_future(rpc::closed_error("local node is shutting down"));
+    }
+    auto rpc_client_ptr = ms->get_rpc_client(verb, id, host_id);
+    auto& rpc_client = *rpc_client_ptr;
+
+    auto c = std::make_unique<seastar::rpc::cancellable>();
+    auto& c_ref = *c;
+    auto sub = as.subscribe([c = std::move(c)] () noexcept {
+        c->cancel();
+    });
+    if (!sub) {
+        return futurator::make_exception_future(abort_requested_exception{});
+    }
+
+    return rpc_handler(rpc_client, c_ref, std::forward<MsgOut>(msg)...).handle_exception([ms = ms->shared_from_this(), id, host_id, verb, rpc_client_ptr = std::move(rpc_client_ptr), sub = std::move(sub)] (std::exception_ptr&& eptr) {
+        if (const auto* exp = try_catch<rpc::closed_error>(eptr)) {
+            ms->increment_dropped_messages(verb);
+            // This is a transport error
+            if (host_id) {
+                ms->remove_error_rpc_client(verb, *host_id);
+            } else {
+                ms->remove_error_rpc_client(verb, id);
+            }
+            return futurator::make_exception_future(rpc::closed_error(fmt::format("got error from node {}/{}: {}",
+                    host_id.value_or(locator::host_id{}), id.addr, exp->what())));
+        } else if (try_catch<rpc::canceled_error>(eptr)) {
+            // The sender cancelled the message, so it wasn't dropped.
+            // Translate low-level canceled_error into high-level abort_requested_exception.
+            return futurator::make_exception_future(abort_requested_exception{});
+        } else {
+            ms->increment_dropped_messages(verb);
+            // This is expected to be a rpc server error, e.g., the rpc handler throws a std::runtime_error.
+            return futurator::make_exception_future(std::move(eptr));
+        }
+    });
+}
+
+template <typename MsgIn, typename... MsgOut>
+auto send_message_cancellable(messaging_service* ms, messaging_verb verb, msg_addr id, abort_source& as, MsgOut&&... msg) {
+    return send_message_cancellable<MsgIn, MsgOut...>(ms, verb, std::nullopt, id, as, std::forward<MsgOut>(msg)...);
+}
+
+template <typename MsgIn, typename... MsgOut>
+auto send_message_cancellable(messaging_service* ms, messaging_verb verb, locator::host_id id, abort_source& as, MsgOut&&... msg) {
+    return send_message_cancellable<MsgIn, MsgOut...>(ms, verb, std::optional{id}, ms->addr_for_host_id(id), as, std::forward<MsgOut>(msg)...);
+}
+
+template <typename MsgIn, typename Timeout, typename... MsgOut>
+auto send_message_timeout_cancellable(messaging_service* ms, messaging_verb verb, locator::host_id host_id, Timeout timeout, abort_source& as, MsgOut&&... msg) {
+    auto rpc_handler = ms->rpc()->make_client<MsgIn(MsgOut...)>(verb);
+    using futurator = futurize<std::invoke_result_t<decltype(rpc_handler), rpc_protocol::client&, MsgOut...>>;
+    if (ms->is_shutting_down()) {
+        return futurator::make_exception_future(rpc::closed_error("local node is shutting down"));
+    }
+    auto address = ms->addr_for_host_id(host_id);
+    auto rpc_client_ptr = ms->get_rpc_client(verb, address, host_id);
+    auto& rpc_client = *rpc_client_ptr;
+
+    auto c = std::make_unique<seastar::rpc::cancellable>();
+    auto& c_ref = *c;
+    auto sub = as.subscribe([c = std::move(c)] () noexcept {
+        c->cancel();
+    });
+    if (!sub) {
+        return futurator::make_exception_future(abort_requested_exception{});
+    }
+
+    return rpc_handler(rpc_client, timeout, c_ref, std::forward<MsgOut>(msg)...).handle_exception([ms = ms->shared_from_this(), host_id, address, verb, rpc_client_ptr = std::move(rpc_client_ptr), sub = std::move(sub)] (std::exception_ptr&& eptr) {
+        if (const auto* exp = try_catch<rpc::closed_error>(eptr)) {
+            ms->increment_dropped_messages(verb);
+            // This is a transport error
+            ms->remove_error_rpc_client(verb, host_id);
+            return futurator::make_exception_future(rpc::closed_error(fmt::format("got error from node {}/{}: {}",
+                    host_id, address.addr, exp->what())));
+        } else if (try_catch<rpc::canceled_error>(eptr)) {
+            // The sender cancelled the message, so it wasn't dropped.
+            // Translate low-level canceled_error into high-level abort_requested_exception.
+            return futurator::make_exception_future(abort_requested_exception{});
+        } else {
+            ms->increment_dropped_messages(verb);
+            // This is expected to be a rpc server error, e.g., the rpc handler throws a std::runtime_error.
+            return futurator::make_exception_future(std::move(eptr));
         }
     });
 }
@@ -177,8 +297,30 @@ auto send_message_oneway(messaging_service* ms, messaging_verb verb, msg_addr id
 
 // Send one way message for verb
 template <typename Timeout, typename... MsgOut>
-auto send_message_oneway_timeout(messaging_service* ms, Timeout timeout, messaging_verb verb, msg_addr id, MsgOut&&... msg) {
+auto send_message_oneway_timeout(messaging_service* ms, messaging_verb verb, msg_addr id, Timeout timeout, MsgOut&&... msg) {
     return send_message_timeout<rpc::no_wait_type>(ms, std::move(verb), std::move(id), timeout, std::forward<MsgOut>(msg)...);
+}
+
+template <typename... MsgOut>
+auto send_message_oneway(messaging_service* ms, messaging_verb verb, locator::host_id id, MsgOut&&... msg) {
+    return send_message<rpc::no_wait_type>(ms, std::move(verb), std::move(id), std::forward<MsgOut>(msg)...);
+}
+
+// Send one way message for verb
+template <typename Timeout, typename... MsgOut>
+auto send_message_oneway_timeout(messaging_service* ms, messaging_verb verb, locator::host_id id, Timeout timeout, MsgOut&&... msg) {
+    return send_message_timeout<rpc::no_wait_type>(ms, std::move(verb), std::move(id), timeout, std::forward<MsgOut>(msg)...);
+}
+
+// Send one way message for verb, aborting the send when `as` is triggered
+template <typename... MsgOut>
+auto send_message_oneway_cancellable(messaging_service* ms, messaging_verb verb, msg_addr id, abort_source& as, MsgOut&&... msg) {
+    return send_message_cancellable<rpc::no_wait_type>(ms, std::move(verb), std::move(id), as, std::forward<MsgOut>(msg)...);
+}
+
+template <typename... MsgOut>
+auto send_message_oneway_cancellable(messaging_service* ms, messaging_verb verb, locator::host_id id, abort_source& as, MsgOut&&... msg) {
+    return send_message_cancellable<rpc::no_wait_type>(ms, std::move(verb), std::move(id), as, std::forward<MsgOut>(msg)...);
 }
 
 } // namespace netw

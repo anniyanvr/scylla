@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,7 +11,6 @@
 #include "vint-serialization.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/iostream.hh>
-#include "sstables/exceptions.hh"
 #include "sstables/progress_monitor.hh"
 #include <seastar/core/byteorder.hh>
 #include <seastar/util/variant_utils.hh>
@@ -19,13 +18,13 @@
 #include "bytes.hh"
 #include "reader_permit.hh"
 #include "utils/fragmented_temporary_buffer.hh"
-#include "utils/overloaded_functor.hh"
 #include "utils/small_vector.hh"
+#include "exceptions.hh"
 
 #include <variant>
 
-template<typename T>
-static inline T consume_be(temporary_buffer<char>& p) {
+template<typename T, ContiguousSharedBuffer Buffer>
+inline T consume_be(Buffer& p) {
     T i = read_be<T>(p.get());
     p.trim_front(sizeof(T));
     return i;
@@ -38,10 +37,6 @@ using processing_result = std::variant<proceed, skip_bytes>;
 inline bool operator==(const processing_result& result, proceed value) {
     const proceed* p = std::get_if<proceed>(&result);
     return (p != nullptr && *p == value);
-}
-
-inline bool operator!=(const processing_result& result, proceed value) {
-    return !(result == value);
 }
 
 enum class read_status { ready, waiting };
@@ -65,7 +60,9 @@ enum class read_status { ready, waiting };
 //   }
 //   return pc._u32;
 //
-class primitive_consumer {
+template<ContiguousSharedBuffer Buffer>
+class primitive_consumer_impl {
+    using FragmentedBuffer = basic_fragmented_buffer<Buffer>;
 private:
     // state machine progress:
     enum class prestate {
@@ -73,6 +70,7 @@ private:
         READING_U8,
         READING_U16,
         READING_U32,
+        READING_U56,
         READING_U64,
         READING_BYTES_CONTIGUOUS,
         READING_BYTES,
@@ -108,21 +106,26 @@ private:
 
     // state for READING_BYTES prestate
     size_t _read_bytes_len = 0;
-    utils::small_vector<temporary_buffer<char>, 1> _read_bytes;
+    temporary_buffer<char> _read_bytes_buf; // for contiguous reading.
+    utils::small_vector<Buffer, 1> _read_bytes;
     temporary_buffer<char>* _read_bytes_where_contiguous; // which buffer to set, _key, _val, _cell_path or _pk?
-    fragmented_temporary_buffer* _read_bytes_where;
+    FragmentedBuffer* _read_bytes_where;
 
     // Alloc-free
-    inline read_status read_partial_int(temporary_buffer<char>& data, prestate next_state) noexcept {
+    inline read_status read_partial_int(Buffer& data, prestate next_state) noexcept {
         std::copy(data.begin(), data.end(), _read_int.bytes);
         _pos = data.size();
         data.trim(0);
         _prestate = next_state;
         return read_status::waiting;
     }
-    template <typename VintType, prestate ReadingVint, prestate ReadingVintWithLen, typename T>
-    inline read_status read_vint(temporary_buffer<char>& data, T& dest) {
-        static_assert(std::is_same_v<T, typename VintType::value_type>, "Destination type mismatch");
+    inline read_status read_partial_int(prestate next_state) noexcept {
+        _pos = 0;
+        _prestate = next_state;
+        return read_status::waiting;
+    }
+    template <typename VintType, prestate ReadingVint, prestate ReadingVintWithLen>
+    inline read_status read_vint(Buffer& data, typename VintType::value_type& dest) {
         if (data.empty()) {
             _prestate = ReadingVint;
             return read_status::waiting;
@@ -134,9 +137,8 @@ private:
                 data.trim_front(len);
                 return read_status::ready;
             } else {
-                _read_bytes.clear();
-                _read_bytes.push_back(make_tracked_temporary_buffer(temporary_buffer<char>(len), _permit));
-                std::copy(data.begin(), data.end(), _read_bytes.front().get_write());
+                _read_bytes_buf = make_new_tracked_temporary_buffer(len, _permit);
+                std::copy(data.begin(), data.end(), _read_bytes_buf.get_write());
                 _read_bytes_len = len;
                 _pos = data.size();
                 data.trim(0);
@@ -145,25 +147,24 @@ private:
             }
         }
     }
-    template <typename VintType, typename T>
-    inline read_status read_vint_with_len(temporary_buffer<char>& data, T& dest) {
-        static_assert(std::is_same_v<T, typename VintType::value_type>, "Destination type mismatch");
+    template <typename VintType>
+    inline read_status read_vint_with_len(Buffer& data, typename VintType::value_type& dest) {
         const auto n = std::min(_read_bytes_len - _pos, data.size());
-        std::copy_n(data.begin(), n, _read_bytes.front().get_write() + _pos);
+        std::copy_n(data.begin(), n, _read_bytes_buf.get_write() + _pos);
         data.trim_front(n);
         _pos += n;
         if (_pos == _read_bytes_len) {
             dest = VintType::deserialize(
-                    bytes_view(reinterpret_cast<bytes::value_type*>(_read_bytes.front().get_write()), _read_bytes_len));
+                    bytes_view(reinterpret_cast<bytes::value_type*>(_read_bytes_buf.get_write()), _read_bytes_len));
             _prestate = prestate::NONE;
             return read_status::ready;
         }
         return read_status::waiting;
     };
 public:
-    primitive_consumer(reader_permit permit) : _permit(std::move(permit)) {}
+    primitive_consumer_impl(reader_permit permit) : _permit(std::move(permit)) {}
 
-    inline read_status read_8(temporary_buffer<char>& data) {
+    inline read_status read_8(Buffer& data) {
         if (data.size() >= sizeof(uint8_t)) {
             _u8 = consume_be<uint8_t>(data);
             return read_status::ready;
@@ -177,7 +178,7 @@ public:
     // (this is the common case), do this immediately. Otherwise, remember
     // what we have in the buffer, and remember to continue later by using
     // a "prestate":
-    inline read_status read_16(temporary_buffer<char>& data) {
+    inline read_status read_16(Buffer& data) {
         if (data.size() >= sizeof(uint16_t)) {
             _u16 = consume_be<uint16_t>(data);
             return read_status::ready;
@@ -186,7 +187,7 @@ public:
         }
     }
     // Alloc-free
-    inline read_status read_32(temporary_buffer<char>& data) noexcept {
+    inline read_status read_32(Buffer& data) noexcept {
         if (data.size() >= sizeof(uint32_t)) {
             _u32 = consume_be<uint32_t>(data);
             return read_status::ready;
@@ -194,7 +195,21 @@ public:
             return read_partial_int(data, prestate::READING_U32);
         }
     }
-    inline read_status read_64(temporary_buffer<char>& data) {
+    inline read_status read_32() noexcept {
+        return read_partial_int(prestate::READING_U32);
+    }
+    inline read_status read_56(Buffer& data) {
+        if (data.size() >= 7) {
+            char buf[8] = {0};
+            std::memcpy(buf + 1, data.get(), 7);
+            _u64 = read_be<uint64_t>(buf);
+            data.trim_front(7);
+            return read_status::ready;
+        } else {
+            return read_partial_int(data, prestate::READING_U56);
+        }
+    }
+    inline read_status read_64(Buffer& data) {
         if (data.size() >= sizeof(uint64_t)) {
             _u64 = consume_be<uint64_t>(data);
             return read_status::ready;
@@ -202,16 +217,24 @@ public:
             return read_partial_int(data, prestate::READING_U64);
         }
     }
-    inline read_status read_bytes_contiguous(temporary_buffer<char>& data, uint32_t len, temporary_buffer<char>& where) {
+    temporary_buffer<char> share(Buffer& data, uint32_t offset, uint32_t len) {
+        if constexpr(std::is_same_v<Buffer, temporary_buffer<char>>) {
+            return data.share(offset, len);
+        } else {
+            auto ret = make_new_tracked_temporary_buffer(len, _permit);
+            std::copy(data.begin() + offset, data.begin() + offset + len, ret.get_write());
+            return ret;
+        }
+    }
+    inline read_status read_bytes_contiguous(Buffer& data, uint32_t len, temporary_buffer<char>& where) {
         if (data.size() >= len) {
-            where = data.share(0, len);
+            where = share(data, 0, len);
             data.trim_front(len);
             return read_status::ready;
         } else {
             // copy what we have so far, read the rest later
-            _read_bytes.clear();
-            _read_bytes.push_back(make_tracked_temporary_buffer(temporary_buffer<char>(len), _permit));
-            std::copy(data.begin(), data.end(),_read_bytes.front().get_write());
+            _read_bytes_buf = make_new_tracked_temporary_buffer(len, _permit);
+            std::copy(data.begin(), data.end(), _read_bytes_buf.get_write());
             _read_bytes_len = len;
             _read_bytes_where_contiguous = &where;
             _pos = data.size();
@@ -220,11 +243,12 @@ public:
             return read_status::waiting;
         }
     }
-    inline read_status read_bytes(temporary_buffer<char>& data, uint32_t len, fragmented_temporary_buffer& where) {
+    inline read_status read_bytes(Buffer& data, uint32_t len, FragmentedBuffer& where) {
         if (data.size() >= len) {
-            std::vector<temporary_buffer<char>> fragments;
-            fragments.push_back(data.share(0,len));
-            where = fragmented_temporary_buffer(std::move(fragments), len);
+            auto fragments = std::move(where).release();
+            fragments.clear();
+            fragments.push_back(data.share(0, len));
+            where = FragmentedBuffer(std::move(fragments), len);
             data.trim_front(len);
             return read_status::ready;
         } else {
@@ -239,7 +263,7 @@ public:
             return read_status::waiting;
         }
     }
-    inline read_status read_short_length_bytes(temporary_buffer<char>& data, temporary_buffer<char>& where) {
+    inline read_status read_short_length_bytes(Buffer& data, temporary_buffer<char>& where) {
         if (data.size() >= sizeof(uint16_t)) {
             _u16 = consume_be<uint16_t>(data);
         } else {
@@ -248,19 +272,19 @@ public:
         }
         return read_bytes_contiguous(data, uint32_t{_u16}, where);
     }
-    inline read_status read_unsigned_vint(temporary_buffer<char>& data) {
+    inline read_status read_unsigned_vint(Buffer& data) {
         return read_vint<
                 unsigned_vint,
                 prestate::READING_UNSIGNED_VINT,
                 prestate::READING_UNSIGNED_VINT_WITH_LEN>(data, _u64);
     }
-    inline read_status read_signed_vint(temporary_buffer<char>& data) {
+    inline read_status read_signed_vint(Buffer& data) {
         return read_vint<
                 signed_vint,
                 prestate::READING_SIGNED_VINT,
                 prestate::READING_SIGNED_VINT_WITH_LEN>(data, _i64);
     }
-    inline read_status read_unsigned_vint_length_bytes_contiguous(temporary_buffer<char>& data, temporary_buffer<char>& where) {
+    inline read_status read_unsigned_vint_length_bytes_contiguous(Buffer& data, temporary_buffer<char>& where) {
         if (data.empty()) {
             _prestate = prestate::READING_UNSIGNED_VINT_LENGTH_BYTES_CONTIGUOUS;
             _read_bytes_where_contiguous = &where;
@@ -273,9 +297,8 @@ public:
                 data.trim_front(len);
                 return read_bytes_contiguous(data, static_cast<uint32_t>(_u64), where);
             } else {
-                _read_bytes.clear();
-                _read_bytes.push_back(make_tracked_temporary_buffer(temporary_buffer<char>(len), _permit));
-                std::copy(data.begin(), data.end(),_read_bytes.front().get_write());
+                _read_bytes_buf = make_new_tracked_temporary_buffer(len, _permit);
+                std::copy(data.begin(), data.end(), _read_bytes_buf.get_write());
                 _read_bytes_len = len;
                 _pos = data.size();
                 data.trim(0);
@@ -285,7 +308,7 @@ public:
             }
         }
     }
-    inline read_status read_unsigned_vint_length_bytes(temporary_buffer<char>& data, fragmented_temporary_buffer& where) {
+    inline read_status read_unsigned_vint_length_bytes(Buffer& data, FragmentedBuffer& where) {
         if (data.empty()) {
             _prestate = prestate::READING_UNSIGNED_VINT_LENGTH_BYTES;
             _read_bytes_where = &where;
@@ -298,9 +321,8 @@ public:
                 data.trim_front(len);
                 return read_bytes(data, static_cast<uint32_t>(_u64), where);
             } else {
-                _read_bytes.clear();
-                _read_bytes.push_back(make_tracked_temporary_buffer(temporary_buffer<char>(len), _permit));
-                std::copy(data.begin(), data.end(),_read_bytes.front().get_write());
+                _read_bytes_buf = make_new_tracked_temporary_buffer(len, _permit);
+                std::copy(data.begin(), data.end(), _read_bytes_buf.get_write());
                 _read_bytes_len = len;
                 _pos = data.size();
                 data.trim(0);
@@ -313,8 +335,8 @@ public:
 private:
     // Reads bytes belonging to an integer of size len. Returns true
     // if a full integer is now available.
-    bool process_int(temporary_buffer<char>& data, unsigned len) {
-        assert(_pos < len);
+    bool process_int(Buffer& data, unsigned len) {
+        sstables::parse_assert(_pos < len);
         auto n = std::min((size_t)(len - _pos), data.size());
         std::copy(data.begin(), data.begin() + n, _read_int.bytes + _pos);
         data.trim_front(n);
@@ -322,10 +344,19 @@ private:
         return _pos == len;
     }
 public:
+    read_status consume_u32(Buffer& data) {
+        if (process_int(data, sizeof(uint32_t))) {
+            _u32 = net::ntoh(_read_int.uint32);
+            _prestate = prestate::NONE;
+            return read_status::ready;
+        }
+        return read_status::waiting;
+    }
+
     // Feeds data into the state machine.
     // After the call, when data is not empty then active() can be assumed to be false.
-    read_status consume(temporary_buffer<char>& data) {
-        if (__builtin_expect(_prestate == prestate::NONE, true)) {
+    read_status consume(Buffer& data) {
+        if (_prestate == prestate::NONE) [[likely]] {
             return read_status::ready;
         }
         // We're in the middle of reading a basic type, which crossed
@@ -366,12 +397,12 @@ public:
             return read_vint_with_len<signed_vint>(data, _i64);
         case prestate::READING_UNSIGNED_VINT_LENGTH_BYTES_WITH_LEN_CONTIGUOUS: {
             const auto n = std::min(_read_bytes_len - _pos, data.size());
-            std::copy_n(data.begin(), n, _read_bytes.front().get_write() + _pos);
+            std::copy_n(data.begin(), n, _read_bytes_buf.get_write() + _pos);
             data.trim_front(n);
             _pos += n;
             if (_pos == _read_bytes_len) {
                 _u64 = unsigned_vint::deserialize(
-                        bytes_view(reinterpret_cast<bytes::value_type*>(_read_bytes.front().get_write()), _read_bytes_len));
+                        bytes_view(reinterpret_cast<bytes::value_type*>(_read_bytes_buf.get_write()), _read_bytes_len));
                 if (read_bytes_contiguous(data, _u64, *_read_bytes_where_contiguous) == read_status::ready) {
                     _prestate = prestate::NONE;
                     return read_status::ready;
@@ -381,12 +412,12 @@ public:
         }
         case prestate::READING_UNSIGNED_VINT_LENGTH_BYTES_WITH_LEN: {
             const auto n = std::min(_read_bytes_len - _pos, data.size());
-            std::copy_n(data.begin(), n, _read_bytes.front().get_write() + _pos);
+            std::copy_n(data.begin(), n, _read_bytes_buf.get_write() + _pos);
             data.trim_front(n);
             _pos += n;
             if (_pos == _read_bytes_len) {
                 _u64 = unsigned_vint::deserialize(
-                        bytes_view(reinterpret_cast<bytes::value_type*>(_read_bytes.front().get_write()), _read_bytes_len));
+                        bytes_view(reinterpret_cast<bytes::value_type*>(_read_bytes_buf.get_write()), _read_bytes_len));
                 if (read_bytes(data, _u64, *_read_bytes_where) == read_status::ready) {
                     _prestate = prestate::NONE;
                     return read_status::ready;
@@ -396,11 +427,11 @@ public:
         }
         case prestate::READING_BYTES_CONTIGUOUS: {
             auto n = std::min(_read_bytes_len - _pos, data.size());
-            std::copy(data.begin(), data.begin() + n, _read_bytes.front().get_write() + _pos);
+            std::copy(data.begin(), data.begin() + n, _read_bytes_buf.get_write() + _pos);
             data.trim_front(n);
             _pos += n;
             if (_pos == _read_bytes_len) {
-                *_read_bytes_where_contiguous = std::move(_read_bytes.front());
+                *_read_bytes_where_contiguous = std::move(_read_bytes_buf);
                 _prestate = prestate::NONE;
                 return read_status::ready;
             }
@@ -412,8 +443,8 @@ public:
             data.trim_front(n);
             _pos += n;
             if (_pos == _read_bytes_len) {
-                std::vector<temporary_buffer<char>> fragments(std::make_move_iterator(_read_bytes.begin()), std::make_move_iterator(_read_bytes.end()));
-                *_read_bytes_where = fragmented_temporary_buffer(std::move(fragments), _read_bytes_len);
+                std::vector<Buffer> fragments(std::make_move_iterator(_read_bytes.begin()), std::make_move_iterator(_read_bytes.end()));
+                *_read_bytes_where = FragmentedBuffer(std::move(fragments), _read_bytes_len);
                 _prestate = prestate::NONE;
                 return read_status::ready;
             }
@@ -441,8 +472,10 @@ public:
             }
             break;
         case prestate::READING_U32:
-            if (process_int(data, sizeof(uint32_t))) {
-                _u32 = net::ntoh(_read_int.uint32);
+            return consume_u32(data);
+        case prestate::READING_U56:
+            if (process_int(data, 7)) {
+                _u64 = net::ntoh(_read_int.uint64) >> 8;
                 _prestate = prestate::NONE;
                 return read_status::ready;
             }
@@ -467,6 +500,8 @@ public:
     }
 };
 
+using primitive_consumer = primitive_consumer_impl<temporary_buffer<char>>;
+
 template <typename StateProcessor>
 class continuous_data_consumer : protected primitive_consumer {
     using proceed = data_consumer::proceed;
@@ -478,7 +513,7 @@ protected:
     sstables::reader_position_tracker _stream_position;
     // remaining length of input to read (if <0, continue until end of file).
     uint64_t _remain;
-    std::optional<reader_permit::blocked_guard> _blocked_guard;
+    std::optional<reader_permit::awaits_guard> _awaits_guard;
     bool _first_invoke = true;
 public:
     using read_status = data_consumer::read_status;
@@ -508,11 +543,11 @@ public:
     }
 
     void mark_blocked() {
-        _blocked_guard.emplace(_permit);
+        _awaits_guard.emplace(_permit);
     }
 
     void mark_unblocked() {
-        _blocked_guard.reset();
+        _awaits_guard.reset();
     }
 
     data_consumer::processing_result skip(temporary_buffer<char>& data, uint32_t len) {
@@ -540,12 +575,12 @@ public:
     inline processing_result process(temporary_buffer<char>& data) {
         while (data || (!primitive_consumer::active() && non_consuming())) {
             // The primitive_consumer must finish before the enclosing state machine can continue.
-            if (__builtin_expect(primitive_consumer::consume(data) == read_status::waiting, false)) {
-                assert(data.size() == 0);
+            if (primitive_consumer::consume(data) == read_status::waiting) [[unlikely]] {
+                sstables::parse_assert(data.size() == 0);
                 return proceed::yes;
             }
             auto ret = state_processor().process_state(data);
-            if (__builtin_expect(ret != proceed::yes, 0)) {
+            if (ret != proceed::yes) [[unlikely]] {
                 return ret;
             }
         }
@@ -591,7 +626,7 @@ public:
             }, [this, &data, orig_data_size](skip_bytes skip) {
                 // we only expect skip_bytes to be used if reader needs to skip beyond the provided buffer
                 // otherwise it should just trim_front and proceed as usual
-                assert(data.size() == 0);
+                sstables::parse_assert(data.size() == 0);
                 _remain -= orig_data_size;
                 if (skip.get_value() >= _remain) {
                     skip_bytes skip_remaining(_remain);
@@ -609,15 +644,15 @@ public:
     }
 
     future<> fast_forward_to(size_t begin, size_t end) {
-        assert(begin >= _stream_position.position);
+        sstables::parse_assert(begin >= _stream_position.position);
         auto n = begin - _stream_position.position;
         _stream_position.position = begin;
 
-        assert(end >= _stream_position.position);
+        sstables::parse_assert(end >= _stream_position.position);
         _remain = end - _stream_position.position;
 
         primitive_consumer::reset();
-        reader_permit::blocked_guard _{_permit};
+        reader_permit::awaits_guard _{_permit};
         co_await _input.skip(n);
     }
 
@@ -632,7 +667,7 @@ public:
         return _stream_position.position;
     }
 
-    const sstables::reader_position_tracker& reader_position() {
+    const sstables::reader_position_tracker& reader_position() const {
         return _stream_position;
     }
 

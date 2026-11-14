@@ -3,34 +3,48 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <fmt/base.h>
+#include <fmt/core.h>
+#include <iostream>
 #include <seastar/util/defer.hh>
+#undef SEASTAR_TESTING_MAIN
+#include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <string>
-#include <boost/range/adaptor/map.hpp>
+#include <fmt/ranges.h>
+#include <fmt/std.h>
 
 #include "cdc/log.hh"
-#include "cdc/cdc_extension.hh"
-#include "db/config.hh"
-#include "schema_builder.hh"
+#include "cdc/cdc_options.hh"
+#include "cdc/metadata.hh"
+#include "db/system_keyspace.hh"
+#include "schema/schema_builder.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/exception_utils.hh"
 #include "test/lib/log.hh"
+#include "test/lib/test_utils.hh"
 #include "transport/messages/result_message.hh"
 
-#include "types.hh"
-#include "types/tuple.hh"
+#include "types/types.hh"
 #include "types/map.hh"
 #include "types/list.hh"
 #include "types/set.hh"
 #include "types/user.hh"
+#include "types/vector.hh"
 
 #include "cql3/column_identifier.hh"
 
+#include "utils/assert.hh"
 #include "utils/UUID_gen.hh"
+#include "utils/to_string.hh"
+#include "replica/database.hh"
+#include "service/raft/raft_group0_client.hh"
+#include "mutation/canonical_mutation.hh"
+#include "service/raft/group0_state_machine.hh"
 
 using namespace std::string_literals;
 
@@ -39,13 +53,26 @@ api::timestamp_type find_timestamp(const mutation&);
 utils::UUID generate_timeuuid(api::timestamp_type);
 }
 
+namespace {
+
+cql_test_config enable_tablets() {
+    cql_test_config cfg;
+    cfg.initial_tablets = 1;
+    cfg.need_remote_proxy = true; // DROP TABLE on tablets cleans view building state via proxy remote
+    return cfg;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_SUITE(cdc_test)
+
 SEASTAR_THREAD_TEST_CASE(test_find_mutation_timestamp) {
     do_with_cql_env_thread([] (cql_test_env& e) {
         cquery_nofail(e, "CREATE TYPE ut (a int, b int)");
         cquery_nofail(e, "CREATE TABLE ks.t (pk int, ck int, vstatic int static, vint int, "
                 "vmap map<int, int>, vfmap frozen<map<int, int>>, vut ut, vfut frozen<ut>, primary key (pk, ck))");
 
-        auto schema = schema_builder("ks", "t")
+        auto schema = schema_builder(this_smp_shard_count(), "ks", "t")
             .with_column("pk", int32_type, column_kind::partition_key)
             .with_column("vstatic", int32_type, column_kind::static_column)
             .with_column("ck", int32_type, column_kind::clustering_key)
@@ -57,7 +84,7 @@ SEASTAR_THREAD_TEST_CASE(test_find_mutation_timestamp) {
             .build();
 
         auto check_stmt = [&] (const sstring& query) {
-            auto muts = e.get_modification_mutations(query).get0();
+            auto muts = e.get_modification_mutations(query).get();
             BOOST_REQUIRE(!muts.empty());
 
             for (auto& m: muts) {
@@ -148,9 +175,7 @@ SEASTAR_THREAD_TEST_CASE(test_with_cdc_parameter) {
             BOOST_REQUIRE_EQUAL(exp.enabled,
                     e.local_db().find_schema("ks", "tbl")->cdc_options().enabled());
             if (exp.enabled) {
-                e.require_table_exists("ks", cdc::log_name("tbl")).get();
-            } else {
-                e.require_table_does_not_exist("ks", cdc::log_name("tbl")).get();
+                BOOST_REQUIRE(e.local_db().has_schema("ks", cdc::log_name("tbl")));
             }
             BOOST_REQUIRE_EQUAL(exp.preimage,
                     e.local_db().find_schema("ks", "tbl")->cdc_options().preimage());
@@ -173,7 +198,7 @@ SEASTAR_THREAD_TEST_CASE(test_with_cdc_parameter) {
             e.execute_cql(format("ALTER TABLE ks.tbl WITH cdc = {}", alter2_prop)).get();
             assert_cdc(alter2_expected);
             e.execute_cql("DROP TABLE ks.tbl").get();
-            e.require_table_does_not_exist("ks", cdc::log_name("tbl")).get();
+            BOOST_REQUIRE(!e.local_db().has_schema("ks", cdc::log_name("tbl")));
         };
 
         test("", "{'enabled':'true'}", "{'enabled':'false'}", {false}, {true}, {false});
@@ -189,56 +214,84 @@ SEASTAR_THREAD_TEST_CASE(test_detecting_conflict_of_cdc_log_table_with_existing_
         // Conflict on CREATE which enables cdc log
         e.execute_cql("CREATE TABLE ks.tbl_scylla_cdc_log (a int PRIMARY KEY)").get();
         BOOST_REQUIRE_THROW(e.execute_cql("CREATE TABLE ks.tbl (a int PRIMARY KEY) WITH cdc = {'enabled': true}").get(), exceptions::invalid_request_exception);
-        e.require_table_does_not_exist("ks", "tbl").get();
+        BOOST_REQUIRE(!e.local_db().has_schema("ks", "tbl"));
+
+        e.execute_cql("CREATE TABLE ks.tbl (a int PRIMARY KEY)").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "tbl"));
 
         // Conflict on ALTER which enables cdc log
-        e.execute_cql("CREATE TABLE ks.tbl (a int PRIMARY KEY)").get();
-        e.require_table_exists("ks", "tbl").get();
         BOOST_REQUIRE_THROW(e.execute_cql("ALTER TABLE ks.tbl WITH cdc = {'enabled': true}").get(), exceptions::invalid_request_exception);
     }).get();
 }
 
-SEASTAR_THREAD_TEST_CASE(test_permissions_of_cdc_log_table) {
+SEASTAR_THREAD_TEST_CASE(test_detecting_conflict_of_cdc_log_table_with_existing_table_when_vector_index_created) {
     do_with_cql_env_thread([] (cql_test_env& e) {
-        auto assert_unauthorized = [&e] (const sstring& stmt) {
-            testlog.info("Must throw unauthorized_exception: {}", stmt);
-            BOOST_REQUIRE_THROW(e.execute_cql(stmt).get(), exceptions::unauthorized_exception);
-        };
+        // Conflict on CREATE which enables cdc log
+        e.execute_cql("CREATE TABLE ks.tbl_scylla_cdc_log (a int PRIMARY KEY)").get();
 
-        e.execute_cql("CREATE TABLE ks.tbl (a int PRIMARY KEY) WITH cdc = {'enabled': true}").get();
-        e.require_table_exists("ks", "tbl").get();
+        e.execute_cql("CREATE TABLE ks.tbl (a int PRIMARY KEY, b vector<float, 3>)").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "tbl"));
 
-        // Allow MODIFY, SELECT, ALTER
-        auto log_table = "ks." + cdc::log_name("tbl");
-        auto stream_id = cdc::log_meta_column_name("stream_id");
-        auto time = cdc::log_meta_column_name("time");
-        auto batch_seq_no = cdc::log_meta_column_name("batch_seq_no");
-        auto ttl = cdc::log_meta_column_name("ttl");
+        // Conflict on CREATE INDEX which enables cdc log for vector search
+        BOOST_REQUIRE_THROW(e.execute_cql("CREATE INDEX ON ks.tbl (b) USING 'vector_index'").get(), exceptions::invalid_request_exception);
+    }, enable_tablets()).get();
+}
 
-        e.execute_cql(format("INSERT INTO {} (\"{}\", \"{}\", \"{}\") VALUES (0x00000000000000000000000000000000, now(), 0)",
-            log_table, stream_id, time, batch_seq_no
-        )).get();
-        e.execute_cql(format("UPDATE {} SET \"{}\"= 100 WHERE \"{}\" = 0x00000000000000000000000000000000 AND \"{}\" = now() AND \"{}\" = 0",
-            log_table, ttl, stream_id, time, batch_seq_no
-        )).get();
-        e.execute_cql(format("DELETE FROM {} WHERE \"{}\" = 0x00000000000000000000000000000000 AND \"{}\" = now() AND \"{}\" = 0",
-            log_table, stream_id, time, batch_seq_no
-        )).get();
-        e.execute_cql("SELECT * FROM " + log_table).get();
-        e.execute_cql("ALTER TABLE " + log_table + " ALTER \"" + ttl + "\" TYPE blob").get();
+SEASTAR_THREAD_TEST_CASE(test_permissions_of_cdc_log_table) {
 
-        // Disallow DROP
-        assert_unauthorized("DROP TABLE " + log_table);
-    }).get();
+    std::vector<std::pair<sstring, cql_test_config>> cdc_enablement_queries = {
+            {"ALTER TABLE ks.tbl WITH cdc = {'enabled': true}", cql_test_config{}},
+            {"CREATE INDEX ON ks.tbl (b) USING 'vector_index'", enable_tablets()},
+    };
+
+    for (auto& [q, cfg] : cdc_enablement_queries) {
+        do_with_cql_env_thread([&] (cql_test_env& e) {
+            auto assert_unauthorized = [&e] (const sstring& stmt) {
+                testlog.info("Must throw unauthorized_exception: {}", stmt);
+                BOOST_REQUIRE_THROW(e.execute_cql(stmt).get(), exceptions::unauthorized_exception);
+            };
+
+            // Allow MODIFY, SELECT, ALTER
+            auto log_table = "ks." + cdc::log_name("tbl");
+            auto stream_id = cdc::log_meta_column_name("stream_id");
+            auto time = cdc::log_meta_column_name("time");
+            auto batch_seq_no = cdc::log_meta_column_name("batch_seq_no");
+            auto ttl = cdc::log_meta_column_name("ttl");
+
+
+                e.execute_cql("CREATE TABLE ks.tbl (a int PRIMARY KEY, b vector<float, 3>)").get();
+                BOOST_REQUIRE(e.local_db().has_schema("ks", "tbl"));
+
+                e.execute_cql(q).get();
+                BOOST_REQUIRE(e.local_db().has_schema("ks", cdc::log_name("tbl")));
+
+                e.execute_cql(format("INSERT INTO {} (\"{}\", \"{}\", \"{}\") VALUES (0x00000000000000000000000000000000, now(), 0)",
+                    log_table, stream_id, time, batch_seq_no
+                )).get();
+                e.execute_cql(format("UPDATE {} SET \"{}\"= 100 WHERE \"{}\" = 0x00000000000000000000000000000000 AND \"{}\" = now() AND \"{}\" = 0",
+                    log_table, ttl, stream_id, time, batch_seq_no
+                )).get();
+                e.execute_cql(format("DELETE FROM {} WHERE \"{}\" = 0x00000000000000000000000000000000 AND \"{}\" = now() AND \"{}\" = 0",
+                    log_table, stream_id, time, batch_seq_no
+                )).get();
+                e.execute_cql("SELECT * FROM " + log_table).get();
+                e.execute_cql("ALTER TABLE " + log_table + " WITH comment = 'some not very interesting comment'").get();
+
+                // Disallow DROP
+                assert_unauthorized("DROP TABLE " + log_table);
+
+                e.execute_cql("DROP TABLE ks.tbl").get();
+        }, cfg).get();
+    }
 }
 
 SEASTAR_THREAD_TEST_CASE(test_disallow_cdc_on_materialized_view) {
     do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("CREATE TABLE ks.tbl (a int PRIMARY KEY)").get();
-        e.require_table_exists("ks", "tbl").get();
+        BOOST_REQUIRE(e.local_db().has_schema("ks", "tbl"));
 
         BOOST_REQUIRE_THROW(e.execute_cql("CREATE MATERIALIZED VIEW ks.mv AS SELECT a FROM ks.tbl PRIMARY KEY (a) WITH cdc = {'enabled': true}").get(), exceptions::invalid_request_exception);
-        e.require_table_does_not_exist("ks", "mv").get();
+        BOOST_REQUIRE(!e.local_db().has_schema("ks", "mv"));
     }).get();
 }
 
@@ -249,132 +302,149 @@ SEASTAR_THREAD_TEST_CASE(test_permissions_of_cdc_description) {
             BOOST_REQUIRE_THROW(e.execute_cql(stmt).get(), exceptions::unauthorized_exception);
         };
 
-        const std::string generations_v2 = "system_distributed_everywhere.cdc_generation_descriptions_v2";
         const std::string streams = "system_distributed.cdc_streams_descriptions_v2";
         const std::string timestamps = "system_distributed.cdc_generation_timestamps";
 
-        for (auto& t : {generations_v2, streams, timestamps}) {
-            e.require_table_exists(t).get();
+        for (auto& t : {streams, timestamps}) {
+            auto dot_pos = t.find_first_of('.');
+            SCYLLA_ASSERT(dot_pos != std::string_view::npos && dot_pos != 0 && dot_pos != t.size() - 1);
+            BOOST_REQUIRE(e.local_db().has_schema(t.substr(0, dot_pos), t.substr(dot_pos + 1)));
 
             // Disallow DROP
-            assert_unauthorized(format("DROP TABLE {}", t));
+            assert_unauthorized(seastar::format("DROP TABLE {}", t));
 
             // Allow SELECT
-            e.execute_cql(format("SELECT * FROM {}", t)).get();
+            e.execute_cql(seastar::format("SELECT * FROM {}", t)).get();
         }
 
         // Disallow ALTER
         for (auto& t : {streams}) {
-            assert_unauthorized(format("ALTER TABLE {} ALTER time TYPE blob", t));
+            assert_unauthorized(seastar::format("ALTER TABLE {} ALTER time TYPE blob", t));
         }
-        assert_unauthorized(format("ALTER TABLE {} ALTER id TYPE blob", generations_v2));
-        assert_unauthorized(format("ALTER TABLE {} ALTER key TYPE blob", timestamps));
+        assert_unauthorized(seastar::format("ALTER TABLE {} ALTER key TYPE blob", timestamps));
 
         // Allow DELETE
         for (auto& t : {streams}) {
-            e.execute_cql(format("DELETE FROM {} WHERE time = toTimeStamp(now())", t)).get();
+            e.execute_cql(seastar::format("DELETE FROM {} WHERE time = toTimeStamp(now())", t)).get();
         }
-        e.execute_cql(format("DELETE FROM {} WHERE id = uuid()", generations_v2)).get();
-        e.execute_cql(format("DELETE FROM {} WHERE key = 'timestamps'", timestamps)).get();
+        e.execute_cql(seastar::format("DELETE FROM {} WHERE key = 'timestamps'", timestamps)).get();
 
         // Allow UPDATE, INSERT
-        e.execute_cql(format("INSERT INTO {} (id, range_end) VALUES (uuid(), 0)", generations_v2)).get();
-        e.execute_cql(format("INSERT INTO {} (time, range_end) VALUES (toTimeStamp(now()), 0)", streams)).get();
-        e.execute_cql(format("UPDATE {} SET expired = toTimeStamp(now()) WHERE key = 'timestamps' AND time = toTimeStamp(now())", timestamps)).get();
+        e.execute_cql(seastar::format("INSERT INTO {} (time, range_end) VALUES (toTimeStamp(now()), 0)", streams)).get();
+        e.execute_cql(seastar::format("UPDATE {} SET expired = toTimeStamp(now()) WHERE key = 'timestamps' AND time = toTimeStamp(now())", timestamps)).get();
     }).get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_cdc_log_schema) {
-    do_with_cql_env_thread([] (cql_test_env& e) {
-        int required_column_count = 0;
+    const auto base_tbl_name = "tbl";
+    std::vector<std::pair<sstring, cql_test_config>> cdc_enablement_queries = {
+            {format("ALTER TABLE {} WITH cdc = {{'enabled': true}}", base_tbl_name), cql_test_config{}},
+            {format("CREATE INDEX ON {} (c_vec) USING 'vector_index'", base_tbl_name), enable_tablets()},
+    };
+    for (auto& [q, cfg] : cdc_enablement_queries) {
+        do_with_cql_env_thread([&] (cql_test_env& e) {
+            int required_column_count = 0;
 
-        const auto base_tbl_name = "tbl";
-        e.execute_cql("CREATE TYPE typ (x int)").get();
-        e.execute_cql(format("CREATE TABLE {} (pk int, ck int, s int static, c int, "
-                "c_list list<int>, c_map map<int, int>, c_set set<int>, c_typ typ,"
-                "PRIMARY KEY (pk, ck)) WITH cdc = {{'enabled': 'true'}}", base_tbl_name)).get();
-        const auto log_schema = e.local_db().find_schema("ks", cdc::log_name(base_tbl_name));
+            e.execute_cql(format("CREATE TYPE {} (x int)", "typ")).get();
 
-        auto assert_has_column = [&] (sstring column_name, data_type type, column_kind kind = column_kind::regular_column) {
-            BOOST_TEST_MESSAGE(format("Checking that column {} exists", column_name));
-            const auto cdef = log_schema->get_column_definition(to_bytes(column_name));
-            BOOST_REQUIRE_NE(cdef, nullptr);
-            BOOST_TEST_MESSAGE(format("Want kind {}, has {}", (int)kind, (int)cdef->kind));
-            BOOST_REQUIRE(cdef->kind == kind);
-            BOOST_TEST_MESSAGE(format("Want type {}, has {}", type->name(), cdef->type->name()));
-            BOOST_REQUIRE(*cdef->type == *type);
-            required_column_count++;
-        };
+            e.execute_cql(format("CREATE TABLE {} (pk int, ck int, s int static, c int, "
+                "c_list list<int>, c_map map<int, int>, c_set set<int>, c_typ typ, c_vec vector<float, 3>,"
+                "PRIMARY KEY (pk, ck))", base_tbl_name)).get();
+            e.execute_cql(q).get();
+            const auto log_schema = e.local_db().find_schema("ks", cdc::log_name(base_tbl_name));
 
-        auto assert_does_not_have_column = [&] (sstring column_name) {
-            BOOST_TEST_MESSAGE(format("Checking that column {} does not exist", column_name));
-            const auto cdef = log_schema->get_column_definition(to_bytes(column_name));
-            BOOST_REQUIRE_EQUAL(cdef, nullptr);
-        };
+            auto assert_has_column = [&] (sstring column_name, data_type type, column_kind kind = column_kind::regular_column) {
+                BOOST_TEST_MESSAGE(format("Checking that column {} exists", column_name));
+                const auto cdef = log_schema->get_column_definition(to_bytes(column_name));
+                BOOST_REQUIRE_NE(cdef, nullptr);
+                BOOST_TEST_MESSAGE(format("Want kind {}, has {}", (int)kind, (int)cdef->kind));
+                BOOST_REQUIRE(cdef->kind == kind);
+                BOOST_TEST_MESSAGE(format("Want type {}, has {}", type->name(), cdef->type->name()));
+                BOOST_REQUIRE(*cdef->type == *type);
+                required_column_count++;
+            };
 
-        BOOST_TEST_MESSAGE(format("Schema of the cdc log table is: {}", log_schema));
+            auto assert_does_not_have_column = [&] (sstring column_name) {
+                BOOST_TEST_MESSAGE(format("Checking that column {} does not exist", column_name));
+                const auto cdef = log_schema->get_column_definition(to_bytes(column_name));
+                BOOST_REQUIRE_EQUAL(cdef, nullptr);
+            };
 
-        // cdc log partition key
-        assert_has_column(cdc::log_meta_column_name("stream_id"), bytes_type, column_kind::partition_key);
-        assert_has_column(cdc::log_meta_column_name("time"), timeuuid_type, column_kind::clustering_key);
-        assert_has_column(cdc::log_meta_column_name("batch_seq_no"), int32_type, column_kind::clustering_key);
+            BOOST_TEST_MESSAGE(format("Schema of the cdc log table is: {}", log_schema));
 
-        // cdc log clustering key
-        assert_has_column(cdc::log_meta_column_name("operation"), byte_type);
-        assert_has_column(cdc::log_meta_column_name("ttl"), long_type);
-        assert_has_column(cdc::log_meta_column_name("end_of_batch"), boolean_type);
+            // cdc log partition key
+            assert_has_column(cdc::log_meta_column_name("stream_id"), bytes_type, column_kind::partition_key);
+            assert_has_column(cdc::log_meta_column_name("time"), timeuuid_type, column_kind::clustering_key);
+            assert_has_column(cdc::log_meta_column_name("batch_seq_no"), int32_type, column_kind::clustering_key);
 
-        // pk
-        assert_has_column(cdc::log_data_column_name("pk"), int32_type);
-        assert_does_not_have_column(cdc::log_data_column_deleted_name("pk"));
-        assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("pk"));
+            // cdc log clustering key
+            assert_has_column(cdc::log_meta_column_name("operation"), byte_type);
+            assert_has_column(cdc::log_meta_column_name("ttl"), long_type);
+            assert_has_column(cdc::log_meta_column_name("end_of_batch"), boolean_type);
 
-        // ck
-        assert_has_column(cdc::log_data_column_name("ck"), int32_type);
-        assert_does_not_have_column(cdc::log_data_column_deleted_name("ck"));
-        assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("ck"));
+            // pk
+            assert_has_column(cdc::log_data_column_name("pk"), int32_type);
+            assert_does_not_have_column(cdc::log_data_column_deleted_name("pk"));
+            assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("pk"));
 
-        // static row
-        assert_has_column(cdc::log_data_column_name("s"), int32_type);
-        assert_has_column(cdc::log_data_column_deleted_name("s"), boolean_type);
-        assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("s"));
+            // ck
+            assert_has_column(cdc::log_data_column_name("ck"), int32_type);
+            assert_does_not_have_column(cdc::log_data_column_deleted_name("ck"));
+            assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("ck"));
 
-        // clustering row, atomic
-        assert_has_column(cdc::log_data_column_name("c"), int32_type);
-        assert_has_column(cdc::log_data_column_deleted_name("c"), boolean_type);
-        assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("c"));
+            // static row
+            assert_has_column(cdc::log_data_column_name("s"), int32_type);
+            assert_has_column(cdc::log_data_column_deleted_name("s"), boolean_type);
+            assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("s"));
 
-        // clustering row, list
-        assert_has_column(cdc::log_data_column_name("c_list"), map_type_impl::get_instance(timeuuid_type, int32_type, false));
-        assert_has_column(cdc::log_data_column_deleted_name("c_list"), boolean_type);
-        assert_has_column(cdc::log_data_column_deleted_elements_name("c_list"), set_type_impl::get_instance(timeuuid_type, false));
+            // clustering row, atomic
+            assert_has_column(cdc::log_data_column_name("c"), int32_type);
+            assert_has_column(cdc::log_data_column_deleted_name("c"), boolean_type);
+            assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("c"));
 
-        // clustering row, map
-        assert_has_column(cdc::log_data_column_name("c_map"), map_type_impl::get_instance(int32_type, int32_type, false));
-        assert_has_column(cdc::log_data_column_deleted_name("c_map"), boolean_type);
-        assert_has_column(cdc::log_data_column_deleted_elements_name("c_map"), set_type_impl::get_instance(int32_type, false));
+            // clustering row, list
+            assert_has_column(cdc::log_data_column_name("c_list"), map_type_impl::get_instance(timeuuid_type, int32_type, false));
+            assert_has_column(cdc::log_data_column_deleted_name("c_list"), boolean_type);
+            assert_has_column(cdc::log_data_column_deleted_elements_name("c_list"), set_type_impl::get_instance(timeuuid_type, false));
 
-        // clustering row, set
-        assert_has_column(cdc::log_data_column_name("c_set"), set_type_impl::get_instance(int32_type, false));
-        assert_has_column(cdc::log_data_column_deleted_name("c_set"), boolean_type);
-        assert_has_column(cdc::log_data_column_deleted_elements_name("c_set"), set_type_impl::get_instance(int32_type, false));
+            // clustering row, map
+            assert_has_column(cdc::log_data_column_name("c_map"), map_type_impl::get_instance(int32_type, int32_type, false));
+            assert_has_column(cdc::log_data_column_deleted_name("c_map"), boolean_type);
+            assert_has_column(cdc::log_data_column_deleted_elements_name("c_map"), set_type_impl::get_instance(int32_type, false));
 
-        // clustering row, udt
-        const auto c_typ_frozen = user_type_impl::get_instance("ks", "typ", {to_bytes("x")}, {int32_type}, false);
-        assert_has_column(cdc::log_data_column_name("c_typ"), c_typ_frozen);
-        assert_has_column(cdc::log_data_column_deleted_name("c_typ"), boolean_type);
-        assert_has_column(cdc::log_data_column_deleted_elements_name("c_typ"), set_type_impl::get_instance(short_type, false));
+            // clustering row, set
+            assert_has_column(cdc::log_data_column_name("c_set"), set_type_impl::get_instance(int32_type, false));
+            assert_has_column(cdc::log_data_column_deleted_name("c_set"), boolean_type);
+            assert_has_column(cdc::log_data_column_deleted_elements_name("c_set"), set_type_impl::get_instance(int32_type, false));
 
-        // Check if we missed something
-        BOOST_REQUIRE_EQUAL(required_column_count, log_schema->all_columns_count());
-    }).get();
+            // clustering row, udt
+            const auto c_typ_frozen = user_type_impl::get_instance("ks", "typ", {to_bytes("x")}, {int32_type}, false);
+            assert_has_column(cdc::log_data_column_name("c_typ"), c_typ_frozen);
+            assert_has_column(cdc::log_data_column_deleted_name("c_typ"), boolean_type);
+            assert_has_column(cdc::log_data_column_deleted_elements_name("c_typ"), set_type_impl::get_instance(short_type, false));
+
+            // clustering row, vector
+            assert_has_column(cdc::log_data_column_name("c_vec"), vector_type_impl::get_instance(float_type, 3));
+            assert_has_column(cdc::log_data_column_deleted_name("c_vec"), boolean_type);
+            assert_does_not_have_column(cdc::log_data_column_deleted_elements_name("c_vec"));
+
+            // Check if we missed something
+            BOOST_REQUIRE_EQUAL(required_column_count, log_schema->all_columns_count());
+
+            e.execute_cql("DROP TABLE ks.tbl").get();
+            required_column_count = 0;
+
+        }, cfg).get();
+    }
 }
+
+} // cdc_test namespace
 
 static std::vector<std::vector<bytes_opt>> to_bytes(const cql_transport::messages::result_message::rows& rows) {
     auto rs = rows.rs().result_set().rows();
     std::vector<std::vector<bytes_opt>> results;
     for (auto it = rs.begin(); it != rs.end(); ++it) {
-        results.push_back(*it);
+        results.push_back(*it | std::views::transform([] (const managed_bytes_opt& x) { return to_bytes_opt(x); }) | std::ranges::to<std::vector<bytes_opt>>());
     }
     return results;
 }
@@ -417,11 +487,13 @@ static void sort_by_time(const cql_transport::messages::result_message::rows& ro
 }
 
 static auto select_log(cql_test_env& e, const sstring& table_name) {
-    auto msg = e.execute_cql(format("SELECT * FROM ks.{}", cdc::log_name(table_name))).get0();
+    auto msg = e.execute_cql(format("SELECT * FROM ks.{}", cdc::log_name(table_name))).get();
     auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
     BOOST_REQUIRE(rows);
     return rows;
 };
+
+namespace cdc_test {
 
 SEASTAR_THREAD_TEST_CASE(test_primary_key_logging) {
     do_with_cql_env_thread([](cql_test_env& e) {
@@ -447,7 +519,7 @@ SEASTAR_THREAD_TEST_CASE(test_primary_key_logging) {
             cdc::log_data_column_name("ck2"),
             cdc::log_meta_column_name("operation"),
             cdc::log_meta_column_name("ttl"),
-            cdc::log_name("tbl"))).get0();
+            cdc::log_name("tbl"))).get();
         auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
         BOOST_REQUIRE(rows);
 
@@ -458,7 +530,7 @@ SEASTAR_THREAD_TEST_CASE(test_primary_key_logging) {
         auto actual_i = results.begin();
         auto actual_end = results.end();
         auto assert_row = [&] (int pk, int pk2, int ck = -1, int ck2 = -1, std::optional<int64_t> ttl = {}) {
-            std::cerr << "check " << pk << " " << pk2 << " " << ck << " " << ck2 << " " << ttl << std::endl;
+            fmt::print(std::cerr, "check {} {} {} {} {}\n", pk, pk2, ck, ck2, ttl);
             BOOST_REQUIRE(actual_i != actual_end);
             auto& actual_row = *actual_i;
             BOOST_REQUIRE_EQUAL(int32_type->decompose(pk), actual_row[1]);
@@ -546,7 +618,8 @@ SEASTAR_THREAD_TEST_CASE(test_pre_post_image_logging) {
             for (auto i = 0u; i < 10; ++i) {
                 auto nv = last + 1;
                 const int64_t new_ttl = 100 * (i + 1);
-                cquery_nofail(e, "UPDATE ks.tbl" + (with_ttl ? format(" USING TTL {}", new_ttl) : "") + " SET val=" + std::to_string(nv) +" where pk=1 AND pk2=11 AND ck=111 AND ck2=1111");
+                cquery_nofail(e, seastar::format("UPDATE ks.tbl{} SET val={} where pk=1 AND pk2=11 AND ck=111 AND ck2=1111",
+                        with_ttl ? seastar::format(" USING TTL {}", new_ttl) : "", nv));
 
                 rows = select_log(e, "tbl");
 
@@ -641,7 +714,8 @@ SEASTAR_THREAD_TEST_CASE(test_pre_post_image_logging_static_row) {
             for (auto i = 0u; i < 10; ++i) {
                 auto nv = last + 1;
                 const int64_t new_ttl = 100 * (i + 1);
-                cquery_nofail(e, "UPDATE ks.tbl" + (with_ttl ? format(" USING TTL {}", new_ttl) : "") + " SET s=" + std::to_string(nv) +" where pk=1 AND pk2=11");
+                cquery_nofail(e, seastar::format("UPDATE ks.tbl{} SET s={} where pk=1 AND pk2=11",
+                        with_ttl ? seastar::format(" USING TTL {}", new_ttl) : "", nv));
 
                 rows = select_log(e, "tbl");
 
@@ -696,7 +770,7 @@ SEASTAR_THREAD_TEST_CASE(test_range_deletion) {
             cdc::log_data_column_name("pk"),
             cdc::log_data_column_name("ck"),
             cdc::log_meta_column_name("operation"),
-            cdc::log_name("tbl"))).get0();
+            cdc::log_name("tbl"))).get();
         auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
         BOOST_REQUIRE(rows);
 
@@ -753,31 +827,9 @@ SEASTAR_THREAD_TEST_CASE(test_add_columns) {
     }).get();
 }
 
-// #5582 - just quickly test that we can create the cdc enabled table on a different shard
-// and still get the logs proper.
-SEASTAR_THREAD_TEST_CASE(test_cdc_across_shards) {
-    do_with_cql_env_thread([](cql_test_env& e) {
-        if (smp::count < 2) {
-            testlog.warn("This test case requires at least 2 shards");
-            return;
-        }
-        smp::submit_to(1, [&e] {
-            // this is actually ok. there is no members of cql_test_env actually used in call
-            return seastar::async([&] {
-                cquery_nofail(e, "CREATE TABLE ks.tbl (pk int, pk2 int, ck int, ck2 int, val int, PRIMARY KEY((pk, pk2), ck, ck2)) WITH cdc = {'enabled':'true'}");
-            });
-        }).get();
-        cquery_nofail(e, "INSERT INTO ks.tbl(pk, pk2, ck, ck2, val) VALUES(1, 11, 111, 1111, 11111)");
-
-        auto rows = select_log(e, "tbl");
-
-        BOOST_REQUIRE(!to_bytes_filtered(*rows, cdc::operation::insert).empty());
-    }).get();
-}
-
 SEASTAR_THREAD_TEST_CASE(test_negative_ttl_fail) {
     do_with_cql_env_thread([](cql_test_env& e) {
-        BOOST_REQUIRE_EXCEPTION(e.execute_cql("CREATE TABLE ks.fail (a int PRIMARY KEY, b int) WITH cdc = {'enabled':true,'ttl':'-1'}").get0(),
+        BOOST_REQUIRE_EXCEPTION(e.execute_cql("CREATE TABLE ks.fail (a int PRIMARY KEY, b int) WITH cdc = {'enabled':true,'ttl':'-1'}").get(),
                 exceptions::configuration_exception,
                 exception_predicate::message_contains("ttl"));
     }).get();
@@ -787,9 +839,9 @@ SEASTAR_THREAD_TEST_CASE(test_ttls) {
     do_with_cql_env_thread([](cql_test_env& e) {
         auto test_ttl = [&e] (int ttl_seconds) {
             const auto base_tbl_name = "tbl" + std::to_string(ttl_seconds);
-            cquery_nofail(e, format("CREATE TABLE ks.{} (pk int, ck int, val int, PRIMARY KEY(pk, ck)) WITH cdc = {{'enabled':'true', 'ttl':{}}}", base_tbl_name, ttl_seconds));
+            cquery_nofail(e, seastar::format("CREATE TABLE ks.{} (pk int, ck int, val int, PRIMARY KEY(pk, ck)) WITH cdc = {{'enabled':'true', 'ttl':{}}}", base_tbl_name, ttl_seconds));
             BOOST_REQUIRE_EQUAL(e.local_db().find_schema("ks", base_tbl_name)->cdc_options().ttl(), ttl_seconds);
-            cquery_nofail(e, format("INSERT INTO ks.{} (pk, ck, val) VALUES(1, 11, 111)", base_tbl_name));
+            cquery_nofail(e, seastar::format("INSERT INTO ks.{} (pk, ck, val) VALUES(1, 11, 111)", base_tbl_name));
 
             auto log_schema = e.local_db().find_schema("ks", cdc::log_name(base_tbl_name));
 
@@ -808,7 +860,7 @@ SEASTAR_THREAD_TEST_CASE(test_ttls) {
             query += format(" FROM ks.{}", cdc::log_name(base_tbl_name));
 
             // Execute query and get the first (and only) row of results:
-            auto msg = e.execute_cql(query).get0();
+            auto msg = e.execute_cql(query).get();
             auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
             BOOST_REQUIRE(rows);
             auto results = to_bytes(*rows);
@@ -910,7 +962,8 @@ static void test_collection(cql_test_env& e, data_type val_type, data_type del_t
 SEASTAR_THREAD_TEST_CASE(test_map_logging) {
     do_with_cql_env_thread([](cql_test_env& e) {
         cquery_nofail(e, "CREATE TABLE ks.tbl (pk int, pk2 int, ck int, val map<text, text>, PRIMARY KEY((pk, pk2), ck)) WITH cdc = {'enabled':'true', 'preimage':'true', 'postimage':'true' }"s);
-        auto cleanup = defer([&] {
+        auto cleanup = defer([&] noexcept {
+            // Can in fact throw, will terminate test
             e.execute_cql("DROP TABLE ks.tbl").get();
         });
 
@@ -994,7 +1047,8 @@ SEASTAR_THREAD_TEST_CASE(test_map_logging) {
 SEASTAR_THREAD_TEST_CASE(test_set_logging) {
     do_with_cql_env_thread([](cql_test_env& e) {
         cquery_nofail(e, "CREATE TABLE ks.tbl (pk int, pk2 int, ck int, val set<text>, PRIMARY KEY((pk, pk2), ck)) WITH cdc = {'enabled':'true', 'preimage':'true', 'postimage':'true' }"s);
-        auto cleanup = defer([&] {
+        auto cleanup = defer([&] noexcept {
+            // Can in fact throw, will terminate test
             e.execute_cql("DROP TABLE ks.tbl").get();
         });
 
@@ -1065,7 +1119,8 @@ SEASTAR_THREAD_TEST_CASE(test_set_logging) {
 SEASTAR_THREAD_TEST_CASE(test_list_logging) {
     do_with_cql_env_thread([](cql_test_env& e) {
         cquery_nofail(e, "CREATE TABLE ks.tbl (pk int, pk2 int, ck int, val list<text>, PRIMARY KEY((pk, pk2), ck)) WITH cdc = {'enabled':'true', 'preimage':'true', 'postimage':'true' }"s);
-        auto cleanup = defer([&] {
+        auto cleanup = defer([&] noexcept {
+            // Can in fact throw, will terminate test
             e.execute_cql("DROP TABLE ks.tbl").get();
         });
 
@@ -1144,9 +1199,9 @@ SEASTAR_THREAD_TEST_CASE(test_list_logging) {
             }
         }, [&](data_value v) {
             auto map = value_cast<map_type_impl::native_type>(std::move(v));
-            auto cpy = boost::copy_range<std::vector<data_value>>(map | boost::adaptors::map_values);
+            auto cpy = map | std::views::values | std::ranges::to<std::vector>();
             // verify key is timeuuid
-            for (auto& key : map | boost::adaptors::map_keys) {
+            for (auto& key : map | std::views::keys) {
                 value_cast<utils::UUID>(key);
             }
             return ::make_list_value(list_type, std::move(cpy));
@@ -1158,7 +1213,8 @@ SEASTAR_THREAD_TEST_CASE(test_udt_logging) {
     do_with_cql_env_thread([](cql_test_env& e) {
         cquery_nofail(e, "CREATE TYPE ks.mytype (field0 int, field1 text)"s);
         cquery_nofail(e, "CREATE TABLE ks.tbl (pk int, pk2 int, ck int, val mytype, PRIMARY KEY((pk, pk2), ck)) WITH cdc = {'enabled':'true', 'preimage':'true', 'postimage':'true' }"s);
-        auto cleanup = defer([&] {
+        auto cleanup = defer([&] noexcept {
+            // Can in fact throw, will terminate test
             e.execute_cql("DROP TABLE ks.tbl").get();
             e.execute_cql("DROP TYPE ks.mytype").get();
         });
@@ -1268,13 +1324,13 @@ SEASTAR_THREAD_TEST_CASE(test_frozen_logging) {
                     keyspace_name, base_tbl_name, column_name, value_string)).get();
 
             // Expect only one row, with the same value as inserted
-            const auto base_msg = e.execute_cql(format("SELECT {} FROM {}.{}", column_name, keyspace_name, base_tbl_name)).get0();
+            const auto base_msg = e.execute_cql(format("SELECT {} FROM {}.{}", column_name, keyspace_name, base_tbl_name)).get();
             const auto base_rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(base_msg);
             BOOST_REQUIRE(base_rows);
             const auto base_bytes = to_bytes(*base_rows);
             BOOST_REQUIRE_EQUAL(base_bytes.size(), 1);
 
-            const auto log_msg = e.execute_cql(format("SELECT {} FROM {}.{}", column_name, keyspace_name, log_tbl_name)).get0();
+            const auto log_msg = e.execute_cql(format("SELECT {} FROM {}.{}", column_name, keyspace_name, log_tbl_name)).get();
             const auto log_rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(log_msg);
             BOOST_REQUIRE(log_rows);
             const auto log_bytes = to_bytes(*log_rows);
@@ -1304,7 +1360,7 @@ SEASTAR_THREAD_TEST_CASE(test_update_insert_delete_distinction) {
         cquery_nofail(e, format("DELETE FROM ks.{} WHERE pk = {} AND ck = {}", base_tbl_name, pk, ck));          // (3) a row delete
 
         const sstring query = format("SELECT \"{}\" FROM ks.{}", cdc::log_meta_column_name("operation"), cdc::log_name(base_tbl_name));
-        auto msg = e.execute_cql(query).get0();
+        auto msg = e.execute_cql(query).get();
         auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
         BOOST_REQUIRE(rows);
         auto results = to_bytes(*rows);
@@ -1324,6 +1380,8 @@ SEASTAR_THREAD_TEST_CASE(test_update_insert_delete_distinction) {
     }).get();
 }
 
+} // namespace cdc_test
+
 static std::vector<std::vector<data_value>> get_result(cql_test_env& e,
         const std::vector<data_type>& col_types, const sstring& query) {
     auto deser = [] (const data_type& t, const bytes_opt& b) -> data_value {
@@ -1333,7 +1391,7 @@ static std::vector<std::vector<data_value>> get_result(cql_test_env& e,
         return t->deserialize(*b);
     };
 
-    auto msg = e.execute_cql(query).get0();
+    auto msg = e.execute_cql(query).get();
     auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
     BOOST_REQUIRE(rows);
 
@@ -1348,6 +1406,8 @@ static std::vector<std::vector<data_value>> get_result(cql_test_env& e,
     }
     return res;
 }
+
+namespace cdc_test {
 
 SEASTAR_THREAD_TEST_CASE(test_change_splitting) {
     do_with_cql_env_thread([](cql_test_env& e) {
@@ -1591,7 +1651,7 @@ SEASTAR_THREAD_TEST_CASE(test_batch_with_row_delete) {
                 fmt::arg("tbl_name", base_tbl_name), fmt::arg("pk", pk), fmt::arg("ck", ck)));
 
         const sstring query = format("SELECT v1, v2, v3, v4, \"{}\" FROM ks.{}", cdc::log_meta_column_name("operation"), cdc::log_name(base_tbl_name));
-        auto msg = e.execute_cql(query).get0();
+        auto msg = e.execute_cql(query).get();
         auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
         BOOST_REQUIRE(rows);
         auto results = to_bytes(*rows);
@@ -1683,11 +1743,11 @@ static void test_pre_post_image(cql_test_env& e, const std::vector<image_persist
         }
 
         // Register new encountered timestamps so that we won't repeat them in next run
-        for (const auto& time : groups | boost::adaptors::map_keys) {
+        for (const auto& time : groups | std::views::keys) {
             processed_times.insert(time);
         }
 
-        BOOST_TEST_MESSAGE(format("Returned rows: {}", groups));
+        BOOST_TEST_MESSAGE(seastar::format("Returned rows: {}", groups));
 
         // Assert that there is the same number of groups differentiated by cdc$time
         BOOST_REQUIRE_EQUAL(groups.size(), t.groups.size());
@@ -1713,12 +1773,12 @@ static void test_pre_post_image(cql_test_env& e, const std::vector<image_persist
                     actual_values.push_back(std::move(actual_value));
                 }
 
-                BOOST_TEST_MESSAGE(format("Looking up corresponding row to {}", actual_values));
+                BOOST_TEST_MESSAGE(seastar::format("Looking up corresponding row to {}", actual_values));
 
                 // Order in pre-postimage is unspecified
                 const auto it = std::find(expected.begin(), expected.end(), actual_values);
                 if (it == expected.end()) {
-                    BOOST_FAIL(format("Failed to find corresponding expected row for {}", actual_values));
+                    BOOST_FAIL(seastar::format("Failed to find corresponding expected row for {}", actual_values));
                 }
                 expected.erase(it);
             }
@@ -1959,6 +2019,63 @@ SEASTAR_THREAD_TEST_CASE(test_batch_pre_post_image) {
     test_batch_images(true, true);
 }
 
+// Deleting a row in a table with a clustering key and preimage enabled logs
+// the preimage. In tables without a clustering key, though, the preimage is
+// missing. Reproduces #26382.
+SEASTAR_THREAD_TEST_CASE(test_preimage_delete_no_clustering_key) {
+    do_with_cql_env_thread([](cql_test_env& e) {
+        using oper_ut = std::underlying_type_t<cdc::operation>;
+        for (const auto pre : {cdc::image_mode::on, cdc::image_mode::full}) {
+            cquery_nofail(e, format("CREATE TABLE ks.t (pk INT, val INT, PRIMARY KEY (pk)) WITH cdc = {{'enabled': true, 'preimage': '{}'}}", pre));
+            cquery_nofail(e, "INSERT INTO ks.t (pk, val) VALUES (1, 2)");
+            cquery_nofail(e, "INSERT INTO ks.t (pk, val) VALUES (1, 3)");
+            cquery_nofail(e, "DELETE FROM ks.t WHERE pk = 1");
+
+            const auto result = get_result(e, {
+                    data_type_for<oper_ut>(), int32_type, int32_type},
+                    "SELECT \"cdc$operation\", pk, val FROM ks.t_scylla_cdc_log");
+
+            const std::vector<std::vector<data_value>> expected = {
+                    {oper_ut(cdc::operation::insert), int32_t(1), int32_t(2)},
+                    {oper_ut(cdc::operation::pre_image), int32_t(1), int32_t(2)},
+                    {oper_ut(cdc::operation::insert), int32_t(1), int32_t(3)},
+                    {oper_ut(cdc::operation::pre_image), int32_t(1), int32_t(3)},
+                    {oper_ut(cdc::operation::partition_delete), int32_t(1), data_value::make_null(int32_type)}
+            };
+
+            BOOST_REQUIRE_EQUAL(expected, result);
+            cquery_nofail(e, "DROP TABLE ks.t");
+        }
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_preimage_delete_clustering_key) {
+    do_with_cql_env_thread([](cql_test_env& e) {
+        using oper_ut = std::underlying_type_t<cdc::operation>;
+        for (const auto pre : {cdc::image_mode::on, cdc::image_mode::full}) {
+            cquery_nofail(e, format("CREATE TABLE ks.t (pk INT, ck INT, val INT, PRIMARY KEY (pk, ck)) WITH cdc = {{'enabled': true, 'preimage': '{}'}}", pre));
+            cquery_nofail(e, "INSERT INTO ks.t (pk, ck, val) VALUES (1, 11, 2)");
+            cquery_nofail(e, "INSERT INTO ks.t (pk, ck, val) VALUES (1, 11, 3)");
+            cquery_nofail(e, "DELETE FROM ks.t WHERE pk = 1 AND ck = 11");
+
+            const auto result = get_result(e, {
+                    data_type_for<oper_ut>(), int32_type, int32_type},
+                    "SELECT \"cdc$operation\", pk, val FROM ks.t_scylla_cdc_log");
+
+            const std::vector<std::vector<data_value>> expected = {
+                    {oper_ut(cdc::operation::insert), int32_t(1), int32_t(2)},
+                    {oper_ut(cdc::operation::pre_image), int32_t(1), int32_t(2)},
+                    {oper_ut(cdc::operation::insert), int32_t(1), int32_t(3)},
+                    {oper_ut(cdc::operation::pre_image), int32_t(1), int32_t(3)},
+                    {oper_ut(cdc::operation::row_delete), int32_t(1), data_value::make_null(int32_type)}
+            };
+
+            BOOST_REQUIRE_EQUAL(expected, result);
+            cquery_nofail(e, "DROP TABLE ks.t");
+        }
+    }).get();
+}
+
 // Regression test for #7716
 SEASTAR_THREAD_TEST_CASE(test_postimage_with_no_regular_columns) {
     do_with_cql_env_thread([] (cql_test_env& e) {
@@ -2013,8 +2130,9 @@ SEASTAR_THREAD_TEST_CASE(test_image_deleted_column) {
             cquery_nofail(e, "insert into tbl(pk, ck, v, v2) values (1, 1, null, 1)");
             cquery_nofail(e, "insert into tbl(pk, ck, v, v2) values (2, 2, null, 2)");
 
-            // These are the queried columns:
-            sstring query_string = "select \"cdc$operation\", pk, ck, v, \"cdc$deleted_v\", \"cdc$deleted_v2\" from tbl_scylla_cdc_log";
+            auto query_pk = [] (int32_t pk_value) -> sstring {
+                return fmt::format("select \"cdc$operation\", pk, ck, v, \"cdc$deleted_v\", \"cdc$deleted_v2\" from tbl_scylla_cdc_log where pk = {} allow filtering", pk_value);
+            };
 
             // Perform an insert that does not affect v column.
             // Pre-image: v=NULL, cdc$deleted_v=NULL
@@ -2027,6 +2145,11 @@ SEASTAR_THREAD_TEST_CASE(test_image_deleted_column) {
             std::vector<data_value> postimage1 = 
                 { oper_ut(cdc::operation::post_image), int32_t(1), int32_t(1), data_value::make_null(int32_type), data_value::make_null(boolean_type), data_value::make_null(boolean_type) };
 
+            auto pk1_result = get_result(e, {oper_type, int32_type, int32_type, int32_type, boolean_type, boolean_type}, query_pk(1));
+            BOOST_REQUIRE_EQUAL(pk1_result.size(), 5);
+            BOOST_REQUIRE_EQUAL(pk1_result[2], preimage1);
+            BOOST_REQUIRE_EQUAL(pk1_result[4], postimage1);
+
             // Perform an insert that affects v column.
             // Pre-image: v=NULL, cdc$deleted_v=true
             // Pre-image ('full' mode): v=NULL, cdc$deleted_v=true
@@ -2037,12 +2160,10 @@ SEASTAR_THREAD_TEST_CASE(test_image_deleted_column) {
             std::vector<data_value> postimage2 = 
                 { oper_ut(cdc::operation::post_image), int32_t(2), int32_t(2), int32_t(2), data_value::make_null(boolean_type), data_value::make_null(boolean_type) };
 
-            auto result = get_result(e, {oper_type, int32_type, int32_type, int32_type, boolean_type, boolean_type}, query_string);
-            BOOST_REQUIRE_EQUAL(result.size(), 10);
-            BOOST_REQUIRE_EQUAL(result[2], preimage1);
-            BOOST_REQUIRE_EQUAL(result[4], postimage1);
-            BOOST_REQUIRE_EQUAL(result[7], preimage2);
-            BOOST_REQUIRE_EQUAL(result[9], postimage2);
+            auto pk2_result = get_result(e, {oper_type, int32_type, int32_type, int32_type, boolean_type, boolean_type}, query_pk(2));
+            BOOST_REQUIRE_EQUAL(pk2_result.size(), 5);
+            BOOST_REQUIRE_EQUAL(pk2_result[2], preimage2);
+            BOOST_REQUIRE_EQUAL(pk2_result[4], postimage2);
 
             auto test_table_with_collection = [&](bool frozen_collection) {
                 // Create a table and insert data with v = NULL
@@ -2057,9 +2178,6 @@ SEASTAR_THREAD_TEST_CASE(test_image_deleted_column) {
                 cquery_nofail(e, "insert into tbl(pk, ck, v, v2) values (1, 1, null, {1})");
                 cquery_nofail(e, "insert into tbl(pk, ck, v, v2) values (2, 2, null, {2})");
 
-                // These are the queried columns:
-                sstring query_string = "select \"cdc$operation\", pk, ck, v, \"cdc$deleted_v\", \"cdc$deleted_v2\" from tbl_scylla_cdc_log";
-
                 // Perform an insert that does not affect v column.
                 // Pre-image: v=NULL, cdc$deleted_v=NULL
                 // Pre-image ('full' mode): v=NULL, cdc$deleted_v=true
@@ -2069,6 +2187,11 @@ SEASTAR_THREAD_TEST_CASE(test_image_deleted_column) {
                     { oper_ut(cdc::operation::pre_image), int32_t(1), int32_t(1), data_value::make_null(int32_set_type), deleted_v, data_value::make_null(boolean_type) };
                 std::vector<data_value> postimage1 = 
                     { oper_ut(cdc::operation::post_image), int32_t(1), int32_t(1), data_value::make_null(int32_set_type), data_value::make_null(boolean_type), data_value::make_null(boolean_type) };
+
+                auto pk1_result = get_result(e, {oper_type, int32_type, int32_type, int32_set_type, boolean_type, boolean_type}, query_pk(1));
+                BOOST_REQUIRE_EQUAL(pk1_result.size(), 5);
+                BOOST_REQUIRE_EQUAL(pk1_result[2], preimage1);
+                BOOST_REQUIRE_EQUAL(pk1_result[4], postimage1);
 
                 // Perform an insert that affects v column.
                 // Pre-image: v=NULL, cdc$deleted_v=true
@@ -2080,12 +2203,10 @@ SEASTAR_THREAD_TEST_CASE(test_image_deleted_column) {
                 std::vector<data_value> postimage2 = 
                     { oper_ut(cdc::operation::post_image), int32_t(2), int32_t(2), make_int32_set(2), data_value::make_null(boolean_type), data_value::make_null(boolean_type) };
 
-                auto result = get_result(e, {oper_type, int32_type, int32_type, int32_set_type, boolean_type, boolean_type}, query_string);
-                BOOST_REQUIRE_EQUAL(result.size(), 10);
-                BOOST_REQUIRE_EQUAL(result[2], preimage1);
-                BOOST_REQUIRE_EQUAL(result[4], postimage1);
-                BOOST_REQUIRE_EQUAL(result[7], preimage2);
-                BOOST_REQUIRE_EQUAL(result[9], postimage2);
+                auto pk2_result = get_result(e, {oper_type, int32_type, int32_type, int32_set_type, boolean_type, boolean_type}, query_pk(2));
+                BOOST_REQUIRE_EQUAL(pk2_result.size(), 5);
+                BOOST_REQUIRE_EQUAL(pk2_result[2], preimage2);
+                BOOST_REQUIRE_EQUAL(pk2_result[4], postimage2);
             };
 
             test_table_with_collection(false);
@@ -2096,3 +2217,496 @@ SEASTAR_THREAD_TEST_CASE(test_image_deleted_column) {
         perform_test(true);
     }).get();
 }
+
+SEASTAR_THREAD_TEST_CASE(test_construct_next_stream_set) {
+    // for convenience of testing we represent stream_id by its token as int64_t.
+    // this function takes care of translating it into stream_id and back
+    using stream_set = std::vector<int64_t>;
+
+    auto do_test = [&] (stream_set prev, stream_set opened, stream_set closed, stream_set expected) {
+        std::unordered_map<int64_t, cdc::stream_id> token_to_stream;
+
+        auto stream_id_for_token = [&token_to_stream] (int64_t t) {
+            if (!token_to_stream.contains(t)) {
+                token_to_stream[t] = cdc::stream_id(dht::token(t), 0);
+            }
+            return token_to_stream[t];
+        };
+
+        auto tokens_to_stream_ids = [&stream_id_for_token] (const stream_set& tokens) {
+            utils::chunked_vector<cdc::stream_id> stream_ids;
+            for (auto t : tokens) {
+                stream_ids.push_back(stream_id_for_token(t));
+            }
+            return stream_ids;
+        };
+
+        auto result = cdc::metadata::construct_next_stream_set(
+                tokens_to_stream_ids(prev),
+                tokens_to_stream_ids(opened),
+                tokens_to_stream_ids(closed)).get();
+
+        stream_set result_tokens = std::views::transform(result, [] (cdc::stream_id sid) { return dht::token::to_int64(sid.token()); }) | std::ranges::to<std::vector>();
+
+        BOOST_REQUIRE_EQUAL(expected, result_tokens);
+    };
+
+    do_test(
+        stream_set { 10, 20, 30 }, stream_set { 15, 25 }, stream_set { 20 },
+        stream_set { 10, 15, 25, 30 }
+    );
+
+    do_test(
+        stream_set { 10, 20, 30 }, stream_set { 5, 15, 25, 35 }, stream_set { 10, 20, 30 },
+        stream_set { 5, 15, 25, 35 }
+    );
+
+    do_test(
+        stream_set { 10, 20, 30 }, stream_set {}, stream_set { 10, 20, 30 },
+        stream_set {}
+    );
+
+    do_test(
+        stream_set {}, stream_set { 10, 20, 30 }, stream_set {},
+        stream_set { 10, 20, 30 }
+    );
+
+    do_test(
+        stream_set { 15 }, stream_set { 10, 20, 30 }, stream_set {},
+        stream_set { 10, 15, 20, 30 }
+    );
+
+    // Randomized test: create a random prev set, a random closed subset, and a random opened set
+    {
+        std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<int> size_dist(1, 100);
+        std::uniform_int_distribution<int> token_dist(1, 1000);
+
+        // Generate random prev set
+        int prev_size = size_dist(rng);
+        std::set<int64_t> prev_set;
+        while (prev_set.size() < size_t(prev_size)) {
+            auto x = token_dist(rng);
+            if (!prev_set.count(x)) { // ensure uniqueness
+                prev_set.insert(x);
+            }
+        }
+        std::vector<int64_t> prev(prev_set.begin(), prev_set.end());
+        std::vector<int64_t> expected;
+
+        // Generate random closed subset of prev
+        std::vector<int64_t> closed;
+        for (auto t : prev) {
+            if (std::bernoulli_distribution(0.5)(rng)) {
+                closed.push_back(t);
+            } else {
+                expected.push_back(t);
+            }
+        }
+
+        // Generate random opened set (disjoint from prev)
+        int opened_size = size_dist(rng);
+        std::set<int64_t> opened_set;
+        while (opened_set.size() < size_t(opened_size)) {
+            int64_t candidate = token_dist(rng);
+            if (!prev_set.count(candidate) && !opened_set.count(candidate)) {
+                opened_set.insert(candidate);
+                expected.push_back(candidate);
+            }
+        }
+        std::vector<int64_t> opened(opened_set.begin(), opened_set.end());
+
+        std::ranges::sort(expected);
+
+        testlog.info("test_construct_next_stream_set: prev={}", prev);
+        testlog.info("test_construct_next_stream_set: opened={}", opened);
+        testlog.info("test_construct_next_stream_set: closed={}", closed);
+        testlog.info("test_construct_next_stream_set: expected={}", expected);
+
+        do_test(prev, opened, closed, expected);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_cdc_generate_stream_diff) {
+    // for convenience of testing we represent stream_id by its token as int64_t.
+    // this function takes care of translating it into stream_id and back
+    using stream_set = std::vector<int64_t>;
+
+    auto do_test_diff = [&] (stream_set a, stream_set b, stream_set expected_closed, stream_set expected_opened) {
+        std::unordered_map<int64_t, cdc::stream_id> token_to_stream;
+
+        auto stream_id_for_token = [&token_to_stream] (int64_t t) {
+            if (!token_to_stream.contains(t)) {
+                token_to_stream[t] = cdc::stream_id(dht::token(t), 0);
+            }
+            return token_to_stream[t];
+        };
+
+        auto tokens_to_stream_ids = [&stream_id_for_token] (const stream_set& tokens) {
+            utils::chunked_vector<cdc::stream_id> stream_ids;
+            for (auto t : tokens) {
+                stream_ids.push_back(stream_id_for_token(t));
+            }
+            return stream_ids;
+        };
+
+        auto diff = cdc::metadata::generate_stream_diff(
+                tokens_to_stream_ids(a),
+                tokens_to_stream_ids(b)).get();
+
+        stream_set closed_streams_tokens = std::views::transform(diff.closed_streams, [] (cdc::stream_id sid) { return dht::token::to_int64(sid.token()); }) | std::ranges::to<std::vector>();
+        stream_set opened_streams_tokens = std::views::transform(diff.opened_streams, [] (cdc::stream_id sid) { return dht::token::to_int64(sid.token()); }) | std::ranges::to<std::vector>();
+
+        BOOST_REQUIRE_EQUAL(closed_streams_tokens, expected_closed);
+        BOOST_REQUIRE_EQUAL(opened_streams_tokens, expected_opened);
+    };
+
+    do_test_diff(
+        stream_set { 10, 20, 30 }, stream_set { 10, 30, 50 },
+        stream_set { 20 }, stream_set { 50 }
+    );
+
+    do_test_diff(
+        stream_set { 10, 20, 30 }, stream_set { 30, 50, 70 },
+        stream_set { 10, 20 }, stream_set { 50, 70 }
+    );
+
+    do_test_diff(
+        stream_set {}, stream_set { 30, 50, 70 },
+        stream_set {}, stream_set { 30, 50, 70 }
+    );
+
+    do_test_diff(
+        stream_set { 10, 20, 30 }, stream_set {},
+        stream_set { 10, 20, 30 }, stream_set {}
+    );
+
+    do_test_diff(
+        stream_set { 10, 20, 30 }, stream_set { 5 },
+        stream_set { 10, 20, 30 }, stream_set { 5 }
+    );
+
+    do_test_diff(
+        stream_set { 10, 20, 30 }, stream_set { 5, 40, 80 },
+        stream_set { 10, 20, 30 }, stream_set { 5, 40, 80 }
+    );
+
+    do_test_diff(
+        stream_set { 10, 20, 30 }, stream_set { 10, 15, 20, 25, 30 },
+        stream_set {}, stream_set { 15, 25 }
+    );
+
+    do_test_diff(
+        stream_set { 10, 20, 30, 40, 50 }, stream_set { 10, 30, 50},
+        stream_set { 20, 40 }, stream_set {}
+    );
+
+    // Randomized test
+    {
+        std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<int> size_dist(1, 100);
+        std::uniform_int_distribution<int> token_dist(1, 1000);
+
+        int a_size = size_dist(rng);
+        std::set<int64_t> a_set;
+        while (a_set.size() < size_t(a_size)) {
+            a_set.insert(token_dist(rng));
+        }
+        std::vector<int64_t> a(a_set.begin(), a_set.end());
+
+        // Generate random opened set (disjoint from prev)
+        int b_size = size_dist(rng);
+        std::set<int64_t> b_set;
+        while (b_set.size() < size_t(b_size)) {
+            int64_t candidate = token_dist(rng);
+            b_set.insert(candidate);
+        }
+        std::vector<int64_t> b(b_set.begin(), b_set.end());
+
+        std::vector<int64_t> expected_closed, expected_opened;
+        std::ranges::set_difference(b, a, std::back_inserter(expected_opened));
+        std::ranges::set_difference(a, b, std::back_inserter(expected_closed));
+
+        testlog.info("test_construct_next_stream_set: a={}", a);
+        testlog.info("test_construct_next_stream_set: b={}", b);
+        testlog.info("test_construct_next_stream_set: expected_closed={}", expected_closed);
+        testlog.info("test_construct_next_stream_set: expected_opened={}", expected_opened);
+
+        do_test_diff(a, b, expected_closed, expected_opened);
+    }
+}
+
+struct cdc_gc_test_config {
+    table_id table;
+    std::vector<utils::chunked_vector<cdc::stream_id>> streams;
+    size_t new_base_stream;
+};
+
+void do_cdc_gc_test(cql_test_env& e, const cdc_gc_test_config& cfg) {
+    auto do_group0_write = [&] (std::function<future<utils::chunked_vector<mutation>>(api::timestamp_type ts)> fn) -> future<> {
+        while (true) {
+            auto& group0_client = e.get_raft_group0_client();
+            abort_source as;
+            auto guard = group0_client.start_operation(as).get();
+            auto ts = guard.write_timestamp();
+
+            auto muts = fn(ts).get();
+            utils::chunked_vector<canonical_mutation> cmuts = {muts.begin(), muts.end()};
+
+            auto group0_cmd = group0_client.prepare_command(
+                ::service::write_mutations{
+                    .mutations{std::move(cmuts)},
+                },
+                guard,
+                "test_cdc_gc_mutations");
+            try {
+                group0_client.add_entry(std::move(group0_cmd), std::move(guard), as, ::service::raft_timeout{}).get();
+            } catch (::service::group0_concurrent_modification&) {
+                continue;
+            }
+            break;
+        }
+        return make_ready_future<>();
+    };
+
+    std::vector<db_clock::time_point> stream_ts;
+    {
+        auto db_now = db_clock::now();
+        auto next_stream_ts = db_now;
+        for (size_t i = 0; i < cfg.streams.size(); i++) {
+            stream_ts.emplace_back(next_stream_ts);
+            next_stream_ts += std::chrono::seconds(5);
+        }
+    }
+
+    // write base stream to cdc_streams_state
+    do_group0_write([&] (api::timestamp_type ts) -> future<utils::chunked_vector<mutation>> {
+        auto m = co_await cdc::create_table_streams_mutation(cfg.table, stream_ts[0], cfg.streams[0], ts);
+        co_return utils::chunked_vector<mutation>({ std::move(m) });
+    }).get();
+
+    // write stream diffs to cdc_streams_history
+    for (size_t i = 0; i + 1 < cfg.streams.size(); i++) {
+        do_group0_write([&] (api::timestamp_type ts) -> future<utils::chunked_vector<mutation>> {
+            auto history_schema = db::system_keyspace::cdc_streams_history();
+            auto diff = co_await cdc::metadata::generate_stream_diff(cfg.streams[i], cfg.streams[i+1]);
+            auto mut = co_await get_switch_streams_mutation(cfg.table, stream_ts[i+1], diff, ts);
+            co_return utils::chunked_vector<mutation>({ std::move(mut) });
+        }).get();
+    }
+
+    // verify the base stream (streams[0]) is written to cdc_streams_state
+    e.execute_cql(format("SELECT stream_id FROM system.cdc_streams_state WHERE table_id = {}", cfg.table.uuid())).then([&] (shared_ptr<cql_transport::messages::result_message> msg) {
+        auto row_assert = assert_that(msg).is_rows()
+                    .with_size(cfg.streams[0].size());
+        for (auto sid : cfg.streams[0]) {
+            row_assert.with_row({ {sid.to_bytes()} });
+        }
+    }).get();
+
+    // gc the cdc streams with the new base stream cfg.new_base_stream
+    testlog.info("test_cdc_gc_mutations: start gc");
+
+    do_group0_write([&] (api::timestamp_type ts) -> future<utils::chunked_vector<mutation>> {
+        return cdc::get_cdc_stream_gc_mutations(cfg.table, stream_ts[cfg.new_base_stream], cfg.streams[cfg.new_base_stream], ts);
+    }).get();
+
+    // verify the new base stream is written to cdc_streams_state
+    e.execute_cql(format("SELECT stream_id FROM system.cdc_streams_state WHERE table_id = {}", cfg.table.uuid())).then([&] (shared_ptr<cql_transport::messages::result_message> msg) {
+        auto row_assert = assert_that(msg).is_rows()
+                    .with_size(cfg.streams[cfg.new_base_stream].size());
+        for (auto sid : cfg.streams[cfg.new_base_stream]) {
+            row_assert.with_row({ {sid.to_bytes()} });
+        }
+    }).get();
+
+    // verify that cdc_streams_history contains now only the timestamps that are bigger than the new base timestamp
+    e.execute_cql(format("SELECT timestamp FROM system.cdc_streams_history WHERE table_id = {}", cfg.table.uuid())).then([&] (shared_ptr<cql_transport::messages::result_message> msg) {
+        // find the distinct timestamps in cdc_streams_history
+        auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
+        auto results = to_bytes(*rows);
+        size_t col_idx = column_index(*rows, "timestamp");
+        std::set<db_clock::time_point> history_ts;
+        for (const auto& row : results) {
+            auto value = row[col_idx];
+            auto ts_val = timestamp_type->deserialize(*value);
+            auto ts = value_cast<db_clock::time_point>(ts_val);
+            history_ts.insert(ts);
+        }
+
+        // verify it's exactly the timestamps that are after the new base stream timestamp
+        auto new_history_base = std::next(stream_ts.begin(), cfg.new_base_stream + 1);
+        BOOST_REQUIRE_EQUAL(std::distance(new_history_base, stream_ts.end()), history_ts.size());
+        for (auto it = new_history_base; it != stream_ts.end(); ++it) {
+            BOOST_REQUIRE(history_ts.contains(*it));
+        }
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_cdc_gc_mutations) {
+    do_with_cql_env_thread([](cql_test_env& e) {
+
+        {
+            // create stream sets:
+            // 0: 10 20 30
+            // 1: 10    30 40 (20 closed, 40 opened)
+            // then gc with 1 as the new base, so after gc we should have only stream 1
+            // as the base and the history is empty
+
+            auto table = table_id(utils::UUID_gen::get_time_UUID());
+            utils::chunked_vector<cdc::stream_id> streams0;
+            for (auto t : {10, 20, 30}) {
+                streams0.emplace_back(dht::token(t), 0);
+            }
+            utils::chunked_vector<cdc::stream_id> streams1 = {streams0[0], streams0[2], cdc::stream_id(dht::token(40), 0)};
+
+            cdc_gc_test_config test1 = {
+                .table = table,
+                .streams = { std::move(streams0), std::move(streams1) },
+                .new_base_stream = 1,
+            };
+
+            do_cdc_gc_test(e, test1);
+
+            e.execute_cql(format("SELECT * FROM system.cdc_streams_history WHERE table_id = {}", table.uuid())).then([] (shared_ptr<cql_transport::messages::result_message> msg) {
+                assert_that(msg).is_rows()
+                        .with_size(0);
+            }).get();
+        }
+
+        {
+            // create stream sets:
+            // 0: 10 20 30
+            // 1: 10    30 40       (20 closed, 40 opened)
+            // 2: 10    30 40 50    (50 opened)
+            // then gc with 1 as the new base, so after gc we should have stream 1
+            // as the base and one history entry for open 50
+
+            auto table = table_id(utils::UUID_gen::get_time_UUID());
+            utils::chunked_vector<cdc::stream_id> streams0;
+            for (auto t : {10, 20, 30}) {
+                streams0.emplace_back(dht::token(t), 0);
+            }
+            utils::chunked_vector<cdc::stream_id> streams1 = {streams0[0], streams0[2], cdc::stream_id(dht::token(40), 0)};
+            utils::chunked_vector<cdc::stream_id> streams2 = {streams0[0], streams0[2], streams1[2], cdc::stream_id(dht::token(50), 0)};
+
+            cdc_gc_test_config test2 = {
+                .table = table,
+                .streams = { std::move(streams0), std::move(streams1), std::move(streams2)},
+                .new_base_stream = 1,
+            };
+
+            do_cdc_gc_test(e, test2);
+
+            e.execute_cql(format("SELECT stream_state, stream_id FROM system.cdc_streams_history WHERE table_id = {}", table.uuid())).then([&] (shared_ptr<cql_transport::messages::result_message> msg) {
+                assert_that(msg).is_rows()
+                        .with_size(1)
+                        .with_row({ {byte_type->decompose(std::to_underlying(cdc::stream_state::opened))}, { test2.streams[2][3].to_bytes() } });
+            }).get();
+        }
+    }).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_cdc_gc_get_new_base) {
+    auto make_streams_map = [&](std::vector<std::chrono::seconds> entries) {
+        cdc::table_streams streams_map;
+        auto base_time = db_clock::now() - std::chrono::seconds(100); // Start from 100 seconds ago
+
+        for (const auto& offset : entries) {
+            auto tp = base_time + offset;
+            auto ts = std::chrono::duration_cast<api::timestamp_clock::duration>(tp.time_since_epoch()).count();
+
+            streams_map[ts] = cdc::committed_stream_set{tp, utils::chunked_vector<cdc::stream_id>{}};
+        }
+        return streams_map;
+    };
+
+    // Test case 1: Single entry
+    {
+        auto streams_map = make_streams_map({
+            std::chrono::seconds(20),
+        });
+
+        // Should point to the only entry
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(50));
+            BOOST_REQUIRE(it == streams_map.begin());
+        }
+
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(150));
+            BOOST_REQUIRE(it == streams_map.begin());
+        }
+    }
+
+    // Test case 2: two entries
+    {
+        auto streams_map = make_streams_map({
+            std::chrono::seconds(30), // covers up to 10 seconds ago
+            std::chrono::seconds(90),
+        });
+
+        // Should point to the first entry
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(80));
+            BOOST_REQUIRE(it == streams_map.begin());
+        }
+
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(50));
+            BOOST_REQUIRE(it == streams_map.begin());
+        }
+
+        // Should point to the second entry
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(10));
+            BOOST_REQUIRE(it == std::next(streams_map.begin()));
+        }
+
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(5));
+            BOOST_REQUIRE(it == std::next(streams_map.begin()));
+        }
+    }
+
+    // Test case 3: multiple entries
+    {
+        auto streams_map = make_streams_map({
+            std::chrono::seconds(10), // covers up to 70 seconds ago
+            std::chrono::seconds(30), // covers up to 40 seconds ago
+            std::chrono::seconds(60), // covers up to 10 seconds ago
+            std::chrono::seconds(90),
+        });
+
+        // Should point to the first entry
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(80));
+            BOOST_REQUIRE(it == streams_map.begin());
+        }
+
+        // Should point to the second entry
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(70));
+            BOOST_REQUIRE(it == std::next(streams_map.begin()));
+        }
+
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(50));
+            BOOST_REQUIRE(it == std::next(streams_map.begin()));
+        }
+
+        // Should point to the third entry
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(15));
+            BOOST_REQUIRE(it == std::next(streams_map.begin(), 2));
+        }
+
+        // Should point to the last entry
+        {
+            auto it = cdc::get_new_base_for_gc(streams_map, std::chrono::seconds(5));
+            BOOST_REQUIRE(it == std::next(streams_map.begin(), 3));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()

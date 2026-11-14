@@ -3,31 +3,46 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include <unordered_set>
+#include <stdexcept>
 #include <unordered_map>
 #include <exception>
-#include <absl/container/btree_set.h>
+#include <fmt/core.h>
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/condition-variable.hh>
-#include <seastar/core/gate.hh>
 
-#include "replica/database_fwd.hh"
-#include "frozen_mutation.hh"
-#include "utils/UUID.hh"
-#include "utils/hash.hh"
+#include "gms/inet_address.hh"
+#include "service/topology_guard.hh"
 #include "streaming/stream_reason.hh"
-#include "locator/token_metadata.hh"
+#include "locator/abstract_replication_strategy.hh"
+#include "replica/database_fwd.hh"
+#include "schema/schema_fwd.hh"
+#include "mutation/frozen_mutation.hh"
+#include "utils/hash.hh"
+#include "repair/hash.hh"
+#include "utils/stall_free.hh"
+#include "repair/sync_boundary.hh"
+#include "tasks/types.hh"
+#include "gms/gossip_address_map.hh"
 
-class flat_mutation_reader;
+struct tablets_unsupported : std::runtime_error {
+    tablets_unsupported() : std::runtime_error("tablets are not supported for this operation") {}
+};
+
+namespace tasks {
+namespace repair {
+class task_manager_module;
+}
+}
 
 namespace replica {
 class database;
@@ -35,16 +50,18 @@ class database;
 
 class repair_service;
 namespace db {
+class cluster_config_manager;
     namespace view {
-        class view_update_generator;
+        class view_builder;
     }
-    class system_distributed_keyspace;
 }
 namespace netw { class messaging_service; }
 namespace service {
 class migration_manager;
 }
 namespace gms { class gossiper; }
+
+namespace locator { enum class tablet_repair_incremental_mode : uint8_t; }
 
 class repair_exception : public std::exception {
 private:
@@ -62,17 +79,19 @@ public:
 struct repair_uniq_id {
     // The integer ID used to identify a repair job. It is currently used by nodetool and http API.
     int id;
-    // A UUID to identifiy a repair job. We will transit to use UUID over the integer ID.
-    utils::UUID uuid;
+    // A UUID to identify a repair job.
+    tasks::task_id task_id;
+
+    tasks::task_id uuid() const noexcept {
+        return task_id;
+    }
 };
 std::ostream& operator<<(std::ostream& os, const repair_uniq_id& x);
 
-struct node_ops_info {
-    utils::UUID ops_uuid;
-    bool abort = false;
-    std::list<gms::inet_address> ignore_nodes;
-    void check_abort();
-};
+// If the repair master sets the dst_cpu_id to repair_unspecified_shard. It
+// means the repair master does not choose shard id for the repair follower.
+// The repair follower should choose the shard id itself.
+constexpr shard_id repair_unspecified_shard = shard_id(-1);
 
 // NOTE: repair_start() can be run on any node, but starts a node-global
 // operation.
@@ -81,7 +100,8 @@ struct node_ops_info {
 // repair_get_status(). The returned future<int> becomes available quickly,
 // as soon as repair_get_status() can be used - it doesn't wait for the
 // repair to complete.
-future<int> repair_start(seastar::sharded<repair_service>& repair,
+// repair_start() repairs only vnode keyspaces.
+future<int> repair_start(seastar::sharded<repair_service>& repair, sharded<gms::gossip_address_map>& am,
         sstring keyspace, std::unordered_map<sstring, sstring> options);
 
 // TODO: Have repair_progress contains a percentage progress estimator
@@ -111,11 +131,11 @@ public:
     uint64_t tx_row_bytes = 0;
     uint64_t rx_row_bytes = 0;
 
-    std::map<gms::inet_address, uint64_t> row_from_disk_bytes;
-    std::map<gms::inet_address, uint64_t> row_from_disk_nr;
+    std::map<locator::host_id, uint64_t> row_from_disk_bytes;
+    std::map<locator::host_id, uint64_t> row_from_disk_nr;
 
-    std::map<gms::inet_address, uint64_t> tx_row_nr_peer;
-    std::map<gms::inet_address, uint64_t> rx_row_nr_peer;
+    std::map<locator::host_id, uint64_t> tx_row_nr_peer;
+    std::map<locator::host_id, uint64_t> rx_row_nr_peer;
 
     lowres_clock::time_point start_time = lowres_clock::now();
 
@@ -126,188 +146,27 @@ public:
 
 class repair_neighbors {
 public:
-    std::vector<gms::inet_address> all;
-    std::vector<gms::inet_address> mandatory;
+    std::vector<locator::host_id> all;
+    std::vector<locator::host_id> mandatory;
+    std::unordered_map<locator::host_id, shard_id> shard_map;
     repair_neighbors() = default;
-    explicit repair_neighbors(std::vector<gms::inet_address> a)
+    explicit repair_neighbors(std::vector<locator::host_id> a)
         : all(std::move(a)) {
     }
-    repair_neighbors(std::vector<gms::inet_address> a, std::vector<gms::inet_address> m)
+    repair_neighbors(std::vector<locator::host_id> a, std::vector<locator::host_id> m)
         : all(std::move(a))
         , mandatory(std::move(m)) {
     }
-};
-
-class repair_info {
-public:
-    repair_service& rs;
-    seastar::sharded<replica::database>& db;
-    seastar::sharded<netw::messaging_service>& messaging;
-    sharded<db::system_distributed_keyspace>& sys_dist_ks;
-    sharded<db::view::view_update_generator>& view_update_generator;
-    service::migration_manager& mm;
-    gms::gossiper& gossiper;
-    const dht::sharder& sharder;
-    sstring keyspace;
-    dht::token_range_vector ranges;
-    std::vector<sstring> cfs;
-    std::vector<utils::UUID> table_ids;
-    repair_uniq_id id;
-    shard_id shard;
-    std::vector<sstring> data_centers;
-    std::vector<sstring> hosts;
-    std::unordered_set<gms::inet_address> ignore_nodes;
-    streaming::stream_reason reason;
-    std::unordered_map<dht::token_range, repair_neighbors> neighbors;
-    size_t total_rf;
-    uint64_t nr_ranges_finished = 0;
-    uint64_t nr_ranges_total;
-    size_t nr_failed_ranges = 0;
-    bool aborted = false;
-    int ranges_index = 0;
-    repair_stats _stats;
-    std::unordered_set<sstring> dropped_tables;
-    std::optional<utils::UUID> _ops_uuid;
-    bool _hints_batchlog_flushed = false;
-public:
-    repair_info(repair_service& repair,
-            const sstring& keyspace_,
-            const dht::token_range_vector& ranges_,
-            std::vector<utils::UUID> table_ids_,
-            repair_uniq_id id_,
-            const std::vector<sstring>& data_centers_,
-            const std::vector<sstring>& hosts_,
-            const std::unordered_set<gms::inet_address>& ingore_nodes_,
-            streaming::stream_reason reason_,
-            std::optional<utils::UUID> ops_uuid,
-            bool hints_batchlog_flushed);
-    void check_failed_ranges();
-    void abort();
-    void check_in_abort();
-    void check_in_shutdown();
-    repair_neighbors get_repair_neighbors(const dht::token_range& range);
-    void update_statistics(const repair_stats& stats) {
-        _stats.add(stats);
-    }
-    const std::vector<sstring>& table_names() {
-        return cfs;
-    }
-    const std::optional<utils::UUID>& ops_uuid() const {
-        return _ops_uuid;
-    };
-
-    bool hints_batchlog_flushed() const {
-        return _hints_batchlog_flushed;
-    }
-
-    future<> repair_range(const dht::token_range& range);
-};
-
-// The repair_tracker tracks ongoing repair operations and their progress.
-// A repair which has already finished successfully is dropped from this
-// table, but a failed repair will remain in the table forever so it can
-// be queried about more than once (FIXME: reconsider this. But note that
-// failed repairs should be rare anwyay).
-// This object is not thread safe, and must be used by only one cpu.
-class tracker {
-private:
-    // Each repair_start() call returns a unique int which the user can later
-    // use to follow the status of this repair with repair_status().
-    // We can't use the number 0 - if repair_start() returns 0, it means it
-    // decide quickly that there is nothing to repair.
-    int _next_repair_command = 1;
-    // Note that there are no "SUCCESSFUL" entries in the "status" map:
-    // Successfully-finished repairs are those with id < _next_repair_command
-    // but aren't listed as running or failed the status map.
-    std::unordered_map<int, repair_status> _status;
-    // Used to allow shutting down repairs in progress, and waiting for them.
-    seastar::gate _gate;
-    // Set when the repair service is being shutdown
-    std::atomic_bool _shutdown alignas(seastar::cache_line_size);
-    // Map repair id into repair_info.
-    std::unordered_map<int, lw_shared_ptr<repair_info>> _repairs;
-    // The semaphore used to control the maximum
-    // ranges that can be repaired in parallel.
-    named_semaphore _range_parallelism_semaphore;
-    static constexpr size_t _max_repair_memory_per_range = 32 * 1024 * 1024;
-    seastar::condition_variable _done_cond;
-    void start(repair_uniq_id id);
-    void done(repair_uniq_id id, bool succeeded);
-public:
-    explicit tracker(size_t max_repair_memory);
-    repair_status get(int id) const;
-    repair_uniq_id next_repair_command();
-    future<> shutdown();
-    void check_in_shutdown();
-    void add_repair_info(int id, lw_shared_ptr<repair_info> ri);
-    void remove_repair_info(int id);
-    lw_shared_ptr<repair_info> get_repair_info(int id);
-    std::vector<int> get_active() const;
-    size_t nr_running_repair_jobs();
-    void abort_all_repairs();
-    named_semaphore& range_parallelism_semaphore();
-    static size_t max_repair_memory_per_range() { return _max_repair_memory_per_range; }
-    future<> run(repair_uniq_id id, std::function<void ()> func);
-    future<repair_status> repair_await_completion(int id, std::chrono::steady_clock::time_point timeout);
-    float report_progress(streaming::stream_reason reason);
-    void abort_repair_node_ops(utils::UUID ops_uuid);
+    repair_neighbors(std::vector<locator::host_id> nodes, std::vector<shard_id> shards);
 };
 
 future<uint64_t> estimate_partitions(seastar::sharded<replica::database>& db, const sstring& keyspace,
         const sstring& cf, const dht::token_range& range);
 
-// Represent a position of a mutation_fragment read from a flat mutation
-// reader. Repair nodes negotiate a small range identified by two
-// repair_sync_boundary to work on in each round.
-struct repair_sync_boundary {
-    dht::decorated_key pk;
-    position_in_partition position;
-    class tri_compare {
-        dht::ring_position_comparator _pk_cmp;
-        position_in_partition::tri_compare _position_cmp;
-    public:
-        tri_compare(const schema& s) : _pk_cmp(s), _position_cmp(s) { }
-        std::strong_ordering operator()(const repair_sync_boundary& a, const repair_sync_boundary& b) const {
-            auto ret = _pk_cmp(a.pk, b.pk);
-            if (ret == 0) {
-                ret = _position_cmp(a.position, b.position);
-            }
-            return ret;
-        }
-    };
-    friend std::ostream& operator<<(std::ostream& os, const repair_sync_boundary& x) {
-        return os << "{ " << x.pk << "," <<  x.position << " }";
-    }
-};
+// Return the total on-disk size (in bytes) of a table summed across all the
+// shards of the local node. Returns 0 if the table does not exist locally.
+future<uint64_t> local_table_on_disk_size(seastar::sharded<replica::database>& db, table_id table);
 
-// Hash of a repair row
-class repair_hash {
-public:
-    uint64_t hash = 0;
-    repair_hash() = default;
-    explicit repair_hash(uint64_t h) : hash(h) {
-    }
-    void clear() {
-        hash = 0;
-    }
-    void add(const repair_hash& other) {
-        hash ^= other.hash;
-    }
-    bool operator==(const repair_hash& x) const {
-        return x.hash == hash;
-    }
-    bool operator!=(const repair_hash& x) const {
-        return x.hash != hash;
-    }
-    bool operator<(const repair_hash& x) const {
-        return x.hash < hash;
-    }
-    friend std::ostream& operator<<(std::ostream& os, const repair_hash& x) {
-        return os << x.hash;
-    }
-};
-
-using repair_hash_set = absl::btree_set<repair_hash>;
 
 enum class repair_row_level_start_status: uint8_t {
     ok,
@@ -334,7 +193,7 @@ struct get_sync_boundary_response {
 using get_combined_row_hash_response = repair_hash;
 
 struct node_repair_meta_id {
-    gms::inet_address ip;
+    locator::host_id ip;
     uint32_t repair_meta_id;
     bool operator==(const node_repair_meta_id& x) const {
         return x.ip == ip && x.repair_meta_id == repair_meta_id;
@@ -344,20 +203,34 @@ struct node_repair_meta_id {
 // Represent a partition_key and frozen_mutation_fragments within the partition_key.
 class partition_key_and_mutation_fragments {
     partition_key _key;
-    std::list<frozen_mutation_fragment> _mfs;
+    utils::chunked_vector<frozen_mutation_fragment> _mfs;
+    // When this is set to true, the receiver should use the last partition_key
+    // sent by the sender and the partition_key _key will be an empty partition
+    // key. This is used as an optimization to avoid sending the same
+    // partition_key more than once.
+    bool _use_last_partition_key = false;
 public:
     partition_key_and_mutation_fragments()
         : _key(std::vector<bytes>() ) {
     }
-    partition_key_and_mutation_fragments(partition_key key, std::list<frozen_mutation_fragment> mfs)
+    partition_key_and_mutation_fragments(partition_key key, utils::chunked_vector<frozen_mutation_fragment> mfs, bool use_last_partition_key)
         : _key(std::move(key))
-        , _mfs(std::move(mfs)) {
+        , _mfs(std::move(mfs))
+        , _use_last_partition_key(use_last_partition_key) {
+    }
+    partition_key_and_mutation_fragments(utils::chunked_vector<frozen_mutation_fragment> mfs)
+        : partition_key_and_mutation_fragments(partition_key::make_empty(), std::move(mfs), true) {
+    }
+    partition_key_and_mutation_fragments(partition_key key, utils::chunked_vector<frozen_mutation_fragment> mfs)
+        : partition_key_and_mutation_fragments(std::move(key), std::move(mfs), false) {
     }
     const partition_key& get_key() const { return _key; }
-    const std::list<frozen_mutation_fragment>& get_mutation_fragments() const { return _mfs; }
+    const utils::chunked_vector<frozen_mutation_fragment>& get_mutation_fragments() const { return _mfs; }
     partition_key& get_key() { return _key; }
-    std::list<frozen_mutation_fragment>& get_mutation_fragments() { return _mfs; }
+    utils::chunked_vector<frozen_mutation_fragment>& get_mutation_fragments() { return _mfs; }
     void push_mutation_fragment(frozen_mutation_fragment mf) { _mfs.push_back(std::move(mf)); }
+    future<> clear_gently() { return utils::clear_gently(_mfs); };
+    bool use_last_partition_key() const { return _use_last_partition_key; }
 };
 
 using repair_row_on_wire = partition_key_and_mutation_fragments;
@@ -389,83 +262,11 @@ enum class row_level_diff_detect_algorithm : uint8_t {
     send_full_set_rpc_stream,
 };
 
-std::ostream& operator<<(std::ostream& out, row_level_diff_detect_algorithm algo);
-
-enum class node_ops_cmd : uint32_t {
-     removenode_prepare,
-     removenode_heartbeat,
-     removenode_sync_data,
-     removenode_abort,
-     removenode_done,
-     replace_prepare,
-     replace_prepare_mark_alive,
-     replace_prepare_pending_ranges,
-     replace_heartbeat,
-     replace_abort,
-     replace_done,
-     decommission_prepare,
-     decommission_heartbeat,
-     decommission_abort,
-     decommission_done,
-     bootstrap_prepare,
-     bootstrap_heartbeat,
-     bootstrap_abort,
-     bootstrap_done,
-     query_pending_ops,
-     repair_updater,
-};
-
-std::ostream& operator<<(std::ostream& out, node_ops_cmd cmd);
-
-// The cmd and ops_uuid are mandatory for each request.
-// The ignore_nodes and leaving_node are optional.
-struct node_ops_cmd_request {
-    // Mandatory field, set by all cmds
-    node_ops_cmd cmd;
-    // Mandatory field, set by all cmds
-    utils::UUID ops_uuid;
-    // Optional field, list nodes to ignore, set by all cmds
-    std::list<gms::inet_address> ignore_nodes;
-    // Optional field, list leaving nodes, set by decommission and removenode cmd
-    std::list<gms::inet_address> leaving_nodes;
-    // Optional field, map existing nodes to replacing nodes, set by replace cmd
-    std::unordered_map<gms::inet_address, gms::inet_address> replace_nodes;
-    // Optional field, map bootstrapping nodes to bootstrap tokens, set by bootstrap cmd
-    std::unordered_map<gms::inet_address, std::list<dht::token>> bootstrap_nodes;
-    // Optional field, list uuids of tables being repaired, set by repair cmd
-    std::list<utils::UUID> repair_tables;
-    node_ops_cmd_request(node_ops_cmd command,
-            utils::UUID uuid,
-            std::list<gms::inet_address> ignore = {},
-            std::list<gms::inet_address> leaving = {},
-            std::unordered_map<gms::inet_address, gms::inet_address> replace = {},
-            std::unordered_map<gms::inet_address, std::list<dht::token>> bootstrap = {},
-            std::list<utils::UUID> tables = {})
-        : cmd(command)
-        , ops_uuid(std::move(uuid))
-        , ignore_nodes(std::move(ignore))
-        , leaving_nodes(std::move(leaving))
-        , replace_nodes(std::move(replace))
-        , bootstrap_nodes(std::move(bootstrap))
-        , repair_tables(std::move(tables)) {
-    }
-};
-
-struct node_ops_cmd_response {
-    // Mandatory field, set by all cmds
-    bool ok;
-    // Optional field, set by query_pending_ops cmd
-    std::list<utils::UUID> pending_ops;
-    node_ops_cmd_response(bool o, std::list<utils::UUID> pending = {})
-        : ok(o)
-        , pending_ops(std::move(pending)) {
-    }
-};
-
+std::string_view format_as(row_level_diff_detect_algorithm);
 
 struct repair_update_system_table_request {
-    utils::UUID repair_uuid;
-    utils::UUID table_uuid;
+    tasks::task_id repair_uuid;
+    table_id table_uuid;
     sstring keyspace_name;
     sstring table_name;
     dht::token_range range;
@@ -476,13 +277,157 @@ struct repair_update_system_table_response {
 };
 
 struct repair_flush_hints_batchlog_request {
-    utils::UUID repair_uuid;
-    std::list<gms::inet_address> target_nodes;
+    tasks::task_id repair_uuid;
+    std::list<gms::inet_address> unused;
     std::chrono::seconds hints_timeout;
     std::chrono::seconds batchlog_timeout;
+    // A cached flush time can be up to the cache time old, which a caller with
+    // a cache of its own would otherwise add to its own.
+    bool skip_cache = false;
 };
 
 struct repair_flush_hints_batchlog_response {
+    gc_clock::time_point flush_time;
+};
+
+// Asks node to flush its hints and batchlog and returns the time of that
+// flush. Waits for the longer of the request's timeouts plus a margin, then
+// fails with timed_out_error. The replica bounds itself by the timeouts in
+// the request, counted from the request's arrival and covering its wait
+// behind earlier requests, and logs its failure, so with the margin that
+// failure wins over the caller's, and the caller times out only on a replica
+// that is stuck or unreachable. Aborting as stops the wait early with the
+// exception as carries.
+future<gc_clock::time_point> flush_hints_batchlog_on_node(netw::messaging_service& ms, locator::host_id node, const repair_flush_hints_batchlog_request& req, abort_source& as);
+
+// The timeout a flush request gives each node for its hints and for its
+// batchlog, from the repair_hints_batchlog_flush_timeout_in_seconds cluster
+// config option.
+std::chrono::seconds repair_hints_batchlog_flush_timeout(const db::cluster_config_manager& ccm);
+
+struct tablet_repair_task_meta {
+    sstring keyspace_name;
+    sstring table_name;
+    table_id tid;
+    shard_id master_shard_id;
+    dht::token_range range;
+    repair_neighbors neighbors;
+    locator::tablet_replica_set replicas;
+    locator::effective_replication_map_ptr erm;
+};
+
+// Repair mode tombstone GC lets compaction drop tombstones older than the
+// last repair of a range, on the ground that the repair made all replicas
+// agree on the data written before its time. Writes still waiting in hints
+// or batchlog at that time are not covered by that, so they are flushed on
+// all nodes before the repair starts.
+bool repair_needs_hints_batchlog_flush(const schema& s);
+
+struct tablet_repair_sched_info {
+    bool sched_by_scheduler = false;
+    bool for_tablet_rebuild = false;
+    locator::tablet_repair_incremental_mode incremental_mode;
+};
+
+namespace repair {
+class task_manager_module;
+}
+
+// The state of a single shard repair that the row level repair machinery
+// works with.
+class shard_repair_state {
+public:
+    repair_service& rs;
+    seastar::sharded<replica::database>& db;
+    seastar::sharded<netw::messaging_service>& messaging;
+    gms::gossiper& gossiper;
+private:
+    locator::effective_replication_map_ptr _erm;
+    std::string _keyspace;
+    streaming::stream_reason _reason;
+    // The abort source of the task owning this repair. Plugged in with
+    // plug_abort_source() when the task starts.
+    seastar::abort_source* _as = nullptr;
+public:
+    dht::token_range_vector ranges;
+    std::vector<table_id> table_ids;
+    std::vector<sstring> cfs;
+    repair_uniq_id global_repair_id;
+    std::vector<sstring> data_centers;
+    std::vector<sstring> hosts;
+    std::unordered_set<locator::host_id> ignore_nodes;
+    std::unordered_map<dht::token_range, repair_neighbors> neighbors;
+    repair_stats stats;
+    uint64_t nr_ranges_finished = 0;
+    size_t nr_failed_ranges = 0;
+    int ranges_index = 0;
+    std::unordered_set<sstring> dropped_tables;
+    std::unordered_set<locator::host_id> nodes_down;
+    bool hints_batchlog_flushed = false;
+    bool small_table_optimization = false;
+    size_t small_table_optimization_ranges_reduced_factor = 1;
+private:
+    bool _aborted = false;
+    service::frozen_topology_guard _frozen_topology_guard;
+    service::topology_guard _topology_guard = {service::null_topology_guard};
+    std::optional<semaphore> _user_ranges_parallelism;
+    uint64_t _ranges_complete = 0;
+public:
+    tablet_repair_sched_info sched_info;
+public:
+    shard_repair_state(repair_service& repair,
+            sstring keyspace,
+            locator::effective_replication_map_ptr erm_,
+            dht::token_range_vector ranges_,
+            std::vector<table_id> table_ids_,
+            repair_uniq_id global_repair_id_,
+            std::vector<sstring> data_centers_,
+            std::vector<sstring> hosts_,
+            std::unordered_set<locator::host_id> ignore_nodes_,
+            std::unordered_map<dht::token_range, repair_neighbors> neighbors_,
+            streaming::stream_reason reason_,
+            bool hints_batchlog_flushed,
+            bool small_table_optimization,
+            std::optional<int> ranges_parallelism,
+            service::frozen_topology_guard topo_guard,
+            tablet_repair_sched_info sched_info_ = tablet_repair_sched_info(),
+            size_t small_table_optimization_ranges_reduced_factor_ = 1);
+
+    void plug_abort_source(seastar::abort_source& as) noexcept {
+        _as = &as;
+    }
+
+    void check_in_abort_or_shutdown();
+    // Logs the repair outcome and throws if the repair failed. failed_because
+    // carries the error that interrupted the repair loop, if any.
+    void check_failed_ranges(const std::optional<sstring>& failed_because);
+    repair_neighbors get_repair_neighbors(const dht::token_range& range);
+    size_t ranges_size() const noexcept;
+    // Returns the token metadata version pinned by this repair's
+    // effective_replication_map, or nullopt if it does not hold one.
+    std::optional<locator::token_metadata::version_t> pinned_token_metadata_version() const noexcept {
+        return _erm ? std::optional(_erm->get_token_metadata().get_version()) : std::nullopt;
+    }
+    void abort() noexcept;
+    void update_statistics(const repair_stats& o) {
+        stats.add(o);
+    }
+    const std::vector<sstring>& table_names() const {
+        return cfs;
+    }
+    const std::string& get_keyspace() const noexcept {
+        return _keyspace;
+    }
+    streaming::stream_reason reason() const noexcept {
+        return _reason;
+    }
+    service::frozen_topology_guard get_frozen_topology_guard() const noexcept {
+        return _frozen_topology_guard;
+    }
+    locator::effective_replication_map_ptr get_erm();
+
+    friend class repair_service;
+    friend class repair::task_manager_module;
 };
 
 namespace std {
@@ -498,3 +443,9 @@ struct hash<node_repair_meta_id> {
 };
 
 }
+
+template <> struct fmt::formatter<row_level_diff_detect_algorithm> : fmt::formatter<string_view> {
+    auto format(row_level_diff_detect_algorithm algo, fmt::format_context& ctx) const {
+        return formatter<string_view>::format(format_as(algo), ctx);
+    }
+};

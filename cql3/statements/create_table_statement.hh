@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -18,13 +15,14 @@
 #include "cql3/statements/raw/cf_statement.hh"
 #include "cql3/cql3_type.hh"
 
-#include "schema_fwd.hh"
+#include "schema/schema_fwd.hh"
+
+#include "utils/chunked_vector.hh"
 
 #include <seastar/core/shared_ptr.hh>
 
 #include <seastar/util/indirect.hh>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 #include <set>
 #include <optional>
@@ -32,6 +30,7 @@
 namespace cql3 {
 
 class query_processor;
+struct twcs_restrictions;
 class cf_prop_defs;
 
 namespace statements {
@@ -61,29 +60,27 @@ class create_table_statement : public schema_altering_statement {
                            shared_ptr_equal_by_value<column_identifier>>;
     column_map_type _columns;
     column_set_type _static_columns;
+    ::shared_ptr<column_identifier> _ttl_column; // for row-based TTL
     const ::shared_ptr<cf_prop_defs> _properties;
     const bool _if_not_exists;
-    std::optional<utils::UUID> _id;
+    std::optional<table_id> _id;
 public:
     create_table_statement(cf_name name,
                            ::shared_ptr<cf_prop_defs> properties,
                            bool if_not_exists,
                            column_set_type static_columns,
-                           const std::optional<utils::UUID>& id);
+                           ::shared_ptr<column_identifier> ttl_column,
+                           const std::optional<table_id>& id);
 
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
-    virtual void validate(query_processor&, const service::client_state& state) const override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
-    future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
 
+    future<::shared_ptr<messages::result_message>> execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const override;
 
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
-
-    virtual future<> grant_permissions_to_creator(const service::client_state&) const override;
-
-    virtual future<::shared_ptr<messages::result_message>>
-    execute(query_processor& qp, service::query_state& state, const query_options& options) const override;
+    virtual future<> grant_permissions_to_creator(const service::client_state&, service::group0_batch&) const override;
 
     schema_ptr get_cf_meta_data(const data_dictionary::database) const;
 
@@ -91,11 +88,13 @@ public:
 
     friend raw_statement;
 private:
-    std::vector<column_definition> get_columns() const;
+    utils::chunked_vector<column_definition> get_columns() const;
 
     void apply_properties_to(schema_builder& builder, const data_dictionary::database) const;
 
     void add_column_metadata_from_aliases(schema_builder& builder, std::vector<bytes> aliases, const std::vector<data_type>& types, column_kind kind) const;
+
+    ::shared_ptr<event_t> created_event() const;
 };
 
 class create_table_statement::raw_statement : public raw::cf_statement {
@@ -108,6 +107,7 @@ private:
     std::vector<std::vector<::shared_ptr<column_identifier>>> _key_aliases;
     std::vector<::shared_ptr<column_identifier>> _column_aliases;
     create_table_statement::column_set_type _static_columns;
+    ::shared_ptr<column_identifier> _ttl_column; // for row-based TTL
 
     std::multiset<::shared_ptr<column_identifier>,
             indirect_less<::shared_ptr<column_identifier>, column_identifier::text_comparator>> _defined_names;
@@ -116,7 +116,7 @@ private:
 public:
     raw_statement(cf_name name, bool if_not_exists);
 
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
 
     cf_properties& properties() {
         return _properties;
@@ -124,17 +124,20 @@ public:
 
     data_type get_type_and_remove(column_map_type& columns, ::shared_ptr<column_identifier> t);
 
-    void add_definition(::shared_ptr<column_identifier> def, ::shared_ptr<cql3_type::raw> type, bool is_static);
+    void add_definition(::shared_ptr<column_identifier> def, ::shared_ptr<cql3_type::raw> type, bool is_static, bool is_ttl);
 
     void add_key_aliases(const std::vector<::shared_ptr<column_identifier>> aliases);
 
     void add_column_alias(::shared_ptr<column_identifier> alias);
+protected:
+    virtual audit::statement_category category() const override;
 };
 
 std::optional<sstring> check_restricted_table_properties(
-    query_processor& qp,
+    std::optional<schema_ptr> schema,
     const sstring& keyspace, const sstring& table,
-    const cf_prop_defs& cfprops);
+    const cf_prop_defs& cfprops,
+    const twcs_restrictions& tr);
 
 }
 

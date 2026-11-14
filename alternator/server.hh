@@ -3,46 +3,86 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include "alternator/executor.hh"
+#include "utils/scoped_item_list.hh"
 #include <seastar/core/future.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/tls.hh>
 #include <optional>
 #include "alternator/auth.hh"
+#include "timeout_config.hh"
+#include "service/qos/service_level_controller.hh"
 #include "utils/small_vector.hh"
 #include "utils/updateable_value.hh"
 #include <seastar/core/units.hh>
+#include <boost/regex.hpp>
+
+struct client_data;
 
 namespace alternator {
 
 using chunked_content = rjson::chunked_content;
 
-class server {
-    static constexpr size_t content_length_limit = 16*MB;
+class server : public peering_sharded_service<server> {
+    // The maximum size of a request body that Alternator will accept,
+    // in bytes. This is a safety measure to prevent Alternator from
+    // running out of memory when a client sends a very large request.
+    // DynamoDB also has the same limit set to 16 MB.
+    static constexpr size_t request_content_length_limit = 16*MB;
+    // The maximum combined size of a request's request line (the URL) and its
+    // headers, in bytes. Like request_content_length_limit above, this is a
+    // safety measure to prevent Alternator from running out of memory - the
+    // HTTP server needs to buffer all of these in memory (and each individual
+    // header in *contiguous* memory) before the request can be handled.
+    // We choose 16 KB as the limit to match DynamoDB's limit.
+    static constexpr size_t request_line_and_headers_limit = 16*KB;
     using alternator_callback = std::function<future<executor::request_return_type>(executor&, executor::client_state&,
-            tracing::trace_state_ptr, service_permit, rjson::value, std::unique_ptr<request>)>;
+            tracing::trace_state_ptr, service_permit, rjson::value, std::unique_ptr<http::request>, std::unique_ptr<audit::audit_info_alternator>&)>;
     using alternator_callbacks_map = std::unordered_map<std::string_view, alternator_callback>;
 
-    http_server _http_server;
-    http_server _https_server;
+    httpd::http_server _http_server;
+    httpd::http_server _https_server;
     executor& _executor;
     service::storage_proxy& _proxy;
     gms::gossiper& _gossiper;
+    auth::service& _auth_service;
+    qos::service_level_controller& _sl_controller;
 
     key_cache _key_cache;
-    bool _enforce_authorization;
+    // Caches the result of try_mtls_authentication()'s role validation
+    // (role exists and has can_login=true), keyed by role name, so a
+    // long-lived mTLS connection doesn't re-read the roles table on
+    // every single request.
+    role_cache _mtls_role_cache;
+    // auth_certificate_role_queries patterns (SUBJECT and ALTNAME), compiled once at startup.
+    struct cert_pattern {
+        enum class source_type { subject, altname } source;
+        boost::regex regex;
+    };
+    std::vector<cert_pattern> _cert_patterns;
+    utils::updateable_value<bool> _enforce_authorization;
+    utils::updateable_value<bool> _warn_authorization;
+    utils::updateable_value<uint64_t> _max_users_query_size_in_trace_output;
     utils::small_vector<std::reference_wrapper<seastar::httpd::http_server>, 2> _enabled_servers;
-    gate _pending_requests;
+    named_gate _pending_requests;
+    // In some places we will need a CQL updateable_timeout_config object even
+    // though it isn't really relevant for Alternator which defines its own
+    // timeouts separately.
+    updateable_timeout_config& _timeout_config;
+    client_options_cache_type _connection_options_keys_and_values;
+
     alternator_callbacks_map _callbacks;
 
     semaphore* _memory_limiter;
     utils::updateable_value<uint32_t> _max_concurrent_requests;
+
+    ::shared_ptr<seastar::tls::server_credentials> _credentials;
 
     class json_parser {
         static constexpr size_t yieldable_parsing_threshold = 16*KB;
@@ -64,17 +104,52 @@ class server {
     };
     json_parser _json_parser;
 
-public:
-    server(executor& executor, service::storage_proxy& proxy, gms::gossiper& gossiper);
+    // The server maintains a list of ongoing requests, that are being handled
+    // by handle_api_request(). It uses this list in get_client_data(), which
+    // is called when reading the "system.clients" virtual table.
+    struct ongoing_request {
+        socket_address _client_address;
+        client_options_cache_entry_type _user_agent;
+        sstring _username;
+        scheduling_group _scheduling_group;
+        bool _is_https;
+        client_data make_client_data() const;
+    };
+    utils::scoped_item_list<ongoing_request> _ongoing_requests;
 
-    future<> init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port, std::optional<tls::credentials_builder> creds,
-            bool enforce_authorization, semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests);
+    // Observers for live-update config options that drive Seastar HTTP server state.
+    std::optional<utils::observer<sstring>> _server_header_observer;
+    std::optional<utils::observer<bool>> _date_header_observer;
+
+public:
+    server(executor& executor, service::storage_proxy& proxy, gms::gossiper& gossiper, auth::service& service, qos::service_level_controller& sl_controller, updateable_timeout_config& timeout_config);
+
+    future<> init(net::inet_address addr, std::optional<uint16_t> port, std::optional<uint16_t> https_port,
+            std::optional<uint16_t> port_proxy_protocol, std::optional<uint16_t> https_port_proxy_protocol,
+            std::optional<tls::credentials_builder> creds,
+            utils::updateable_value<bool> enforce_authorization, utils::updateable_value<bool> warn_authorization, utils::updateable_value<uint64_t> max_users_query_size_in_trace_output,
+            semaphore* memory_limiter, utils::updateable_value<uint32_t> max_concurrent_requests);
     future<> stop();
+    // get_client_data() is called (on each shard separately) when the virtual
+    // table "system.clients" is read. It is expected to generate a list of
+    // clients connected to this server (on this shard). This function is
+    // called by alternator::controller::get_client_data().
+    future<utils::chunked_vector<foreign_ptr<std::unique_ptr<client_data>>>> get_client_data();
 private:
     void set_routes(seastar::httpd::routes& r);
-    // If verification succeeds, returns the authenticated user's username
-    future<std::string> verify_signature(const seastar::httpd::request&, const chunked_content&);
-    future<executor::request_return_type> handle_api_request(std::unique_ptr<request> req);
+    // If verification succeeds, returns the authenticated user's username.
+    // Throws an api_error if the verification fails.
+    future<std::string> verify_signature(const seastar::http::request&, const chunked_content&);
+    // Attempt to authenticate via mTLS certificate matching. Returns the role
+    // name if a client certificate was presented and a valid role could be
+    // extracted using auth_certificate_role_queries patterns. Returns
+    // std::nullopt if no client certificate was presented at all (caller
+    // should fall through to SigV4). If a certificate was presented but a
+    // valid role could not be extracted, throws an authentication error when
+    // alternator_enforce_authorization is true, and otherwise returns an
+    // empty string (indicating an unauthenticated request).
+    future<std::optional<std::string>> try_mtls_authentication(const seastar::http::request&);
+    future<executor::request_return_type> handle_api_request(std::unique_ptr<http::request> req);
 };
 
 }

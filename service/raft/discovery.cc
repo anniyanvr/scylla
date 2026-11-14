@@ -3,19 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+#include "utils/assert.hh"
 #include "service/raft/discovery.hh"
 
 namespace service {
 
-void check_peer(const raft::server_address& peer) {
-    if (!peer.info.size()) {
+void check_peer(const discovery_peer& peer) {
+    if (peer.ip_addr == gms::inet_address{}) {
         throw std::logic_error("Discovery requires peer internet address to be set");
     }
 }
 
-discovery::discovery(raft::server_address self, const peer_list& seeds)
+discovery::discovery(discovery_peer self, const peer_list& seeds)
     : _self(std::move(self)) {
 
     // self must have a non-empty Internet address
@@ -29,7 +30,6 @@ discovery::discovery(raft::server_address self, const peer_list& seeds)
 }
 
 void discovery::step(const peer_list& peers) {
-
     if (_is_leader) {
         return;
     }
@@ -41,7 +41,7 @@ void discovery::step(const peer_list& peers) {
 
     for (const auto& addr : peers) {
         // peer must have a non-empty Internet address
-        if (addr.info == _self.info) {
+        if (addr.ip_addr == _self.ip_addr) {
             // do not include _self into _peers
             continue;
         }
@@ -62,7 +62,7 @@ void discovery::step(const peer_list& peers) {
             // If we have this peer, its ID must be the
             // same as we know (with the exceptions of seeds,
             // for which servers might not know ids at first).
-            assert(it == _peers.end() || it->id == addr.id || addr.id == raft::server_id{});
+            SCYLLA_ASSERT(it == _peers.end() || it->id == addr.id || addr.id == raft::server_id{});
         }
     }
     if (refresh_peer_list) {
@@ -87,24 +87,40 @@ void discovery::maybe_become_leader() {
     if (_responded.size() < _peers.size()) {
         return;
     }
-    auto min_id = std::min_element(_peer_list.begin(), _peer_list.end());
+
+    // Note: when we perform this check some peers may still have their Raft IDs
+    // undiscovered (we only know their server_infos: IP addresses etc.).
+    // Then their Raft IDs are set to raft::server_id{}, which contains UUID 0,
+    // which is the smallest UUID.
+    // That's fine - it means this check will not pass this time.
+    // The check can only pass when the Raft IDs of all peers are discovered.
+    //
+    // Note: it may happen we finish the algorithm before we discover all Raft IDs,
+    // if we obtain information about already existing group 0 from some peer.
+    // That's fine as well.
+    auto min_id = std::min_element(_peer_list.begin(), _peer_list.end(),
+        [](const auto& lhs, const auto& rhs) { return lhs.id < rhs.id; });
+
     if (min_id != _peer_list.end() && min_id->id == _self.id) {
         _is_leader = true;
     }
 }
 
-discovery::peer_list discovery::request(const peer_list& peers) {
+std::optional<discovery::peer_list> discovery::request(const peer_list& peers) {
     step(peers);
+    if (_is_leader) {
+        return std::nullopt;
+    }
     return _peer_list;
 }
 
-void discovery::response(raft::server_address from, const peer_list& peers) {
-    assert(_peers.contains(from));
+void discovery::response(discovery_peer from, const peer_list& peers) {
+    SCYLLA_ASSERT(_peers.contains(from));
     _responded.emplace(from);
     step(peers);
 }
 
-discovery::output discovery::get_output() {
+discovery::tick_output discovery::tick() {
     if (_is_leader) {
         return i_am_leader{};
     } else if (!_requests.empty()) {

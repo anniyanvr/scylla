@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "test/lib/cql_test_env.hh"
@@ -11,13 +11,12 @@
 #include "test/lib/random_utils.hh"
 #include "test/lib/log.hh"
 
-#include "schema_builder.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include "replica/database.hh"
 #include "db/config.hh"
 #include "db/commitlog/commitlog.hh"
 
-#include <boost/range/irange.hpp>
+#include <fmt/ranges.h>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/units.hh>
@@ -123,8 +122,8 @@ public:
             return make_ready_future<>();
         }
         return seastar::async([this] {
-            auto f = open_file_dma(_params->output_file, open_flags::create | open_flags::wo).get0();
-            auto os = make_file_output_stream(f, file_output_stream_options{}).get0();
+            auto f = open_file_dma(_params->output_file, open_flags::create | open_flags::wo).get();
+            auto os = make_file_output_stream(f, file_output_stream_options{}).get();
 
             {
                 const auto header = "lsa_used_memory,lsa_free_memory,non_lsa_used_memory,non_lsa_free_memory,reads_memory_consumption,reads\n";
@@ -144,7 +143,7 @@ public:
     }
 };
 
-void execute_reads(const schema& s, reader_concurrency_semaphore& sem, unsigned reads, unsigned concurrency, std::function<future<>(unsigned)> read) {
+void execute_reads(const schema_ptr& schema, reader_concurrency_semaphore& sem, unsigned reads, unsigned concurrency, std::function<future<>(unsigned)> read) {
     const reader_resources initial_res = sem.available_resources();
     unsigned n = 0;
     gate g;
@@ -156,12 +155,12 @@ void execute_reads(const schema& s, reader_concurrency_semaphore& sem, unsigned 
             (void)with_gate(g, [reads, read, &n, concurrency] {
                 const auto start = n;
                 n = std::min(reads, n + concurrency);
-                return parallel_for_each(boost::irange(start, n), read);
+                return parallel_for_each(std::views::iota(start, n), read);
             }).handle_exception([&e, &sem, initial_res] (std::exception_ptr eptr) {
                 const auto res = sem.available_resources();
                 testlog.error("Read failed: {}", eptr);
                 testlog.trace("Reads remaining: count: {}/{}, memory: {}/{}, waiters: {}", (initial_res.count - res.count), initial_res.count,
-                        (initial_res.memory - res.memory), initial_res.memory, sem.waiters());
+                        (initial_res.memory - res.memory), initial_res.memory, sem.get_stats().waiters);
                 e = std::move(eptr);
             });
             thread::yield();
@@ -171,11 +170,11 @@ void execute_reads(const schema& s, reader_concurrency_semaphore& sem, unsigned 
 
         const auto res = sem.available_resources();
         testlog.trace("Initiated reads: {}/{}, count: {}/{}, memory: {}/{}, waiters: {}", n, reads, (initial_res.count - res.count), initial_res.count,
-                (initial_res.memory - res.memory), initial_res.memory, sem.waiters());
+                (initial_res.memory - res.memory), initial_res.memory, sem.get_stats().waiters);
 
-        if (sem.waiters()) {
+        if (sem.get_stats().waiters) {
             testlog.trace("Waiting for queue to drain");
-            sem.obtain_permit(&s, "drain", 1, db::no_timeout).get();
+            sem.obtain_permit(schema, "drain", 1, db::no_timeout, {}).get();
         }
     }
 
@@ -242,7 +241,7 @@ void test_main_thread(cql_test_env& env) {
 
     env.local_db().flush_all_memtables().get();
 
-    testlog.info("Live disk space used: {}", tab.get_stats().live_disk_space_used);
+    testlog.info("Live disk space used: {}", tab.get_stats().sstables_live_disk_space_used.on_disk);
     testlog.info("Live sstables: {}", tab.get_stats().live_sstable_count);
 
     testlog.info("Preparing dummy cache");
@@ -251,7 +250,7 @@ void test_main_thread(cql_test_env& env) {
     row_cache c(s, snapshot_source([&] { return underlying(); }), tr, is_continuous::yes);
     auto prev_evictions = tr.get_stats().row_evictions;
     while (tr.get_stats().row_evictions == prev_evictions) {
-        auto mt = make_lw_shared<memtable>(s);
+        auto mt = make_lw_shared<replica::memtable>(s);
         mt->apply(gen(sstable_size));
         c.update(row_cache::external_updater([] {}), *mt).get();
         thread::maybe_yield();
@@ -266,15 +265,15 @@ void test_main_thread(cql_test_env& env) {
     stats_collector sc(sem, stats_collector_params);
     try {
         auto _ = sc.collect();
-        memory::set_heap_profiling_enabled(true);
-        execute_reads(*s, sem, reads, read_concurrency, [&] (unsigned i) {
+        memory::set_heap_profiling_sampling_rate(100);
+        execute_reads(s, sem, reads, read_concurrency, [&] (unsigned i) {
             return env.execute_cql(format("select * from ks.test where pk = 0 and ck > {} limit 100;",
                     tests::random::get_int(rows / 2))).discard_result();
         });
     } catch (...) {
         testlog.error("Reads aborted due to exception: {}", std::current_exception());
     }
-    memory::set_heap_profiling_enabled(false);
+    memory::set_heap_profiling_sampling_rate(0);
     sc.write_stats().get();
 
     auto occupancy = logalloc::shard_tracker().occupancy();
@@ -295,7 +294,7 @@ int main(int argc, char** argv) {
         ("read-concurrency", bpo::value<unsigned>()->default_value(1), "Concurrency of reads, the amount of reads to fire at once")
         ("sstables", bpo::value<uint64_t>()->default_value(100), "Number of sstables to generate")
         ("sstable-size", bpo::value<uint64_t>()->default_value(10000000), "Size of generated sstables")
-        ("sstable-format", bpo::value<std::string>()->default_value("md"), "Sstable format version to use during population")
+        ("sstable-format", bpo::value<std::string>()->default_value("me"), "Sstable format version to use during population")
         ("clustering-row-size", bpo::value<uint64_t>()->default_value(100), "Size of a clustering row")
         ("collect-stats", "Enable collecting statistics.")
         ("stats-file", bpo::value<sstring>()->default_value("stats.csv"), "Store statistics in the specified file.")
@@ -312,20 +311,15 @@ int main(int argc, char** argv) {
 
         db_cfg.enable_cache(app.configuration().contains("enable-cache"));
         db_cfg.enable_commitlog(false);
-        db_cfg.virtual_dirty_soft_limit(1.0);
+        db_cfg.unspooled_dirty_soft_limit(1.0);
 
-        auto sstable_format_name = app.configuration()["sstable-format"].as<std::string>();
-        if (sstable_format_name == "md") {
-            db_cfg.enable_sstables_md_format(true);
-        } else if (sstable_format_name == "mc") {
-            db_cfg.enable_sstables_md_format(false);
-        } else {
-            throw std::runtime_error(format("Unsupported sstable format: {}", sstable_format_name));
-        }
+        db_cfg.sstable_format(app.configuration()["sstable-format"].as<std::string>());
 
         do_with_cql_env([] (cql_test_env& env) {
-            return with_scheduling_group(env.local_db().get_statement_scheduling_group(), [&] {
-                return seastar::async([&] {
+            return get_scheduling_groups().then([&env] (auto groups) {
+                seastar::thread_attributes attr;
+                attr.sched_group = groups.statement_scheduling_group;
+                return seastar::async(std::move(attr), [&] {
                     test_main_thread(env);
                 });
             });

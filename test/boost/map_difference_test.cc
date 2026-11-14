@@ -3,19 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/unit_test.hpp>
 
-#include "map_difference.hh"
+#include "utils/map_difference.hh"
 
 #include <map>
 #include <set>
 
-using namespace std;
+using std::map;
+using std::set;
 
 BOOST_AUTO_TEST_CASE(both_empty) {
     map<int, int> left;

@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2014-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -32,7 +29,12 @@ private:
 public:
     use_statement(sstring keyspace);
 
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
+protected:
+    virtual audit::statement_category category() const override;
+    virtual audit::audit_info_ptr audit_info() const override {
+        return audit::audit::create_audit_info(category(), _keyspace, sstring());
+    }
 };
 
 }

@@ -4,29 +4,30 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
+trap 'echo "error $? in $0 line $LINENO"' ERR
+
 print_usage() {
-    echo "build_unified.sh --mode <mode>"
-    echo "  --mode specify mode (default: release)"
+    echo "build_unified.sh --build-dir <build_dir>"
+    echo "  --build-dir specify build directory (default: build/release)"
+    echo "  --pkgs specify source packages"
     echo "  --unified-pkg specify package path (default: build/release/scylla-unified-package.tar.gz)"
     exit 1
 }
 
-# configure.py will run SCYLLA-VERSION-GEN prior to this case
-# but just in case...
-if [ ! -f build/SCYLLA-PRODUCT-FILE ]; then
-    ./SCYLLA-VERSION-GEN
-fi
-PRODUCT=`cat build/SCYLLA-PRODUCT-FILE`
-
-MODE="release"
-UNIFIED_PKG="build/release/$PRODUCT-unified-$(arch)-package.tar.gz"
+PKGS=
+BUILD_DIR="build/release"
+UNIFIED_PKG=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        "--mode")
-            MODE="$2"
+        "--build-dir")
+            BUILD_DIR="$2"
+            shift 2
+            ;;
+        "--pkgs")
+            PKGS="${2//;/ }"
             shift 2
             ;;
         "--unified-pkg")
@@ -39,11 +40,37 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-UNIFIED_PKG="$(realpath -s $UNIFIED_PKG)"
-PKGS="build/$MODE/dist/tar/$PRODUCT-$(arch)-package.tar.gz build/$MODE/dist/tar/$PRODUCT-python3-$(arch)-package.tar.gz build/$MODE/dist/tar/$PRODUCT-jmx-package.tar.gz build/$MODE/dist/tar/$PRODUCT-tools-package.tar.gz"
+# configure.py let multiple builds share the same set of
+# SCYLLA-{PRODUCT,VERSION,RELEASE}-FILE, but building system created by CMake
+# different set of P-V-R (short for PRODUCT, VERSION and RELEASE) files for
+# each build.
+VERSION_DIR=$BUILD_DIR
+if [ ! -f $VERSION_DIR/SCYLLA-PRODUCT-FILE ]; then
+    VERSION_DIR="$(dirname "${BUILD_DIR}")"
+fi
+# configure.py will run SCYLLA-VERSION-GEN prior to this case
+# but just in case...
+if [ ! -f "$VERSION_DIR/SCYLLA-PRODUCT-FILE" ]; then
+    VERSION_DIR=$BUILD_DIR
+    ./SCYLLA-VERSION-GEN --output-dir "$VERSION_DIR"
+fi
+PRODUCT=`cat $VERSION_DIR/SCYLLA-PRODUCT-FILE`
+VERSION=`sed 's/-/~/' $VERSION_DIR/SCYLLA-VERSION-FILE`
+VERSION_ESC=${VERSION//./\.}
+RELEASE=`cat $VERSION_DIR/SCYLLA-RELEASE-FILE`
+RELEASE_ESC=${RELEASE//./\.}
 
-rm -rf build/"$MODE"/unified/
-mkdir -p build/"$MODE"/unified/
+if [ -z "$UNIFIED_PKG" ]; then
+    UNIFIED_PKG="$BUILD_DIR/$PRODUCT-unified-$VERSION-$RELEASE.$(arch).tar.gz"
+fi
+UNIFIED_PKG="$(realpath -s $UNIFIED_PKG)"
+if [ -z "$PKGS" ]; then
+    PKGS="$BUILD_DIR/dist/tar/$PRODUCT-$VERSION-$RELEASE.$(arch).tar.gz $BUILD_DIR/dist/tar/$PRODUCT-python3-$VERSION-$RELEASE.$(arch).tar.gz $BUILD_DIR/dist/tar/$PRODUCT-cqlsh-$VERSION-$RELEASE.$(arch).tar.gz"
+fi
+BASEDIR="$BUILD_DIR/unified/$PRODUCT-$VERSION"
+
+rm -rf $BUILD_DIR/unified/
+mkdir -p "$BASEDIR"
 for pkg in $PKGS; do
     if [ ! -e "$pkg" ]; then
         echo "$pkg not found."
@@ -51,15 +78,17 @@ for pkg in $PKGS; do
         exit 1
     fi
     pkg="$(readlink -f $pkg)"
-    tar -C build/"$MODE"/unified/ -xpf "$pkg"
-    dirname=$(basename "$pkg"| sed -e "s/-$(arch)-package.tar.gz//" -e "s/-package.tar.gz//")
+    tar -C "$BASEDIR" -xpf "$pkg"
+    dirname=$(basename "$pkg"| sed -e "s/-$VERSION_ESC-$RELEASE_ESC\.[^.]*\.tar\.gz//")
     dirname=${dirname/#$PRODUCT/scylla}
-    if [ ! -d build/"$MODE"/unified/"$dirname" ]; then
-        echo "Directory $dirname not found in $pkg, the pacakge may corrupted."
+    if [ ! -d "$BASEDIR/$dirname" ]; then
+        echo "Directory $dirname not found in $pkg, the package might be corrupted."
         exit 1
     fi
 done
-ln -f unified/install.sh build/"$MODE"/unified/
-ln -f unified/uninstall.sh build/"$MODE"/unified/
-cd build/"$MODE"/unified
-tar cpf "$UNIFIED_PKG" --use-compress-program=pigz * .relocatable_package_version
+ln -f unified/install.sh "$BASEDIR"
+ln -f unified/uninstall.sh "$BASEDIR"
+# relocatable package format version = 3.0
+echo "3.0" > "$BASEDIR"/.relocatable_package_version
+cd $BUILD_DIR/unified
+tar cpf "$UNIFIED_PKG" --use-compress-program=pigz "$PRODUCT-$VERSION"

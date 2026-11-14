@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,17 +11,29 @@
 #include <string>
 #include <string_view>
 #include <optional>
-#include "types.hh"
-#include "schema_fwd.hh"
-#include "keys.hh"
+#include "types/types.hh"
+#include "schema/schema_fwd.hh"
+#include "keys/keys.hh"
 #include "utils/rjson.hh"
 #include "utils/big_decimal.hh"
+
+class position_in_partition;
 
 namespace alternator {
 
 enum class alternator_type : int8_t {
-    S, B, BOOL, N, NOT_SUPPORTED_YET
+    // Do not reorder or delete entries in this enum, because these values are
+    // written to disk as part of the item encoding.
+    S, B, BOOL, N, NOT_SUPPORTED_YET, FLOAT32VECTOR
 };
+
+// FLOAT32VECTOR is an Alternator-only extension to DynamoDB's JSON type
+// system. It takes a JSON array of numbers (not quoted strings as the N type
+// does) and states that for these numbers, only the precision and range of
+// 32-bit floats is guaranteed. This allows Alternator to store these vectors
+// much more efficiently than if they were a JSON array of N's - we store
+// them as big-endian 32-bit IEEE 754 floats, exactly 4 bytes each.
+inline constexpr std::string_view float32vector_type_name = "FLOAT32VECTOR";
 
 struct type_info {
     alternator_type atype;
@@ -33,11 +45,15 @@ struct type_representation {
     data_type dtype;
 };
 
+inline constexpr std::string_view scylla_paging_region(":scylla:paging:region");
+inline constexpr std::string_view scylla_paging_weight(":scylla:paging:weight");
+
 type_info type_info_from_string(std::string_view type);
 type_representation represent_type(alternator_type atype);
 
 bytes serialize_item(const rjson::value& item);
 rjson::value deserialize_item(bytes_view bv);
+std::optional<bytes> serialized_value_if_type(bytes_view bv, alternator_type expected_type);
 
 std::string type_to_string(data_type type);
 
@@ -47,14 +63,20 @@ rjson::value json_key_column_value(bytes_view cell, const column_definition& col
 
 partition_key pk_from_json(const rjson::value& item, schema_ptr schema);
 clustering_key ck_from_json(const rjson::value& item, schema_ptr schema);
+position_in_partition pos_from_json(const rjson::value& item, schema_ptr schema);
 
-// If v encodes a number (i.e., it is a {"N": [...]}, returns an object representing it.  Otherwise,
+// If v encodes a number (i.e., it is a {"N": [...]}), returns an object representing it.  Otherwise,
 // raises ValidationException with diagnostic.
 big_decimal unwrap_number(const rjson::value& v, std::string_view diagnostic);
 
 // try_unwrap_number is like unwrap_number, but returns an unset optional
 // when the given v does not encode a number.
 std::optional<big_decimal> try_unwrap_number(const rjson::value& v);
+
+// unwrap_bytes decodes byte value, on decoding failure it either raises api_error::serialization
+// iff from_query is true or returns unset optional iff from_query is false.
+// Therefore it's safe to dereference returned optional when called with from_query equal true.
+std::optional<bytes> unwrap_bytes(const rjson::value& value, bool from_query);
 
 // Check if a given JSON object encodes a set (i.e., it is a {"SS": [...]}, or "NS", "BS"
 // and returns set's type and a pointer to that set. If the object does not encode a set,
@@ -83,5 +105,12 @@ std::optional<rjson::value> set_diff(const rjson::value& v1, const rjson::value&
 // Returns a null value if one of the arguments is not actually a list.
 rjson::value list_concatenate(const rjson::value& v1, const rjson::value& v2);
 
+namespace internal {
+struct magnitude_and_precision {
+    int magnitude;
+    int precision;
+};
+magnitude_and_precision get_magnitude_and_precision(std::string_view);
+}
 
 }

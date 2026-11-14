@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -26,22 +23,8 @@ namespace index {
  */
 class secondary_index {
 public:
-    static const sstring custom_index_option_name;
-
-    /**
-     * The name of the option used to specify that the index is on the collection keys.
-     */
-    static const sstring index_keys_option_name;
-
-    /**
-     * The name of the option used to specify that the index is on the collection values.
-     */
-    static const sstring index_values_option_name;
-
-    /**
-     * The name of the option used to specify that the index is on the collection (map) entries.
-     */
-    static const sstring index_entries_option_name;
+    static const sstring custom_class_option_name;
+    static const sstring index_version_option_name;
 
 };
 

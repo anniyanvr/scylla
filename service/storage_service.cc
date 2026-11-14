@@ -6,40 +6,77 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "storage_service.hh"
+#include "db/view/view_building_worker.hh"
+#include "utils/chunked_vector.hh"
+#include "utils/chain_abort_source.hh"
+#include <seastar/core/shard_id.hh>
+#include "db/view/view_building_coordinator.hh"
+#include "utils/disk_space_monitor.hh"
+#include "compaction/task_manager_module.hh"
+#include "gc_clock.hh"
+#include "raft/raft.hh"
+#include "auth/cache.hh"
+#include <ranges>
+#include <seastar/core/sleep.hh>
+#include "service/qos/raft_service_level_distributed_data_accessor.hh"
+#include "service/qos/service_level_controller.hh"
+#include "locator/token_metadata.hh"
+#include "service/topology_guard.hh"
+#include "service/session.hh"
 #include "dht/boot_strapper.hh"
-#include <seastar/core/distributed.hh>
+#include <chrono>
+#include <exception>
+#include <optional>
+#include <fmt/ranges.h>
+#include <seastar/core/sharded.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/coroutine/as_future.hh>
+#include "gms/endpoint_state.hh"
 #include "locator/snitch_base.hh"
 #include "db/system_keyspace.hh"
 #include "db/system_distributed_keyspace.hh"
 #include "db/consistency_level.hh"
-#include "seastar/core/smp.hh"
+#include <seastar/core/when_all.hh>
+#include "service/tablet_allocator.hh"
+#include "locator/types.hh"
+#include "locator/tablets.hh"
+#include "dht/auto_refreshing_sharder.hh"
+#include "mutation_writer/multishard_writer.hh"
+#include "locator/tablet_metadata_guard.hh"
+#include "replica/tablet_mutation_builder.hh"
+#include <seastar/core/smp.hh>
+#include "mutation/canonical_mutation.hh"
+#include "mutation/async_utils.hh"
+#include <seastar/core/on_internal_error.hh>
+#include "service/strong_consistency/groups_manager.hh"
+#include "service/raft/group0_state_machine.hh"
+#include "service/raft/raft_group0_client.hh"
+#include "service/topology_state_machine.hh"
+#include "utils/assert.hh"
 #include "utils/UUID.hh"
+#include "utils/to_string.hh"
 #include "gms/inet_address.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "service/migration_manager.hh"
-#include "service/storage_proxy.hh"
+#include "schema/schema_builder.hh"
 #include "service/raft/raft_group0.hh"
-#include "to_string.hh"
 #include "gms/gossiper.hh"
-#include "gms/failure_detector.hh"
 #include "gms/feature_service.hh"
 #include <seastar/core/thread.hh>
-#include <sstream>
 #include <algorithm>
 #include "locator/local_strategy.hh"
+#include "locator/network_topology_strategy.hh"
+#include "locator/tablet_replication_strategy.hh"
+#include "utils/user_provided_param.hh"
 #include "version.hh"
-#include "unimplemented.hh"
-#include "streaming/stream_plan.hh"
-#include "streaming/stream_state.hh"
+#include "streaming/stream_blob.hh"
+#include "service/paxos/paxos_state.hh"
 #include "dht/range_streamer.hh"
-#include <boost/range/adaptors.hpp>
 #include <boost/range/algorithm.hpp>
-#include "service/load_broadcaster.hh"
 #include "transport/server.hh"
 #include <seastar/core/rwlock.hh>
 #include "db/batchlog_manager.hh"
@@ -50,23 +87,53 @@
 #include "supervisor.hh"
 #include "compaction/compaction_manager.hh"
 #include "sstables/sstables.hh"
+#include "sstables/sstables_manager.hh"
 #include "db/config.hh"
+#include "locator/abstract_replication_strategy.hh"
 #include "db/schema_tables.hh"
+#include "db/view/view_builder.hh"
 #include "replica/database.hh"
+#include "replica/tablets.hh"
 #include <seastar/core/metrics.hh>
 #include "cdc/generation.hh"
 #include "cdc/generation_service.hh"
 #include "repair/repair.hh"
 #include "repair/row_level.hh"
-#include "service/priority_manager.hh"
-#include "utils/generation-number.hh"
+#include "gms/generation-number.hh"
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
+#include "utils/pretty_printers.hh"
 #include "utils/stall_free.hh"
+#include "utils/error_injection.hh"
+#include "locator/util.hh"
+#include "idl/storage_service.dist.hh"
+#include "idl/streaming.dist.hh"
+#include "service/storage_proxy.hh"
+#include "service/raft/join_node.hh"
+#include "idl/join_node.dist.hh"
+#include "idl/migration_manager.dist.hh"
+#include "idl/node_ops.dist.hh"
+#include "transport/protocol_server.hh"
+#include "node_ops/node_ops_ctl.hh"
+#include "node_ops/task_manager_module.hh"
+#include "service/task_manager_module.hh"
+#include "service/topology_mutation.hh"
+#include "db/view/view_build_status.hh"
+#include "cql3/query_processor.hh"
+#include <csignal>
+#include "utils/labels.hh"
+#include "view_info.hh"
+#include "debug.hh"
 
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
-#include <boost/algorithm/string/trim_all.hpp>
+#include <stdexcept>
+#include <unistd.h>
+#include <variant>
+#include <utility>
 
 using token = dht::token;
 using UUID = utils::UUID;
@@ -78,50 +145,147 @@ namespace service {
 
 static logging::logger slogger("storage_service");
 
+static thread_local session_manager topology_session_manager;
+
+session_manager& get_topology_session_manager() {
+    return topology_session_manager;
+}
+
+namespace {
+
+[[nodiscard]] locator::host_id_or_endpoint_list string_list_to_endpoint_list(const std::vector<sstring>& src_node_strings) {
+    locator::host_id_or_endpoint_list resulting_node_list;
+    resulting_node_list.reserve(src_node_strings.size());
+    for (const sstring& n : src_node_strings) {
+        try {
+            resulting_node_list.emplace_back(n);
+        } catch (...) {
+            throw std::runtime_error(::format("Failed to parse node list: {}: invalid node={}: {:t}", src_node_strings, n, std::current_exception()));
+        }
+    }
+    return resulting_node_list;
+}
+
+void check_raft_rpc_scheduling_group(const replica::database& db, const gms::feature_service& feature_service, const std::string_view rpc_name) {
+    if (!feature_service.enforced_raft_rpc_scheduling_group) {
+        return;
+    }
+
+    if (current_scheduling_group() != debug::gossip_scheduling_group) {
+        on_internal_error_noexcept(
+                slogger, seastar::format("Raft group0 RPCs should be executed in the gossip scheduling group, current group is [{}], operation [{}].",
+                                 current_scheduling_group().name(), rpc_name));
+    }
+}
+
+} // namespace
+
+static constexpr std::chrono::seconds wait_for_live_nodes_timeout{30};
+
 storage_service::storage_service(abort_source& abort_source,
-    distributed<replica::database>& db, gms::gossiper& gossiper,
+    sharded<replica::database>& db, gms::gossiper& gossiper,
+    sharded<db::system_keyspace>& sys_ks,
     sharded<db::system_distributed_keyspace>& sys_dist_ks,
     gms::feature_service& feature_service,
-    storage_service_config config,
     sharded<service::migration_manager>& mm,
     locator::shared_token_metadata& stm,
     locator::effective_replication_map_factory& erm_factory,
     sharded<netw::messaging_service>& ms,
-    sharded<cdc::generation_service>& cdc_gen_service,
     sharded<repair_service>& repair,
     sharded<streaming::stream_manager>& stream_manager,
-    raft_group_registry& raft_gr,
     endpoint_lifecycle_notifier& elc_notif,
-    sharded<db::batchlog_manager>& bm)
+    sharded<db::batchlog_manager>& bm,
+    sharded<locator::snitch_ptr>& snitch,
+    sharded<service::tablet_allocator>& tablet_allocator,
+    sharded<cdc::generation_service>& cdc_gens,
+    sharded<db::view::view_builder>& view_builder,
+    sharded<db::view::view_building_worker>& view_building_worker,
+    cql3::query_processor& qp,
+    sharded<qos::service_level_controller>& sl_controller,
+    sharded<db::cluster_config_manager>& cluster_config,
+    auth::cache& auth_cache,
+    sharded<client_routes_service>& client_routes,
+    topology_state_machine& topology_state_machine,
+    db::view::view_building_state_machine& view_building_state_machine,
+    tasks::task_manager& tm,
+    gms::gossip_address_map& address_map,
+    std::function<future<void>(std::string_view)> compression_dictionary_updated_callback,
+    utils::disk_space_monitor* disk_space_monitor,
+    strong_consistency::groups_manager& groups_manager
+    )
         : _abort_source(abort_source)
         , _feature_service(feature_service)
         , _db(db)
         , _gossiper(gossiper)
-        , _raft_gr(raft_gr)
         , _messaging(ms)
         , _migration_manager(mm)
+        , _qp(qp)
         , _repair(repair)
         , _stream_manager(stream_manager)
-        , _node_ops_abort_thread(node_ops_abort_thread())
+        , _snitch(snitch)
+        , _sl_controller(sl_controller)
+        , _cluster_config(cluster_config)
+        , _auth_cache(auth_cache)
+        , _client_routes(client_routes)
+        , _group0(nullptr)
+        , _async_gate("storage_service")
+        , _node_ops_module(make_shared<node_ops::task_manager_module>(tm, *this))
+        , _tablets_module(make_shared<service::task_manager_module>(tm, *this))
+        , _global_topology_requests_module(make_shared<service::topo::task_manager_module>(tm))
+        , _vnodes_to_tablets_migration_module(make_shared<service::vnodes_to_tablets::task_manager_module>(tm, *this))
+        , _address_map(address_map)
         , _shared_token_metadata(stm)
         , _erm_factory(erm_factory)
-        , _cdc_gen_service(cdc_gen_service)
         , _lifecycle_notifier(elc_notif)
         , _batchlog_manager(bm)
+        , _sys_ks(sys_ks)
         , _sys_dist_ks(sys_dist_ks)
-        , _snitch_reconfigure([this] { return snitch_reconfigured(); })
+        , _snitch_reconfigure([this] {
+            return container().invoke_on(0, [] (auto& ss) {
+                return ss.snitch_reconfigured();
+            });
+        })
+        , _tablet_allocator(tablet_allocator)
+        , _cdc_gens(cdc_gens)
+        , _view_builder(view_builder)
+        , _view_building_worker(view_building_worker)
+        , _topology_state_machine(topology_state_machine)
+        , _view_building_state_machine(view_building_state_machine)
+        , _compression_dictionary_updated_callback(std::move(compression_dictionary_updated_callback))
+        , _disk_space_monitor(disk_space_monitor)
+        , _groups_manager(groups_manager)
 {
+    tm.register_module(_node_ops_module->get_name(), _node_ops_module);
+    tm.register_module(_tablets_module->get_name(), _tablets_module);
+    tm.register_module(_global_topology_requests_module->get_name(), _global_topology_requests_module);
+    tm.register_module(_vnodes_to_tablets_migration_module->get_name(), _vnodes_to_tablets_migration_module);
+    if (this_shard_id() == 0) {
+        _node_ops_module->make_virtual_task<node_ops::node_ops_virtual_task>(*this);
+        _tablets_module->make_virtual_task<service::tablet_virtual_task>(*this);
+        _global_topology_requests_module->make_virtual_task<service::topo::global_topology_request_virtual_task>(*this);
+        _vnodes_to_tablets_migration_module->make_virtual_task<service::vnodes_to_tablets::migration_virtual_task>(*this);
+        _vnodes_to_tablets_migration_module->make_virtual_task<service::vnodes_to_tablets::pow2_convergence_virtual_task>(*this);
+    }
     register_metrics();
 
     _listeners.emplace_back(make_lw_shared(bs2::scoped_connection(sstable_read_error.connect([this] { do_isolate_on_error(disk_error::regular); }))));
     _listeners.emplace_back(make_lw_shared(bs2::scoped_connection(sstable_write_error.connect([this] { do_isolate_on_error(disk_error::regular); }))));
     _listeners.emplace_back(make_lw_shared(bs2::scoped_connection(general_disk_error.connect([this] { do_isolate_on_error(disk_error::regular); }))));
     _listeners.emplace_back(make_lw_shared(bs2::scoped_connection(commit_error.connect([this] { do_isolate_on_error(disk_error::commit); }))));
+    _listeners.emplace_back(make_lw_shared(bs2::scoped_connection(logstor_error.connect([this] { do_isolate_on_error(disk_error::logstor); }))));
 
-    auto& snitch = locator::i_endpoint_snitch::snitch_instance();
-    if (snitch.local_is_initialized()) {
-        _listeners.emplace_back(make_lw_shared(snitch.local()->when_reconfigured(_snitch_reconfigure)));
+    if (_snitch.local_is_initialized()) {
+        _listeners.emplace_back(make_lw_shared(_snitch.local()->when_reconfigured(_snitch_reconfigure)));
     }
+
+    init_messaging_service();
+    _migration_manager.local().plug_storage_service(*this);
+}
+
+storage_service::~storage_service() = default;
+
+auth::cache& storage_service::auth_cache() noexcept {
+    return _auth_cache;
 }
 
 enum class node_external_status {
@@ -133,12 +297,15 @@ enum class node_external_status {
     DECOMMISSIONED = 5,
     DRAINING       = 6,
     DRAINED        = 7,
-    MOVING         = 8 //deprecated
+    MOVING         = 8, //deprecated
+    MAINTENANCE    = 9
 };
 
 static node_external_status map_operation_mode(storage_service::mode m) {
     switch (m) {
+    case storage_service::mode::NONE: return node_external_status::STARTING;
     case storage_service::mode::STARTING: return node_external_status::STARTING;
+    case storage_service::mode::BOOTSTRAP: return node_external_status::JOINING;
     case storage_service::mode::JOINING: return node_external_status::JOINING;
     case storage_service::mode::NORMAL: return node_external_status::NORMAL;
     case storage_service::mode::LEAVING: return node_external_status::LEAVING;
@@ -146,6 +313,7 @@ static node_external_status map_operation_mode(storage_service::mode m) {
     case storage_service::mode::DRAINING: return node_external_status::DRAINING;
     case storage_service::mode::DRAINED: return node_external_status::DRAINED;
     case storage_service::mode::MOVING: return node_external_status::MOVING;
+    case storage_service::mode::MAINTENANCE: return node_external_status::MAINTENANCE;
     }
     return node_external_status::UNKNOWN;
 }
@@ -159,86 +327,1302 @@ void storage_service::register_metrics() {
     namespace sm = seastar::metrics;
     _metrics.add_group("node", {
             sm::make_gauge("operation_mode", sm::description("The operation mode of the current node. UNKNOWN = 0, STARTING = 1, JOINING = 2, NORMAL = 3, "
-                    "LEAVING = 4, DECOMMISSIONED = 5, DRAINING = 6, DRAINED = 7, MOVING = 8"), [this] {
+                    "LEAVING = 4, DECOMMISSIONED = 5, DRAINING = 6, DRAINED = 7, MOVING = 8, MAINTENANCE = 9"), [this] {
                 return static_cast<std::underlying_type_t<node_external_status>>(map_operation_mode(_operation_mode));
-            }),
+            })(basic_level),
     });
 }
 
-bool storage_service::is_first_node() {
-    if (_db.local().is_replacing()) {
-        return false;
-    }
-    auto seeds = _gossiper.get_seeds();
-    if (seeds.empty()) {
-        return false;
-    }
-    // Node with the smallest IP address is chosen as the very first node
-    // in the cluster. The first node is the only node that does not
-    // bootstrap in the cluser. All other nodes will bootstrap.
-    std::vector<gms::inet_address> sorted_seeds(seeds.begin(), seeds.end());
-    std::sort(sorted_seeds.begin(), sorted_seeds.end());
-    if (sorted_seeds.front() == get_broadcast_address()) {
-        slogger.info("I am the first node in the cluster. Skip bootstrap. Node={}", get_broadcast_address());
+bool storage_service::is_replacing() {
+    const auto& cfg = _db.local().get_config();
+    if (!cfg.replace_node_first_boot().empty()) {
+        if (_sys_ks.local().bootstrap_complete()) {
+            slogger.info("Replace node on first boot requested; this node is already bootstrapped");
+            return false;
+        }
         return true;
     }
-    return false;
+    if (!cfg.replace_address_first_boot().empty()) {
+      if (_sys_ks.local().bootstrap_complete()) {
+        slogger.info("Replace address on first boot requested; this node is already bootstrapped");
+        return false;
+      }
+      return true;
+    }
+    // Returning true if cfg.replace_address is provided
+    // will trigger an exception down the road if bootstrap_complete(),
+    // as it is an error to use this option post bootstrap.
+    // That said, we should just stop supporting it and force users
+    // to move to the new, replace_node_first_boot config option.
+    return !cfg.replace_address().empty();
 }
 
-bool storage_service::should_bootstrap() {
-    return !db::system_keyspace::bootstrap_complete() && !is_first_node();
+/* Broadcasts the chosen tokens through gossip,
+ * together with a CDC generation timestamp and STATUS=NORMAL.
+ *
+ * Assumes that no other functions modify CDC_GENERATION_ID, TOKENS or STATUS
+ * in the gossiper's local application state while this function runs.
+ */
+static future<> set_gossip_tokens(gms::gossiper& g,
+        const std::unordered_set<dht::token>& tokens) {
+    return g.add_local_application_state(std::pair(gms::application_state::STATUS, gms::versioned_value::normal(tokens)));
 }
 
-future<> storage_service::snitch_reconfigured() {
-    return update_topology(utils::fb_utilities::get_broadcast_address());
+static locator::node::state to_topology_node_state(node_state ns) {
+    switch (ns) {
+        case node_state::bootstrapping: return locator::node::state::bootstrapping;
+        case node_state::decommissioning: return locator::node::state::being_decommissioned;
+        case node_state::removing: return locator::node::state::being_removed;
+        case node_state::normal: return locator::node::state::normal;
+        case node_state::left: return locator::node::state::left;
+        case node_state::replacing: return locator::node::state::replacing;
+        case node_state::rebuilding: return locator::node::state::normal;
+        case node_state::none: return locator::node::state::none;
+    }
+    on_internal_error(rtlogger, format("unhandled node state: {}", ns));
 }
 
-// Runs inside seastar::async context
-void storage_service::prepare_to_join(
-        std::unordered_set<gms::inet_address> initial_contact_nodes,
-        std::unordered_set<gms::inet_address> loaded_endpoints,
-        std::unordered_map<gms::inet_address, sstring> loaded_peer_features) {
-    std::map<gms::application_state, gms::versioned_value> app_states;
-    if (db::system_keyspace::was_decommissioned()) {
-        if (_db.local().get_config().override_decommission()) {
-            slogger.warn("This node was decommissioned, but overriding by operator request.");
-            db::system_keyspace::set_bootstrap_state(db::system_keyspace::bootstrap_state::COMPLETED).get();
+future<> storage_service::raft_topology_update_ip(locator::host_id id, gms::inet_address ip, const host_id_to_ip_map_t& host_id_to_ip_map, nodes_to_notify_after_sync* nodes_to_notify) {
+    const auto& t = _topology_state_machine._topology;
+    raft::server_id raft_id{id.uuid()};
+
+    std::vector<future<>> sys_ks_futures;
+
+    auto node = t.find(raft_id);
+
+    if (!node) {
+        co_return;
+    }
+
+    const auto& rs = node->second;
+
+    switch (rs.state) {
+        case node_state::normal: {
+            if (is_me(id)) {
+                co_return;
+            }
+            // In replace-with-same-ip scenario the replaced node IP will be the same
+            // as ours, we shouldn't put it into system.peers.
+
+            // Some state that is used to fill in 'peers' table is still propagated over gossiper.
+            // Populate the table with the state from the gossiper here since storage_service::on_change()
+            // (which is called each time gossiper state changes) may have skipped it because the tokens
+            // for the node were not in the 'normal' state yet
+            auto info = get_peer_info_for_update(id);
+            if (info) {
+                // And then amend with the info from raft
+                info->tokens = rs.ring.value().tokens;
+                info->data_center = rs.datacenter;
+                info->rack = rs.rack;
+                info->release_version = rs.release_version;
+                info->supported_features = fmt::to_string(fmt::join(rs.supported_features, ","));
+                sys_ks_futures.push_back(_sys_ks.local().update_peer_info(ip, id, *info));
+            }
+
+            if (nodes_to_notify) {
+                nodes_to_notify->joined.emplace_back(ip, id);
+            }
+
+            if (const auto it = host_id_to_ip_map.find(id); it != host_id_to_ip_map.end() && it->second != ip) {
+                utils::get_local_injector().inject("crash-before-prev-ip-removed", [] {
+                    slogger.info("crash-before-prev-ip-removed hit, killing the node");
+                    _exit(1);
+                });
+
+                auto old_ip = it->second;
+                sys_ks_futures.push_back(_sys_ks.local().remove_endpoint(old_ip));
+            }
+        }
+        break;
+        case node_state::bootstrapping:
+            if (!is_me(ip)) {
+                utils::get_local_injector().inject("crash-before-bootstrapping-node-added", [] {
+                    rtlogger.error("crash-before-bootstrapping-node-added hit, killing the node");
+                    _exit(1);
+                });
+
+                // Save ip -> id mapping in peers table because we need it on restart, but do not save tokens until owned
+                sys_ks_futures.push_back(_sys_ks.local().update_peer_info(ip, id, {}));
+            }
+        break;
+        case node_state::replacing:
+            // Save the mapping just like for bootstrap above, but only in the case of replace with different IP, so
+            // that we don't have to delete the row of the node being replaced. For replace with the same IP, the
+            // mapping is recovered on restart based on the state of the topology state machine and system.peers.
+            if (!is_me(ip)) {
+                auto replaced_id = std::get<replace_param>(t.req_param.at(raft_id)).replaced_id;
+                if (const auto it = host_id_to_ip_map.find(locator::host_id(replaced_id.uuid())); it == host_id_to_ip_map.end() || it->second != ip) {
+                    sys_ks_futures.push_back(_sys_ks.local().update_peer_info(ip, id, {}));
+                }
+            }
+        break;
+        default:
+        break;
+    }
+    co_await when_all_succeed(sys_ks_futures.begin(), sys_ks_futures.end()).discard_result();
+}
+
+static std::unordered_set<locator::host_id> get_released_nodes(const service::topology& topology, const locator::token_metadata& tm) {
+    return std::views::concat(topology.left_nodes, topology.ignored_nodes)
+            | std::views::transform([] (const auto& raft_id) { return locator::host_id(raft_id.uuid()); })
+            | std::views::filter([&] (const auto& h) { return !tm.get_topology().has_node(h); })
+            | std::ranges::to<std::unordered_set<locator::host_id>>();
+}
+
+// Synchronizes the local node state (token_metadata, system.peers/system.local tables,
+// gossiper) to align it with the other raft topology nodes.
+future<storage_service::nodes_to_notify_after_sync> storage_service::sync_raft_topology_nodes(mutable_token_metadata_ptr tmptr, std::unordered_set<raft::server_id> prev_normal, std::optional<std::unordered_set<locator::host_id>> prev_released) {
+    nodes_to_notify_after_sync nodes_to_notify;
+
+    rtlogger.debug("Start sync_raft_topology_nodes");
+
+    const auto& t = _topology_state_machine._topology;
+
+    auto update_topology = [&] (locator::host_id id, const replica_state& rs) {
+        tmptr->update_topology(id, locator::endpoint_dc_rack{rs.datacenter, rs.rack},
+                               to_topology_node_state(rs.state), rs.shard_count);
+    };
+
+    std::vector<future<>> sys_ks_futures;
+
+    auto process_left_node = [&] (raft::server_id id, locator::host_id host_id, std::optional<gms::inet_address> ip, bool notify) -> future<> {
+        if (ip) {
+            sys_ks_futures.push_back(_sys_ks.local().remove_endpoint(*ip));
+
+            co_await _gossiper.force_remove_endpoint(host_id, gms::null_permit_id);
+            if (notify) {
+                nodes_to_notify.left.push_back({*ip, host_id});
+            }
+        }
+
+        if (t.left_nodes_rs.find(id) != t.left_nodes_rs.end()) {
+            update_topology(host_id, t.left_nodes_rs.at(id));
+        }
+    };
+
+    auto process_normal_node = [&] (raft::server_id id, locator::host_id host_id, std::optional<gms::inet_address> ip, const replica_state& rs) -> future<> {
+        rtlogger.trace("loading topology: raft id={} ip={} node state={} dc={} rack={} tokens state={} tokens={} shards={} cleanup={}",
+                      id, ip, rs.state, rs.datacenter, rs.rack, _topology_state_machine._topology.tstate, rs.ring.value().tokens, rs.shard_count, rs.cleanup);
+        // Save tokens, not needed for raft topology management, but needed by legacy
+        // Also ip -> id mapping is needed for address map recreation on reboot
+        if (is_me(host_id)) {
+            sys_ks_futures.push_back(_sys_ks.local().update_tokens(rs.ring.value().tokens));
+            co_await _gossiper.add_local_application_state(std::pair(gms::application_state::STATUS, gms::versioned_value::normal(rs.ring.value().tokens)));
+        }
+        update_topology(host_id, rs);
+        co_await tmptr->update_normal_tokens(rs.ring.value().tokens, host_id);
+    };
+
+    auto process_transition_node = [&](raft::server_id id, locator::host_id host_id, std::optional<gms::inet_address> ip, const replica_state& rs) -> future<> {
+        rtlogger.trace("loading topology: raft id={} ip={} node state={} dc={} rack={} tokens state={} tokens={}",
+                      id, ip, rs.state, rs.datacenter, rs.rack, _topology_state_machine._topology.tstate,
+                      seastar::value_of([&] () -> sstring {
+                          return rs.ring ? ::format("{}", rs.ring->tokens) : sstring("null");
+                      }));
+
+        switch (rs.state) {
+        case node_state::bootstrapping:
+            if (rs.ring.has_value()) {
+                update_topology(host_id, rs);
+                if (_topology_state_machine._topology.normal_nodes.empty()) {
+                    // This is the first node in the cluster. Insert the tokens as normal to the token ring early
+                    // so we can perform writes to regular 'distributed' tables during the bootstrap procedure
+                    // (such as the CDC generation write).
+                    // It doesn't break anything to set the tokens to normal early in this single-node case.
+                    co_await tmptr->update_normal_tokens(rs.ring.value().tokens, host_id);
+                } else {
+                    tmptr->add_bootstrap_tokens(rs.ring.value().tokens, host_id);
+                    co_await update_topology_change_info(tmptr, ::format("bootstrapping node {}/{}", id, ip));
+                }
+            }
+            break;
+        case node_state::decommissioning:
+            [[fallthrough]];
+        case node_state::removing:
+            // A decommissioning or removing node loses its tokens when topology moves to left_token_ring.
+            if (_topology_state_machine._topology.tstate == topology::transition_state::left_token_ring) {
+                if (rs.state == node_state::removing && !_feature_service.removenode_with_left_token_ring) {
+                    on_internal_error(
+                            rtlogger, "removenode operation can only enter the left_token_ring state when REMOVENODE_WITH_LEFT_TOKEN_RING feature is enabled");
+                }
+                break;
+            }
+            if (_topology_state_machine._topology.tstate == topology::transition_state::rollback_to_normal) {
+                // no need for double writes anymore since op failed
+                co_await process_normal_node(id, host_id, ip, rs);
+                break;
+            }
+            update_topology(host_id, rs);
+            co_await tmptr->update_normal_tokens(rs.ring.value().tokens, host_id);
+            tmptr->add_leaving_endpoint(host_id);
+            co_await update_topology_change_info(tmptr, ::format("{} {}/{}", rs.state, id, ip));
+            break;
+        case node_state::replacing: {
+            if (!_topology_state_machine._topology.req_param.contains(id)) {
+                on_internal_error(rtlogger, format("No request parameters for replacing node {}", id));
+            }
+            auto replaced_id = std::get<replace_param>(_topology_state_machine._topology.req_param[id]).replaced_id;
+            auto existing_ip = _address_map.find(locator::host_id{replaced_id.uuid()});
+            const auto replaced_host_id = locator::host_id(replaced_id.uuid());
+            tmptr->update_topology(replaced_host_id, std::nullopt, locator::node::state::being_replaced);
+            tmptr->add_replacing_endpoint(replaced_host_id, host_id);
+            if (rs.ring.has_value()) {
+                update_topology(host_id, rs);
+                co_await update_topology_change_info(tmptr, ::format("replacing {}/{} by {}/{}", replaced_id, existing_ip.value_or(gms::inet_address{}), id, ip));
+            }
+        }
+            break;
+        case node_state::rebuilding:
+            // Rebuilding node is normal
+            co_await process_normal_node(id, host_id, ip, rs);
+            break;
+        default:
+            on_internal_error(rtlogger, ::format("Unexpected state {} for node {}", rs.state, id));
+        }
+    };
+
+    sys_ks_futures.reserve(t.left_nodes.size() + t.normal_nodes.size() + t.transition_nodes.size());
+
+    auto id_to_ip_map = co_await _sys_ks.local().get_host_id_to_ip_map();
+    for (const auto& id: t.left_nodes) {
+        locator::host_id host_id{id.uuid()};
+        auto ip = _address_map.find(host_id);
+        co_await process_left_node(id, host_id, ip, id_to_ip_map.find(host_id) != id_to_ip_map.end());
+    }
+    for (const auto& [id, rs]: t.normal_nodes) {
+        locator::host_id host_id{id.uuid()};
+        auto ip = _address_map.find(host_id);
+        co_await process_normal_node(id, host_id, ip, rs);
+        if (ip) {
+            auto it = id_to_ip_map.find(host_id);
+            bool notify = it == id_to_ip_map.end() || it->second != ip || !prev_normal.contains(id);
+            sys_ks_futures.push_back(raft_topology_update_ip(host_id, *ip, id_to_ip_map, notify ?  &nodes_to_notify : nullptr));
+        }
+    }
+    for (const auto& [id, rs]: t.transition_nodes) {
+        locator::host_id host_id{id.uuid()};
+        auto ip = _address_map.find(host_id);
+        co_await process_transition_node(id, host_id, ip, rs);
+        if (ip) {
+            sys_ks_futures.push_back(raft_topology_update_ip(host_id, *ip, id_to_ip_map, nullptr));
+        }
+    }
+    for (auto id : t.excluded_tablet_nodes) {
+        tmptr->set_node_flag(locator::host_id(id.uuid()), locator::node::flag::excluded, true);
+    }
+
+    for (auto [node, req] : t.requests) {
+        if (req == topology_request::leave || req == topology_request::remove) {
+            tmptr->set_node_flag(locator::host_id(node.uuid()), locator::node::flag::draining, true);
+        }
+    }
+
+    if (prev_released) {
+        auto nodes_to_release = get_released_nodes(t, *tmptr);
+        std::erase_if(nodes_to_release, [&] (const auto& host_id) { return prev_released->contains(host_id); });
+        std::copy(nodes_to_release.begin(), nodes_to_release.end(), std::back_inserter(nodes_to_notify.released));
+    }
+
+    rtlogger.debug("sync_raft_topology_nodes: waiting for system keyspace updates to complete");
+    co_await when_all_succeed(sys_ks_futures.begin(), sys_ks_futures.end()).discard_result();
+
+    rtlogger.debug("End sync_raft_topology_nodes");
+
+    co_return nodes_to_notify;
+}
+
+future<> storage_service::notify_nodes_after_sync(nodes_to_notify_after_sync&& nodes_to_notify) {
+    for (auto host_id : nodes_to_notify.released) {
+        co_await notify_released(host_id);
+    }
+    for (auto [ip, host_id] : nodes_to_notify.left) {
+        co_await notify_left(ip, host_id);
+    }
+    for (auto [ip, host_id] : nodes_to_notify.joined) {
+        co_await notify_joined(ip, host_id);
+    }
+}
+
+future<> storage_service::topology_state_load(state_change_hint hint) {
+#ifdef SEASTAR_DEBUG
+    static bool running = false;
+    SCYLLA_ASSERT(!running); // The function is not re-entrant
+    auto d = defer([] noexcept {
+        running = false;
+    });
+    running = true;
+#endif
+
+    co_await utils::get_local_injector().inject("topology_state_load_error", [] {
+        return std::make_exception_ptr(std::runtime_error("topology_state_load_error"));
+    });
+
+    rtlogger.debug("reload raft topology state");
+    std::unordered_set<raft::server_id> prev_normal = _topology_state_machine._topology.normal_nodes | std::views::keys | std::ranges::to<std::unordered_set>();
+    std::optional<std::unordered_set<locator::host_id>> prev_released;
+    if (!_topology_state_machine._topology.is_empty()) {
+        prev_released = get_released_nodes(_topology_state_machine._topology, get_token_metadata());
+    }
+
+    std::unordered_set<locator::host_id> tablet_hosts = co_await replica::read_required_hosts(_qp);
+
+    // read topology state from disk and recreate token_metadata from it
+    rtlogger.debug("topology_state_load: loading topology state");
+    _topology_state_machine._topology = co_await _sys_ks.local().load_topology_state(tablet_hosts);
+    _topology_state_machine.reload_count++;
+    auto& topology = _topology_state_machine._topology;
+
+    co_await _feature_service.container().invoke_on_all([&] (gms::feature_service& fs) {
+        return fs.enable(topology.enabled_features | std::ranges::to<std::set<std::string_view>>());
+    });
+
+    // Update the legacy `enabled_features` key in `system.scylla_local`.
+    // It's OK to update it after enabling features because `system.topology` now
+    // is the source of truth about enabled features.
+    co_await _sys_ks.local().save_local_enabled_features(topology.enabled_features, false);
+
+    auto saved_tmpr = get_token_metadata_ptr();
+    {
+        rtlogger.debug("topology_state_load: waiting for token metadata lock");
+        auto tmlock = co_await get_token_metadata_lock();
+        rtlogger.debug("topology_state_load: updating token metadata");
+        auto tmptr = _shared_token_metadata.make_token_metadata_ptr();
+        tmptr->invalidate_cached_rings();
+
+        tmptr->set_version(topology.version);
+
+        const auto read_new = std::invoke([](std::optional<topology::transition_state> state) {
+            using read_new_t = locator::token_metadata::read_new_t;
+            if (!state.has_value()) {
+                return read_new_t::no;
+            }
+            switch (*state) {
+                case topology::transition_state::lock:
+                    [[fallthrough]];
+                case topology::transition_state::join_group0:
+                    [[fallthrough]];
+                case topology::transition_state::tablet_migration:
+                    [[fallthrough]];
+                case topology::transition_state::tablet_split_finalization:
+                    [[fallthrough]];
+                case topology::transition_state::tablet_resize_finalization:
+                    [[fallthrough]];
+                case topology::transition_state::commit_cdc_generation:
+                    [[fallthrough]];
+                case topology::transition_state::tablet_draining:
+                    [[fallthrough]];
+                case topology::transition_state::write_both_read_old:
+                    [[fallthrough]];
+                case topology::transition_state::left_token_ring:
+                    [[fallthrough]];
+                case topology::transition_state::truncate_table:
+                    [[fallthrough]];
+                case topology::transition_state::snapshot_tables:
+                    [[fallthrough]];
+                case topology::transition_state::rollback_to_normal:
+                    return read_new_t::no;
+                case topology::transition_state::write_both_read_new:
+                    return read_new_t::yes;
+            }
+        }, topology.tstate);
+        tmptr->set_read_new(read_new);
+
+        auto nodes_to_notify = co_await sync_raft_topology_nodes(tmptr, std::move(prev_normal), std::move(prev_released));
+
+        std::optional<locator::tablet_metadata> tablets;
+        if (hint.tablets_hint) {
+            // We want to update the tablet metadata incrementally, so copy it
+            // from the current token metadata and update only the changed parts.
+            tablets = co_await get_token_metadata().tablets().copy();
+            co_await replica::update_tablet_metadata(_db.local(), _qp, *tablets, *hint.tablets_hint);
         } else {
-            auto msg = sstring("This node was decommissioned and will not rejoin the ring unless override_decommission=true has been set,"
-                               "or all existing data is removed and the node is bootstrapped again");
+            tablets = co_await replica::read_tablet_metadata(_qp);
+        }
+        tablets->set_balancing_enabled(topology.tablet_balancing_enabled);
+        tmptr->set_tablets(std::move(*tablets));
+
+        if (_feature_service.parallel_tablet_draining) {
+            for (auto&& [node, req]: topology.requests) {
+                if (req == topology_request::leave || req == topology_request::remove) {
+                    if (tmptr->tablets().has_replica_on(locator::host_id(node.uuid()))) {
+                        topology.paused_requests.emplace(node, req);
+                    }
+                }
+            }
+        }
+
+        rtlogger.debug("topology_state_load: replicating token metadata to all cores");
+        co_await replicate_to_all_cores(std::move(tmptr));
+        rtlogger.debug("topology_state_load: notifying nodes after token metadata replication");
+        co_await notify_nodes_after_sync(std::move(nodes_to_notify));
+        rtlogger.debug("topology_state_load: token metadata replication to all cores finished");
+    }
+
+    co_await update_fence_version(topology.fence_version);
+
+    // As soon as a node joins token_metadata.topology we
+    // need to drop all its rpc connections with ignored_topology flag.
+    {
+        std::vector<future<>> futures;
+        get_token_metadata_ptr()->get_topology().for_each_node([&](const locator::node& n) {
+            const auto ep = n.host_id();
+            if (auto ip_opt = _address_map.find(ep); ip_opt && !saved_tmpr->get_topology().has_node(ep)) {
+                futures.push_back(remove_rpc_client_with_ignored_topology(*ip_opt, n.host_id()));
+            }
+        });
+        co_await when_all_succeed(futures.begin(), futures.end()).discard_result();
+    }
+
+    for (const auto& gen_id : topology.committed_cdc_generations) {
+        rtlogger.trace("topology_state_load: process committed cdc generation {}", gen_id);
+        co_await utils::get_local_injector().inject("topology_state_load_before_update_cdc", utils::wait_for_message{std::chrono::minutes(5)});
+        co_await _cdc_gens.local().handle_cdc_generation(gen_id);
+        if (gen_id == topology.committed_cdc_generations.back()) {
+            rtlogger.debug("topology_state_load: the last committed CDC generation ID: {}", gen_id);
+        }
+    }
+
+    // Ban all left and ignored nodes. We do not allow them to go back online.
+    co_await _messaging.local().ban_hosts(std::views::concat(topology.left_nodes, topology.ignored_nodes)
+        | std::views::transform([] (auto id) { return locator::host_id{id.uuid()}; })
+        | std::ranges::to<utils::chunked_vector<locator::host_id>>());
+
+    slogger.debug("topology_state_load: excluded tablet nodes: {}", topology.excluded_tablet_nodes);
+}
+
+future<> storage_service::topology_transition(state_change_hint hint) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    // An engaged hint may be empty, if the command has no tablet mutations.
+    const bool tablets_changed = hint.tablets_hint && *hint.tablets_hint;
+    co_await topology_state_load(std::move(hint)); // reload new state
+    if (!tablets_changed) {
+        // A tablets change reloads the view building state, which recomputes this.
+        co_await update_built_views(co_await _sys_ks.local().get_view_build_status_map());
+    }
+
+    _topology_state_machine.event.broadcast();
+}
+
+future<> storage_service::update_built_views(const db::system_keyspace::view_build_status_map& statuses) {
+    const auto& topology = get_token_metadata().get_topology();
+    std::unordered_set<table_id> built_views;
+    for (const view_ptr& view : _db.local().get_views()) {
+        auto view_statuses = statuses.find({view->ks_name(), view->cf_name()});
+        bool built = view_statuses != statuses.end();
+        // A joining node counts from the start. The tablets coordinator gives it
+        // status rows only when it turns normal, so a bootstrap keeps the
+        // tombstones of every tablets view until it completes.
+        topology.for_each_node([&] (const locator::node& node) {
+            if (!built || node.is_excluded()) {
+                return;
+            }
+            auto it = view_statuses->second.find(node.host_id());
+            built = it != view_statuses->second.end() && it->second == db::view::build_status::SUCCESS;
+        });
+        if (built) {
+            built_views.insert(view->id());
+        }
+    }
+    rtlogger.debug("views built on every node, tombstone gc not suspended: {}", built_views);
+    co_await _db.invoke_on_all([&built_views] (replica::database& db) {
+        db.get_compaction_manager().get_shared_tombstone_gc_state().set_built_views(built_views);
+    });
+}
+
+future<> storage_service::view_building_state_load() {
+    rtlogger.debug("reload view building state");
+
+    auto filter_vnode_keyspace = [this] (std::string_view ks_name) {
+        // If the keyspace doesn't exist, also filter it out.
+        // It should be entry from vnode view, which hasn't been cleaned up yet.
+        // Entries from tablet-views should be removed in the same batch as drop keyspace/view mutations.
+        return _db.local().has_keyspace(ks_name) && _db.local().find_keyspace(ks_name).uses_tablets();
+    };
+
+
+    auto [vb_tasks, min_alive_uuid] = co_await _sys_ks.local().get_view_building_tasks();
+    auto processing_base_table = co_await _sys_ks.local().get_view_building_processing_base_id();
+
+    std::map<table_id, std::vector<table_id>> views_per_base;
+    auto views = _db.local().get_views()
+        | std::views::filter([&] (const view_ptr& v) { return filter_vnode_keyspace(v->ks_name()); })
+        | std::views::transform([] (const view_ptr& v) { return std::make_pair(v->view_info()->base_id(), v->id()); });
+    for (const auto& [base_id, view_id]: views) {
+        views_per_base[base_id].push_back(view_id);
+    }
+
+    auto statuses = co_await _sys_ks.local().get_view_build_status_map();
+    co_await update_built_views(statuses);
+    auto status_map = statuses
+        | std::views::filter([&] (const auto& e) { return filter_vnode_keyspace(e.first.first); })
+        | std::views::transform([this] (const auto& e) {        // convert (ks_name, view_name) to table_id
+            auto id = _db.local().find_schema(e.first.first, e.first.second)->id();
+            return std::make_pair(id, std::move(e.second));
+        })
+        | std::ranges::to<db::view::views_state::view_build_status_map>();
+
+    db::view::view_building_state building_state {std::move(vb_tasks), std::move(processing_base_table), std::move(min_alive_uuid)};
+    db::view::views_state views_state {std::move(views_per_base), std::move(status_map)};
+
+    _view_building_state_machine.building_state = std::move(building_state);
+    _view_building_state_machine.views_state = std::move(views_state);
+    ++_view_building_state_machine.version;
+}
+
+future<> storage_service::view_building_transition() {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    co_await view_building_state_load();
+
+    _view_building_state_machine.event.broadcast();
+}
+
+future<> storage_service::reload_raft_topology_state(service::raft_group0_client& group0_client) {
+    slogger.info("Waiting for group 0 read/apply mutex before reloading Raft topology state...");
+    auto holder = co_await group0_client.hold_read_apply_mutex(_abort_source);
+    slogger.info("Reloading Raft topology state");
+    // Using topology_transition() instead of topology_state_load(), because the former notifies listeners
+    co_await topology_transition();
+    slogger.info("Reloaded Raft topology state");
+}
+
+future<> storage_service::merge_topology_snapshot(raft_snapshot snp) {
+    auto it = std::partition(snp.mutations.begin(), snp.mutations.end(), [] (const canonical_mutation& m) {
+        return m.column_family_id() != db::system_keyspace::cdc_generations_v3()->id();
+    });
+
+    if (it != snp.mutations.end()) {
+        auto s = _db.local().find_schema(db::system_keyspace::NAME, db::system_keyspace::CDC_GENERATIONS_V3);
+
+        // Split big mutations into smaller ones, prepare frozen_muts_to_apply
+        utils::chunked_vector<frozen_mutation> frozen_muts_to_apply;
+        {
+            frozen_muts_to_apply.reserve(std::distance(it, snp.mutations.end()));
+            const auto max_size = _db.local().schema_commitlog()->max_record_size() / 2;
+            for (auto i = it; i != snp.mutations.end(); i++) {
+                const auto& m = *i;
+                auto mut = co_await to_mutation_gently(m, s);
+                if (m.representation().size() <= max_size) {
+                    frozen_muts_to_apply.push_back(co_await freeze_gently(mut));
+                } else {
+                    utils::chunked_vector<mutation> split_muts;
+                    co_await split_mutation(std::move(mut), split_muts, max_size);
+                    for (auto& m : split_muts) {
+                        frozen_muts_to_apply.push_back(co_await freeze_gently(m));
+                    }
+                }
+            }
+        }
+
+        // Apply non-atomically so as not to hit the commitlog size limit.
+        // The cdc_generations_v3 data is not used in any way until
+        // it's referenced from the topology table.
+        // By applying the cdc_generations_v3 mutations before topology mutations
+        // we ensure that the lack of atomicity isn't a problem here.
+        co_await max_concurrent_for_each(frozen_muts_to_apply, 128, [&] (const frozen_mutation& m) -> future<> {
+            return _db.local().apply(s, m, {}, db::commitlog::force_sync::yes, db::no_timeout).discard_result();
+        });
+    }
+
+    // Apply system.topology and system.topology_requests mutations atomically
+    // to have a consistent state after restart
+    utils::chunked_vector<frozen_mutation> muts;
+    muts.reserve(std::distance(snp.mutations.begin(), it));
+    for (auto cur = snp.mutations.begin(); cur != it; ++cur) {
+        const auto& m = *cur;
+        auto s = _db.local().find_schema(m.column_family_id());
+        // FIXME: in theory, we can generate a frozen_mutation
+        // directly from canonical_mutation rather than building
+        // a mutation and then freezing it.
+        muts.emplace_back(freeze(m.to_mutation(s)));
+        co_await coroutine::maybe_yield();
+    }
+    co_await _db.local().apply(muts, db::no_timeout);
+}
+
+future<> storage_service::update_service_levels_cache(qos::update_both_cache_levels update_only_effective_cache, qos::query_context ctx) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    co_await _sl_controller.local().update_cache(update_only_effective_cache, ctx);
+}
+
+future<> storage_service::compression_dictionary_updated_callback_all() {
+    auto all_dict_names = co_await _sys_ks.local().query_all_dict_names();
+    for (const auto& x : all_dict_names) {
+        co_await _compression_dictionary_updated_callback(x);
+    }
+}
+
+future<> storage_service::compression_dictionary_updated_callback(std::string_view name) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    return _compression_dictionary_updated_callback(name);
+}
+
+future<> storage_service::load_cdc_streams(std::optional<std::unordered_set<table_id>> changed_tables) {
+    co_await _cdc_gens.local().load_cdc_tablet_streams(std::move(changed_tables));
+}
+
+// {{{ ip_address_updater
+
+class storage_service::ip_address_updater: public gms::i_endpoint_state_change_subscriber {
+    gms::gossip_address_map& _address_map;
+    storage_service& _ss;
+
+    future<>
+    on_endpoint_change(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr ep_state, gms::permit_id permit_id, const char* ev) {
+        rslog.debug("ip_address_updater::on_endpoint_change({}) {} {}", ev, endpoint, id);
+
+        // If id maps to different ip in peers table it needs to be updated which is done by sync_raft_topology_nodes below
+        std::optional<gms::inet_address> prev_ip = co_await _ss._sys_ks.local().get_ip_from_peers_table(id);
+        if (_address_map.find(id) != endpoint) {
+            // Address map refused to update IP for the host_id,
+            // this means prev_ip has higher generation than endpoint.
+            // Do not update address.
+            co_return;
+        }
+
+        // If the host_id <-> IP mapping has changed, we need to update system tables, token_metadat and erm.
+        rslog.debug("ip_address_updater::on_endpoint_change({}), host_id {}, "
+                    "old ip [{}], new ip [{}], "
+                    "waiting for group 0 read/apply mutex before reloading Raft topology state...",
+            ev, id, prev_ip, endpoint);
+
+        // We're in a gossiper event handler, so gossiper is currently holding a lock
+        // for the endpoint parameter of on_endpoint_change.
+        // The topology_state_load function can also try to acquire gossiper locks.
+        // If we call sync_raft_topology_nodes here directly, a gossiper lock and
+        // the _group0.read_apply_mutex could be taken in cross-order leading to a deadlock.
+        // To avoid this, we don't wait for sync_raft_topology_nodes to finish.
+        (void)futurize_invoke([this, id, prev_ip, endpoint, h = _ss._async_gate.hold()](this auto) -> future<> {
+            auto guard = co_await _ss._group0->client().hold_read_apply_mutex(_ss._abort_source);
+            co_await utils::get_local_injector().inject("ip-change-raft-sync-delay", std::chrono::milliseconds(500));
+
+            // We need to call raft_topology_update_ip even if ip hasn't changed.
+            // Suppose a bootstrapping node A appears in the system.peers table of
+            // some other node B. Its record has only ID and IP of the node A, due to
+            // the special handling of bootstrapping nodes in raft_topology_update_ip.
+            // Suppose node B gets temporarily isolated from the topology coordinator.
+            // The topology coordinator fences out node B and successfully finishes
+            // bootstrapping of the node A. Later, when the connectivity is restored,
+            // topology_state_load runs on the node B, node A is already in
+            // normal state, but the gossiper on B might not yet have any state for
+            // it. In this case, raft_topology_update_ip would not update
+            // system.peers because the gossiper state is missing. Subsequently,
+            // on_join/on_restart/on_alive events would skip updates because the IP
+            // in gossiper matches the IP for that node in system.peers.
+            //
+            // If ip hasn't changed we set nodes_to_notify to nullptr since
+            // we don't need join events in this case.
+
+            nodes_to_notify_after_sync nodes_to_notify;
+            co_await _ss.raft_topology_update_ip(id, endpoint,
+                co_await _ss._sys_ks.local().get_host_id_to_ip_map(),
+                prev_ip == endpoint ? nullptr : &nodes_to_notify);
+            co_await _ss.notify_nodes_after_sync(std::move(nodes_to_notify));
+        });
+    }
+
+public:
+    ip_address_updater(gms::gossip_address_map& address_map, storage_service& ss)
+        : _address_map(address_map)
+        , _ss(ss)
+    {}
+
+    virtual future<>
+    on_join(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr ep_state, gms::permit_id permit_id) override {
+        return on_endpoint_change(endpoint, id, ep_state, permit_id, "on_join");
+    }
+
+    virtual future<>
+    on_alive(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr ep_state, gms::permit_id permit_id) override {
+        return on_endpoint_change(endpoint, id, ep_state, permit_id, "on_alive");
+    }
+
+    virtual future<>
+    on_restart(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr ep_state, gms::permit_id permit_id) override {
+        return on_endpoint_change(endpoint, id, ep_state, permit_id, "on_restart");
+    }
+};
+
+// }}} ip_address_updater
+
+future<> storage_service::sstable_vnodes_cleanup_fiber(raft::server& server, gate::holder group0_holder, sharded<service::storage_proxy>& proxy) noexcept {
+    while (!_group0_as.abort_requested()) {
+        bool err = false;
+        try {
+            co_await _topology_state_machine.event.when([&] {
+                auto me = _topology_state_machine._topology.find(server.id());
+                return me && me->second.cleanup == cleanup_status::running;
+            });
+
+            std::unordered_map<sstring, std::vector<table_info>> ks_tables;
+            {
+                // The scope for the guard
+                auto guard = co_await _group0->client().start_operation(_group0_as);
+                auto me = _topology_state_machine._topology.find(server.id());
+                // Recheck that cleanup is needed after the barrier
+                if (!me || me->second.cleanup != cleanup_status::running) {
+                    rtlogger.trace("vnodes_cleanup triggered, but not needed");
+                    continue;
+                }
+
+                rtlogger.info("start vnodes_cleanup");
+
+                // Skip tablets tables since they do their own cleanup and system tables
+                // since they are local and not affected by range movements.
+                auto ks_erms = _db.local().get_non_local_strategy_keyspaces_erms();
+                ks_tables.reserve(ks_erms.size());
+
+                for (auto&& [ks_name, erm] : ks_erms) {
+                    auto& ks = _db.local().find_keyspace(ks_name);
+                    const auto& cf_meta_data = ks.metadata().get()->cf_meta_data();
+                    std::vector<table_info> table_infos;
+                    table_infos.reserve(cf_meta_data.size());
+                    for (const auto& [name, schema] : cf_meta_data) {
+                        table_infos.emplace_back(table_info{name, schema->id()});
+                    }
+                    ks_tables.emplace(std::move(ks_name), std::move(table_infos));
+                };
+            }
+
+            {
+                rtlogger.info("vnodes_cleanup: drain closing sessions");
+                co_await proxy.invoke_on_all([] (storage_proxy& sp) {
+                    return get_topology_session_manager().drain_closing_sessions();
+                });
+
+                rtlogger.info("vnodes_cleanup: wait for stale pending writes");
+                co_await proxy.invoke_on_all([] (storage_proxy& sp) {
+                    return sp.await_stale_pending_writes();
+                });
+
+                rtlogger.info("vnodes_cleanup: flush_all_tables");
+                co_await _db.invoke_on_all([&] (replica::database& db) {
+                    return db.flush_all_tables();
+                });
+
+                co_await coroutine::parallel_for_each(ks_tables, [&](auto& item) -> future<> {
+                    auto& [ks_name, table_infos] = item;
+                    auto& compaction_module = _db.local().get_compaction_manager().get_task_manager_module();
+                    // we flush all tables before cleanup the keyspaces individually, so skip the flush-tables step here
+                    auto task = co_await compaction_module.start_cleanup_keyspace_compaction(_db, ks_name, table_infos, compaction::flush_mode::skip, tasks::is_user_task::no);
+                    try {
+                        rtlogger.info("vnodes_cleanup {} started", ks_name);
+                        co_await task->done();
+                        rtlogger.info("vnodes_cleanup {} finished", ks_name);
+                    } catch (...) {
+                        rtlogger.error("vnodes_cleanup failed keyspace={} tables={} failed: {:t}", task->get_status().keyspace, table_infos, std::current_exception());
+                        throw;
+                    }
+                });
+            }
+
+            rtlogger.info("vnodes_cleanup ended");
+
+            while (true) {
+                auto guard = co_await _group0->client().start_operation(_group0_as);
+                topology_mutation_builder builder(guard.write_timestamp());
+                builder.with_node(server.id()).set("cleanup_status", cleanup_status::clean);
+
+                topology_change change{{builder.build()}};
+                group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("cleanup completed for {}", server.id()));
+
+                try {
+                    co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as);
+                } catch (group0_concurrent_modification&) {
+                    rtlogger.info("cleanup flag clearing: concurrent operation is detected, retrying.");
+                    continue;
+                }
+                break;
+            }
+            rtlogger.debug("vnodes_cleanup: cleanup flag cleared");
+        } catch (const seastar::abort_requested_exception&) {
+             rtlogger.info("vnodes_cleanup fiber aborted");
+             break;
+        } catch (raft::request_aborted&) {
+             rtlogger.info("vnodes_cleanup fiber aborted");
+             break;
+        } catch (const seastar::broken_condition_variable&) {
+             rtlogger.info("vnodes_cleanup fiber aborted");
+             break;
+        } catch (...) {
+             rtlogger.error("vnodes_cleanup fiber got an error: {:t}", std::current_exception());
+             err = true;
+        }
+        if (err) {
+            co_await sleep_abortable(std::chrono::seconds(1), _group0_as);
+        }
+    }
+}
+
+future<> storage_service::raft_state_monitor_fiber(raft::server& raft, gate::holder group0_holder) {
+    std::optional<abort_source> as;
+
+    try {
+        while (!_group0_as.abort_requested()) {
+            // Wait for a state change in case we are not a leader yet, or we are are the leader
+            // and coordinator work is running (in which case 'as' is engaged)
+            while (!raft.is_leader() || as) {
+                co_await raft.wait_for_state_change(&_group0_as);
+                if (as) {
+                    as->request_abort(); // we are no longer a leader, so abort the coordinator
+                    co_await std::exchange(_topology_change_coordinator, make_ready_future<>());
+                    as = std::nullopt;
+                    try {
+                        _tablet_allocator.local().on_leadership_lost();
+                    } catch (...) {
+                        rtlogger.error("tablet_allocator::on_leadership_lost() failed: {:t}", std::current_exception());
+                    }
+                }
+            }
+            // We are the leader now but that can change any time!
+            as.emplace();
+            // start topology change coordinator in the background
+            _topology_change_coordinator = run_topology_coordinator(
+                    _sys_dist_ks, _gossiper, _messaging.local(), _shared_token_metadata,
+                    _sys_ks.local(), _db.local(), *_group0, _topology_state_machine, _view_building_state_machine, *as, raft,
+                    std::bind_front(&storage_service::raft_topology_cmd_handler, this),
+                    _tablet_allocator.local(),
+                    _cdc_gens.local(),
+                    get_ring_delay(),
+                    _lifecycle_notifier,
+                    _feature_service,
+                    _sl_controller.local(),
+                    _topology_cmd_rpc_tracker,
+                    _cluster_config.local());
+        }
+    } catch (...) {
+        rtlogger.info("raft_state_monitor_fiber aborted with {:t}", std::current_exception());
+    }
+    if (as) {
+        as->request_abort(); // abort current coordinator if running
+        co_await std::move(_topology_change_coordinator);
+    }
+}
+
+std::unordered_set<raft::server_id> storage_service::find_raft_nodes_from_hoeps(const locator::host_id_or_endpoint_list& hoeps) const {
+    std::unordered_set<raft::server_id> ids;
+    for (const auto& hoep : hoeps) {
+        std::optional<raft::server_id> id;
+        if (hoep.has_host_id()) {
+            id = raft::server_id{hoep.id().uuid()};
+        } else {
+            auto hid = _address_map.find_by_addr(hoep.endpoint());
+            if (!hid) {
+                throw std::runtime_error(::format("Cannot find a mapping to IP {}", hoep.endpoint()));
+            }
+            id = raft::server_id{hid->uuid()};
+        }
+        if (!_topology_state_machine._topology.contains(*id)) {
+            throw std::runtime_error(::format("Node {} is not found in the cluster", *id));
+        }
+        ids.insert(*id);
+    }
+    return ids;
+}
+
+std::unordered_set<raft::server_id> storage_service::ignored_nodes_from_join_params(const join_node_request_params& params) {
+    const locator::host_id_or_endpoint_list ignore_nodes_params = string_list_to_endpoint_list(params.ignore_nodes);
+    std::unordered_set<raft::server_id> ignored_nodes{find_raft_nodes_from_hoeps(ignore_nodes_params)};
+
+    if (params.replaced_id) {
+        // insert node that should be replaced to ignore list so that other topology operations
+        // can ignore it
+        ignored_nodes.insert(*params.replaced_id);
+    }
+
+    return ignored_nodes;
+}
+
+utils::chunked_vector<canonical_mutation> storage_service::build_mutation_from_join_params(const join_node_request_params& params, api::timestamp_type write_timestamp, utils::UUID old_request_id) {
+    topology_mutation_builder builder(write_timestamp);
+    auto ignored_nodes = ignored_nodes_from_join_params(params);
+
+    if (!ignored_nodes.empty()) {
+        auto bad_id = std::find_if_not(ignored_nodes.begin(), ignored_nodes.end(), [&] (auto n) {
+            return _topology_state_machine._topology.normal_nodes.contains(n);
+        });
+        if (bad_id != ignored_nodes.end()) {
+            throw std::runtime_error(::format("replace: there is no node with id {} in normal state. Cannot ignore it.", *bad_id));
+        }
+        builder.add_ignored_nodes(std::move(ignored_nodes));
+    }
+
+    auto& node_builder = builder.with_node(params.host_id)
+        .set("node_state", node_state::none)
+        .set("datacenter", params.datacenter)
+        .set("rack", params.rack)
+        .set("release_version", params.release_version)
+        .set("num_tokens", params.num_tokens)
+        .set("tokens_string", params.tokens_string)
+        .set("shard_count", params.shard_count)
+        .set("ignore_msb", params.ignore_msb)
+        .set("cleanup_status", cleanup_status::clean)
+        .set("supported_features", params.supported_features | std::ranges::to<std::set<sstring>>());
+
+    if (params.replaced_id) {
+        node_builder
+            .set("topology_request", topology_request::replace)
+            .set("replaced_id", *params.replaced_id);
+    } else {
+        node_builder
+            .set("topology_request", topology_request::join);
+    }
+    node_builder.set("request_id", params.request_id);
+    topology_request_tracking_mutation_builder rtbuilder(params.request_id, _feature_service.topology_requests_type_column);
+    rtbuilder.set("initiating_host", params.host_id.uuid())
+             .set("done", false);
+    rtbuilder.set("request_type", params.replaced_id ? topology_request::replace : topology_request::join);
+    if (_feature_service.topology_requests_target_host_column) {
+        auto target = params.replaced_id ? params.replaced_id->uuid() : params.host_id.uuid();
+        rtbuilder.set("target_host", target);
+    }
+
+    utils::chunked_vector<canonical_mutation> muts = {builder.build(), rtbuilder.build()};
+
+    if (old_request_id) {
+        // If this is a replace operation, we need to mark the old request for replaced node as done if exists
+        // It should be safe to do so here since if the request is still pending it means the topology coordinator does not
+        // work on it yet, and if the topology coordinator will pick it up meanwhile the write of this new state will fail
+        topology_mutation_builder builder(write_timestamp);
+        builder.with_node(*params.replaced_id).del("topology_request");
+        topology_request_tracking_mutation_builder rtbuilder(old_request_id, _feature_service.topology_requests_type_column);
+        rtbuilder.done("node was replaced before the request could start");
+        muts.push_back(builder.build());
+        muts.push_back(rtbuilder.build());
+    }
+
+    return muts;
+}
+
+class join_node_rpc_handshaker : public service::group0_handshaker {
+private:
+    service::storage_service& _ss;
+    const join_node_request_params& _req;
+
+public:
+    join_node_rpc_handshaker(service::storage_service& ss, const join_node_request_params& req)
+            : _ss(ss)
+            , _req(req)
+    {}
+
+    future<> pre_server_start(const group0_info& g0_info) override {
+        rtlogger.info("join: sending the join request to {}", g0_info.ip_addr);
+
+        co_await utils::get_local_injector().inject("crash_before_group0_join", [](auto& handler) -> future<> {
+            // This wait ensures that node gossips its state before crashing.
+            co_await handler.wait_for_message(db::timeout_clock::now() + std::chrono::minutes(5));
+            throw std::runtime_error("deliberately crashed for orphan remover test");
+        });
+        auto result = co_await ser::join_node_rpc_verbs::send_join_node_request(
+                &_ss._messaging.local(), netw::msg_addr(g0_info.ip_addr), g0_info.id, _req);
+        if (utils::get_local_injector().is_enabled("pre_server_start_drop_expiring")) {
+            co_await utils::get_local_injector().inject("pre_server_start_drop_expiring",
+                    utils::wait_for_message(5min));
+            _ss._gossiper.get_mutable_address_map().force_drop_expiring_entries();
+        }
+
+        std::visit(overloaded_functor {
+            [this] (const join_node_request_result::ok&) {
+                rtlogger.info("join: request to join placed, waiting"
+                             " for the response from the topology coordinator");
+
+                _ss._join_node_request_done.set_value();
+            },
+            [] (const join_node_request_result::rejected& rej) {
+                throw std::runtime_error(
+                        format("the topology coordinator rejected request to join the cluster: {}", rej.reason));
+            },
+        }, result.result);
+
+        co_return;
+    }
+
+    future<bool> post_server_start(const group0_info& g0_info, abort_source& as) override {
+        // Group 0 has been started. Allow the join_node_response to be handled.
+        _ss._join_node_group0_started.set_value();
+
+        // Processing of the response is done in `join_node_response_handler`.
+        // Wait for it to complete. If the topology coordinator fails to
+        // deliver the rejection, it won't complete. In such a case, the
+        // operator is responsible for shutting down the joining node.
+        co_await _ss._join_node_response_done.get_shared_future(as);
+        rtlogger.info("join: success");
+        co_return true;
+    }
+};
+
+future<bool> storage_service::ongoing_rf_change(const group0_guard& guard, sstring ks) const {
+    auto ongoing_ks_rf_change = [&] (utils::UUID request_id) -> future<bool> {
+        auto req_entry = co_await _sys_ks.local().get_topology_request_entry(request_id);
+        co_return std::holds_alternative<global_topology_request>(req_entry.request_type) &&
+            std::get<global_topology_request>(req_entry.request_type) == global_topology_request::keyspace_rf_change &&
+            req_entry.new_keyspace_rf_change_ks_name.has_value() && req_entry.new_keyspace_rf_change_ks_name.value() == ks;
+    };
+    if (_topology_state_machine._topology.global_request_id.has_value()) {
+        auto req_id = _topology_state_machine._topology.global_request_id.value();
+        if (co_await ongoing_ks_rf_change(req_id)) {
+            co_return true;
+        }
+    }
+    for (auto request_id : _topology_state_machine._topology.paused_rf_change_requests) {
+        if (co_await ongoing_ks_rf_change(request_id)) {
+            co_return true;
+        }
+    }
+    for (auto request_id : _topology_state_machine._topology.global_requests_queue) {
+        if (co_await ongoing_ks_rf_change(request_id)) {
+            co_return true;
+        }
+    }
+    for (auto request_id : _topology_state_machine._topology.ongoing_rf_changes) {
+        if (co_await ongoing_ks_rf_change(request_id)) {
+            co_return true;
+        }
+    }
+    co_return false;
+}
+
+future<std::optional<utils::UUID>> storage_service::ongoing_prepare_migration(const group0_guard& guard, std::optional<sstring> ks) const {
+    auto ongoing_ks_prepare = [&] (utils::UUID request_id) -> future<bool> {
+        auto req_entry = co_await _sys_ks.local().get_topology_request_entry(request_id);
+        co_return std::holds_alternative<global_topology_request>(req_entry.request_type) &&
+            std::get<global_topology_request>(req_entry.request_type) == global_topology_request::prepare_migration &&
+            (!ks || (req_entry.prepare_migration_ks_name.has_value() && req_entry.prepare_migration_ks_name.value() == *ks));
+    };
+    // A prepare_migration request always goes through the queue, never through
+    // global_request_id.
+    for (auto request_id : _topology_state_machine._topology.global_requests_queue) {
+        if (co_await ongoing_ks_prepare(request_id)) {
+            co_return request_id;
+        }
+    }
+    co_return std::nullopt;
+}
+
+future<> storage_service::raft_initialize_discovery_leader(const join_node_request_params& params) {
+    if (params.replaced_id.has_value()) {
+        throw std::runtime_error(::format("Cannot perform a replace operation because this is the first node in the cluster"));
+    }
+
+    if (params.num_tokens == 0 && params.tokens_string.empty()) {
+        throw std::runtime_error("Cannot start the first node in the cluster as zero-token");
+    }
+
+    const auto new_group0_state_id = raft_group0_client::generate_group0_state_id(utils::UUID{});
+    auto write_timestamp = utils::UUID_gen::micros_timestamp(new_group0_state_id);
+
+    rtlogger.info("adding myself as the first node to the topology");
+
+    auto insert_join_request_mutations = build_mutation_from_join_params(params, write_timestamp);
+
+    // We are the first node and we define the cluster.
+    // Set the enabled_features field to our features.
+    topology_mutation_builder builder(write_timestamp);
+    builder.add_enabled_features(params.supported_features | std::ranges::to<std::set<sstring>>())
+            .set_upgrade_state_done(); // Start right in the topology-on-raft mode
+    auto enable_features_mutation = builder.build();
+    insert_join_request_mutations.push_back(std::move(enable_features_mutation));
+
+    auto skip_service_levels_v2_initialization = utils::get_local_injector().enter("skip_service_levels_v2_initialization");
+    auto sl_status_mutation = co_await _sys_ks.local().make_service_levels_version_mutation(skip_service_levels_v2_initialization ? 1 : 2, write_timestamp);
+    insert_join_request_mutations.emplace_back(std::move(sl_status_mutation));
+
+    insert_join_request_mutations.emplace_back(co_await _sys_ks.local().make_auth_version_mutation(write_timestamp, db::system_keyspace::auth_version_t::v2));
+
+    insert_join_request_mutations.emplace_back(co_await _sys_ks.local().make_view_builder_version_mutation(write_timestamp, db::system_keyspace::view_builder_version_t::v2));
+
+    if (!skip_service_levels_v2_initialization) {
+        auto sl_driver_mutations = co_await qos::service_level_controller::get_create_driver_service_level_mutations(_sys_ks.local(), write_timestamp);
+        for (auto& m : sl_driver_mutations) {
+            insert_join_request_mutations.emplace_back(m);
+        }
+    }
+
+    topology_change change{std::move(insert_join_request_mutations)};
+    
+    auto history_append = db::system_keyspace::make_group0_history_state_id_mutation(new_group0_state_id,
+            _migration_manager.local().get_group0_client().get_history_gc_duration(), "bootstrap: adding myself as the first node to the topology");
+    auto mutation_creator_addr = _sys_ks.local().local_db().get_token_metadata().get_topology().my_address();
+
+    co_await write_mutations_to_database(*this, _qp.proxy(), mutation_creator_addr, std::move(change.mutations));
+    co_await _qp.proxy().mutate_locally({history_append}, nullptr);
+}
+
+future<> storage_service::initialize_done_topology_upgrade_state() {
+    const sstring insert_query = format("UPDATE {}.{} SET upgrade_state='done' WHERE key='topology'",
+        db::system_keyspace::NAME, db::system_keyspace::TOPOLOGY);
+    co_await _qp.execute_internal(
+            insert_query,
+            {},
+            cql3::query_processor::cache_internal::no).discard_result();
+}
+
+future<> storage_service::update_topology_with_local_metadata(raft::server& raft_server) {
+    // TODO: include more metadata here
+    auto local_shard_count = this_smp_shard_count();
+    auto local_ignore_msb = _db.local().get_config().murmur3_partitioner_ignore_msb_bits();
+    auto local_release_version = version::release();
+    auto local_supported_features = _feature_service.supported_feature_set() | std::ranges::to<std::set<sstring>>();
+
+    // Only report the mode once every node knows the column; older nodes silently drop
+    // a cell for a column their schema lacks. The flag gates the comparison below too,
+    // or the loop would keep retrying a write it is not allowed to make.
+    const bool report_storage_mode = bool(_feature_service.topology_current_storage_mode);
+    // The mode this node built its tables with. It reads the intent before it has caught
+    // up with group0, and a node can die between committing an intent and applying it, so
+    // the row may already carry one this boot never saw - the tables are vnode-flavored
+    // either way, and that is what the node has to report.
+    storage_mode local_storage_mode = storage_mode::vnodes;
+    if (report_storage_mode) {
+        local_storage_mode = _db.local().get_boot_storage_mode().value_or(storage_mode::vnodes);
+    }
+
+    // Reconcile only while the row still records an intent, or a node booting after
+    // finalization would write back a mode the coordinator has just cleared.
+    auto storage_mode_synchronized = [&] (const replica_state& rs) {
+        if (!report_storage_mode || !rs.intended_storage_mode) {
+            return true;
+        }
+        return rs.current_storage_mode == local_storage_mode;
+    };
+
+    auto synchronized = [&] () {
+        auto it = _topology_state_machine._topology.find(raft_server.id());
+        if (!it) {
+            throw std::runtime_error{"Removed from topology while performing metadata update"};
+        }
+
+        auto& replica_state = it->second;
+
+        return replica_state.shard_count == local_shard_count
+            && replica_state.ignore_msb == local_ignore_msb
+            && replica_state.release_version == local_release_version
+            && replica_state.supported_features == local_supported_features
+            && storage_mode_synchronized(replica_state);
+    };
+
+    // We avoid performing a read barrier if we're sure that our metadata stored in topology
+    // is the same as local metadata. Note that only we can update our metadata, other nodes cannot.
+    //
+    // We use a persisted flag `must_update_topology` to avoid the following scenario:
+    // 1. the node restarts and its metadata changes
+    // 2. the node commits the new metadata to topology, but before the update is applied
+    //    to the local state machine, the node crashes
+    // 3. then the metadata changes back to old values and node restarts again
+    // 4. the local state machine tells us that we're in sync, which is wrong
+    // If the persisted flag is true, it tells us that we attempted a metadata change earlier,
+    // forcing us to perform a read barrier even when the local state machine tells us we're in sync.
+
+    if (synchronized() && !(co_await _sys_ks.local().get_must_synchronize_topology())) {
+        co_return;
+    }
+
+    while (true) {
+        rtlogger.info("refreshing topology to check if it's synchronized with local metadata");
+
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        if (synchronized()) {
+            break;
+        }
+
+        // It might happen that, in the previous run, the node commits a command
+        // that adds support for a feature, crashes before applying it and now
+        // it is not safe to disable support for it. If there is an attempt to
+        // downgrade the node then `enable_features_on_startup` called much
+        // earlier won't catch it, we only can do it here after performing
+        // a read barrier - so we repeat it here.
+        //
+        // Fortunately, there is no risk that this feature was marked as enabled
+        // because it requires that the current node responded to a barrier
+        // request - which will fail in this situation.
+        const auto& enabled_features = _topology_state_machine._topology.enabled_features;
+        const auto unsafe_to_disable_features = _topology_state_machine._topology.calculate_not_yet_enabled_features();
+        _feature_service.check_features(enabled_features, unsafe_to_disable_features);
+
+        rtlogger.info("updating topology with local metadata");
+
+        co_await _sys_ks.local().set_must_synchronize_topology(true);
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        auto& node_builder = builder.with_node(raft_server.id())
+               .set("shard_count", local_shard_count)
+               .set("ignore_msb", local_ignore_msb)
+               .set("release_version", local_release_version)
+               .set("supported_features", local_supported_features);
+        // Mirrors storage_mode_synchronized(); synchronized() above already established
+        // that the node is in the topology.
+        const auto& rs = _topology_state_machine._topology.find(raft_server.id())->second;
+        if (report_storage_mode && rs.intended_storage_mode) {
+            node_builder.set("current_storage_mode", local_storage_mode);
+        }
+
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(
+                std::move(change), guard, ::format("{}: update topology with local metadata", raft_server.id()));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("update topology with local metadata:"
+                         " concurrent operation is detected, retrying.");
+        }
+    }
+
+    co_await _sys_ks.local().set_must_synchronize_topology(false);
+}
+
+future<> storage_service::await_tablets_rebuilt(raft::server_id replaced_id) {
+    auto is_drained = [&] {
+        return !get_token_metadata().tablets().has_replica_on(locator::host_id(replaced_id.uuid()));
+    };
+    if (!is_drained()) {
+        slogger.info("Waiting for tablet replicas from the replaced node to be rebuilt");
+        co_await _topology_state_machine.event.when([&] {
+            return is_drained();
+        });
+    }
+    slogger.info("Tablet replicas from the replaced node have been rebuilt");
+}
+
+future<> storage_service::start_sys_dist_ks() const {
+    slogger.info("starting system distributed keyspace shards");
+    return _sys_dist_ks.invoke_on_all(&db::system_distributed_keyspace::start);
+}
+
+future<> storage_service::join_topology(sharded<service::storage_proxy>& proxy,
+        std::unordered_set<gms::inet_address> initial_contact_nodes,
+        std::unordered_map<locator::host_id, gms::loaded_endpoint_state> loaded_endpoints,
+        start_hint_manager start_hm,
+        gms::generation_type new_generation) {
+    gms::application_state_map app_states;
+    std::optional<replacement_info> ri;
+    std::optional<raft_group0::replace_info> raft_replace_info;
+    if (is_replacing()) {
+        if (_sys_ks.local().bootstrap_complete()) {
+            throw std::runtime_error("Cannot replace address with a node that is already bootstrapped");
+        }
+        ri = co_await prepare_replacement_info(initial_contact_nodes);
+
+        const auto& my_location = _snitch.local()->get_location();
+        if (my_location != ri->dc_rack) {
+            auto msg = fmt::format("Cannot replace node {} with a node on a different data center or rack. Current location={}/{}, new location={}/{}",
+                    ri->host_id, ri->dc_rack.dc, ri->dc_rack.rack, my_location.dc, my_location.rack);
             slogger.error("{}", msg);
             throw std::runtime_error(msg);
         }
-    }
 
-    bool replacing_a_node_with_same_ip = false;
-    bool replacing_a_node_with_diff_ip = false;
-    auto tmlock = std::make_unique<token_metadata_lock>(get_token_metadata_lock().get0());
-    auto tmptr = get_mutable_token_metadata_ptr().get0();
-    if (_db.local().is_replacing()) {
-        if (db::system_keyspace::bootstrap_complete()) {
-            throw std::runtime_error("Cannot replace address with a node that is already bootstrapped");
-        }
-        _bootstrap_tokens = prepare_replacement_info(initial_contact_nodes, loaded_peer_features).get0();
-        auto replace_address = _db.local().get_replace_address();
-        replacing_a_node_with_same_ip = *replace_address == get_broadcast_address();
-        replacing_a_node_with_diff_ip = *replace_address != get_broadcast_address();
-
-        slogger.info("Replacing a node with {} IP address, my address={}, node being replaced={}",
-            get_broadcast_address() == *replace_address ? "the same" : "a different",
-            get_broadcast_address(), *replace_address);
-        tmptr->update_normal_tokens(_bootstrap_tokens, *replace_address).get();
-    } else if (should_bootstrap()) {
-        check_for_endpoint_collision(initial_contact_nodes, loaded_peer_features).get();
-    } else {
-        auto local_features = _feature_service.known_feature_set();
-        slogger.info("Checking remote features with gossip, initial_contact_nodes={}", initial_contact_nodes);
-        _gossiper.do_shadow_round(initial_contact_nodes).get();
-        _gossiper.check_knows_remote_features(local_features, loaded_peer_features);
-        _gossiper.check_snitch_name_matches();
-        _gossiper.reset_endpoint_state_map().get();
-        for (auto ep : loaded_endpoints) {
-            _gossiper.add_saved_endpoint(ep).get();
+        raft_replace_info = raft_group0::replace_info {
+            .raft_id = raft::server_id{ri->host_id.uuid()},
+        };
+    } else if (_sys_ks.local().bootstrap_complete()) {
+        slogger.info("Performing gossip shadow round, initial_contact_nodes={}", initial_contact_nodes);
+        co_await _gossiper.do_shadow_round(initial_contact_nodes, gms::gossiper::mandatory::no);
+        _gossiper.check_snitch_name_matches(_snitch.local()->get_name());
+        co_await _gossiper.reset_endpoint_state_map();
+        for (const auto& [host_id, st] : loaded_endpoints) {
+            // gossiping hasn't started yet
+            // so no need to lock the endpoint
+            co_await _gossiper.add_saved_endpoint(host_id, st, gms::null_permit_id);
         }
     }
     auto features = _feature_service.supported_feature_set();
@@ -246,52 +1630,32 @@ void storage_service::prepare_to_join(
     // Save the advertised feature set to system.local table after
     // all remote feature checks are complete and after gossip shadow rounds are done.
     // At this point, the final feature set is already determined before the node joins the ring.
-    db::system_keyspace::save_local_supported_features(features).get0();
+    co_await _sys_ks.local().save_local_supported_features(features);
 
     // If this is a restarting node, we should update tokens before gossip starts
-    auto my_tokens = db::system_keyspace::get_saved_tokens().get0();
-    bool restarting_normal_node = db::system_keyspace::bootstrap_complete() && !_db.local().is_replacing() && !my_tokens.empty();
+    auto my_tokens = co_await _sys_ks.local().get_saved_tokens();
+    bool restarting_normal_node = _sys_ks.local().bootstrap_complete() && !is_replacing();
     if (restarting_normal_node) {
-        slogger.info("Restarting a node in NORMAL status");
-        // This node must know about its chosen tokens before other nodes do
-        // since they may start sending writes to this node after it gossips status = NORMAL.
-        // Therefore we update _token_metadata now, before gossip starts.
-        tmptr->update_normal_tokens(my_tokens, get_broadcast_address()).get();
-
-        _cdc_gen_id = db::system_keyspace::get_cdc_generation_id().get0();
-        if (!_cdc_gen_id) {
-            // We could not have completed joining if we didn't generate and persist a CDC streams timestamp,
-            // unless we are restarting after upgrading from non-CDC supported version.
-            // In that case we won't begin a CDC generation: it should be done by one of the nodes
-            // after it learns that it everyone supports the CDC feature.
-            cdc_log.warn(
-                    "Restarting node in NORMAL status with CDC enabled, but no streams timestamp was proposed"
-                    " by this node according to its local tables. Are we upgrading from a non-CDC supported version?");
+        if (my_tokens.empty() && _db.local().get_config().join_ring()) {
+            throw std::runtime_error("Cannot restart with join_ring=true because the node has already joined the cluster as a zero-token node");
         }
+        if (!my_tokens.empty() && !_db.local().get_config().join_ring()) {
+            throw std::runtime_error("Cannot restart with join_ring=false because the node already owns tokens");
+        }
+        slogger.info("Restarting a node in NORMAL status");
     }
 
     // have to start the gossip service before we can see any info on other nodes.  this is necessary
     // for bootstrap to get the load info it needs.
     // (we won't be part of the storage ring though until we add a counterId to our state, below.)
     // Seed the host ID-to-endpoint map with our own ID.
-    auto local_host_id = db::system_keyspace::load_local_host_id().get0();
-    if (!replacing_a_node_with_diff_ip) {
-        // Replacing node with a different ip should own the host_id only after
-        // the replacing node becomes NORMAL status. It is updated in
-        // handle_state_normal().
-        tmptr->update_host_id(local_host_id, get_broadcast_address());
-    }
+    auto local_host_id = get_token_metadata().get_my_id();
 
-    // Replicate the tokens early because once gossip runs other nodes
-    // might send reads/writes to this node. Replicate it early to make
-    // sure the tokens are valid on all the shards.
-    replicate_to_all_cores(std::move(tmptr)).get();
-    tmlock.reset();
+    utils::get_local_injector().inject("stop_after_saving_tokens",
+        [] { std::raise(SIGSTOP); });
 
-    auto broadcast_rpc_address = utils::fb_utilities::get_broadcast_rpc_address();
-    auto& proxy = service::get_storage_proxy();
-    // Ensure we know our own actual Schema UUID in preparation for updates
-    db::schema_tables::recalculate_schema_version(proxy, _feature_service).get0();
+    auto broadcast_rpc_address = get_token_metadata_ptr()->get_topology().my_cql_address();
+
     app_states.emplace(gms::application_state::NET_VERSION, versioned_value::network_version());
     app_states.emplace(gms::application_state::HOST_ID, versioned_value::host_id(local_host_id));
     app_states.emplace(gms::application_state::RPC_ADDRESS, versioned_value::rpcaddress(broadcast_rpc_address));
@@ -303,915 +1667,347 @@ void storage_service::prepare_to_join(
     app_states.emplace(gms::application_state::VIEW_BACKLOG, versioned_value(""));
     app_states.emplace(gms::application_state::SCHEMA, versioned_value::schema(_db.local().get_version()));
     if (restarting_normal_node) {
-        // Order is important: both the CDC streams timestamp and tokens must be known when a node handles our status.
-        // Exception: there might be no CDC streams timestamp proposed by us if we're upgrading from a non-CDC version.
-        app_states.emplace(gms::application_state::TOKENS, versioned_value::tokens(my_tokens));
-        app_states.emplace(gms::application_state::CDC_GENERATION_ID, versioned_value::cdc_generation_id(_cdc_gen_id));
         app_states.emplace(gms::application_state::STATUS, versioned_value::normal(my_tokens));
     }
-    if (replacing_a_node_with_same_ip || replacing_a_node_with_diff_ip) {
-        app_states.emplace(gms::application_state::TOKENS, versioned_value::tokens(_bootstrap_tokens));
-    }
-    const auto& snitch_name = locator::i_endpoint_snitch::get_local_snitch_ptr()->get_name();
-    app_states.emplace(gms::application_state::SNITCH_NAME, versioned_value::snitch_name(snitch_name));
-    app_states.emplace(gms::application_state::SHARD_COUNT, versioned_value::shard_count(smp::count));
+    app_states.emplace(gms::application_state::SNITCH_NAME, versioned_value::snitch_name(_snitch.local()->get_name()));
+    app_states.emplace(gms::application_state::SHARD_COUNT, versioned_value::shard_count(this_smp_shard_count()));
     app_states.emplace(gms::application_state::IGNORE_MSB_BITS, versioned_value::ignore_msb_bits(_db.local().get_config().murmur3_partitioner_ignore_msb_bits()));
+
+    for (auto&& s : _snitch.local()->get_app_states()) {
+        app_states.emplace(s.first, std::move(s.second));
+    }
+
+    auto schema_change_announce = _db.local().observable_schema_version().observe([this] (table_schema_version schema_version) mutable {
+        _migration_manager.local().passive_announce(std::move(schema_version));
+    });
+
+    _listeners.emplace_back(make_lw_shared(std::move(schema_change_announce)));
 
     slogger.info("Starting up server gossip");
 
-    auto generation_number = db::system_keyspace::increment_and_get_generation().get0();
-    auto advertise = gms::advertise_myself(!replacing_a_node_with_same_ip);
-    _gossiper.start_gossiping(generation_number, app_states, advertise).get();
-}
+    co_await utils::get_local_injector().inject("sleep_before_start_gossiping", std::chrono::milliseconds{500});
 
-void storage_service::maybe_start_sys_dist_ks() {
-    supervisor::notify("starting system distributed keyspace");
-    _sys_dist_ks.invoke_on_all(&db::system_distributed_keyspace::start).get();
-}
+    co_await _gossiper.start_gossiping(new_generation, app_states, gms::gossiper::joining(!restarting_normal_node));
 
-/* Broadcasts the chosen tokens through gossip,
- * together with a CDC generation timestamp and STATUS=NORMAL.
- *
- * Assumes that no other functions modify CDC_GENERATION_ID, TOKENS or STATUS
- * in the gossiper's local application state while this function runs.
- */
-static future<> set_gossip_tokens(gms::gossiper& g,
-        const std::unordered_set<dht::token>& tokens, std::optional<cdc::generation_id> cdc_gen_id) {
-    assert(!tokens.empty());
+    utils::get_local_injector().inject("stop_after_starting_gossiping",
+        [] { std::raise(SIGSTOP); });
 
-    // Order is important: both the CDC streams timestamp and tokens must be known when a node handles our status.
-    return g.add_local_application_state({
-        { gms::application_state::TOKENS, gms::versioned_value::tokens(tokens) },
-        { gms::application_state::CDC_GENERATION_ID, gms::versioned_value::cdc_generation_id(cdc_gen_id) },
-        { gms::application_state::STATUS, gms::versioned_value::normal(tokens) }
+    SCYLLA_ASSERT(_group0);
+
+    auto request_id = utils::UUID_gen::get_time_UUID();
+    if (!_group0->maintenance_mode() && !_group0->joined_group0()) {
+        join_node_request_params join_params {
+            .host_id = _group0->load_my_id(),
+            .cluster_name = _db.local().get_config().cluster_name(),
+            .snitch_name = _db.local().get_snitch_name(),
+            .datacenter = _snitch.local()->get_datacenter(),
+            .rack = _snitch.local()->get_rack(),
+            .release_version = version::release(),
+            .num_tokens = _db.local().get_config().join_ring() ? _db.local().get_config().num_tokens() : 0,
+            .tokens_string = _db.local().get_config().join_ring() ? _db.local().get_config().initial_token() : sstring(),
+            .shard_count = this_smp_shard_count(),
+            .ignore_msb =  _db.local().get_config().murmur3_partitioner_ignore_msb_bits(),
+            .supported_features = _feature_service.supported_feature_set() | std::ranges::to<std::vector<sstring>>(),
+            .request_id = request_id,
+        };
+
+        if (raft_replace_info) {
+            join_params.replaced_id = raft_replace_info->raft_id;
+            join_params.ignore_nodes = utils::split_comma_separated_list(_db.local().get_config().ignore_dead_nodes_for_replace());
+            if (!locator::check_host_ids_contain_only_uuid(join_params.ignore_nodes)) {
+                slogger.warn("Warning: Using IP addresses for '--ignore-dead-nodes-for-replace' is deprecated and will"
+                            " be disabled in a future release. Please use host IDs instead. Provided values: {}",
+                            _db.local().get_config().ignore_dead_nodes_for_replace());
+            }
+        }
+
+        // We use the legacy handshaker in the Raft-based recovery procedure to join the new group 0 without involving
+        // the topology coordinator. We can assume this node has already been accepted by the topology coordinator once
+        // and joined topology.
+        ::shared_ptr<group0_handshaker> handshaker =
+                !_db.local().get_config().recovery_leader.is_set()
+                ? ::make_shared<join_node_rpc_handshaker>(*this, join_params)
+                : _group0->make_legacy_handshaker(raft::is_voter::no);
+        co_await _group0->setup_group0(_sys_ks.local(), initial_contact_nodes, std::move(handshaker),
+                *this, _qp, _migration_manager.local(), join_params);
+    }
+
+    raft::server& raft_server = _group0->group0_server();
+
+    // This is the moment when the locator::topology has gathered information about other nodes
+    // in the cluster -- either through gossiper, or by loading it from disk -- so it's safe
+    // to start the hint managers.
+    if (start_hm) {
+        co_await proxy.invoke_on_all([] (storage_proxy& local_proxy) {
+            return local_proxy.start_hints_manager();
+        });
+    }
+
+    set_mode(mode::JOINING);
+
+    co_await utils::get_local_injector().inject("delay_bootstrap_120s", std::chrono::seconds(120));
+
+    rtlogger.info("topology changes are using raft");
+
+    // Prevent shutdown hangs. We cannot count on wait_for_group0_stop while we are
+    // joining group 0.
+    auto sub = _abort_source.subscribe([this] () noexcept {
+        _group0_as.request_abort();
+        _topology_state_machine.event.broken(make_exception_ptr(abort_requested_exception()));
     });
-}
 
-// Runs inside seastar::async context
-void storage_service::join_token_ring(int delay) {
-    // This function only gets called on shard 0, but we want to set _joined
-    // on all shards, so this variable can be later read locally.
-    container().invoke_on_all([] (auto&& ss) {
-        ss._joined = true;
-    }).get();
+    // start topology coordinator fiber
+    _raft_state_monitor = raft_state_monitor_fiber(raft_server, _group0->hold_group0_gate());
+    // start vnodes cleanup fiber
+    _sstable_vnodes_cleanup_fiber = sstable_vnodes_cleanup_fiber(raft_server, _group0->hold_group0_gate(), proxy);
 
-    _group0->join_group0().get();
+    // Need to start system_distributed_keyspace before bootstrap because bootstrapping
+    // process may access those tables.
+    co_await start_sys_dist_ks();
 
-    // We bootstrap if we haven't successfully bootstrapped before, as long as we are not a seed.
-    // If we are a seed, or if the user manually sets auto_bootstrap to false,
-    // we'll skip streaming data from other nodes and jump directly into the ring.
-    //
-    // The seed check allows us to skip the RING_DELAY sleep for the single-node cluster case,
-    // which is useful for both new users and testing.
-    //
-    // We attempted to replace this with a schema-presence check, but you need a meaningful sleep
-    // to get schema info from gossip which defeats the purpose.  See CASSANDRA-4427 for the gory details.
-    if (should_bootstrap()) {
-        bool resume_bootstrap = db::system_keyspace::bootstrap_in_progress();
-        if (resume_bootstrap) {
-            slogger.warn("Detected previous bootstrap failure; retrying");
-        } else {
-            db::system_keyspace::set_bootstrap_state(db::system_keyspace::bootstrap_state::IN_PROGRESS).get();
+    if (_sys_ks.local().bootstrap_complete()) {
+        if (_topology_state_machine._topology.left_nodes.contains(raft_server.id())) {
+            throw std::runtime_error("A node that already left the cluster cannot be restarted");
         }
-        set_mode(mode::JOINING, "waiting for ring information", true);
-        // first sleep the delay to make sure we see *at least* one other node
-        for (int i = 0; i < delay && _gossiper.get_live_members().size() < 2; i += 1000) {
-            sleep_abortable(std::chrono::seconds(1), _abort_source).get();
-        }
-        // if our schema hasn't matched yet, keep sleeping until it does
-        // (post CASSANDRA-1391 we don't expect this to be necessary very often, but it doesn't hurt to be careful)
-        while (!_migration_manager.local().have_schema_agreement()) {
-            set_mode(mode::JOINING, "waiting for schema information to complete", true);
-            sleep_abortable(std::chrono::seconds(1), _abort_source).get();
-        }
-        set_mode(mode::JOINING, "schema complete, ready to bootstrap", true);
-        set_mode(mode::JOINING, "waiting for pending range calculation", true);
-        update_pending_ranges("joining").get();
-        set_mode(mode::JOINING, "calculation complete, ready to bootstrap", true);
-        slogger.debug("... got ring + schema info");
-
-        auto t = gms::gossiper::clk::now();
-        auto tmptr = get_token_metadata_ptr();
-        while (_db.local().get_config().consistent_rangemovement() &&
-            (!tmptr->get_bootstrap_tokens().empty() ||
-             !tmptr->get_leaving_endpoints().empty())) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(gms::gossiper::clk::now() - t).count();
-            slogger.info("Checking bootstrapping/leaving nodes: tokens {}, leaving {}, sleep 1 second and check again ({} seconds elapsed)",
-                tmptr->get_bootstrap_tokens().size(),
-                tmptr->get_leaving_endpoints().size(),
-                elapsed);
-
-            sleep_abortable(std::chrono::seconds(1), _abort_source).get();
-
-            if (gms::gossiper::clk::now() > t + std::chrono::seconds(60)) {
-                throw std::runtime_error("Other bootstrapping/leaving nodes detected, cannot bootstrap while consistent_rangemovement is true");
-            }
-
-            // Check the schema and pending range again
-            while (!_migration_manager.local().have_schema_agreement()) {
-                set_mode(mode::JOINING, "waiting for schema information to complete", true);
-                sleep_abortable(std::chrono::seconds(1), _abort_source).get();
-            }
-            update_pending_ranges("bootstrapping/leaving nodes while joining").get();
-            tmptr = get_token_metadata_ptr();
-        }
-        slogger.info("Checking bootstrapping/leaving nodes: ok");
-
-        if (!_db.local().is_replacing()) {
-            if (tmptr->is_member(get_broadcast_address())) {
-                throw std::runtime_error("This node is already a member of the token ring; bootstrap aborted. (If replacing a dead node, remove the old one from the ring first.)");
-            }
-            set_mode(mode::JOINING, "getting bootstrap token", true);
-            if (resume_bootstrap) {
-                _bootstrap_tokens = db::system_keyspace::get_saved_tokens().get0();
-                if (!_bootstrap_tokens.empty()) {
-                    slogger.info("Using previously saved tokens = {}", _bootstrap_tokens);
-                } else {
-                    _bootstrap_tokens = boot_strapper::get_bootstrap_tokens(tmptr, _db.local().get_config(), dht::check_token_endpoint::yes);
-                }
-            } else {
-                _bootstrap_tokens = boot_strapper::get_bootstrap_tokens(tmptr, _db.local().get_config(), dht::check_token_endpoint::yes);
-            }
-        } else {
-            auto replace_addr = _db.local().get_replace_address();
-            if (*replace_addr != get_broadcast_address()) {
-                // Sleep additionally to make sure that the server actually is not alive
-                // and giving it more time to gossip if alive.
-                sleep_abortable(service::load_broadcaster::BROADCAST_INTERVAL, _abort_source).get();
-
-                // check for operator errors...
-                const auto tmptr = get_token_metadata_ptr();
-                for (auto token : _bootstrap_tokens) {
-                    auto existing = tmptr->get_endpoint(token);
-                    if (existing) {
-                        auto* eps = _gossiper.get_endpoint_state_for_endpoint_ptr(*existing);
-                        if (eps && eps->get_update_timestamp() > gms::gossiper::clk::now() - std::chrono::milliseconds(delay)) {
-                            throw std::runtime_error("Cannot replace a live node...");
-                        }
-                    } else {
-                        throw std::runtime_error(format("Cannot replace token {} which does not exist!", token));
-                    }
-                }
-            } else {
-                sleep_abortable(get_ring_delay(), _abort_source).get();
-            }
-            set_mode(mode::JOINING, format("Replacing a node with token(s): {}", _bootstrap_tokens), true);
-            // _bootstrap_tokens was previously set in prepare_to_join using tokens gossiped by the replaced node
-        }
-        maybe_start_sys_dist_ks();
-        mark_existing_views_as_built();
-        db::system_keyspace::update_tokens(_bootstrap_tokens).get();
-        bootstrap(); // blocks until finished
     } else {
-        maybe_start_sys_dist_ks();
-        _bootstrap_tokens = db::system_keyspace::get_saved_tokens().get0();
-        if (_bootstrap_tokens.empty()) {
-            _bootstrap_tokens = boot_strapper::get_bootstrap_tokens(get_token_metadata_ptr(), _db.local().get_config(), dht::check_token_endpoint::no);
-            db::system_keyspace::update_tokens(_bootstrap_tokens).get();
-        } else {
-            size_t num_tokens = _db.local().get_config().num_tokens();
-            if (_bootstrap_tokens.size() != num_tokens) {
-                throw std::runtime_error(format("Cannot change the number of tokens from {:d} to {:d}", _bootstrap_tokens.size(), num_tokens));
-            } else {
-                slogger.info("Using saved tokens {}", _bootstrap_tokens);
-            }
+        if (!_db.local().get_config().join_ring() && !_feature_service.zero_token_nodes) {
+            throw std::runtime_error("Cannot boot a node with join_ring=false because the cluster does not support the ZERO_TOKEN_NODES feature");
+        }
+
+        co_await utils::get_local_injector().inject("crash_before_topology_request_completion", [] (auto& handler) -> future<> {
+            co_await handler.wait_for_message(db::timeout_clock::now() + std::chrono::minutes(5));
+            throw std::runtime_error("Crashed in crash_before_topology_request_completion");
+        });
+
+        auto err = co_await wait_for_topology_request_completion(request_id);
+        if (!err.empty()) {
+            throw std::runtime_error(fmt::format("{} failed. See earlier errors ({})", raft_replace_info ? "Replace" : "Bootstrap", err));
+        }
+
+        if (raft_replace_info) {
+            co_await await_tablets_rebuilt(raft_replace_info->raft_id);
         }
     }
 
-    slogger.debug("Setting tokens to {}", _bootstrap_tokens);
-    mutate_token_metadata([this] (mutable_token_metadata_ptr tmptr) {
-        // This node must know about its chosen tokens before other nodes do
-        // since they may start sending writes to this node after it gossips status = NORMAL.
-        // Therefore, in case we haven't updated _token_metadata with our tokens yet, do it now.
-        return tmptr->update_normal_tokens(_bootstrap_tokens, get_broadcast_address());
-    }).get();
+    co_await update_topology_with_local_metadata(raft_server);
 
-    if (!db::system_keyspace::bootstrap_complete()) {
-        // If we're not bootstrapping then we shouldn't have chosen a CDC streams timestamp yet.
-        assert(should_bootstrap() || !_cdc_gen_id);
+    // Node state is enough to know that bootstrap has completed, but to make legacy code happy
+    // let it know that the bootstrap is completed as well
+    co_await _sys_ks.local().set_bootstrap_state(db::system_keyspace::bootstrap_state::COMPLETED);
+    set_mode(mode::NORMAL);
+    // Reaching NORMAL here means this node's ring/tablet ownership is settled,
+    // regardless of whether this run actually went through mode::BOOTSTRAP above
+    // (a node that was already bootstrapped skips that branch entirely). So this
+    // is the universal point to allow vnodes cleanup, not "leaving BOOTSTRAP".
+    co_await _db.invoke_on_all([] (replica::database& db) {
+        db.allow_vnodes_cleanup();
+    });
+    // Load schema version into the database object
+    co_await db::schema_tables::update_schema_version_and_announce(_sys_ks, proxy, co_await db::schema_tables::get_group0_schema_version(_sys_ks.local()));
 
-        // Don't try rewriting CDC stream description tables.
-        // See cdc.md design notes, `Streams description table V1 and rewriting` section, for explanation.
-        db::system_keyspace::cdc_set_rewritten(std::nullopt).get();
-    }
-
-    if (!_cdc_gen_id) {
-        // If we didn't observe any CDC generation at this point, then either
-        // 1. we're replacing a node,
-        // 2. we've already bootstrapped, but are upgrading from a non-CDC version,
-        // 3. we're the first node, starting a fresh cluster.
-
-        // In the replacing case we won't create any CDC generation: we're not introducing any new tokens,
-        // so the current generation used by the cluster is fine.
-
-        // In the case of an upgrading cluster, one of the nodes is responsible for creating
-        // the first CDC generation. We'll check if it's us.
-
-        // Finally, if we're the first node, we'll create the first generation.
-
-        if (!_db.local().is_replacing()
-                && (!db::system_keyspace::bootstrap_complete()
-                    || cdc::should_propose_first_generation(get_broadcast_address(), _gossiper))) {
-            try {
-                _cdc_gen_id = _cdc_gen_service.local().make_new_generation(_bootstrap_tokens, !is_first_node()).get0();
-            } catch (...) {
-                cdc_log.warn(
-                    "Could not create a new CDC generation: {}. This may make it impossible to use CDC or cause performance problems."
-                    " Use nodetool checkAndRepairCdcStreams to fix CDC.", std::current_exception());
-            }
-        }
-    }
-
-    // Persist the CDC streams timestamp before we persist bootstrap_state = COMPLETED.
-    if (_cdc_gen_id) {
-        db::system_keyspace::update_cdc_generation_id(*_cdc_gen_id).get();
-    }
-    // If we crash now, we will choose a new CDC streams timestamp anyway (because we will also choose a new set of tokens).
-    // But if we crash after setting bootstrap_state = COMPLETED, we will keep using the persisted CDC streams timestamp after restarting.
-
-    db::system_keyspace::set_bootstrap_state(db::system_keyspace::bootstrap_state::COMPLETED).get();
-    // At this point our local tokens and CDC streams timestamp are chosen (_bootstrap_tokens, _cdc_gen_id) and will not be changed.
-
-    // start participating in the ring.
-    set_gossip_tokens(_gossiper, _bootstrap_tokens, _cdc_gen_id).get();
-
-    set_mode(mode::NORMAL, "node is now in normal status", true);
+    utils::get_local_injector().inject("stop_after_setting_mode_to_normal_raft_topology",
+        [] { std::raise(SIGSTOP); });
 
     if (get_token_metadata().sorted_tokens().empty()) {
-        auto err = format("join_token_ring: Sorted token in token_metadata is empty");
+        auto err = ::format("join_topology: Sorted token in token_metadata is empty");
         slogger.error("{}", err);
         throw std::runtime_error(err);
     }
 
-    _cdc_gen_service.local().after_join(std::move(_cdc_gen_id)).get();
+    co_await _migration_manager.local().ensure_committed_by_group0();
+
+    // Initializes monitor only after updating local topology.
+    start_tablet_split_monitor();
+
+    auto ids = _topology_state_machine._topology.normal_nodes |
+                std::views::keys |
+                std::views::transform([] (raft::server_id id) { return locator::host_id{id.uuid()}; }) |
+                std::ranges::to<std::unordered_set<locator::host_id>>();
+
+    co_await _gossiper.notify_nodes_on_up(std::move(ids));
 }
 
-void storage_service::mark_existing_views_as_built() {
-    _db.invoke_on(0, [this] (replica::database& db) {
-        return do_with(db.get_views(), [this] (std::vector<view_ptr>& views) {
-            return parallel_for_each(views, [this] (view_ptr& view) {
-                return db::system_keyspace::mark_view_as_built(view->ks_name(), view->cf_name()).then([this, view] {
-                    return _sys_dist_ks.local().finish_view_build(view->ks_name(), view->cf_name());
-                });
-            });
-        });
-    }).get();
-}
+future<std::unordered_map<dht::token_range, inet_address_vector_replica_set>>
+storage_service::get_range_to_address_map(sstring keyspace, std::optional<table_id> table_id) const {
+    locator::effective_replication_map_ptr erm;
+    utils::chunked_vector<token> tokens;
 
-std::list<gms::inet_address> storage_service::get_ignore_dead_nodes_for_replace() {
-    std::vector<sstring> ignore_nodes_strs;
-    std::list<gms::inet_address> ignore_nodes;
-    boost::split(ignore_nodes_strs, _db.local().get_config().ignore_dead_nodes_for_replace(), boost::is_any_of(","));
-    for (std::string n : ignore_nodes_strs) {
-        try {
-            std::replace(n.begin(), n.end(), '\"', ' ');
-            std::replace(n.begin(), n.end(), '\'', ' ');
-            boost::trim_all(n);
-            if (!n.empty()) {
-                auto node = gms::inet_address(n);
-                ignore_nodes.push_back(node);
-            }
-        } catch (...) {
-            throw std::runtime_error(format("Failed to parse --ignore-dead-nodes-for-replace parameter: ignore_nodes={}, node={}", ignore_nodes_strs, n));
-        }
-    }
-    return ignore_nodes;
-}
-
-// Runs inside seastar::async context
-void storage_service::bootstrap() {
-    _is_bootstrap_mode = true;
-    auto x = seastar::defer([this] { _is_bootstrap_mode = false; });
-    auto bootstrap_rbno = is_repair_based_node_ops_enabled(streaming::stream_reason::bootstrap);
-
-    slogger.debug("bootstrap: rbno={} replacing={}", bootstrap_rbno, _db.local().is_replacing());
-    if (!_db.local().is_replacing()) {
-        // Wait until we know tokens of existing node before announcing join status.
-        _gossiper.wait_for_range_setup().get();
-        int retry = 0;
-        while (get_token_metadata_ptr()->count_normal_token_owners() == 0) {
-            if (retry++ < 500) {
-                sleep_abortable(std::chrono::milliseconds(10), _abort_source).get();
-                continue;
-            }
-            // We're joining an existing cluster, so there are normal nodes in the cluster.
-            // We've waited for tokens to arrive.
-            // But we didn't see any normal token owners. Something's wrong, we cannot proceed.
-            throw std::runtime_error{
-                    "Failed to learn about other nodes' tokens during bootstrap. Make sure that:\n"
-                    " - the node can contact other nodes in the cluster,\n"
-                    " - the `ring_delay` parameter is large enough (the 30s default should be enough for small-to-middle-sized clusters),\n"
-                    " - a node with this IP didn't recently leave the cluster. If it did, wait for some time first (the IP is quarantined),\n"
-                    "and retry the bootstrap."};
-        }
-
-        // Even if we reached this point before but crashed, we will make a new CDC generation.
-        // It doesn't hurt: other nodes will (potentially) just do more generation switches.
-        // We do this because with this new attempt at bootstrapping we picked a different set of tokens.
-
-        // Update pending ranges now, so we correctly count ourselves as a pending replica
-        // when inserting the new CDC generation.
-      if (!bootstrap_rbno) {
-        // When is_repair_based_node_ops_enabled is true, the bootstrap node
-        // will use node_ops_cmd to bootstrap, node_ops_cmd will update the pending ranges.
-        slogger.debug("bootstrap: update pending ranges: endpoint={} bootstrap_tokens={}", get_broadcast_address(), _bootstrap_tokens);
-        mutate_token_metadata([this] (mutable_token_metadata_ptr tmptr) {
-            auto endpoint = get_broadcast_address();
-            tmptr->add_bootstrap_tokens(_bootstrap_tokens, endpoint);
-            return update_pending_ranges(std::move(tmptr), format("bootstrapping node {}", endpoint));
-        }).get();
-      }
-
-        // After we pick a generation timestamp, we start gossiping it, and we stick with it.
-        // We don't do any other generation switches (unless we crash before complecting bootstrap).
-        assert(!_cdc_gen_id);
-
-        _cdc_gen_id = _cdc_gen_service.local().make_new_generation(_bootstrap_tokens, !is_first_node()).get0();
-
-      if (!bootstrap_rbno) {
-        // When is_repair_based_node_ops_enabled is true, the bootstrap node
-        // will use node_ops_cmd to bootstrap, bootstrapping gossip status is not needed for bootstrap.
-        _gossiper.add_local_application_state({
-            // Order is important: both the CDC streams timestamp and tokens must be known when a node handles our status.
-            { gms::application_state::TOKENS, versioned_value::tokens(_bootstrap_tokens) },
-            { gms::application_state::CDC_GENERATION_ID, versioned_value::cdc_generation_id(_cdc_gen_id) },
-            { gms::application_state::STATUS, versioned_value::bootstrapping(_bootstrap_tokens) },
-        }).get();
-
-        set_mode(mode::JOINING, format("sleeping {} ms for pending range setup", get_ring_delay().count()), true);
-        _gossiper.wait_for_range_setup().get();
-     }
+    if (table_id.has_value()) {
+        auto& cf = _db.local().find_column_family(*table_id);
+        erm = cf.get_effective_replication_map();
     } else {
-        // Wait until we know tokens of existing node before announcing replacing status.
-        set_mode(mode::JOINING, fmt::format("Wait until local node knows tokens of peer nodes"), true);
-        _gossiper.wait_for_range_setup().get();
-        auto replace_addr = _db.local().get_replace_address();
-        slogger.debug("Removing replaced endpoint {} from system.peers", *replace_addr);
-        db::system_keyspace::remove_endpoint(*replace_addr).get();
-        _group0->leave_group0(replace_addr).get();
+        auto& ks = _db.local().find_keyspace(keyspace);
+        erm = ks.get_static_effective_replication_map();
     }
 
-    _db.invoke_on_all([this] (replica::database& db) {
-        for (auto& cf : db.get_non_system_column_families()) {
-            cf->notify_bootstrap_or_replace_start();
-        }
-    }).get();
-
-    set_mode(mode::JOINING, "Starting to bootstrap...", true);
-    if (_db.local().is_replacing()) {
-        run_replace_ops();
+    const auto& tm = *erm->get_token_metadata_ptr();
+    if (erm->get_replication_strategy().uses_tablets()) {
+        const auto& tablets = tm.tablets().get_tablet_map(*table_id);
+        tokens = co_await tablets.get_sorted_tokens();
     } else {
-        if (bootstrap_rbno) {
-            run_bootstrap_ops();
-        } else {
-            dht::boot_strapper bs(_db, _stream_manager, _abort_source, get_broadcast_address(), _bootstrap_tokens, get_token_metadata_ptr());
-            bs.bootstrap(streaming::stream_reason::bootstrap, _gossiper).get();
-        }
-    }
-    _db.invoke_on_all([this] (replica::database& db) {
-        for (auto& cf : db.get_non_system_column_families()) {
-            cf->notify_bootstrap_or_replace_end();
-        }
-    }).get();
-
-
-    slogger.info("Bootstrap completed! for the tokens {}", _bootstrap_tokens);
-}
-
-sstring
-storage_service::get_rpc_address(const inet_address& endpoint) const {
-    if (endpoint != get_broadcast_address()) {
-        auto* v = _gossiper.get_application_state_ptr(endpoint, gms::application_state::RPC_ADDRESS);
-        if (v) {
-            return v->value;
-        }
-    }
-    return boost::lexical_cast<std::string>(endpoint);
-}
-
-std::unordered_map<dht::token_range, inet_address_vector_replica_set>
-storage_service::get_range_to_address_map(const sstring& keyspace) const {
-    return get_range_to_address_map(keyspace, get_token_metadata().sorted_tokens());
-}
-
-std::unordered_map<dht::token_range, inet_address_vector_replica_set>
-storage_service::get_range_to_address_map_in_local_dc(
-        const sstring& keyspace) const {
-    auto orig_map = get_range_to_address_map(keyspace, get_tokens_in_local_dc());
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> filtered_map;
-    for (auto entry : orig_map) {
-        auto& addresses = filtered_map[entry.first];
-        addresses.reserve(entry.second.size());
-        std::copy_if(entry.second.begin(), entry.second.end(), std::back_inserter(addresses), db::is_local);
+        tokens = tm.sorted_tokens();
     }
 
-    return filtered_map;
+    co_return (co_await locator::get_range_to_address_map(erm, std::move(tokens))) |
+        std::views::transform([&] (auto tid) { return std::make_pair(tid.first,
+                tid.second | std::views::transform([&] (auto id) { return _address_map.get(id); }) | std::ranges::to<inet_address_vector_replica_set>()); }) |
+        std::ranges::to<std::unordered_map>();
 }
 
-std::vector<token>
-storage_service::get_tokens_in_local_dc() const {
-    std::vector<token> filtered_tokens;
+future<> storage_service::on_join(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr ep_state, gms::permit_id pid) {
+    slogger.debug("endpoint={} on_join: permit_id={}", endpoint, pid);
+    co_await on_change(endpoint, id, ep_state->get_application_state_map(), pid);
+}
+
+future<> storage_service::on_alive(gms::inet_address endpoint, locator::host_id host_id, gms::endpoint_state_ptr state, gms::permit_id pid) {
     const auto& tm = get_token_metadata();
-    for (auto token : tm.sorted_tokens()) {
-        auto endpoint = tm.get_endpoint(token);
-        if (db::is_local(*endpoint))
-            filtered_tokens.push_back(token);
-    }
-    return filtered_tokens;
-}
-
-std::unordered_map<dht::token_range, inet_address_vector_replica_set>
-storage_service::get_range_to_address_map(const sstring& keyspace,
-        const std::vector<token>& sorted_tokens) const {
-    sstring ks = keyspace;
-    // some people just want to get a visual representation of things. Allow null and set it to the first
-    // non-system keyspace.
-    if (keyspace == "") {
-        auto keyspaces = _db.local().get_non_system_keyspaces();
-        if (keyspaces.empty()) {
-            throw std::runtime_error("No keyspace provided and no non system kespace exist");
-        }
-        ks = keyspaces[0];
-    }
-    return construct_range_to_endpoint_map(ks, get_all_ranges(sorted_tokens));
-}
-
-future<> storage_service::handle_state_replacing_update_pending_ranges(mutable_token_metadata_ptr tmptr, inet_address replacing_node) {
-    try {
-        slogger.info("handle_state_replacing: Waiting for replacing node {} to be alive on all shards", replacing_node);
-        co_await _gossiper.wait_alive({replacing_node}, std::chrono::milliseconds(5 * 1000));
-        slogger.info("handle_state_replacing: Replacing node {} is now alive on all shards", replacing_node);
-    } catch (...) {
-        slogger.warn("handle_state_replacing: Failed to wait for replacing node {} to be alive on all shards: {}",
-                replacing_node, std::current_exception());
-    }
-    slogger.info("handle_state_replacing: Update pending ranges for replacing node {}", replacing_node);
-    co_await update_pending_ranges(tmptr, format("handle_state_replacing {}", replacing_node));
-}
-
-future<> storage_service::handle_state_replacing(inet_address replacing_node) {
-    slogger.debug("endpoint={} handle_state_replacing", replacing_node);
-    auto host_id = _gossiper.get_host_id(replacing_node);
-    auto tmlock = co_await get_token_metadata_lock();
-    auto tmptr = co_await get_mutable_token_metadata_ptr();
-    auto existing_node_opt = tmptr->get_endpoint_for_host_id(host_id);
-    auto replace_addr = _db.local().get_replace_address();
-    if (replacing_node == get_broadcast_address() && replace_addr && *replace_addr == get_broadcast_address()) {
-        existing_node_opt = replacing_node;
-    }
-    if (!existing_node_opt) {
-        slogger.warn("Can not find the existing node for the replacing node {}", replacing_node);
-        co_return;
-    }
-    auto existing_node = *existing_node_opt;
-    auto existing_tokens = get_tokens_for(existing_node);
-    auto replacing_tokens = get_tokens_for(replacing_node);
-    slogger.info("Node {} is replacing existing node {} with host_id={}, existing_tokens={}, replacing_tokens={}",
-            replacing_node, existing_node, host_id, existing_tokens, replacing_tokens);
-    tmptr->add_replacing_endpoint(existing_node, replacing_node);
-    if (_gossiper.is_alive(replacing_node)) {
-        slogger.info("handle_state_replacing: Replacing node {} is already alive, update pending ranges", replacing_node);
-        co_await handle_state_replacing_update_pending_ranges(tmptr, replacing_node);
+    slogger.debug("endpoint={}/{} on_alive: permit_id={}", endpoint, host_id, pid);
+    const auto* node = tm.get_topology().find_node(host_id);
+    if (node && node->is_member()) {
+        co_await notify_up(endpoint, host_id);
     } else {
-        slogger.info("handle_state_replacing: Replacing node {} is not alive yet, delay update pending ranges", replacing_node);
-        _replacing_nodes_pending_ranges_updater.insert(replacing_node);
-    }
-    co_await replicate_to_all_cores(std::move(tmptr));
-}
-
-future<> storage_service::handle_state_bootstrap(inet_address endpoint) {
-    slogger.debug("endpoint={} handle_state_bootstrap", endpoint);
-    // explicitly check for TOKENS, because a bootstrapping node might be bootstrapping in legacy mode; that is, not using vnodes and no token specified
-    auto tokens = get_tokens_for(endpoint);
-
-    slogger.debug("Node {} state bootstrapping, token {}", endpoint, tokens);
-
-    // if this node is present in token metadata, either we have missed intermediate states
-    // or the node had crashed. Print warning if needed, clear obsolete stuff and
-    // continue.
-    auto tmlock = co_await get_token_metadata_lock();
-    auto tmptr = co_await get_mutable_token_metadata_ptr();
-    if (tmptr->is_member(endpoint)) {
-        // If isLeaving is false, we have missed both LEAVING and LEFT. However, if
-        // isLeaving is true, we have only missed LEFT. Waiting time between completing
-        // leave operation and rebootstrapping is relatively short, so the latter is quite
-        // common (not enough time for gossip to spread). Therefore we report only the
-        // former in the log.
-        if (!tmptr->is_leaving(endpoint)) {
-            slogger.info("Node {} state jump to bootstrap", endpoint);
-        }
-        tmptr->remove_endpoint(endpoint);
-    }
-
-    tmptr->add_bootstrap_tokens(tokens, endpoint);
-    if (_gossiper.uses_host_id(endpoint)) {
-        tmptr->update_host_id(_gossiper.get_host_id(endpoint), endpoint);
-    }
-    co_await update_pending_ranges(tmptr, format("handle_state_bootstrap {}", endpoint));
-    co_await replicate_to_all_cores(std::move(tmptr));
-}
-
-future<> storage_service::handle_state_normal(inet_address endpoint) {
-    slogger.debug("endpoint={} handle_state_normal", endpoint);
-    auto tokens = get_tokens_for(endpoint);
-
-    slogger.debug("Node {} state normal, token {}", endpoint, tokens);
-
-    auto tmlock = std::make_unique<token_metadata_lock>(co_await get_token_metadata_lock());
-    auto tmptr = co_await get_mutable_token_metadata_ptr();
-    if (tmptr->is_member(endpoint)) {
-        slogger.info("Node {} state jump to normal", endpoint);
-    }
-    std::unordered_set<inet_address> endpoints_to_remove;
-
-    auto do_remove_node = [&] (gms::inet_address node) {
-        tmptr->remove_endpoint(node);
-        endpoints_to_remove.insert(node);
-    };
-    // Order Matters, TM.updateHostID() should be called before TM.updateNormalToken(), (see CASSANDRA-4300).
-    if (_gossiper.uses_host_id(endpoint)) {
-        auto host_id = _gossiper.get_host_id(endpoint);
-        auto existing = tmptr->get_endpoint_for_host_id(host_id);
-        if (existing && *existing != endpoint) {
-            if (*existing == get_broadcast_address()) {
-                slogger.warn("Not updating host ID {} for {} because it's mine", host_id, endpoint);
-                do_remove_node(endpoint);
-            } else if (_gossiper.compare_endpoint_startup(endpoint, *existing) > 0) {
-                slogger.warn("Host ID collision for {} between {} and {}; {} is the new owner", host_id, *existing, endpoint, endpoint);
-                do_remove_node(*existing);
-                slogger.info("Set host_id={} to be owned by node={}, existing={}", host_id, endpoint, *existing);
-                tmptr->update_host_id(host_id, endpoint);
-            } else {
-                slogger.warn("Host ID collision for {} between {} and {}; ignored {}", host_id, *existing, endpoint, endpoint);
-                do_remove_node(endpoint);
-            }
-        } else if (existing && *existing == endpoint) {
-            tmptr->del_replacing_endpoint(endpoint);
-        } else {
-            slogger.info("Set host_id={} to be owned by node={}", host_id, endpoint);
-            tmptr->update_host_id(host_id, endpoint);
-        }
-    }
-
-    // Tokens owned by the handled endpoint.
-    // The endpoint broadcasts its set of chosen tokens. If a token was also chosen by another endpoint,
-    // the collision is resolved by assigning the token to the endpoint which started later.
-    std::unordered_set<token> owned_tokens;
-
-    for (auto t : tokens) {
-        // we don't want to update if this node is responsible for the token and it has a later startup time than endpoint.
-        auto current_owner = tmptr->get_endpoint(t);
-        if (!current_owner) {
-            slogger.debug("handle_state_normal: New node {} at token {}", endpoint, t);
-            owned_tokens.insert(t);
-        } else if (endpoint == *current_owner) {
-            slogger.debug("handle_state_normal: endpoint={} == current_owner={} token {}", endpoint, *current_owner, t);
-            // set state back to normal, since the node may have tried to leave, but failed and is now back up
-            owned_tokens.insert(t);
-        } else if (_gossiper.compare_endpoint_startup(endpoint, *current_owner) > 0) {
-            slogger.debug("handle_state_normal: endpoint={} > current_owner={}, token {}", endpoint, *current_owner, t);
-            owned_tokens.insert(t);
-            // currentOwner is no longer current, endpoint is.  Keep track of these moves, because when
-            // a host no longer has any tokens, we'll want to remove it.
-            std::multimap<inet_address, token> ep_to_token_copy = get_token_metadata().get_endpoint_to_token_map_for_reading();
-            auto rg = ep_to_token_copy.equal_range(*current_owner);
-            for (auto it = rg.first; it != rg.second; it++) {
-                if (it->second == t) {
-                    slogger.info("handle_state_normal: remove endpoint={} token={}", *current_owner, t);
-                    ep_to_token_copy.erase(it);
-                }
-            }
-            if (!ep_to_token_copy.contains(*current_owner)) {
-                slogger.info("handle_state_normal: endpoints_to_remove endpoint={}", *current_owner);
-                endpoints_to_remove.insert(*current_owner);
-            }
-            slogger.info("handle_state_normal: Nodes {} and {} have the same token {}. {} is the new owner", endpoint, *current_owner, t, endpoint);
-        } else {
-            slogger.info("handle_state_normal: Nodes {} and {} have the same token {}. Ignoring {}", endpoint, *current_owner, t, endpoint);
-        }
-    }
-
-    bool is_member = tmptr->is_member(endpoint);
-    // Update pending ranges after update of normal tokens immediately to avoid
-    // a race where natural endpoint was updated to contain node A, but A was
-    // not yet removed from pending endpoints
-    co_await tmptr->update_normal_tokens(owned_tokens, endpoint);
-    co_await update_pending_ranges(tmptr, format("handle_state_normal {}", endpoint));
-    co_await replicate_to_all_cores(std::move(tmptr));
-    tmlock.reset();
-
-    for (auto ep : endpoints_to_remove) {
-        co_await remove_endpoint(ep);
-    }
-    slogger.debug("handle_state_normal: endpoint={} owned_tokens = {}", endpoint, owned_tokens);
-    if (!owned_tokens.empty() && !endpoints_to_remove.count(endpoint)) {
-        co_await update_peer_info(endpoint);
-        try {
-            co_await db::system_keyspace::update_tokens(endpoint, owned_tokens);
-        } catch (...) {
-            slogger.error("handle_state_normal: fail to update tokens for {}: {}", endpoint, std::current_exception());
-        }
-    }
-
-    // Send joined notification only when this node was not a member prior to this
-    if (!is_member) {
-        co_await notify_joined(endpoint);
-    }
-
-    if (slogger.is_enabled(logging::log_level::debug)) {
-        const auto& tm = get_token_metadata();
-        auto ver = tm.get_ring_version();
-        for (auto& x : tm.get_token_to_endpoint()) {
-            slogger.debug("handle_state_normal: token_metadata.ring_version={}, token={} -> endpoint={}", ver, x.first, x.second);
-        }
+        slogger.debug("ignore on_alive since endpoint {}/{} is not a topology member", endpoint, host_id);
     }
 }
 
-future<> storage_service::handle_state_leaving(inet_address endpoint) {
-    slogger.debug("endpoint={} handle_state_leaving", endpoint);
+future<> storage_service::on_change(gms::inet_address endpoint, locator::host_id host_id, const gms::application_state_map& states_, gms::permit_id pid) {
+    // copy the states map locally since the coroutine may yield
+    auto states = states_;
+    slogger.debug("endpoint={} on_change:     states={}, permit_id={}", endpoint, states, pid);
 
-    auto tokens = get_tokens_for(endpoint);
-
-    slogger.debug("Node {} state leaving, tokens {}", endpoint, tokens);
-
-    // If the node is previously unknown or tokens do not match, update tokenmetadata to
-    // have this node as 'normal' (it must have been using this token before the
-    // leave). This way we'll get pending ranges right.
-    auto tmlock = co_await get_token_metadata_lock();
-    auto tmptr = co_await get_mutable_token_metadata_ptr();
-    if (!tmptr->is_member(endpoint)) {
-        // FIXME: this code should probably resolve token collisions too, like handle_state_normal
-        slogger.info("Node {} state jump to leaving", endpoint);
-
-        co_await tmptr->update_normal_tokens(tokens, endpoint);
-    } else {
-        auto tokens_ = tmptr->get_tokens(endpoint);
-        std::set<token> tmp(tokens.begin(), tokens.end());
-        if (!std::includes(tokens_.begin(), tokens_.end(), tmp.begin(), tmp.end())) {
-            slogger.warn("Node {} 'leaving' token mismatch. Long network partition?", endpoint);
-            slogger.debug("tokens_={}, tokens={}", tokens_, tmp);
-
-            co_await tmptr->update_normal_tokens(tokens, endpoint);
-        }
-    }
-
-    // at this point the endpoint is certainly a member with this token, so let's proceed
-    // normally
-    tmptr->add_leaving_endpoint(endpoint);
-
-    co_await update_pending_ranges(tmptr, format("handle_state_leaving", endpoint));
-    co_await replicate_to_all_cores(std::move(tmptr));
-}
-
-future<> storage_service::handle_state_left(inet_address endpoint, std::vector<sstring> pieces) {
-    slogger.debug("endpoint={} handle_state_left", endpoint);
-    if (pieces.size() < 2) {
-        slogger.warn("Fail to handle_state_left endpoint={} pieces={}", endpoint, pieces);
+    auto ep_state = _gossiper.get_endpoint_state_ptr(host_id);
+    if (!ep_state || _gossiper.is_left(*ep_state)) {
+        slogger.debug("Ignoring state change for dead or unknown endpoint: {}", endpoint);
         co_return;
     }
-    auto tokens = get_tokens_for(endpoint);
-    slogger.debug("Node {} state left, tokens {}", endpoint, tokens);
-    if (tokens.empty()) {
-        auto eps = _gossiper.get_endpoint_state_for_endpoint_ptr(endpoint);
-        if (eps) {
-            slogger.warn("handle_state_left: Tokens for node={} are empty, endpoint_state={}", endpoint, *eps);
-        } else {
-            slogger.warn("handle_state_left: Couldn't find endpoint state for node={}", endpoint);
+    const auto& tm = get_token_metadata();
+    const auto* node = tm.get_topology().find_node(host_id);
+    // The check peers[host_id] == endpoint is needed when a node changes
+    // its IP - on_change can be called by the gossiper for old IP as part
+    // of its removal, after handle_state_normal has already been called for
+    // the new one. Without the check, the do_update_system_peers_table call
+    // overwrites the IP back to its old value.
+    // In essence, the code under the 'if' should fire if the given IP belongs
+    // to a cluster member.
+    if (node && node->is_member() && (co_await _sys_ks.local().get_ip_from_peers_table(host_id)) == endpoint) {
+        if (!is_me(endpoint)) {
+            slogger.debug("endpoint={}/{} on_change:     updating system.peers table", endpoint, host_id);
+            if (auto info = get_peer_info_for_update(host_id, states)) {
+                co_await _sys_ks.local().update_peer_info(endpoint, host_id, *info);
+            }
         }
-        auto tokens_from_tm = get_token_metadata().get_tokens(endpoint);
-        slogger.warn("handle_state_left: Get tokens from token_metadata, node={}, tokens={}", endpoint, tokens_from_tm);
-        tokens = std::unordered_set<dht::token>(tokens_from_tm.begin(), tokens_from_tm.end());
+        if (states.contains(application_state::RPC_READY)) {
+            slogger.debug("Got application_state::RPC_READY for node {}, is_cql_ready={}", endpoint, ep_state->is_cql_ready());
+            co_await notify_cql_change(endpoint, host_id, ep_state->is_cql_ready());
+        }
+        if (auto it = states.find(application_state::INTERNAL_IP); it != states.end()) {
+            co_await maybe_reconnect_to_preferred_ip(endpoint, inet_address(it->second.value().linearize()), host_id);
+        }
     }
-    co_await excise(tokens, endpoint, extract_expire_time(pieces));
 }
 
-void storage_service::handle_state_moving(inet_address endpoint, std::vector<sstring> pieces) {
-    throw std::runtime_error(format("Move operation is not supported anymore, endpoint={}", endpoint));
-}
-
-future<> storage_service::handle_state_removing(inet_address endpoint, std::vector<sstring> pieces) {
-    slogger.debug("endpoint={} handle_state_removing", endpoint);
-    if (pieces.empty()) {
-        slogger.warn("Fail to handle_state_removing endpoint={} pieces={}", endpoint, pieces);
+future<> storage_service::maybe_reconnect_to_preferred_ip(inet_address ep, inet_address local_ip, locator::host_id host_id) {
+    if (!_snitch.local()->prefer_local()) {
         co_return;
     }
-    if (endpoint == get_broadcast_address()) {
-        slogger.info("Received removenode gossip about myself. Is this node rejoining after an explicit removenode?");
-        try {
-            co_await drain();
-        } catch (...) {
-            slogger.error("Fail to drain: {}", std::current_exception());
-            throw;
-        }
-        co_return;
-    }
-    if (get_token_metadata().is_member(endpoint)) {
-        auto state = pieces[0];
-        auto remove_tokens = get_token_metadata().get_tokens(endpoint);
-        if (sstring(gms::versioned_value::REMOVED_TOKEN) == state) {
-            std::unordered_set<token> tmp(remove_tokens.begin(), remove_tokens.end());
-            co_await excise(std::move(tmp), endpoint, extract_expire_time(pieces));
-        } else if (sstring(gms::versioned_value::REMOVING_TOKEN) == state) {
-            co_await mutate_token_metadata([this, remove_tokens = std::move(remove_tokens), endpoint] (mutable_token_metadata_ptr tmptr) mutable {
-                slogger.debug("Tokens {} removed manually (endpoint was {})", remove_tokens, endpoint);
-                // Note that the endpoint is being removed
-                tmptr->add_leaving_endpoint(endpoint);
-                return update_pending_ranges(std::move(tmptr), format("handle_state_removing {}", endpoint));
-            });
-            // find the endpoint coordinating this removal that we need to notify when we're done
-            auto* value = _gossiper.get_application_state_ptr(endpoint, application_state::REMOVAL_COORDINATOR);
-            if (!value) {
-                auto err = format("Can not find application_state for endpoint={}", endpoint);
-                slogger.warn("{}", err);
-                throw std::runtime_error(err);
-            }
-            std::vector<sstring> coordinator;
-            boost::split(coordinator, value->value, boost::is_any_of(sstring(versioned_value::DELIMITER_STR)));
-            if (coordinator.size() != 2) {
-                auto err = format("Can not split REMOVAL_COORDINATOR for endpoint={}, value={}", endpoint, value->value);
-                slogger.warn("{}", err);
-                throw std::runtime_error(err);
-            }
-            UUID host_id(coordinator[1]);
-            // grab any data we are now responsible for and notify responsible node
-            auto ep = get_token_metadata().get_endpoint_for_host_id(host_id);
-            if (!ep) {
-                auto err = format("Can not find host_id={}", host_id);
-                slogger.warn("{}", err);
-                throw std::runtime_error(err);
-            }
-            // Kick off streaming commands. No need to wait for
-            // restore_replica_count to complete which can take a long time,
-            // since when it completes, this node will send notification to
-            // tell the removal_coordinator with IP address notify_endpoint
-            // that the restore process is finished on this node. This node
-            // will be removed from _replicating_nodes on the
-            // removal_coordinator.
-            auto notify_endpoint = ep.value();
-            //FIXME: discarded future.
-            (void)restore_replica_count(endpoint, notify_endpoint).handle_exception([endpoint, notify_endpoint] (auto ep) {
-                slogger.info("Failed to restore_replica_count for node {}, notify_endpoint={} : {}", endpoint, notify_endpoint, ep);
-            });
-        }
-    } else { // now that the gossiper has told us about this nonexistent member, notify the gossiper to remove it
-        if (sstring(gms::versioned_value::REMOVED_TOKEN) == pieces[0]) {
-            add_expire_time_if_found(endpoint, extract_expire_time(pieces));
-        }
-        co_await remove_endpoint(endpoint);
-    }
-}
 
-future<> storage_service::on_join(gms::inet_address endpoint, gms::endpoint_state ep_state) {
-    slogger.debug("endpoint={} on_join", endpoint);
-    for (const auto& e : ep_state.get_application_state_map()) {
-        co_await on_change(endpoint, e.first, e.second);
-    }
-}
-
-future<> storage_service::on_alive(gms::inet_address endpoint, gms::endpoint_state state) {
-    slogger.debug("endpoint={} on_alive", endpoint);
-    if (get_token_metadata().is_member(endpoint)) {
-        co_await notify_up(endpoint);
-    }
-    if (_replacing_nodes_pending_ranges_updater.contains(endpoint)) {
-        _replacing_nodes_pending_ranges_updater.erase(endpoint);
-        slogger.info("Trigger pending ranges updater for replacing node {}", endpoint);
-        auto tmlock = co_await get_token_metadata_lock();
-        auto tmptr = co_await get_mutable_token_metadata_ptr();
-        co_await handle_state_replacing_update_pending_ranges(tmptr, endpoint);
-        co_await replicate_to_all_cores(std::move(tmptr));
-    }
-}
-
-future<> storage_service::before_change(gms::inet_address endpoint, gms::endpoint_state current_state, gms::application_state new_state_key, const gms::versioned_value& new_value) {
-    slogger.debug("endpoint={} before_change: new app_state={}, new versioned_value={}", endpoint, new_state_key, new_value);
-    return make_ready_future();
-}
-
-future<> storage_service::on_change(inet_address endpoint, application_state state, const versioned_value& value) {
-    slogger.debug("endpoint={} on_change:     app_state={}, versioned_value={}", endpoint, state, value);
-    if (state == application_state::STATUS) {
-        std::vector<sstring> pieces;
-        boost::split(pieces, value.value, boost::is_any_of(sstring(versioned_value::DELIMITER_STR)));
-        if (pieces.empty()) {
-            slogger.warn("Fail to split status in on_change: endpoint={}, app_state={}, value={}", endpoint, state, value);
-            co_return;
-        }
-        sstring move_name = pieces[0];
-        if (move_name == sstring(versioned_value::STATUS_BOOTSTRAPPING)) {
-            co_await handle_state_bootstrap(endpoint);
-        } else if (move_name == sstring(versioned_value::STATUS_NORMAL) ||
-                   move_name == sstring(versioned_value::SHUTDOWN)) {
-            co_await handle_state_normal(endpoint);
-        } else if (move_name == sstring(versioned_value::REMOVING_TOKEN) ||
-                   move_name == sstring(versioned_value::REMOVED_TOKEN)) {
-            co_await handle_state_removing(endpoint, pieces);
-        } else if (move_name == sstring(versioned_value::STATUS_LEAVING)) {
-            co_await handle_state_leaving(endpoint);
-        } else if (move_name == sstring(versioned_value::STATUS_LEFT)) {
-            co_await handle_state_left(endpoint, pieces);
-        } else if (move_name == sstring(versioned_value::STATUS_MOVING)) {
-            handle_state_moving(endpoint, pieces);
-        } else if (move_name == sstring(versioned_value::HIBERNATE)) {
-            co_await handle_state_replacing(endpoint);
-        } else {
-            co_return; // did nothing.
-        }
-    } else {
-        auto* ep_state = _gossiper.get_endpoint_state_for_endpoint_ptr(endpoint);
-        if (!ep_state || _gossiper.is_dead_state(*ep_state)) {
-            slogger.debug("Ignoring state change for dead or unknown endpoint: {}", endpoint);
-            co_return;
-        }
-        if (get_token_metadata().is_member(endpoint)) {
-            co_await do_update_system_peers_table(endpoint, state, value);
-            if (state == application_state::RPC_READY) {
-                slogger.debug("Got application_state::RPC_READY for node {}, is_cql_ready={}", endpoint, ep_state->is_cql_ready());
-                co_await notify_cql_change(endpoint, ep_state->is_cql_ready());
-            }
-        }
+    const auto& topo = get_token_metadata().get_topology();
+    if (topo.get_datacenter() == topo.get_datacenter(host_id) && _messaging.local().get_preferred_ip(ep) != local_ip) {
+        slogger.debug("Initiated reconnect to an Internal IP {} for the {}", local_ip, ep);
+        co_await _messaging.invoke_on_all([ep, local_ip] (auto& local_ms) {
+            local_ms.cache_preferred_ip(ep, local_ip);
+        });
     }
 }
 
 
-future<> storage_service::on_remove(gms::inet_address endpoint) {
-    slogger.debug("endpoint={} on_remove", endpoint);
-    auto tmlock = co_await get_token_metadata_lock();
-    auto tmptr = co_await get_mutable_token_metadata_ptr();
-    tmptr->remove_endpoint(endpoint);
-    co_await update_pending_ranges(tmptr, format("on_remove {}", endpoint));
-    co_await replicate_to_all_cores(std::move(tmptr));
+future<> storage_service::on_remove(gms::inet_address endpoint, locator::host_id host_id, gms::permit_id pid) {
+    slogger.debug("endpoint={}/{} on_remove: permit_id={}", endpoint, host_id, pid);
+    return make_ready_future<>();
 }
 
-future<> storage_service::on_dead(gms::inet_address endpoint, gms::endpoint_state state) {
-    slogger.debug("endpoint={} on_dead", endpoint);
-    return notify_down(endpoint);
+future<> storage_service::on_dead(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr state, gms::permit_id pid) {
+    slogger.debug("endpoint={}/{} on_dead: permit_id={}", endpoint, id, pid);
+    return notify_down(endpoint, id);
 }
 
-future<> storage_service::on_restart(gms::inet_address endpoint, gms::endpoint_state state) {
-    slogger.debug("endpoint={} on_restart", endpoint);
+future<> storage_service::on_restart(gms::inet_address endpoint, locator::host_id id, gms::endpoint_state_ptr state, gms::permit_id pid) {
+    slogger.debug("endpoint={}/{} on_restart: permit_id={}", endpoint, id, pid);
     // If we have restarted before the node was even marked down, we need to reset the connection pool
-    if (state.is_alive()) {
-        return on_dead(endpoint, state);
+    if (id != my_host_id() && _gossiper.is_alive(id)) {
+        return on_dead(endpoint, id, state, pid);
     }
     return make_ready_future();
 }
 
-template <typename T>
-static future<> update_table(gms::inet_address endpoint, sstring col, T value) {
-    try {
-        co_await db::system_keyspace::update_peer_info(endpoint, col, value);
-    } catch (...) {
-        slogger.error("fail to update {} for {}: {}", col, endpoint, std::current_exception());
-    }
-}
-
-future<> storage_service::do_update_system_peers_table(gms::inet_address endpoint, const application_state& state, const versioned_value& value) {
-    slogger.debug("Update system.peers table: endpoint={}, app_state={}, versioned_value={}", endpoint, state, value);
-    if (state == application_state::RELEASE_VERSION) {
-        co_await update_table(endpoint, "release_version", value.value);
-    } else if (state == application_state::DC) {
-        co_await update_table(endpoint, "data_center", value.value);
-    } else if (state == application_state::RACK) {
-        co_await update_table(endpoint, "rack", value.value);
-    } else if (state == application_state::RPC_ADDRESS) {
-        auto col = sstring("rpc_address");
-        inet_address ep;
-        try {
-            ep = gms::inet_address(value.value);
-        } catch (...) {
-            slogger.error("fail to update {} for {}: invalid rcpaddr {}", col, endpoint, value.value);
-            co_return;
-        }
-        co_await update_table(endpoint, col, ep.addr());
-    } else if (state == application_state::SCHEMA) {
-        co_await update_table(endpoint, "schema_version", utils::UUID(value.value));
-    } else if (state == application_state::HOST_ID) {
-        co_await update_table(endpoint, "host_id", utils::UUID(value.value));
-    } else if (state == application_state::SUPPORTED_FEATURES) {
-        co_await update_table(endpoint, "supported_features", value.value);
-    }
-}
-
-future<> storage_service::update_peer_info(gms::inet_address endpoint) {
-    using namespace gms;
-    auto* ep_state = _gossiper.get_endpoint_state_for_endpoint_ptr(endpoint);
+std::optional<db::system_keyspace::peer_info> storage_service::get_peer_info_for_update(locator::host_id endpoint) {
+    auto ep_state = _gossiper.get_endpoint_state_ptr(endpoint);
     if (!ep_state) {
-        co_return;
+        return db::system_keyspace::peer_info{};
     }
-    for (auto& entry : ep_state->get_application_state_map()) {
-        auto& app_state = entry.first;
-        auto& value = entry.second;
-        co_await do_update_system_peers_table(endpoint, app_state, value);
-    }
+    auto info = get_peer_info_for_update(endpoint, ep_state->get_application_state_map());
+    return info;
 }
 
-std::unordered_set<locator::token> storage_service::get_tokens_for(inet_address endpoint) {
-    auto tokens_string = _gossiper.get_application_state_value(endpoint, application_state::TOKENS);
-    slogger.trace("endpoint={}, tokens_string={}", endpoint, tokens_string);
-    auto ret = versioned_value::tokens_from_string(tokens_string);
-    slogger.trace("endpoint={}, tokens={}", endpoint, ret);
+std::optional<db::system_keyspace::peer_info> storage_service::get_peer_info_for_update(locator::host_id endpoint, const gms::application_state_map& app_state_map) {
+    std::optional<db::system_keyspace::peer_info> ret;
+
+    auto get_peer_info = [&] () -> db::system_keyspace::peer_info& {
+        if (!ret) {
+            ret.emplace();
+        }
+        return *ret;
+    };
+
+    auto set_field = [&]<typename T> (std::optional<T>& field,
+            const gms::versioned_value& value,
+            std::string_view name)
+    {
+        try {
+            field = T(value.value().linearize());
+        } catch (...) {
+            on_internal_error(slogger, fmt::format("failed to parse {} {} for {}: {}", name, value.value().linearize(),
+                endpoint, std::current_exception()));
+        }
+    };
+
+    // Fields managed by raft are skipped here
+    for (const auto& [state, value] : app_state_map) {
+        switch (state) {
+        case application_state::INTERNAL_IP:
+            set_field(get_peer_info().preferred_ip, value, "preferred_ip");
+            break;
+        case application_state::RPC_ADDRESS:
+            set_field(get_peer_info().rpc_address, value, "rpc_address");
+            break;
+        case application_state::SCHEMA:
+            set_field(get_peer_info().schema_version, value, "schema_version");
+            break;
+        default:
+            break;
+        }
+    }
     return ret;
+}
+
+std::optional<locator::endpoint_dc_rack> storage_service::get_dc_rack_for(const gms::endpoint_state& ep_state) {
+    auto* dc = ep_state.get_application_state_ptr(gms::application_state::DC);
+    auto* rack = ep_state.get_application_state_ptr(gms::application_state::RACK);
+    if (!dc || !rack) {
+        return std::nullopt;
+    }
+    return locator::endpoint_dc_rack{
+        .dc = dc->value().linearize(),
+        .rack = rack->value().linearize(),
+    };
+}
+
+std::optional<locator::endpoint_dc_rack> storage_service::get_dc_rack_for(locator::host_id endpoint) {
+    auto eps = _gossiper.get_endpoint_state_ptr(endpoint);
+    if (!eps) {
+        return std::nullopt;
+    }
+    return get_dc_rack_for(*eps);
 }
 
 void endpoint_lifecycle_notifier::register_subscriber(endpoint_lifecycle_subscriber* subscriber)
@@ -1226,9 +2022,10 @@ future<> endpoint_lifecycle_notifier::unregister_subscriber(endpoint_lifecycle_s
 
 future<> storage_service::stop_transport() {
     if (!_transport_stopped.has_value()) {
-        _transport_stopped.emplace();
+        promise<> stopped;
+        _transport_stopped = stopped.get_future();
 
-        (void) seastar::async([this] {
+        seastar::async([this] {
             slogger.info("Stop transport: starts");
 
             shutdown_protocol_servers().get();
@@ -1237,147 +2034,260 @@ future<> storage_service::stop_transport() {
             _gossiper.container().invoke_on_all(&gms::gossiper::shutdown).get();
             slogger.info("Stop transport: stop_gossiping done");
 
-            do_stop_ms().get();
+            _messaging.invoke_on_all(&netw::messaging_service::shutdown).get();
             slogger.info("Stop transport: shutdown messaging_service done");
 
             _stream_manager.invoke_on_all(&streaming::stream_manager::shutdown).get();
             slogger.info("Stop transport: shutdown stream_manager done");
-        }).then_wrapped([this] (future<> f) {
-            if (f.failed()) {
-                _transport_stopped->set_exception(f.get_exception());
-            } else {
-                _transport_stopped->set_value();
-            }
 
             slogger.info("Stop transport: done");
-        });
+        }).forward_to(std::move(stopped));
     }
 
-    return _transport_stopped->get_shared_future();
+    return _transport_stopped.value();
 }
 
 future<> storage_service::drain_on_shutdown() {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
     return (_operation_mode == mode::DRAINING || _operation_mode == mode::DRAINED) ?
         _drain_finished.get_future() : do_drain();
 }
 
-future<> storage_service::init_messaging_service_part() {
-    return container().invoke_on_all(&service::storage_service::init_messaging_service);
+void storage_service::set_group0(raft_group0& group0) {
+    _group0 = &group0;
 }
 
-future<> storage_service::uninit_messaging_service_part() {
-    return container().invoke_on_all(&service::storage_service::uninit_messaging_service);
+future<> storage_service::init_address_map(gms::gossip_address_map& address_map) {
+    _ip_address_updater = make_shared<ip_address_updater>(address_map, *this);
+    _gossiper.register_(_ip_address_updater);
+    co_return;
 }
 
-future<> storage_service::init_server(cql3::query_processor& qp) {
-    assert(this_shard_id() == 0);
+future<> storage_service::uninit_address_map() {
+    return _gossiper.unregister_(_ip_address_updater);
+}
 
-    return seastar::async([this, &qp] {
-        _initialized = true;
+future<> storage_service::join_cluster(sharded<service::storage_proxy>& proxy,
+        start_hint_manager start_hm, gms::generation_type new_generation) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
 
-        _group0 = std::make_unique<raft_group0>(_abort_source, _raft_gr, _messaging.local(),
-            _gossiper, qp, _migration_manager.local());
+    if (_sys_ks.local().was_decommissioned()) {
+        auto msg = sstring("This node was decommissioned and will not rejoin the ring unless "
+                           "all existing data is removed and the node is bootstrapped again");
+        slogger.error("{}", msg);
+        throw std::runtime_error(msg);
+    }
 
-        std::unordered_set<inet_address> loaded_endpoints;
-        if (_db.local().get_config().load_ring_state()) {
-            slogger.info("Loading persisted ring state");
-            auto loaded_tokens = db::system_keyspace::load_tokens().get0();
-            auto loaded_host_ids = db::system_keyspace::load_host_ids().get0();
+    set_mode(mode::STARTING);
 
-            for (auto& x : loaded_tokens) {
-                slogger.debug("Loaded tokens: endpoint={}, tokens={}", x.first, x.second);
-            }
-
-            for (auto& x : loaded_host_ids) {
-                slogger.debug("Loaded host_id: endpoint={}, uuid={}", x.first, x.second);
-            }
-
-            auto tmlock = get_token_metadata_lock().get0();
-            auto tmptr = get_mutable_token_metadata_ptr().get0();
-            for (auto x : loaded_tokens) {
-                auto ep = x.first;
-                auto tokens = x.second;
-                if (ep == get_broadcast_address()) {
-                    // entry has been mistakenly added, delete it
-                    db::system_keyspace::remove_endpoint(ep).get();
-                } else {
-                    tmptr->update_normal_tokens(tokens, ep).get();
-                    if (loaded_host_ids.contains(ep)) {
-                        tmptr->update_host_id(loaded_host_ids.at(ep), ep);
-                    }
-                    loaded_endpoints.insert(ep);
-                    _gossiper.add_saved_endpoint(ep).get();
+    std::unordered_map<locator::host_id, gms::loaded_endpoint_state> loaded_endpoints = co_await _sys_ks.local().load_endpoint_state();
+    if (_group0->joined_group0()) {
+        // Recover the endpoint state of the node replacing with the same IP. Its IP mapping is not in system.peers.
+        const auto& topo = _topology_state_machine._topology;
+        for (const auto& [id, replica_state]: topo.transition_nodes) {
+            auto host_id = locator::host_id(id.uuid());
+            if (replica_state.state == node_state::replacing && !loaded_endpoints.contains(host_id)) {
+                auto replaced_id = std::get<replace_param>(topo.req_param.at(id)).replaced_id;
+                if (const auto it = loaded_endpoints.find(locator::host_id(replaced_id.uuid())); it != loaded_endpoints.end()) {
+                    auto ip = it->second.endpoint;
+                    slogger.info("Adding node {}/{} that is replacing {}/{} to loaded_endpoints", host_id, ip, replaced_id, ip);
+                    gms::loaded_endpoint_state st{.endpoint = ip};
+                    loaded_endpoints.emplace(host_id, std::move(st));
                 }
             }
-            replicate_to_all_cores(std::move(tmptr)).get();
         }
+    }
 
-        // Seeds are now only used as the initial contact point nodes. If the
-        // loaded_endpoints are empty which means this node is a completely new
-        // node, we use the nodes specified in seeds as the initial contact
-        // point nodes, otherwise use the peer nodes persisted in system table.
-        auto seeds = _gossiper.get_seeds();
-        auto initial_contact_nodes = loaded_endpoints.empty() ?
-            std::unordered_set<gms::inet_address>(seeds.begin(), seeds.end()) :
-            loaded_endpoints;
-        auto loaded_peer_features = db::system_keyspace::load_peer_features().get0();
-        slogger.info("initial_contact_nodes={}, loaded_endpoints={}, loaded_peer_features={}",
-                initial_contact_nodes, loaded_endpoints, loaded_peer_features.size());
-        for (auto& x : loaded_peer_features) {
-            slogger.info("peer={}, supported_features={}", x.first, x.second);
+    // Seeds are now only used as the initial contact point nodes. If the
+    // loaded_endpoints are empty which means this node is a completely new
+    // node, we use the nodes specified in seeds as the initial contact
+    // point nodes, otherwise use the peer nodes persisted in system table.
+    auto seeds = _gossiper.get_seeds();
+    auto initial_contact_nodes = loaded_endpoints.empty() ?
+        std::unordered_set<gms::inet_address>(seeds.begin(), seeds.end()) :
+        loaded_endpoints | std::views::transform([] (const auto& x) {
+            return x.second.endpoint;
+        }) | std::ranges::to<std::unordered_set<gms::inet_address>>();
+
+    gms::inet_address recovery_leader_ip;
+    locator::host_id recovery_leader_id;
+    if (_db.local().get_config().recovery_leader.is_set()) {
+        if (_group0->joined_group0()) {
+            // Something is wrong unless it is a noninitial (and unneeded) restart while recreating the new group 0 in
+            // the Raft-based recovery procedure.
+            slogger.warn(
+                    "recovery_leader is set to {} but persistent group 0 ID is present: {}. "
+                    "The recovery_leader option will be ignored. If you are trying to run "
+                    "the Raft-based recovery procedure, please follow the steps in the documentation.",
+                    _db.local().get_config().recovery_leader(), _group0->load_my_id());
+        } else {
+            recovery_leader_id = locator::host_id(_db.local().get_config().recovery_leader());
+            auto recovery_leader_it = loaded_endpoints.find(recovery_leader_id);
+            if (recovery_leader_id != my_host_id() && recovery_leader_it == loaded_endpoints.end()) {
+                throw std::runtime_error(
+                        fmt::format("Recovery leader {} unrecognised as a cluster member, loaded endpoints: {}",
+                        recovery_leader_id, loaded_endpoints));
+            }
+            recovery_leader_ip = recovery_leader_id == my_host_id() ?
+                    get_broadcast_address() : recovery_leader_it->second.endpoint;
+            initial_contact_nodes = std::unordered_set{recovery_leader_ip};
+
+            if (!_sys_ks.local().bootstrap_complete()) {
+                throw std::runtime_error("Cannot bootstrap in the Raft-based recovery procedure");
+            }
         }
-        prepare_to_join(std::move(initial_contact_nodes), std::move(loaded_endpoints), std::move(loaded_peer_features));
-    });
+    }
+
+    if (recovery_leader_id) {
+        // The Raft-based recovery procedure.
+        slogger.info("Performing Raft-based recovery procedure with recovery leader {}/{}",
+                recovery_leader_id, recovery_leader_ip);
+        auto g0_info = co_await _group0->discover_group0(std::vector{recovery_leader_ip}, _qp);
+        if (g0_info.id.uuid() != recovery_leader_id.uuid()) {
+            throw std::runtime_error(fmt::format(
+                    "Raft-based recovery procedure - found group 0 {} with leader {}/{} not matching "
+                    "recovery leader {}/{}. The procedure must be restarted.",
+                    g0_info.group0_id, g0_info.id, g0_info.ip_addr, recovery_leader_id, recovery_leader_ip));
+        }
+        slogger.info("Raft-based recovery procedure - found group 0 with ID {}", g0_info.group0_id);
+    } else if (_group0->joined_group0()) {
+        slogger.info("The node is already in group 0");
+    } else if (_sys_ks.local().bootstrap_complete()) {
+        // setup_group0_if_exist() should already throw in this case, so do internal error here.
+        on_internal_error(slogger, "The node does not have group 0 but has already completed bootstrap. This should not happen.");
+    } else {
+        // We are not in group 0 and we are just bootstrapping. We need to discover group 0.
+        const std::vector<gms::inet_address> contact_nodes{initial_contact_nodes.begin(), initial_contact_nodes.end()};
+        auto g0_info = co_await _group0->discover_group0(contact_nodes, _qp);
+        slogger.info("Found group 0 with ID {}, with leader of ID {} and IP {}",
+                g0_info.group0_id, g0_info.id, g0_info.ip_addr);
+
+        if (_group0->load_my_id() == g0_info.id) {
+            // We're creating the group 0.
+            slogger.info("We are creating the group 0. Start in raft topology operations mode");
+        } else {
+            // Ask the current member of the raft group about which mode to use
+            auto params = join_node_query_params {};
+            auto result = co_await ser::join_node_rpc_verbs::send_join_node_query(
+                    &_messaging.local(), netw::msg_addr(g0_info.ip_addr), g0_info.id, std::move(params));
+            switch (result.topo_mode) {
+            case join_node_query_result::topology_mode::raft:
+                slogger.info("Will join existing cluster in raft topology operations mode");
+                break;
+            case join_node_query_result::topology_mode::legacy:
+                throw std::runtime_error(
+                        "Cannot join existing cluster in legacy topology operations mode because it is no longer supported. "
+                        "Enable consistent topology changes with Raft.");
+            }
+        }
+    }
+
+    auto loaded_peer_features = co_await _sys_ks.local().load_peer_features();
+    slogger.info("initial_contact_nodes={}, loaded_endpoints={}, loaded_peer_features={}",
+            initial_contact_nodes, loaded_endpoints | std::views::keys, loaded_peer_features.size());
+    for (auto& x : loaded_peer_features) {
+        slogger.info("peer={}, supported_features={}", x.first, x.second);
+    }
+
+    co_return co_await join_topology(proxy, std::move(initial_contact_nodes),
+            std::move(loaded_endpoints), start_hm, new_generation);
 }
 
-future<> storage_service::join_cluster() {
-    return seastar::async([this] {
-        join_token_ring(get_ring_delay().count());
-    });
-}
-
-future<> storage_service::replicate_to_all_cores(mutable_token_metadata_ptr tmptr) noexcept {
-    assert(this_shard_id() == 0);
-
-    slogger.debug("Replicating token_metadata to all cores");
+future<token_metadata_change> storage_service::prepare_token_metadata_change(mutable_token_metadata_ptr tmptr, const schema_getter& schema_getter) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
     std::exception_ptr ex;
+    token_metadata_change change;
 
-    std::vector<mutable_token_metadata_ptr> pending_token_metadata_ptr;
-    pending_token_metadata_ptr.resize(smp::count);
-    std::vector<std::unordered_map<sstring, locator::effective_replication_map_ptr>> pending_effective_replication_maps;
-    pending_effective_replication_maps.resize(smp::count);
+    // Collect open sessions
+    {
+        auto session = _topology_state_machine._topology.session;
+        if (session) {
+            change.open_sessions.insert(session);
+        }
+
+        for (auto&& [table, tables] : tmptr->tablets().all_table_groups()) {
+            const auto& tmap = tmptr->tablets().get_tablet_map(table);
+            for (auto&& [tid, trinfo]: tmap.transitions()) {
+                if (trinfo.session_id) {
+                    auto id = session_id(trinfo.session_id);
+                    change.open_sessions.insert(id);
+                }
+            }
+        }
+    }
 
     try {
         auto base_shard = this_shard_id();
-        pending_token_metadata_ptr[base_shard] = tmptr;
+        change.pending_token_metadata_ptr[base_shard] = tmptr;
+        auto& sharded_token_metadata = _shared_token_metadata.container();
         // clone a local copy of updated token_metadata on all other shards
-        co_await smp::invoke_on_others(base_shard, [&, base_shard, tmptr] () -> future<> {
-            pending_token_metadata_ptr[this_shard_id()] = make_token_metadata_ptr(co_await tmptr->clone_async());
+        co_await smp::invoke_on_others(base_shard, [&, tmptr] () -> future<> {
+            change.pending_token_metadata_ptr[this_shard_id()] = sharded_token_metadata.local().make_token_metadata_ptr(co_await tmptr->clone_async());
         });
 
         // Precalculate new effective_replication_map for all keyspaces
         // and clone to all shards;
         //
         // TODO: at the moment create on shard 0 first
-        // but in the future we may want to use hash() % smp::count
+        // but in the future we may want to use hash() % this_smp_shard_count()
         // to evenly distribute the load.
-        auto& db = _db.local();
-        auto keyspaces = db.get_all_keyspaces();
-        for (auto& ks_name : keyspaces) {
-            auto rs = db.find_keyspace(ks_name).get_replication_strategy_ptr();
-            auto erm = co_await get_erm_factory().create_effective_replication_map(rs, tmptr);
-            pending_effective_replication_maps[base_shard].emplace(ks_name, std::move(erm));
-        }
-        co_await container().invoke_on_others([&, base_shard] (storage_service& ss) -> future<> {
-            auto& db = ss._db.local();
-            for (auto& ks_name : keyspaces) {
-                auto rs = db.find_keyspace(ks_name).get_replication_strategy_ptr();
-                auto tmptr = pending_token_metadata_ptr[this_shard_id()];
-                auto erm = co_await ss.get_erm_factory().create_effective_replication_map(rs, std::move(tmptr));
-                pending_effective_replication_maps[this_shard_id()].emplace(ks_name, std::move(erm));
-
+        auto replications = schema_getter.get_keyspaces_replication();
+        for (const auto& [ks_name, rs] : replications) {
+            if (rs->is_per_table()) {
+                continue;
             }
+            auto erm = co_await get_erm_factory().create_static_effective_replication_map(rs, tmptr);
+            change.pending_effective_replication_maps[base_shard].emplace(ks_name, std::move(erm));
+        }
+        co_await container().invoke_on_others([&] (storage_service& ss) -> future<> {
+            auto replications = schema_getter.get_keyspaces_replication();
+            for (const auto& [ks_name, rs] : replications) {
+                if (rs->is_per_table()) {
+                    continue;
+                }
+                auto tmptr = change.pending_token_metadata_ptr[this_shard_id()];
+                auto erm = co_await ss.get_erm_factory().create_static_effective_replication_map(rs, tmptr);
+                change.pending_effective_replication_maps[this_shard_id()].emplace(ks_name, std::move(erm));
+            }
+        });
+        // Prepare per-table erms.
+        co_await container().invoke_on_all([&] (storage_service& ss) -> future<> {
+            auto tmptr = change.pending_token_metadata_ptr[this_shard_id()];
+            auto replications = schema_getter.get_keyspaces_replication();
+            co_await schema_getter.for_each_table_schema_gently([&] (table_id id, schema_ptr table_schema) {
+                auto rs = replications.at(table_schema->ks_name());
+                locator::effective_replication_map_ptr erm;
+                if (auto pt_rs = rs->maybe_as_per_table()) {
+                    erm = pt_rs->make_replication_map(id, tmptr);
+                } else {
+                    const locator::abstract_replication_strategy *old_rs = ss.get_database().column_family_exists(id)
+                            ? &ss.get_database().find_column_family(id).get_effective_replication_map()->get_replication_strategy()
+                            : nullptr;
+                    if (old_rs && old_rs->uses_tablets()) {
+                        // The table is under vnodes-to-tablets migration:
+                        // the keyspace uses vnodes, but the table uses a tablet-based ERM.
+                        // Preserve the tablet flavor of the ERM.
+                        // The ERM flavor is a node-local setting that expresses
+                        // the node's storage organization, which can change only
+                        // on startup after resharding (while the node is offline).
+                        // It is determined on startup by the distributed loader.
+                        auto old_tablet_rs = old_rs->maybe_as_tablet_aware();
+                        locator::replication_strategy_params params(rs->get_config_options(), old_tablet_rs->get_initial_tablets(), old_tablet_rs->get_consistency());
+                        auto& ks = ss.get_database().find_keyspace(table_schema->ks_name());
+                        auto tablet_rs = locator::abstract_replication_strategy::create_replication_strategy(ks.metadata()->strategy_name(), params, tmptr->get_topology());
+                        auto pt_rs = tablet_rs->maybe_as_per_table();
+                        erm = pt_rs->make_replication_map(id, tmptr);
+                    } else {
+                        erm = change.pending_effective_replication_maps[this_shard_id()][table_schema->ks_name()];
+                    }
+                }
+                if (table_schema->is_view()) {
+                    change.pending_view_erms[this_shard_id()].emplace(id, std::move(erm));
+                } else {
+                    change.pending_table_erms[this_shard_id()].emplace(id, std::move(erm));
+                }
+                return make_ready_future();
+            });
         });
     } catch (...) {
         ex = std::current_exception();
@@ -1387,159 +2297,222 @@ future<> storage_service::replicate_to_all_cores(mutable_token_metadata_ptr tmpt
     if (ex) {
         try {
             co_await smp::invoke_on_all([&] () -> future<> {
-                auto tmptr = std::move(pending_token_metadata_ptr[this_shard_id()]);
-                auto erms = std::move(pending_effective_replication_maps[this_shard_id()]);
+                auto tmptr = std::move(change.pending_token_metadata_ptr[this_shard_id()]);
+                auto erms = std::move(change.pending_effective_replication_maps[this_shard_id()]);
+                auto table_erms = std::move(change.pending_table_erms[this_shard_id()]);
+                auto view_erms = std::move(change.pending_view_erms[this_shard_id()]);
 
                 co_await utils::clear_gently(erms);
                 co_await utils::clear_gently(tmptr);
+                co_await utils::clear_gently(table_erms);
+                co_await utils::clear_gently(view_erms);
             });
         } catch (...) {
-            slogger.warn("Failure to reset pending token_metadata in cleanup path: {}. Ignored.", std::current_exception());
+            slogger.warn("Failure to reset pending token_metadata in cleanup path: {:t}. Ignored.", std::current_exception());
         }
 
         std::rethrow_exception(std::move(ex));
     }
 
-    // Apply changes on all shards
-    try {
-        co_await container().invoke_on_all([&] (storage_service& ss) {
-            ss._shared_token_metadata.set(std::move(pending_token_metadata_ptr[this_shard_id()]));
+    co_return change;
+}
 
-            auto& erms = pending_effective_replication_maps[this_shard_id()];
-            for (auto it = erms.begin(); it != erms.end(); ) {
-                auto& db = ss._db.local();
-                auto& ks = db.find_keyspace(it->first);
-                ks.update_effective_replication_map(std::move(it->second));
-                it = erms.erase(it);
+void storage_service::commit_token_metadata_change(token_metadata_change& change) noexcept {
+    slogger.debug("Replicating token_metadata");
+
+    // Apply changes on a single shard
+    try {
+        _shared_token_metadata.set(std::move(change.pending_token_metadata_ptr[this_shard_id()]));
+        _groups_manager.update(_shared_token_metadata.get());
+
+        auto& db =_db.local();
+        auto& erms = change.pending_effective_replication_maps[this_shard_id()];
+        for (auto it = erms.begin(); it != erms.end(); ) {
+            auto& ks = db.find_keyspace(it->first);
+            ks.update_static_effective_replication_map(std::move(it->second));
+            it = erms.erase(it);
+        }
+
+        auto& table_erms = change.pending_table_erms[this_shard_id()];
+        auto& view_erms = change.pending_view_erms[this_shard_id()];
+        for (auto it = table_erms.begin(); it != table_erms.end(); ) {
+            // Update base/views effective_replication_maps atomically.
+            auto& cf = db.find_column_family(it->first);
+            cf.update_effective_replication_map(std::move(it->second));
+            for (const auto& view_ptr : cf.views()) {
+                const auto& view_id = view_ptr->id();
+                auto& view = db.find_column_family(view_id);
+                auto view_it = view_erms.find(view_id);
+                if (view_it == view_erms.end()) {
+                    throw std::runtime_error(format("Could not find pending effective_replication_map for view {}.{} id={}", view_ptr->ks_name(), view_ptr->cf_name(), view_id));
+                }
+                view.update_effective_replication_map(std::move(view_it->second));
+                if (view.uses_tablets()) {
+                    register_tablet_split_candidate(view_it->first);
+                }
+                view_erms.erase(view_it);
             }
-        });
+            if (cf.uses_tablets()) {
+                register_tablet_split_candidate(it->first);
+            }
+            it = table_erms.erase(it);
+        }
+
+        if (!view_erms.empty()) {
+            throw std::runtime_error(fmt::format("Found orphaned pending effective_replication_maps for the following views: {}", std::views::keys(view_erms)));
+        }
+
+        auto& session_mgr = get_topology_session_manager();
+        session_mgr.initiate_close_of_sessions_except(change.open_sessions);
+        for (auto id : change.open_sessions) {
+            session_mgr.create_session(id);
+        }
     } catch (...) {
         // applying the changes on all shards should never fail
         // it will end up in an inconsistent state that we can't recover from.
-        slogger.error("Failed to apply token_metadata changes: {}. Aborting.", std::current_exception());
+        slogger.error("Failed to apply token_metadata changes: {:t}. Aborting.", std::current_exception());
         abort();
     }
 }
 
-future<> storage_service::stop() {
-    // make sure nobody uses the semaphore
-    node_ops_singal_abort(std::nullopt);
-    _listeners.clear();
-    try {
-        co_await (_group0 ?  _group0->abort() : make_ready_future<>());
-    } catch (...) {
-        slogger.error("failed to stop Raft Group 0: {}", std::current_exception());
-    }
-    co_await std::move(_node_ops_abort_thread);
-}
-
-future<> storage_service::check_for_endpoint_collision(std::unordered_set<gms::inet_address> initial_contact_nodes, const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features) {
-    slogger.debug("Starting shadow gossip round to check for endpoint collision");
-
-    return seastar::async([this, initial_contact_nodes, loaded_peer_features] {
-        auto t = gms::gossiper::clk::now();
-        bool found_bootstrapping_node = false;
-        auto local_features = _feature_service.known_feature_set();
-        do {
-            slogger.info("Checking remote features with gossip");
-            _gossiper.do_shadow_round(initial_contact_nodes).get();
-            _gossiper.check_knows_remote_features(local_features, loaded_peer_features);
-            _gossiper.check_snitch_name_matches();
-            auto addr = get_broadcast_address();
-            if (!_gossiper.is_safe_for_bootstrap(addr)) {
-                throw std::runtime_error(fmt::format("A node with address {} already exists, cancelling join. "
-                    "Use replace_address if you want to replace this node.", addr));
-            }
-            if (_db.local().get_config().consistent_rangemovement()) {
-                found_bootstrapping_node = false;
-                for (auto& x : _gossiper.get_endpoint_states()) {
-                    auto state = _gossiper.get_gossip_status(x.second);
-                    if (state == sstring(versioned_value::STATUS_UNKNOWN)) {
-                        continue;
-                    }
-                    auto addr = x.first;
-                    slogger.debug("Checking bootstrapping/leaving/moving nodes: node={}, status={} (check_for_endpoint_collision)", addr, state);
-                    if (state == sstring(versioned_value::STATUS_BOOTSTRAPPING) ||
-                        state == sstring(versioned_value::STATUS_LEAVING) ||
-                        state == sstring(versioned_value::STATUS_MOVING)) {
-                        if (gms::gossiper::clk::now() > t + std::chrono::seconds(60)) {
-                            throw std::runtime_error("Other bootstrapping/leaving/moving nodes detected, cannot bootstrap while consistent_rangemovement is true (check_for_endpoint_collision)");
-                        } else {
-                            sstring saved_state(state);
-                            _gossiper.goto_shadow_round();
-                            _gossiper.reset_endpoint_state_map().get();
-                            found_bootstrapping_node = true;
-                            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(gms::gossiper::clk::now() - t).count();
-                            slogger.info("Checking bootstrapping/leaving/moving nodes: node={}, status={}, sleep 1 second and check again ({} seconds elapsed) (check_for_endpoint_collision)", addr, saved_state, elapsed);
-                            sleep_abortable(std::chrono::seconds(1), _abort_source).get();
-                            break;
-                        }
-                    }
-                }
-            }
-        } while (found_bootstrapping_node);
-        slogger.info("Checking bootstrapping/leaving/moving nodes: ok (check_for_endpoint_collision)");
-        _gossiper.reset_endpoint_state_map().get();
+ future<> token_metadata_change::destroy() {
+    return smp::invoke_on_all([this] () -> future<> {
+        pending_token_metadata_ptr[this_shard_id()] = nullptr;
+        co_await utils::clear_gently(pending_effective_replication_maps[this_shard_id()]);
+        co_await utils::clear_gently(pending_table_erms[this_shard_id()]);
+        co_await utils::clear_gently(pending_view_erms[this_shard_id()]);
     });
 }
 
-future<> storage_service::remove_endpoint(inet_address endpoint) {
-    co_await _gossiper.remove_endpoint(endpoint);
+future<> storage_service::replicate_to_all_cores(mutable_token_metadata_ptr tmptr) noexcept {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    slogger.debug("Replicating token_metadata to all cores");
+
+    class db_schema_getter : public schema_getter {
+    private:
+        sharded<replica::database>& _db;
+    public:
+        db_schema_getter(sharded<replica::database>& db) : _db(db) {};
+
+        virtual flat_hash_map<sstring, locator::replication_strategy_ptr> get_keyspaces_replication() const override {
+            flat_hash_map<sstring, locator::replication_strategy_ptr> out;
+            for (auto& [name, ks] : _db.local().get_keyspaces()) {
+                out.emplace(name, ks->get_replication_strategy_ptr());
+            }
+            return out;
+        };
+        virtual future<> for_each_table_schema_gently(std::function<future<>(table_id, schema_ptr)> f) const override {
+            auto ff = [&f](table_id id, lw_shared_ptr<replica::table> t) -> future<> {
+                return f(id, t->schema());
+            };
+            return _db.local().get_tables_metadata().for_each_table_gently(ff);
+        };
+    };
+
+    db_schema_getter getter{_db};
+    auto change = co_await prepare_token_metadata_change(tmptr, getter);
+    co_await container().invoke_on_all([&change] (storage_service& ss) {
+        ss.commit_token_metadata_change(change);
+    });
+    co_await change.destroy();
+    co_await _db.local().get_compaction_manager().get_shared_tombstone_gc_state().
+            flush_pending_repair_time_update(_db, _sys_ks);
+}
+
+future<> storage_service::stop() {
+    co_await _migration_manager.local().unplug_storage_service();
+    // if there is a background "isolate" shutdown
+    // in progress, we need to sync with it. Mostly
+    // relevant for tests
+    if (_transport_stopped.has_value()) {
+        co_await stop_transport();
+    }
+    co_await uninit_messaging_service();
+    // make sure nobody uses the semaphore
+    _listeners.clear();
+    co_await _tablets_module->stop();
+    co_await _node_ops_module->stop();
+    co_await _global_topology_requests_module->stop();
+    co_await _vnodes_to_tablets_migration_module->stop();
+    co_await _async_gate.close();
+    // The quiesce action runs detached from its callers, so it can outlive the gate.
+    co_await _quiesce_topology.join();
+    _tablet_split_monitor_event.signal();
+    co_await std::move(_tablet_split_monitor);
+}
+
+future<> storage_service::wait_for_group0_stop() {
+    if (!_group0_as.abort_requested()) {
+        _group0_as.request_abort();
+        _topology_state_machine.event.broken(make_exception_ptr(abort_requested_exception()));
+        _view_building_state_machine.event.broken(make_exception_ptr(abort_requested_exception()));
+        co_await when_all(std::move(_raft_state_monitor), std::move(_sstable_vnodes_cleanup_fiber), std::move(_upgrade_to_topology_coordinator_fiber));
+    }
+}
+
+future<> storage_service::remove_endpoint(inet_address endpoint, gms::permit_id pid) {
+    auto host_id_opt = _gossiper.try_get_host_id(endpoint);
+    if (host_id_opt) {
+        co_await _gossiper.remove_endpoint(*host_id_opt, pid);
+    }
     try {
-        co_await db::system_keyspace::remove_endpoint(endpoint);
+        co_await _sys_ks.local().remove_endpoint(endpoint);
     } catch (...) {
-        slogger.error("fail to remove endpoint={}: {}", endpoint, std::current_exception());
+        slogger.error("fail to remove endpoint={}: {:t}", endpoint, std::current_exception());
     }
 }
 
 future<storage_service::replacement_info>
-storage_service::prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes, const std::unordered_map<gms::inet_address, sstring>& loaded_peer_features) {
-    if (!_db.local().get_replace_address()) {
-        throw std::runtime_error(format("replace_address is empty"));
-    }
-    auto replace_address = _db.local().get_replace_address().value();
-    slogger.info("Gathering node replacement information for {}", replace_address);
+storage_service::prepare_replacement_info(std::unordered_set<gms::inet_address> initial_contact_nodes) {
+    locator::host_id replace_host_id;
+    gms::inet_address replace_address;
 
-    // if (!MessagingService.instance().isListening())
-    //     MessagingService.instance().listen(FBUtilities.getLocalAddress());
+    auto& cfg = _db.local().get_config();
+    if (!cfg.replace_node_first_boot().empty()) {
+        replace_host_id = locator::host_id(utils::UUID(cfg.replace_node_first_boot()));
+    } else if (!cfg.replace_address_first_boot().empty()) {
+        replace_address = gms::inet_address(cfg.replace_address_first_boot());
+        slogger.warn("The replace_address_first_boot={} option is deprecated. Please use the replace_node_first_boot option", replace_address);
+    } else if (!cfg.replace_address().empty()) {
+        replace_address = gms::inet_address(cfg.replace_address());
+        slogger.warn("The replace_address={} option is deprecated. Please use the replace_node_first_boot option", replace_address);
+    } else {
+        on_internal_error(slogger, "No replace_node or replace_address configuration options found");
+    }
+
+    slogger.info("Gathering node replacement information for {}/{}", replace_host_id, replace_address);
+
     auto seeds = _gossiper.get_seeds();
     if (seeds.size() == 1 && seeds.contains(replace_address)) {
-        throw std::runtime_error(format("Cannot replace_address {} because no seed node is up", replace_address));
+        throw std::runtime_error(::format("Cannot replace_address {} because no seed node is up", replace_address));
     }
 
     // make magic happen
-    slogger.info("Checking remote features with gossip");
-    return _gossiper.do_shadow_round(initial_contact_nodes).then([this, loaded_peer_features, replace_address] {
-        auto local_features = _feature_service.known_feature_set();
-        _gossiper.check_knows_remote_features(local_features, loaded_peer_features);
+    slogger.info("Performing gossip shadow round");
+    co_await _gossiper.do_shadow_round(initial_contact_nodes, gms::gossiper::mandatory::yes);
 
-        // now that we've gossiped at least once, we should be able to find the node we're replacing
-        auto* state = _gossiper.get_endpoint_state_for_endpoint_ptr(replace_address);
-        if (!state) {
-            throw std::runtime_error(format("Cannot replace_address {} because it doesn't exist in gossip", replace_address));
+    // now that we've gossiped at least once, we should be able to find the node we're replacing
+    if (replace_host_id) {
+        auto node = _gossiper.get_node_ip(replace_host_id);
+        if (!node) {
+            throw std::runtime_error(::format("Replaced node with Host ID {} not found", replace_host_id));
         }
+        replace_address = *node;
+    } else {
+        replace_host_id = _gossiper.get_host_id(replace_address);
+    }
 
-        // Reject to replace a node that has left the ring
-        auto status = _gossiper.get_gossip_status(replace_address);
-        if (status == gms::versioned_value::STATUS_LEFT || status == gms::versioned_value::REMOVED_TOKEN) {
-            throw std::runtime_error(format("Cannot replace_address {} because it has left the ring, status={}", replace_address, status));
-        }
+    auto dc_rack = get_dc_rack_for(replace_host_id).value_or(locator::endpoint_dc_rack::default_location);
 
-        auto tokens = get_tokens_for(replace_address);
-        if (tokens.empty()) {
-            throw std::runtime_error(format("Could not find tokens for {} to replace", replace_address));
-        }
+    auto ri = replacement_info {
+        .dc_rack = std::move(dc_rack),
+        .host_id = std::move(replace_host_id),
+    };
 
-        replacement_info ret {std::move(tokens)};
+    slogger.info("Host {}/{} is replacing {}/{}", get_token_metadata().get_my_id(), get_broadcast_address(), replace_host_id, replace_address);
+    co_await _gossiper.reset_endpoint_state_map();
 
-        // use the replacee's host Id as our own so we receive hints, etc
-        auto host_id = _gossiper.get_host_id(replace_address);
-        return db::system_keyspace::set_local_host_id(host_id).discard_result().then([this, ret = std::move(ret)] () mutable {
-            return _gossiper.reset_endpoint_state_map().then([ret = std::move(ret)] () mutable { // clean up since we have what we need
-                return make_ready_future<replacement_info>(std::move(ret));
-            });
-        });
-    });
+    co_return ri;
 }
 
 future<std::map<gms::inet_address, float>> storage_service::get_ownership() {
@@ -1549,23 +2522,31 @@ future<std::map<gms::inet_address, float>> storage_service::get_ownership() {
         // describeOwnership returns tokens in an unspecified order, let's re-order them
         std::map<gms::inet_address, float> ownership;
         for (auto entry : token_map) {
-            gms::inet_address endpoint = tm.get_endpoint(entry.first).value();
+            locator::host_id id = tm.get_endpoint(entry.first).value();
             auto token_ownership = entry.second;
-            ownership[endpoint] += token_ownership;
+            ownership[ss._address_map.get(id)] += token_ownership;
         }
         return ownership;
     });
 }
 
-future<std::map<gms::inet_address, float>> storage_service::effective_ownership(sstring keyspace_name) {
-    return run_with_no_api_lock([keyspace_name] (storage_service& ss) mutable -> future<std::map<gms::inet_address, float>> {
+future<std::map<gms::inet_address, float>> storage_service::effective_ownership(sstring keyspace_name, sstring table_name) {
+    return run_with_no_api_lock([keyspace_name, table_name] (storage_service& ss) mutable -> future<std::map<gms::inet_address, float>> {
+        locator::effective_replication_map_ptr erm;
         if (keyspace_name != "") {
             //find throws no such keyspace if it is missing
             const replica::keyspace& ks = ss._db.local().find_keyspace(keyspace_name);
             // This is ugly, but it follows origin
             auto&& rs = ks.get_replication_strategy();  // clang complains about typeid(ks.get_replication_strategy());
-            if (typeid(rs) == typeid(locator::local_strategy)) {
+            if (rs.is_local()) {
                 throw std::runtime_error("Ownership values for keyspaces with LocalStrategy are meaningless");
+            }
+
+            if (table_name.empty()) {
+                erm = ks.get_static_effective_replication_map();
+            } else {
+                auto& cf = ss._db.local().find_column_family(keyspace_name, table_name);
+                erm = cf.get_effective_replication_map();
             }
         } else {
             auto non_system_keyspaces = ss._db.local().get_non_system_keyspaces();
@@ -1580,6 +2561,8 @@ future<std::map<gms::inet_address, float>> storage_service::effective_ownership(
                 throw std::runtime_error("Non-system keyspaces don't have the same replication settings, effective ownership information is meaningless");
             }
             keyspace_name = "system_traces";
+            const auto& ks = ss._db.local().find_keyspace(keyspace_name);
+            erm = ks.get_static_effective_replication_map();
         }
 
         // The following loops seems computationally heavy, but it's not as bad.
@@ -1587,9 +2570,19 @@ future<std::map<gms::inet_address, float>> storage_service::effective_ownership(
         // DC and all the instances in each DC.
         //
         // The call for get_range_for_endpoint is done once per endpoint
-        const auto& tm = ss.get_token_metadata();
-        const auto token_ownership = dht::token::describe_ownership(tm.sorted_tokens());
-        const auto datacenter_endpoints = tm.get_topology().get_datacenter_endpoints();
+        const auto& tm = *erm->get_token_metadata_ptr();
+        const auto tokens = co_await std::invoke([&]() -> future<utils::chunked_vector<token>> {
+            if (!erm->get_replication_strategy().uses_tablets()) {
+                return make_ready_future<utils::chunked_vector<token>>(tm.sorted_tokens());
+            } else {
+                auto& cf = ss._db.local().find_column_family(keyspace_name, table_name);
+                const auto& tablets = tm.tablets().get_tablet_map(cf.schema()->id());
+                return tablets.get_sorted_tokens();
+            }
+        });
+
+        const auto token_ownership = dht::token::describe_ownership(tokens);
+        const auto datacenter_endpoints = tm.get_topology().get_datacenter_host_ids();
         std::map<gms::inet_address, float> final_ownership;
 
         for (const auto& [dc, endpoints_map] : datacenter_endpoints) {
@@ -1597,13 +2590,13 @@ future<std::map<gms::inet_address, float>> storage_service::effective_ownership(
                 // calculate the ownership with replication and add the endpoint to the final ownership map
                 try {
                     float ownership = 0.0f;
-                    auto ranges = ss.get_ranges_for_endpoint(keyspace_name, endpoint);
+                    auto ranges = co_await ss.get_ranges_for_endpoint(*erm, endpoint);
                     for (auto& r : ranges) {
                         // get_ranges_for_endpoint will unwrap the first range.
-                        // With t0 t1 t2 t3, the first range (t3,t0] will be splitted
+                        // With t0 t1 t2 t3, the first range (t3,t0] will be split
                         // as (min,t0] and (t3,max]. Skippping the range (t3,max]
                         // we will get the correct ownership number as if the first
-                        // range were not splitted.
+                        // range were not split.
                         if (!r.end()) {
                             continue;
                         }
@@ -1613,10 +2606,10 @@ future<std::map<gms::inet_address, float>> storage_service::effective_ownership(
                             ownership += loc->second;
                         }
                     }
-                    final_ownership[endpoint] = ownership;
+                    final_ownership[ss._address_map.find(endpoint).value()] = ownership;
                 }  catch (replica::no_such_keyspace&) {
                     // In case ss.get_ranges_for_endpoint(keyspace_name, endpoint) is not found, just mark it as zero and continue
-                    final_ownership[endpoint] = 0;
+                    final_ownership[ss._address_map.find(endpoint).value()] = 0;
                 }
             }
         }
@@ -1624,32 +2617,24 @@ future<std::map<gms::inet_address, float>> storage_service::effective_ownership(
     });
 }
 
-static const std::map<storage_service::mode, sstring> mode_names = {
-    {storage_service::mode::STARTING,       "STARTING"},
-    {storage_service::mode::NORMAL,         "NORMAL"},
-    {storage_service::mode::JOINING,        "JOINING"},
-    {storage_service::mode::LEAVING,        "LEAVING"},
-    {storage_service::mode::DECOMMISSIONED, "DECOMMISSIONED"},
-    {storage_service::mode::MOVING,         "MOVING"},
-    {storage_service::mode::DRAINING,       "DRAINING"},
-    {storage_service::mode::DRAINED,        "DRAINED"},
-};
+void storage_service::set_mode(mode m) {
+    if (m == mode::MAINTENANCE && _operation_mode != mode::NONE) {
+        // Prevent from calling `start_maintenance_mode` after `join_cluster`.
+        on_fatal_internal_error(slogger, format("Node should enter maintenance mode only from mode::NONE (current mode: {})", _operation_mode));
+    }
+    if (m == mode::STARTING && _operation_mode == mode::MAINTENANCE) {
+        // Prevent from calling `join_cluster` after `start_maintenance_mode`.
+        on_fatal_internal_error(slogger, "Node in the maintenance mode cannot enter the starting mode");
+    }
 
-std::ostream& operator<<(std::ostream& os, const storage_service::mode& m) {
-    os << mode_names.at(m);
-    return os;
-}
-
-void storage_service::set_mode(mode m, bool log) {
-    set_mode(m, "", log);
-}
-
-void storage_service::set_mode(mode m, sstring msg, bool log) {
-    _operation_mode = m;
-    if (log) {
-        slogger.info("{}: {}", m, msg);
+    if (m != _operation_mode) {
+        slogger.info("entering {} mode", m);
+        _operation_mode = m;
     } else {
-        slogger.debug("{}: {}", m, msg);
+        // This shouldn't happen, but it's too much for an SCYLLA_ASSERT,
+        // so -- just emit a warning in the hope that it will be
+        // noticed, reported and fixed
+        slogger.warn("re-entering {} mode", m);
     }
 }
 
@@ -1661,30 +2646,38 @@ sstring storage_service::get_schema_version() {
     return _db.local().get_version().to_sstring();
 }
 
+cluster_info storage_service::describe_cluster() const {
+    return cluster_info{
+        .cluster_name = _gossiper.get_cluster_name(),
+        .partitioner = _gossiper.get_partitioner_name(),
+        .snitch_name = _snitch.local()->get_name()
+    };
+}
+
 static constexpr auto UNREACHABLE = "UNREACHABLE";
 
 future<std::unordered_map<sstring, std::vector<sstring>>> storage_service::describe_schema_versions() {
     auto live_hosts = _gossiper.get_live_members();
     std::unordered_map<sstring, std::vector<sstring>> results;
     netw::messaging_service& ms = _messaging.local();
-    return map_reduce(std::move(live_hosts), [&ms] (auto host) {
-        auto f0 = ms.send_schema_check(netw::msg_addr{ host, 0 });
+    return map_reduce(std::move(live_hosts), [&ms, as = abort_source()] (auto host) mutable {
+        auto f0 = ser::migration_manager_rpc_verbs::send_schema_check(&ms, host, as);
         return std::move(f0).then_wrapped([host] (auto f) {
             if (f.failed()) {
                 f.ignore_ready_future();
-                return std::pair<gms::inet_address, std::optional<utils::UUID>>(host, std::nullopt);
+                return std::pair<locator::host_id, std::optional<table_schema_version>>(host, std::nullopt);
             }
-            return std::pair<gms::inet_address, std::optional<utils::UUID>>(host, f.get0());
+            return std::pair<locator::host_id, std::optional<table_schema_version>>(host, f.get());
         });
-    }, std::move(results), [] (auto results, auto host_and_version) {
+    }, std::move(results), [this] (auto results, auto host_and_version) {
         auto version = host_and_version.second ? host_and_version.second->to_sstring() : UNREACHABLE;
-        results.try_emplace(version).first->second.emplace_back(host_and_version.first.to_sstring());
+        results.try_emplace(version).first->second.emplace_back(fmt::to_string(_address_map.get(host_and_version.first)));
         return results;
     }).then([this] (auto results) {
         // we're done: the results map is ready to return to the client.  the rest is just debug logging:
         auto it_unreachable = results.find(UNREACHABLE);
         if (it_unreachable != results.end()) {
-            slogger.debug("Hosts not in agreement. Didn't get a response from everybody: {}", ::join( ",", it_unreachable->second));
+            slogger.debug("Hosts not in agreement. Didn't get a response from everybody: {}", fmt::join(it_unreachable->second, ","));
         }
         auto my_version = get_schema_version();
         for (auto&& entry : results) {
@@ -1703,17 +2696,9 @@ future<std::unordered_map<sstring, std::vector<sstring>>> storage_service::descr
     });
 };
 
-future<sstring> storage_service::get_operation_mode() {
+future<storage_service::mode> storage_service::get_operation_mode() {
     return run_with_no_api_lock([] (storage_service& ss) {
-        auto mode = ss._operation_mode;
-        return make_ready_future<sstring>(format("{}", mode));
-    });
-}
-
-future<bool> storage_service::is_starting() {
-    return run_with_no_api_lock([] (storage_service& ss) {
-        auto mode = ss._operation_mode;
-        return mode == storage_service::mode::STARTING;
+        return make_ready_future<mode>(ss._operation_mode);
     });
 }
 
@@ -1724,198 +2709,147 @@ future<bool> storage_service::is_gossip_running() {
 }
 
 future<> storage_service::start_gossiping() {
-    return run_with_api_lock(sstring("start_gossiping"), [] (storage_service& ss) {
-        return seastar::async([&ss] {
-            if (!ss._initialized) {
-                slogger.warn("Starting gossip by operator request");
-                ss._gossiper.container().invoke_on_all(&gms::gossiper::start).get();
-                auto undo = defer([&ss] { ss._gossiper.container().invoke_on_all(&gms::gossiper::stop).get(); });
-                auto cdc_gen_ts = db::system_keyspace::get_cdc_generation_id().get0();
-                if (!cdc_gen_ts) {
-                    cdc_log.warn("CDC generation timestamp missing when starting gossip");
-                }
-                set_gossip_tokens(ss._gossiper,
-                        db::system_keyspace::get_local_tokens().get0(),
-                        cdc_gen_ts).get();
+    return run_with_api_lock(sstring("start_gossiping"), [] (storage_service& ss) -> future<> {
+        if (!ss._gossiper.is_enabled()) {
+            slogger.warn("Starting gossip by operator request");
+            co_await ss._gossiper.container().invoke_on_all(&gms::gossiper::start);
+            bool should_stop_gossiper = false; // undo action
+            try {
+                co_await set_gossip_tokens(ss._gossiper,
+                        co_await ss._sys_ks.local().get_local_tokens());
                 ss._gossiper.force_newer_generation();
-                ss._gossiper.start_gossiping(utils::get_generation_number()).then([&ss] {
-                    ss._initialized = true;
-                }).get();
-                undo.cancel();
+                co_await ss._gossiper.start_gossiping(gms::get_generation_number());
+            } catch (...) {
+                should_stop_gossiper = true;
             }
-        });
+            if (should_stop_gossiper) {
+                co_await ss._gossiper.container().invoke_on_all(&gms::gossiper::stop);
+            }
+        }
     });
 }
 
 future<> storage_service::stop_gossiping() {
     return run_with_api_lock(sstring("stop_gossiping"), [] (storage_service& ss) {
-        if (ss._initialized) {
+        if (ss._gossiper.is_enabled()) {
             slogger.warn("Stopping gossip by operator request");
-            return ss._gossiper.container().invoke_on_all(&gms::gossiper::stop).then([&ss] {
-                ss._initialized = false;
-            });
+            return ss._gossiper.container().invoke_on_all(&gms::gossiper::stop);
         }
         return make_ready_future<>();
     });
 }
 
-future<> storage_service::do_stop_ms() {
-    if (_ms_stopped) {
-        return make_ready_future<>();
+static size_t count_normal_token_owners(const topology& topology) {
+    return std::count_if(topology.normal_nodes.begin(), topology.normal_nodes.end(), [] (const auto& node) {
+        return !node.second.ring.value().tokens.empty();
+    });
+}
+
+future<> storage_service::raft_decommission() {
+    auto& raft_server = _group0->group0_server();
+    auto holder = _group0->hold_group0_gate();
+    utils::UUID request_id;
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        auto it = _topology_state_machine._topology.find(raft_server.id());
+        if (!it) {
+            throw std::runtime_error(::format("local node {} is not a member of the cluster", raft_server.id()));
+        }
+
+        const auto& rs = it->second;
+
+        if (rs.state != node_state::normal) {
+            throw std::runtime_error(::format("local node is not in the normal state (current state: {})", rs.state));
+        }
+
+        if (_topology_state_machine._topology.normal_nodes.size() == 1) {
+            throw std::runtime_error("Cannot decommission last node in the cluster");
+        }
+
+        if (!rs.ring.value().tokens.empty() && count_normal_token_owners(_topology_state_machine._topology) == 1) {
+            throw std::runtime_error("Cannot decommission the last token-owning node in the cluster");
+        }
+
+        auto validation_result = validate_removing_node(_db.local(), locator::host_id(raft_server.id().uuid()));
+        if (std::holds_alternative<node_validation_failure>(validation_result)) {
+            throw std::runtime_error(fmt::format("Decommission failed: node decommission rejected: {}",
+                                                 std::get<node_validation_failure>(validation_result).reason));
+        }
+
+        rtlogger.info("request decommission for: {}", raft_server.id());
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.with_node(raft_server.id())
+               .set("topology_request", topology_request::leave)
+               .set("request_id", guard.new_group0_state_id());
+        topology_request_tracking_mutation_builder rtbuilder(guard.new_group0_state_id(), _feature_service.topology_requests_type_column);
+        rtbuilder.set("initiating_host",_group0->group0_server().id().uuid())
+                 .set("done", false);
+        rtbuilder.set("request_type", topology_request::leave);
+        if (_feature_service.topology_requests_target_host_column) {
+            rtbuilder.set("target_host", raft_server.id().uuid());
+        }
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("decommission: request decommission for {}", raft_server.id()));
+
+        request_id = guard.new_group0_state_id();
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("decommission: concurrent operation is detected, retrying.");
+            continue;
+        }
+        break;
     }
-    _ms_stopped = true;
-    return _messaging.invoke_on_all([] (auto& ms) {
-        return ms.shutdown();
-    }).then([] {
-        slogger.info("messaging_service stopped");
-    });
+
+    rtlogger.info("decommission: waiting for completion (request ID: {})", request_id);
+    auto error = co_await wait_for_topology_request_completion(request_id);
+
+    if (!error.empty()) {
+        auto err = fmt::format("Decommission failed. See earlier errors ({}). Request ID: {}", error, request_id);
+        rtlogger.error("{}", err);
+        throw std::runtime_error(err);
+    }
 }
 
-future<> storage_service::node_ops_cmd_heartbeat_updater(const node_ops_cmd& cmd, utils::UUID uuid, std::list<gms::inet_address> nodes, lw_shared_ptr<bool> heartbeat_updater_done) {
-    return seastar::async([this, cmd, uuid, nodes = std::move(nodes), heartbeat_updater_done] {
-        std::string ops;
-        if (cmd == node_ops_cmd::decommission_heartbeat) {
-            ops = "decommission";
-        } else if (cmd == node_ops_cmd::removenode_heartbeat) {
-            ops = "removenode";
-        } else if (cmd == node_ops_cmd::replace_heartbeat) {
-            ops = "replace";
-        } else if (cmd == node_ops_cmd::bootstrap_heartbeat) {
-            ops = "bootstrap";
-        } else {
-            throw std::runtime_error(format("node_ops_cmd_heartbeat_updater: node_ops_cmd is not supported"));
-        }
-        slogger.info("{}[{}]: Started heartbeat_updater", ops, uuid);
-        while (!(*heartbeat_updater_done)) {
-            auto req = node_ops_cmd_request{cmd, uuid, {}, {}, {}};
-            parallel_for_each(nodes, [this, ops, uuid, &req] (const gms::inet_address& node) {
-                return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([ops, uuid, node] (node_ops_cmd_response resp) {
-                    slogger.debug("{}[{}]: Got heartbeat response from node={}", ops, uuid, node);
-                    return make_ready_future<>();
-                });
-            }).handle_exception([ops, uuid] (std::exception_ptr ep) {
-                slogger.warn("{}[{}]: Failed to send heartbeat: {}", ops, uuid, ep);
-            }).get();
-            int nr_seconds = 10;
-            while (!(*heartbeat_updater_done) && nr_seconds--) {
-                sleep(std::chrono::seconds(1)).get();
-            }
-        }
-        slogger.info("{}[{}]: Stopped heartbeat_updater", ops, uuid);
-    });
+future<> storage_service::drain_hints_before_leaving() {
+    auto holder = _async_gate.hold();
+    slogger.info("DECOMMISSIONING: draining hints");
+    try {
+        co_await _qp.proxy().container().invoke_on_all(&storage_proxy::drain_all_hints);
+    } catch (...) {
+        // Failing the barrier would only make the coordinator fence and barrier again;
+        // drain_for is one-shot, so it would not retry the drain.
+        slogger.warn("DECOMMISSIONING: draining hints failed, undelivered hints will be lost: {}", std::current_exception());
+        co_return;
+    }
+    slogger.info("DECOMMISSIONING: draining hints finished");
 }
 
-future<> storage_service::decommission() {
-    return run_with_api_lock(sstring("decommission"), [] (storage_service& ss) {
-        return seastar::async([&ss] {
-            auto uuid = utils::make_random_uuid();
-            auto tmptr = ss.get_token_metadata_ptr();
-            auto& db = ss._db.local();
-            auto endpoint = ss.get_broadcast_address();
-            if (!tmptr->is_member(endpoint)) {
-                throw std::runtime_error("local node is not a member of the token ring yet");
-            }
-
-            auto temp = tmptr->clone_after_all_left().get0();
-            auto num_tokens_after_all_left = temp.sorted_tokens().size();
-            temp.clear_gently().get();
-            if (num_tokens_after_all_left < 2) {
-                throw std::runtime_error("no other normal nodes in the ring; decommission would be pointless");
-            }
-
+future<> storage_service::decommission(sharded<db::snapshot_ctl>& snapshot_ctl) {
+    return run_with_api_lock(sstring("decommission"), [&] (storage_service& ss) {
+        return seastar::async([&] {
             if (ss._operation_mode != mode::NORMAL) {
-                throw std::runtime_error(format("Node in {} state; wait for status to become normal or restart", ss._operation_mode));
+                throw std::runtime_error(::format("Node in {} state; wait for status to become normal or restart", ss._operation_mode));
             }
 
-            ss.update_pending_ranges(format("decommission {}", endpoint)).get();
+            ss.raft_decommission().get();
 
-            auto non_system_keyspaces = db.get_non_system_keyspaces();
-            for (const auto& keyspace_name : non_system_keyspaces) {
-                if (ss.get_token_metadata().has_pending_ranges(keyspace_name, ss.get_broadcast_address())) {
-                    throw std::runtime_error("data is currently moving to this node; unable to leave the ring");
-                }
-            }
-
-            slogger.info("DECOMMISSIONING: starts");
-            auto leaving_nodes = std::list<gms::inet_address>{endpoint};
-            // TODO: wire ignore_nodes provided by user
-            std::list<gms::inet_address> ignore_nodes;
-
-            // Step 1: Decide who needs to sync data
-            std::list<gms::inet_address> nodes;
-            for (const auto& x : tmptr->get_endpoint_to_host_id_map_for_reading()) {
-                seastar::thread::maybe_yield();
-                if (std::find(ignore_nodes.begin(), ignore_nodes.end(), x.first) == ignore_nodes.end()) {
-                    nodes.push_back(x.first);
-                }
-            }
-            slogger.info("decommission[{}]: Started decommission operation, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-
-            // Step 2: Prepare to sync data
-            std::unordered_set<gms::inet_address> nodes_unknown_verb;
-            std::unordered_set<gms::inet_address> nodes_down;
-            auto req = node_ops_cmd_request{node_ops_cmd::decommission_prepare, uuid, ignore_nodes, leaving_nodes, {}};
-            try {
-                parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("decommission[{}]: Got prepare response from node={}", uuid, node);
-                    }).handle_exception_type([&nodes_unknown_verb, node, uuid] (seastar::rpc::unknown_verb_error&) {
-                        slogger.warn("decommission[{}]: Node {} does not support decommission verb", uuid, node);
-                        nodes_unknown_verb.emplace(node);
-                    }).handle_exception_type([&nodes_down, node, uuid] (seastar::rpc::closed_error&) {
-                        slogger.warn("decommission[{}]: Node {} is down for node_ops_cmd verb", uuid, node);
-                        nodes_down.emplace(node);
-                    });
-                }).get();
-                if (!nodes_unknown_verb.empty()) {
-                    auto msg = format("decommission[{}]: Nodes={} do not support decommission verb. Please upgrade your cluster and run decommission again.", uuid, nodes_unknown_verb);
-                    slogger.warn("{}", msg);
-                    throw std::runtime_error(msg);
-                }
-                if (!nodes_down.empty()) {
-                    auto msg = format("decommission[{}]: Nodes={} needed for decommission operation are down. It is highly recommended to fix the down nodes and try again. To proceed with best-effort mode which might cause data inconsistency, run nodetool decommission --ignore-dead-nodes <list_of_dead_nodes>. E.g., nodetool decommission --ignore-dead-nodes 127.0.0.1,127.0.0.2", uuid, nodes_down);
-                    slogger.warn("{}", msg);
-                    throw std::runtime_error(msg);
-                }
-
-                // Step 3: Start heartbeat updater
-                auto heartbeat_updater_done = make_lw_shared<bool>(false);
-                auto heartbeat_updater = ss.node_ops_cmd_heartbeat_updater(node_ops_cmd::decommission_heartbeat, uuid, nodes, heartbeat_updater_done);
-                auto stop_heartbeat_updater = defer([&] {
-                    *heartbeat_updater_done = true;
-                    heartbeat_updater.get();
-                });
-
-                // Step 5: Start to sync data
-                slogger.info("DECOMMISSIONING: unbootstrap starts");
-                ss.unbootstrap();
-                slogger.info("DECOMMISSIONING: unbootstrap done");
-
-                // Step 6: Finish
-                req.cmd = node_ops_cmd::decommission_done;
-                parallel_for_each(nodes, [&ss, &req, uuid] (const gms::inet_address& node) {
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("decommission[{}]: Got done response from node={}", uuid, node);
-                        return make_ready_future<>();
-                    });
-                }).get();
-                slogger.info("decommission[{}]: Finished decommission operation, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-            } catch (...) {
-                slogger.warn("decommission[{}]: Abort decommission operation started, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-                // we need to revert the effect of prepare verb the decommission ops is failed
-                req.cmd = node_ops_cmd::decommission_abort;
-                parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-                    if (nodes_unknown_verb.contains(node) || nodes_down.contains(node)) {
-                        // No need to revert previous prepare cmd for those who do not apply prepare cmd.
-                        return make_ready_future<>();
-                    }
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("decommission[{}]: Got abort response from node={}", uuid, node);
-                    });
-                }).get();
-                slogger.warn("decommission[{}]: Abort decommission operation finished, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-                throw;
-            }
+            // SCYLLADB-1693. In case we abort, the snapshot/backup mechanism need
+            // to remain open. Move it to after raft_decommission.
+            // In the case of a cluster snapshot, our nodes ownership
+            // or not of tables will be serialized by raft anyway, so
+            // should remain consistent. In that case we at worst coordinate
+            // from a node in "leave" status
+            // In the case of a local snapshot, ownership matters less,
+            // only sstables on disk, which should not change.
+            // In the case of backup, this operates on a snapshot, state of which
+            // is not affected.
+            snapshot_ctl.invoke_on_all([](auto& sctl) {
+                return sctl.disable_all_operations();
+            }).get();
+            slogger.info("DECOMMISSIONING: disabled backup and snapshots");
 
             ss.stop_transport().get();
             slogger.info("DECOMMISSIONING: stopped transport");
@@ -1925,625 +2859,212 @@ future<> storage_service::decommission() {
             }).get();
             slogger.info("DECOMMISSIONING: stop batchlog_manager done");
 
-            // Leave Raft group 0
-            ss._group0->leave_group0().get();
             // StageManager.shutdownNow();
-            db::system_keyspace::set_bootstrap_state(db::system_keyspace::bootstrap_state::DECOMMISSIONED).get();
+            ss._sys_ks.local().set_bootstrap_state(db::system_keyspace::bootstrap_state::DECOMMISSIONED).get();
             slogger.info("DECOMMISSIONING: set_bootstrap_state done");
-            ss.set_mode(mode::DECOMMISSIONED, true);
+            ss.set_mode(mode::DECOMMISSIONED);
+
             slogger.info("DECOMMISSIONING: done");
             // let op be responsible for killing the process
         });
     });
 }
 
-// Runs inside seastar::async context
-void storage_service::run_bootstrap_ops() {
-    auto uuid = utils::make_random_uuid();
-    // TODO: Specify ignore_nodes
-    std::list<gms::inet_address> ignore_nodes;
-    std::list<gms::inet_address> sync_nodes;
+future<> storage_service::raft_removenode(locator::host_id host_id, locator::host_id_or_endpoint_list ignore_nodes_params) {
+    auto id = raft::server_id{host_id.uuid()};
+    utils::UUID request_id;
 
-    auto start_time = std::chrono::steady_clock::now();
-    for (;;) {
-        sync_nodes.clear();
-        // Step 1: Decide who needs to sync data for bootstrap operation
-        for (const auto& x :_gossiper.endpoint_state_map) {
-            seastar::thread::maybe_yield();
-            const auto& node = x.first;
-            slogger.info("bootstrap[{}]: Check node={}, status={}", uuid, node, _gossiper.get_gossip_status(node));
-            if (node != get_broadcast_address() &&
-                    _gossiper.is_normal_ring_member(node) &&
-                    std::find(ignore_nodes.begin(), ignore_nodes.end(), x.first) == ignore_nodes.end()) {
-                sync_nodes.push_back(node);
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        auto it = _topology_state_machine._topology.find(id);
+
+        if (!it) {
+            throw std::runtime_error(::format("removenode: host id {} is not found in the cluster", host_id));
+        }
+
+        auto& rs = it->second; // not usable after yield
+
+        if (rs.state != node_state::normal) {
+            throw std::runtime_error(::format("removenode: node {} is in '{}' state. Wait for it to be in 'normal' state", id, rs.state));
+        }
+
+        if (!rs.ring.value().tokens.empty() && count_normal_token_owners(_topology_state_machine._topology) == 1) {
+            throw std::runtime_error(::format(
+                    "removenode: node {} cannot be removed because it is the last token-owning "
+                    "node in the cluster. If this node is unrecoverable, the cluster has entered an incorrect "
+                    "and unrecoverable state. All user data and a part of the system data is lost.",
+                    id));
+        }
+
+        if (_gossiper.is_alive(host_id)) {
+            const std::string message = ::format(
+                "removenode: Rejected removenode operation for node {}; "
+                "the node being removed is alive, maybe you should use decommission instead?",
+                id);
+            rtlogger.warn("{}", message);
+            throw std::runtime_error(message);
+        }
+
+        auto validation_result = validate_removing_node(_db.local(), host_id);
+        if (std::holds_alternative<node_validation_failure>(validation_result)) {
+            throw std::runtime_error(fmt::format("Removenode failed: node remove rejected: {}",
+                                                 std::get<node_validation_failure>(validation_result).reason));
+        }
+
+        auto ignored_ids = find_raft_nodes_from_hoeps(ignore_nodes_params);
+
+        for (auto ignored_id : ignored_ids) {
+            if (_gossiper.is_alive(locator::host_id(ignored_id.uuid()))) {
+                const std::string message = fmt::format(
+                    "removenode: Rejected removenode operation for node {}; ignored node {} is alive",
+                    id, ignored_id);
+                rtlogger.warn("{}", message);
+                throw std::runtime_error(message);
             }
         }
-        sync_nodes.push_front(get_broadcast_address());
 
-        // Step 2: Wait until no pending node operations
-        std::unordered_map<gms::inet_address, std::list<utils::UUID>> pending_ops;
-        auto req = node_ops_cmd_request(node_ops_cmd::query_pending_ops, uuid);
-        parallel_for_each(sync_nodes, [this, req, uuid, &pending_ops] (const gms::inet_address& node) {
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node, &pending_ops] (node_ops_cmd_response resp) {
-                slogger.debug("bootstrap[{}]: Got query_pending_ops response from node={}, resp.pending_ops={}", uuid, node, resp.pending_ops);
-                if (!resp.pending_ops.empty()) {
-                    pending_ops.emplace(node, resp.pending_ops);
-                }
-                return make_ready_future<>();
-            });
-        }).handle_exception([uuid] (std::exception_ptr ep) {
-            slogger.warn("bootstrap[{}]: Failed to query_pending_ops : {}", uuid, ep);
-        }).get();
-        if (pending_ops.empty()) {
-            break;
-        } else {
-            if (std::chrono::steady_clock::now() > start_time + std::chrono::seconds(60)) {
-                throw std::runtime_error(format("bootstrap[{}]: Found pending node ops = {}, reject bootstrap", uuid, pending_ops));
+        for (auto& [node_id, _] : _topology_state_machine._topology.normal_nodes) {
+            bool is_excluded = node_id == id
+                    || ignored_ids.contains(node_id)
+                    || _topology_state_machine._topology.excluded_tablet_nodes.contains(node_id);
+            if (!is_excluded && !_gossiper.is_alive(locator::host_id(node_id.uuid()))) {
+                const std::string message = ::format(
+                        "removenode: Rejected removenode operation for node {} because node {} is down and not ignored; "
+                        "if the node is down, restart it before retrying removenode; "
+                        "if the node is unrecoverable, retry removenode with the node added to the ignore list",
+                        id, node_id);
+                rtlogger.warn("{}", message);
+                throw std::runtime_error(message);
             }
-            slogger.warn("bootstrap[{}]: Found pending node ops = {}, sleep 5 seconds and check again", uuid, pending_ops);
-            sleep_abortable(std::chrono::seconds(5), _abort_source).get();
         }
+
+        // insert node that should be removed to ignore list so that other topology operations
+        // can ignore it
+        ignored_ids.insert(id);
+
+        rtlogger.info("request removenode for: {}, new ignored nodes: {}, existing ignore nodes: {}", id, ignored_ids, _topology_state_machine._topology.ignored_nodes);
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.add_ignored_nodes(ignored_ids).with_node(id)
+               .set("topology_request", topology_request::remove)
+               .set("request_id", guard.new_group0_state_id());
+        topology_request_tracking_mutation_builder rtbuilder(guard.new_group0_state_id(), _feature_service.topology_requests_type_column);
+        rtbuilder.set("initiating_host",_group0->group0_server().id().uuid())
+                 .set("done", false);
+        rtbuilder.set("request_type", topology_request::remove);
+        if (_feature_service.topology_requests_target_host_column) {
+            rtbuilder.set("target_host", id.uuid());
+        }
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("removenode: request remove for {}", id));
+
+        request_id = guard.new_group0_state_id();
+
+        if (auto itr = _topology_state_machine._topology.requests.find(id);
+                itr != _topology_state_machine._topology.requests.end() && itr->second == topology_request::remove) {
+            throw std::runtime_error("Removenode failed. Concurrent request for removal already in progress");
+        }
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("removenode: concurrent operation is detected, retrying.");
+            continue;
+        }
+
+        break;
     }
 
-    std::unordered_set<gms::inet_address> nodes_unknown_verb;
-    std::unordered_set<gms::inet_address> nodes_down;
-    std::unordered_set<gms::inet_address> nodes_aborted;
-    auto tokens = std::list<dht::token>(_bootstrap_tokens.begin(), _bootstrap_tokens.end());
-    std::unordered_map<gms::inet_address, std::list<dht::token>> bootstrap_nodes = {
-        {get_broadcast_address(), tokens},
-    };
-    auto req = node_ops_cmd_request(node_ops_cmd::bootstrap_prepare, uuid, ignore_nodes, {}, {}, bootstrap_nodes);
-    slogger.info("bootstrap[{}]: Started bootstrap operation, bootstrap_nodes={}, sync_nodes={}, ignore_nodes={}", uuid, bootstrap_nodes, sync_nodes, ignore_nodes);
-    try {
-        // Step 3: Prepare to sync data
-        parallel_for_each(sync_nodes, [this, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                slogger.debug("bootstrap[{}]: Got node_ops_cmd::bootstrap_prepare response from node={}", uuid, node);
-            }).handle_exception_type([&nodes_unknown_verb, node, uuid] (seastar::rpc::unknown_verb_error&) {
-                slogger.warn("bootstrap[{}]: Node {} does not support node_ops_cmd verb", uuid, node);
-                nodes_unknown_verb.emplace(node);
-            }).handle_exception_type([&nodes_down, node, uuid] (seastar::rpc::closed_error&) {
-                slogger.warn("bootstrap[{}]: Node {} is down for node_ops_cmd verb", uuid, node);
-                nodes_down.emplace(node);
-            });
-        }).get();
-        if (!nodes_unknown_verb.empty()) {
-            auto msg = format("bootstrap[{}]: Nodes={} do not support bootstrap verb. Please upgrade your cluster and run bootstrap again.", uuid, nodes_unknown_verb);
-            slogger.warn("{}", msg);
-            throw std::runtime_error(msg);
-        }
-        if (!nodes_down.empty()) {
-            auto msg = format("bootstrap[{}]: Nodes={} needed for bootstrap operation are down. It is highly recommended to fix the down nodes and try again. To proceed with best-effort mode which might cause data inconsistency, add --ignore-dead-nodes <list_of_dead_nodes>. E.g., scylla --ignore-dead-nodes 127.0.0.1,127.0.0.2", uuid, nodes_down);
-            slogger.warn("{}", msg);
-            throw std::runtime_error(msg);
-        }
+    rtlogger.info("removenode: waiting for completion (request ID: {})", request_id);
 
-        // Step 4: Start heartbeat updater
-        auto heartbeat_updater_done = make_lw_shared<bool>(false);
-        auto heartbeat_updater = node_ops_cmd_heartbeat_updater(node_ops_cmd::bootstrap_heartbeat, uuid, sync_nodes, heartbeat_updater_done);
-        auto stop_heartbeat_updater = defer([&] {
-            *heartbeat_updater_done = true;
-            heartbeat_updater.get();
-        });
+    // Wait until request completes
+    auto error = co_await wait_for_topology_request_completion(request_id);
 
-        // Step 5: Sync data for bootstrap
-        _repair.local().bootstrap_with_repair(get_token_metadata_ptr(), _bootstrap_tokens).get();
+    if (!error.empty()) {
+        auto err = fmt::format("Removenode failed. See earlier errors ({}). Request ID: {}", error, request_id);
+        rtlogger.error("{}", err);
+        throw std::runtime_error(err);
+    }
 
-        // Step 6: Finish
-        req.cmd = node_ops_cmd::bootstrap_done;
-        parallel_for_each(sync_nodes, [this, &req, &nodes_aborted, uuid] (const gms::inet_address& node) {
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([&nodes_aborted, uuid, node] (node_ops_cmd_response resp) {
-                nodes_aborted.emplace(node);
-                slogger.debug("bootstrap[{}]: Got done response from node={}", uuid, node);
-                return make_ready_future<>();
-            });
-        }).get();
-    } catch (...) {
-        slogger.error("bootstrap[{}]: Abort bootstrap operation started, bootstrap_nodes={}, sync_nodes={}, ignore_nodes={}: {}",
-                uuid, bootstrap_nodes, sync_nodes, ignore_nodes, std::current_exception());
-        // we need to revert the effect of prepare verb the bootstrap ops is failed
-        req.cmd = node_ops_cmd::bootstrap_abort;
-        parallel_for_each(sync_nodes, [this, &req, &nodes_unknown_verb, &nodes_down, &nodes_aborted, uuid] (const gms::inet_address& node) {
-            if (nodes_unknown_verb.contains(node) || nodes_down.contains(node) || nodes_aborted.contains(node)) {
-                // No need to revert previous prepare cmd for those who do not apply prepare cmd.
-                return make_ready_future<>();
+    rtlogger.info("Removenode succeeded. Request ID: {}", request_id);
+}
+
+future<> storage_service::mark_excluded(const std::vector<locator::host_id>& hosts) {
+    // Callers forward to shard 0 via run_with_no_api_lock (group0 is only set on shard 0).
+    SCYLLA_ASSERT(this_shard_id() == 0);
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        std::unordered_set<raft::server_id> raft_hosts;
+        for (auto host : hosts) {
+            if (_gossiper.is_alive(host)) {
+                const std::string message = ::format("Cannot mark host {} as excluded because it's alive", host);
+                rtlogger.warn("{}", message);
+                throw std::runtime_error(message);
             }
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                slogger.debug("bootstrap[{}]: Got abort response from node={}", uuid, node);
-            });
-        }).get();
-        slogger.error("bootstrap[{}]: Abort bootstrap operation finished, bootstrap_nodes={}, sync_nodes={}, ignore_nodes={}: {}",
-                uuid, bootstrap_nodes, sync_nodes, ignore_nodes, std::current_exception());
-        throw;
+            raft_hosts.insert(raft::server_id(host.uuid()));
+        }
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.add_ignored_nodes(raft_hosts);
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("Mark as excluded: {}", hosts));
+        rtlogger.info("Marking nodes as excluded: {}, previous set: {}", hosts, _topology_state_machine._topology.ignored_nodes);
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("mark_excluded: concurrent operation is detected, retrying.");
+            continue;
+        }
+        rtlogger.info("Nodes marked as excluded: {}", hosts);
+        break;
     }
 }
 
-// Runs inside seastar::async context
-void storage_service::run_replace_ops() {
-    if (!_db.local().get_replace_address()) {
-        throw std::runtime_error(format("replace_address is empty"));
-    }
-    auto replace_address = _db.local().get_replace_address().value();
-    auto uuid = utils::make_random_uuid();
-    std::list<gms::inet_address> ignore_nodes = get_ignore_dead_nodes_for_replace();
-    // Step 1: Decide who needs to sync data for replace operation
-    std::list<gms::inet_address> sync_nodes;
-    for (const auto& x :_gossiper.endpoint_state_map) {
-        seastar::thread::maybe_yield();
-        const auto& node = x.first;
-        slogger.debug("replace[{}]: Check node={}, status={}", uuid, node, _gossiper.get_gossip_status(node));
-        if (node != get_broadcast_address() &&
-                node != replace_address &&
-                _gossiper.is_normal_ring_member(node) &&
-                std::find(ignore_nodes.begin(), ignore_nodes.end(), x.first) == ignore_nodes.end()) {
-            sync_nodes.push_back(node);
-        }
-    }
-    sync_nodes.push_front(get_broadcast_address());
-    auto sync_nodes_generations = _gossiper.get_generation_for_nodes(sync_nodes).get();
-    // Map existing nodes to replacing nodes
-    std::unordered_map<gms::inet_address, gms::inet_address> replace_nodes = {
-        {replace_address, get_broadcast_address()},
-    };
-    std::unordered_set<gms::inet_address> nodes_unknown_verb;
-    std::unordered_set<gms::inet_address> nodes_down;
-    std::unordered_set<gms::inet_address> nodes_aborted;
-    auto req = node_ops_cmd_request{node_ops_cmd::replace_prepare, uuid, ignore_nodes, {}, replace_nodes};
-    slogger.info("replace[{}]: Started replace operation, replace_nodes={}, sync_nodes={}, ignore_nodes={}", uuid, replace_nodes, sync_nodes, ignore_nodes);
-    try {
-        // Step 2: Prepare to sync data
-        parallel_for_each(sync_nodes, [this, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                slogger.debug("replace[{}]: Got node_ops_cmd::replace_prepare response from node={}", uuid, node);
-            }).handle_exception_type([&nodes_unknown_verb, node, uuid] (seastar::rpc::unknown_verb_error&) {
-                slogger.warn("replace[{}]: Node {} does not support node_ops_cmd verb", uuid, node);
-                nodes_unknown_verb.emplace(node);
-            }).handle_exception_type([&nodes_down, node, uuid] (seastar::rpc::closed_error&) {
-                slogger.warn("replace[{}]: Node {} is down for node_ops_cmd verb", uuid, node);
-                nodes_down.emplace(node);
-            });
-        }).get();
-        if (!nodes_unknown_verb.empty()) {
-            auto msg = format("replace[{}]: Nodes={} do not support replace verb. Please upgrade your cluster and run replace again.", uuid, nodes_unknown_verb);
-            slogger.warn("{}", msg);
-            throw std::runtime_error(msg);
-        }
-        if (!nodes_down.empty()) {
-            auto msg = format("replace[{}]: Nodes={} needed for replace operation are down. It is highly recommended to fix the down nodes and try again. To proceed with best-effort mode which might cause data inconsistency, add --ignore-dead-nodes-for-replace <list_of_dead_nodes>. E.g., scylla --ignore-dead-nodes-for-replace 127.0.0.1,127.0.0.2", uuid, nodes_down);
-            slogger.warn("{}", msg);
-            throw std::runtime_error(msg);
-        }
-
-        // Step 3: Start heartbeat updater
-        auto heartbeat_updater_done = make_lw_shared<bool>(false);
-        auto heartbeat_updater = node_ops_cmd_heartbeat_updater(node_ops_cmd::replace_heartbeat, uuid, sync_nodes, heartbeat_updater_done);
-        auto stop_heartbeat_updater = defer([&] {
-            *heartbeat_updater_done = true;
-            heartbeat_updater.get();
-        });
-
-
-        // Step 4: Allow nodes in sync_nodes list to mark the replacing node as alive
-        _gossiper.advertise_to_nodes(sync_nodes_generations).get();
-        slogger.info("replace[{}]: Allow nodes={} to mark replacing node={} as alive", uuid, sync_nodes, get_broadcast_address());
-
-        // Step 5: Wait for nodes to finish marking the replacing node as live
-        req.cmd = node_ops_cmd::replace_prepare_mark_alive;
-        parallel_for_each(sync_nodes, [this, &req, uuid] (const gms::inet_address& node) {
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                slogger.debug("replace[{}]: Got prepare_mark_alive response from node={}", uuid, node);
-                return make_ready_future<>();
-            });
-        }).get();
-
-        // Step 6: Update pending ranges on nodes
-        req.cmd = node_ops_cmd::replace_prepare_pending_ranges;
-        parallel_for_each(sync_nodes, [this, &req, uuid] (const gms::inet_address& node) {
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                slogger.debug("replace[{}]: Got pending_ranges response from node={}", uuid, node);
-                return make_ready_future<>();
-            });
-        }).get();
-
-
-        // Step 7: Sync data for replace
-        if (is_repair_based_node_ops_enabled(streaming::stream_reason::replace)) {
-            slogger.info("replace[{}]: Using repair based node ops to sync data", uuid);
-            _repair.local().replace_with_repair(get_token_metadata_ptr(), _bootstrap_tokens, ignore_nodes).get();
-        } else {
-            slogger.info("replace[{}]: Using streaming based node ops to sync data", uuid);
-            dht::boot_strapper bs(_db, _stream_manager, _abort_source, get_broadcast_address(), _bootstrap_tokens, get_token_metadata_ptr());
-            bs.bootstrap(streaming::stream_reason::replace, _gossiper).get();
-        }
-
-
-        // Step 8: Finish
-        req.cmd = node_ops_cmd::replace_done;
-        parallel_for_each(sync_nodes, [this, &req, &nodes_aborted, uuid] (const gms::inet_address& node) {
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([&nodes_aborted, uuid, node] (node_ops_cmd_response resp) {
-                nodes_aborted.emplace(node);
-                slogger.debug("replace[{}]: Got done response from node={}", uuid, node);
-                return make_ready_future<>();
-            });
-        }).get();
-        // Allow any nodes to mark the replacing node as alive
-        _gossiper.advertise_to_nodes({}).get();
-        slogger.info("replace[{}]: Allow any nodes to mark replacing node={} as alive", uuid,  get_broadcast_address());
-    } catch (...) {
-        slogger.error("replace[{}]: Abort replace operation started, replace_nodes={}, sync_nodes={}, ignore_nodes={}: {}",
-                uuid, replace_nodes, sync_nodes, ignore_nodes, std::current_exception());
-        // we need to revert the effect of prepare verb the replace ops is failed
-        req.cmd = node_ops_cmd::replace_abort;
-        parallel_for_each(sync_nodes, [this, &req, &nodes_unknown_verb, &nodes_down, &nodes_aborted, uuid] (const gms::inet_address& node) {
-            if (nodes_unknown_verb.contains(node) || nodes_down.contains(node) || nodes_aborted.contains(node)) {
-                // No need to revert previous prepare cmd for those who do not apply prepare cmd.
-                return make_ready_future<>();
-            }
-            return _messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                slogger.debug("replace[{}]: Got abort response from node={}", uuid, node);
-            });
-        }).get();
-        slogger.error("replace[{}]: Abort replace operation finished, replace_nodes={}, sync_nodes={}, ignore_nodes={}: {}",
-                uuid, replace_nodes, sync_nodes, ignore_nodes, std::current_exception());
-        throw;
-    }
-}
-
-future<> storage_service::removenode(sstring host_id_string, std::list<gms::inet_address> ignore_nodes) {
-    return run_with_api_lock(sstring("removenode"), [host_id_string, ignore_nodes = std::move(ignore_nodes)] (storage_service& ss) mutable {
-        return seastar::async([&ss, host_id_string, ignore_nodes = std::move(ignore_nodes)] {
-            auto uuid = utils::make_random_uuid();
-            auto tmptr = ss.get_token_metadata_ptr();
-            auto host_id = utils::UUID(host_id_string);
-            auto endpoint_opt = tmptr->get_endpoint_for_host_id(host_id);
-            if (!endpoint_opt) {
-                throw std::runtime_error(format("removenode[{}]: Host ID not found in the cluster", uuid));
-            }
-            auto endpoint = *endpoint_opt;
-            auto tokens = tmptr->get_tokens(endpoint);
-            auto leaving_nodes = std::list<gms::inet_address>{endpoint};
-
-            // Step 1: Decide who needs to sync data
-            //
-            // By default, we require all nodes in the cluster to participate
-            // the removenode operation and sync data if needed. We fail the
-            // removenode operation if any of them is down or fails.
-            //
-            // If the user want the removenode opeartion to succeed even if some of the nodes
-            // are not available, the user has to explicitly pass a list of
-            // node that can be skipped for the operation.
-            std::list<gms::inet_address> nodes;
-            for (const auto& x : tmptr->get_endpoint_to_host_id_map_for_reading()) {
-                seastar::thread::maybe_yield();
-                if (x.first != endpoint && std::find(ignore_nodes.begin(), ignore_nodes.end(), x.first) == ignore_nodes.end()) {
-                    nodes.push_back(x.first);
-                }
-            }
-            slogger.info("removenode[{}]: Started removenode operation, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-
-            // Step 2: Prepare to sync data
-            std::unordered_set<gms::inet_address> nodes_unknown_verb;
-            std::unordered_set<gms::inet_address> nodes_down;
-            auto req = node_ops_cmd_request{node_ops_cmd::removenode_prepare, uuid, ignore_nodes, leaving_nodes, {}};
-            try {
-                parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("removenode[{}]: Got prepare response from node={}", uuid, node);
-                    }).handle_exception_type([&nodes_unknown_verb, node, uuid] (seastar::rpc::unknown_verb_error&) {
-                        slogger.warn("removenode[{}]: Node {} does not support removenode verb", uuid, node);
-                        nodes_unknown_verb.emplace(node);
-                    }).handle_exception_type([&nodes_down, node, uuid] (seastar::rpc::closed_error&) {
-                        slogger.warn("removenode[{}]: Node {} is down for node_ops_cmd verb", uuid, node);
-                        nodes_down.emplace(node);
-                    });
-                }).get();
-                if (!nodes_unknown_verb.empty()) {
-                    auto msg = format("removenode[{}]: Nodes={} do not support removenode verb. Please upgrade your cluster and run removenode again.", uuid, nodes_unknown_verb);
-                    slogger.warn("{}", msg);
-                    throw std::runtime_error(msg);
-                }
-                if (!nodes_down.empty()) {
-                    auto msg = format("removenode[{}]: Nodes={} needed for removenode operation are down. It is highly recommended to fix the down nodes and try again. To proceed with best-effort mode which might cause data inconsistency, run nodetool removenode --ignore-dead-nodes <list_of_dead_nodes> <host_id>. E.g., nodetool removenode --ignore-dead-nodes 127.0.0.1,127.0.0.2 817e9515-316f-4fe3-aaab-b00d6f12dddd", uuid, nodes_down);
-                    slogger.warn("{}", msg);
-                    throw std::runtime_error(msg);
-                }
-
-                // Step 3: Start heartbeat updater
-                auto heartbeat_updater_done = make_lw_shared<bool>(false);
-                auto heartbeat_updater = ss.node_ops_cmd_heartbeat_updater(node_ops_cmd::removenode_heartbeat, uuid, nodes, heartbeat_updater_done);
-                auto stop_heartbeat_updater = defer([&] {
-                    *heartbeat_updater_done = true;
-                    heartbeat_updater.get();
-                });
-
-                // Step 4: Start to sync data
-                req.cmd = node_ops_cmd::removenode_sync_data;
-                parallel_for_each(nodes, [&ss, &req, uuid] (const gms::inet_address& node) {
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("removenode[{}]: Got sync_data response from node={}", uuid, node);
-                        return make_ready_future<>();
-                    });
-                }).get();
-
-
-                // Step 5: Announce the node has left
-                ss._gossiper.advertise_token_removed(endpoint, host_id).get();
-                std::unordered_set<token> tmp(tokens.begin(), tokens.end());
-                ss.excise(std::move(tmp), endpoint).get();
-
-                // Step 6: Finish
-                req.cmd = node_ops_cmd::removenode_done;
-                parallel_for_each(nodes, [&ss, &req, uuid] (const gms::inet_address& node) {
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("removenode[{}]: Got done response from node={}", uuid, node);
-                        return make_ready_future<>();
-                    });
-                }).get();
-                ss._group0->leave_group0(endpoint).get();
-                slogger.info("removenode[{}]: Finished removenode operation, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-            } catch (...) {
-                // we need to revert the effect of prepare verb the removenode ops is failed
-                req.cmd = node_ops_cmd::removenode_abort;
-                parallel_for_each(nodes, [&ss, &req, &nodes_unknown_verb, &nodes_down, uuid] (const gms::inet_address& node) {
-                    if (nodes_unknown_verb.contains(node) || nodes_down.contains(node)) {
-                        // No need to revert previous prepare cmd for those who do not apply prepare cmd.
-                        return make_ready_future<>();
-                    }
-                    return ss._messaging.local().send_node_ops_cmd(netw::msg_addr(node), req).then([uuid, node] (node_ops_cmd_response resp) {
-                        slogger.debug("removenode[{}]: Got abort response from node={}", uuid, node);
-                    });
-                }).get();
-                slogger.info("removenode[{}]: Aborted removenode operation, removing node={}, sync_nodes={}, ignore_nodes={}", uuid, endpoint, nodes, ignore_nodes);
-                throw;
-            }
+future<> storage_service::removenode(locator::host_id host_id, locator::host_id_or_endpoint_list ignore_nodes_params) {
+    return run_with_no_api_lock([host_id, ignore_nodes_params = std::move(ignore_nodes_params)] (storage_service& ss) mutable {
+        return seastar::async([&ss, host_id, ignore_nodes_params = std::move(ignore_nodes_params)] () mutable {
+            ss.raft_removenode(host_id, std::move(ignore_nodes_params)).get();
         });
     });
 }
 
-void storage_service::node_ops_cmd_check(gms::inet_address coordinator, const node_ops_cmd_request& req) {
-    auto ops_uuids = boost::copy_range<std::vector<utils::UUID>>(_node_ops| boost::adaptors::map_keys);
-    std::string msg;
-    if (req.cmd == node_ops_cmd::removenode_prepare || req.cmd == node_ops_cmd::replace_prepare ||
-            req.cmd == node_ops_cmd::decommission_prepare || req.cmd == node_ops_cmd::bootstrap_prepare) {
-        // Peer node wants to start a new node operation. Make sure no pending node operation is in progress.
-        if (!_node_ops.empty()) {
-            msg = format("node_ops_cmd_check: Node {} rejected node_ops_cmd={} from node={} with ops_uuid={}, pending_node_ops={}, pending node ops is in progress",
-                    get_broadcast_address(), req.cmd, coordinator, req.ops_uuid, ops_uuids);
-        }
-    } else {
-        if (ops_uuids.size() == 1 && ops_uuids.front() == req.ops_uuid) {
-            // Check is good, since we know this ops_uuid and this is the only ops_uuid we are working on.
-        } else if (ops_uuids.size() == 0) {
-            // The ops_uuid received is unknown. Fail the request.
-            msg = format("node_ops_cmd_check: Node {} rejected node_ops_cmd={} from node={} with ops_uuid={}, pending_node_ops={}, the node ops is unknown",
-                    get_broadcast_address(), req.cmd, coordinator, req.ops_uuid, ops_uuids);
-        } else {
-            // Other node ops is in progress. Fail the request.
-            msg = format("node_ops_cmd_check: Node {} rejected node_ops_cmd={} from node={} with ops_uuid={}, pending_node_ops={}, pending node ops is in progress",
-                    get_broadcast_address(), req.cmd, coordinator, req.ops_uuid, ops_uuids);
-        }
+future<> storage_service::check_and_repair_cdc_streams() {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+
+    if (!_cdc_gens.local_is_initialized()) {
+        return make_exception_future<>(std::runtime_error("CDC generation service not initialized yet"));
     }
-    if (!msg.empty()) {
-        slogger.warn("{}", msg);
-        throw std::runtime_error(msg);
-    }
+
+    return raft_check_and_repair_cdc_streams();
 }
 
-future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_address coordinator, node_ops_cmd_request req) {
+
+future<node_ops_cmd_response> storage_service::node_ops_cmd_handler(gms::inet_address coordinator, std::optional<locator::host_id> coordinator_host_id, node_ops_cmd_request req) {
     return seastar::async([this, coordinator, req = std::move(req)] () mutable {
         auto ops_uuid = req.ops_uuid;
         slogger.debug("node_ops_cmd_handler cmd={}, ops_uuid={}", req.cmd, ops_uuid);
 
-        if (req.cmd == node_ops_cmd::query_pending_ops) {
-            bool ok = true;
-            auto ops_uuids = boost::copy_range<std::list<utils::UUID>>(_node_ops| boost::adaptors::map_keys);
-            node_ops_cmd_response resp(ok, ops_uuids);
-            slogger.debug("node_ops_cmd_handler: Got query_pending_ops request from {}, pending_ops={}", coordinator, ops_uuids);
-            return resp;
-        } else if (req.cmd == node_ops_cmd::repair_updater) {
+        if (req.cmd == node_ops_cmd::repair_updater) {
             slogger.debug("repair[{}]: Got repair_updater request from {}", ops_uuid, coordinator);
             _db.invoke_on_all([coordinator, ops_uuid, tables = req.repair_tables] (replica::database &db) {
                 for (const auto& table_id : tables) {
-                    auto& table = db.find_column_family(table_id);
-                    table.update_off_strategy_trigger();
-                    slogger.debug("repair[{}]: Updated off_strategy_trigger for table {}.{} by node {}",
-                            ops_uuid, table.schema()->ks_name(), table.schema()->cf_name(), coordinator);
+                    try {
+                        auto& table = db.find_column_family(table_id);
+                        table.update_off_strategy_trigger();
+                        slogger.debug("repair[{}]: Updated off_strategy_trigger for table {}.{} by node {}",
+                                ops_uuid, table.schema()->ks_name(), table.schema()->cf_name(), coordinator);
+                    } catch (replica::no_such_column_family&) {
+                        // The table could be dropped by user, ignore it.
+                    } catch (...) {
+                        throw;
+                    }
                 }
             }).get();
-            bool ok = true;
-            return node_ops_cmd_response(ok);
+            return node_ops_cmd_response(true);
         }
-
-        node_ops_cmd_check(coordinator, req);
-
-        if (req.cmd == node_ops_cmd::removenode_prepare) {
-            if (req.leaving_nodes.size() > 1) {
-                auto msg = format("removenode[{}]: Could not removenode more than one node at a time: leaving_nodes={}", req.ops_uuid, req.leaving_nodes);
-                slogger.warn("{}", msg);
-                throw std::runtime_error(msg);
-            }
-            mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
-                for (auto& node : req.leaving_nodes) {
-                    slogger.info("removenode[{}]: Added node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
-                    tmptr->add_leaving_endpoint(node);
-                }
-                return update_pending_ranges(tmptr, format("removenode {}", req.leaving_nodes));
-            }).get();
-            auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
-            auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
-                return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
-                    for (auto& node : req.leaving_nodes) {
-                        slogger.info("removenode[{}]: Removed node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
-                        tmptr->del_leaving_endpoint(node);
-                    }
-                    return update_pending_ranges(tmptr, format("removenode {}", req.leaving_nodes));
-                });
-            },
-            [this, ops_uuid] () mutable { node_ops_singal_abort(ops_uuid); });
-            _node_ops.emplace(ops_uuid, std::move(meta));
-        } else if (req.cmd == node_ops_cmd::removenode_heartbeat) {
-            slogger.debug("removenode[{}]: Updated heartbeat from coordinator={}", req.ops_uuid,  coordinator);
-            node_ops_update_heartbeat(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::removenode_done) {
-            slogger.info("removenode[{}]: Marked ops done from coordinator={}", req.ops_uuid, coordinator);
-            node_ops_done(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::removenode_sync_data) {
-            auto it = _node_ops.find(ops_uuid);
-            if (it == _node_ops.end()) {
-                throw std::runtime_error(format("removenode[{}]: Can not find ops_uuid={}", ops_uuid, ops_uuid));
-            }
-            auto ops = it->second.get_ops_info();
-            auto as = it->second.get_abort_source();
-            for (auto& node : req.leaving_nodes) {
-                if (is_repair_based_node_ops_enabled(streaming::stream_reason::removenode)) {
-                    slogger.info("removenode[{}]: Started to sync data for removing node={} using repair, coordinator={}", req.ops_uuid, node, coordinator);
-                    _repair.local().removenode_with_repair(get_token_metadata_ptr(), node, ops).get();
-                } else {
-                    slogger.info("removenode[{}]: Started to sync data for removing node={} using stream, coordinator={}", req.ops_uuid, node, coordinator);
-                    removenode_with_stream(node, as).get();
-                }
-            }
-        } else if (req.cmd == node_ops_cmd::removenode_abort) {
-            node_ops_abort(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::decommission_prepare) {
-            if (req.leaving_nodes.size() > 1) {
-                auto msg = format("decommission[{}]: Could not decommission more than one node at a time: leaving_nodes={}", req.ops_uuid, req.leaving_nodes);
-                slogger.warn("{}", msg);
-                throw std::runtime_error(msg);
-            }
-            mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
-                for (auto& node : req.leaving_nodes) {
-                    slogger.info("decommission[{}]: Added node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
-                    tmptr->add_leaving_endpoint(node);
-                }
-                return update_pending_ranges(tmptr, format("decommission {}", req.leaving_nodes));
-            }).get();
-            auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
-            auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
-                return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
-                    for (auto& node : req.leaving_nodes) {
-                        slogger.info("decommission[{}]: Removed node={} as leaving node, coordinator={}", req.ops_uuid, node, coordinator);
-                        tmptr->del_leaving_endpoint(node);
-                    }
-                    return update_pending_ranges(tmptr, format("decommission {}", req.leaving_nodes));
-                });
-            },
-            [this, ops_uuid] () mutable { node_ops_singal_abort(ops_uuid); });
-            _node_ops.emplace(ops_uuid, std::move(meta));
-        } else if (req.cmd == node_ops_cmd::decommission_heartbeat) {
-            slogger.debug("decommission[{}]: Updated heartbeat from coordinator={}", req.ops_uuid,  coordinator);
-            node_ops_update_heartbeat(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::decommission_done) {
-            slogger.info("decommission[{}]: Marked ops done from coordinator={}", req.ops_uuid, coordinator);
-            slogger.debug("Triggering off-strategy compaction for all non-system tables on decommission completion");
-            _db.invoke_on_all([](replica::database &db) {
-                for (auto& table : db.get_non_system_column_families()) {
-                    table->trigger_offstrategy_compaction();
-                }
-            }).get();
-            node_ops_done(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::decommission_abort) {
-            node_ops_abort(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::replace_prepare) {
-            // Mark the replacing node as replacing
-            if (req.replace_nodes.size() > 1) {
-                auto msg = format("replace[{}]: Could not replace more than one node at a time: replace_nodes={}", req.ops_uuid, req.replace_nodes);
-                slogger.warn("{}", msg);
-                throw std::runtime_error(msg);
-            }
-            mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
-                for (auto& x: req.replace_nodes) {
-                    auto existing_node = x.first;
-                    auto replacing_node = x.second;
-                    slogger.info("replace[{}]: Added replacing_node={} to replace existing_node={}, coordinator={}", req.ops_uuid, replacing_node, existing_node, coordinator);
-                    tmptr->add_replacing_endpoint(existing_node, replacing_node);
-                }
-                return make_ready_future<>();
-            }).get();
-            auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
-            auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
-                return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
-                    for (auto& x: req.replace_nodes) {
-                        auto existing_node = x.first;
-                        auto replacing_node = x.second;
-                        slogger.info("replace[{}]: Removed replacing_node={} to replace existing_node={}, coordinator={}", req.ops_uuid, replacing_node, existing_node, coordinator);
-                        tmptr->del_replacing_endpoint(existing_node);
-                    }
-                    return update_pending_ranges(tmptr, format("replace {}", req.replace_nodes));
-                });
-            },
-            [this, ops_uuid ] { node_ops_singal_abort(ops_uuid); });
-            _node_ops.emplace(ops_uuid, std::move(meta));
-        } else if (req.cmd == node_ops_cmd::replace_prepare_mark_alive) {
-            // Wait for local node has marked replacing node as alive
-            auto nodes = boost::copy_range<std::vector<inet_address>>(req.replace_nodes| boost::adaptors::map_values);
-            try {
-                _gossiper.wait_alive(nodes, std::chrono::milliseconds(120 * 1000)).get();
-            } catch (...) {
-                slogger.warn("replace[{}]: Failed to wait for marking replacing node as up, replace_nodes={}: {}",
-                        req.ops_uuid, req.replace_nodes, std::current_exception());
-                throw;
-            }
-        } else if (req.cmd == node_ops_cmd::replace_prepare_pending_ranges) {
-            // Update the pending_ranges for the replacing node
-            slogger.debug("replace[{}]: Updated pending_ranges from coordinator={}", req.ops_uuid, coordinator);
-            mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
-                return update_pending_ranges(tmptr, format("replace {}", req.replace_nodes));
-            }).get();
-        } else if (req.cmd == node_ops_cmd::replace_heartbeat) {
-            slogger.debug("replace[{}]: Updated heartbeat from coordinator={}", req.ops_uuid, coordinator);
-            node_ops_update_heartbeat(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::replace_done) {
-            slogger.info("replace[{}]: Marked ops done from coordinator={}", req.ops_uuid, coordinator);
-            node_ops_done(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::replace_abort) {
-            node_ops_abort(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::bootstrap_prepare) {
-            // Mark the bootstrap node as bootstrapping
-            if (req.bootstrap_nodes.size() > 1) {
-                auto msg = format("bootstrap[{}]: Could not bootstrap more than one node at a time: bootstrap_nodes={}", req.ops_uuid, req.bootstrap_nodes);
-                slogger.warn("{}", msg);
-                throw std::runtime_error(msg);
-            }
-            mutate_token_metadata([coordinator, &req, this] (mutable_token_metadata_ptr tmptr) mutable {
-                for (auto& x: req.bootstrap_nodes) {
-                    auto& endpoint = x.first;
-                    auto tokens = std::unordered_set<dht::token>(x.second.begin(), x.second.end());
-                    slogger.info("bootstrap[{}]: Added node={} as bootstrap, coordinator={}", req.ops_uuid, endpoint, coordinator);
-                    tmptr->add_bootstrap_tokens(tokens, endpoint);
-                }
-                return update_pending_ranges(tmptr, format("bootstrap {}", req.bootstrap_nodes));
-            }).get();
-            auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::move(req.ignore_nodes)});
-            auto meta = node_ops_meta_data(ops_uuid, coordinator, std::move(ops), [this, coordinator, req = std::move(req)] () mutable {
-                return mutate_token_metadata([this, coordinator, req = std::move(req)] (mutable_token_metadata_ptr tmptr) mutable {
-                    for (auto& x: req.bootstrap_nodes) {
-                        auto& endpoint = x.first;
-                        auto tokens = std::unordered_set<dht::token>(x.second.begin(), x.second.end());
-                        slogger.info("bootstrap[{}]: Removed node={} as bootstrap, coordinator={}", req.ops_uuid, endpoint, coordinator);
-                        tmptr->remove_bootstrap_tokens(tokens);
-                    }
-                    return update_pending_ranges(tmptr, format("bootstrap {}", req.bootstrap_nodes));
-                });
-            },
-            [this, ops_uuid ] { node_ops_singal_abort(ops_uuid); });
-            _node_ops.emplace(ops_uuid, std::move(meta));
-        } else if (req.cmd == node_ops_cmd::bootstrap_heartbeat) {
-            slogger.debug("bootstrap[{}]: Updated heartbeat from coordinator={}", req.ops_uuid, coordinator);
-            node_ops_update_heartbeat(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::bootstrap_done) {
-            slogger.info("bootstrap[{}]: Marked ops done from coordinator={}", req.ops_uuid, coordinator);
-            node_ops_done(ops_uuid);
-        } else if (req.cmd == node_ops_cmd::bootstrap_abort) {
-            node_ops_abort(ops_uuid);
-        } else {
-            auto msg = format("node_ops_cmd_handler: ops_uuid={}, unknown cmd={}", req.ops_uuid, req.cmd);
-            slogger.warn("{}", msg);
-            throw std::runtime_error(msg);
-        }
-        bool ok = true;
-        node_ops_cmd_response resp(ok);
-        return resp;
+        slogger.error("node_ops_cmd_handler cmd={}, ops_uuid={} this cmd is no longer supported", req.cmd, ops_uuid);
+        return node_ops_cmd_response(false);
     });
 }
 
@@ -2554,16 +3075,71 @@ future<> storage_service::drain() {
             return make_ready_future<>();
         }
 
-        ss.set_mode(mode::DRAINING, "starting drain process", true);
+        ss.set_mode(mode::DRAINING);
         return ss.do_drain().then([&ss] {
             ss._drain_finished.set_value();
-            ss.set_mode(mode::DRAINED, true);
+            ss.set_mode(mode::DRAINED);
         });
     });
 }
 
 future<> storage_service::do_drain() {
+    co_await utils::get_local_injector().inject("storage_service_drain_wait", utils::wait_for_message(60s));
+
+    // Hand the leadership of strongly consistent tablet groups led by this node
+    // over to other replicas. Otherwise the tablets we lead would stay unavailable for writes
+    // until the remaining replicas expired their election timeouts.
+    //
+    // This has to happen before stop_transport() below: the transfer is done with Raft RPCs,
+    // which need messaging_service to be up. That is also why it is not a part of
+    // groups_manager::stop_all_shards(), which runs only after the transport is gone.
+    try {
+        co_await _groups_manager.container().invoke_on_all(
+                &strong_consistency::groups_manager::stepdown_leaders);
+    } catch (...) {
+        slogger.warn("Failed to transfer Raft leadership of strongly consistent tablets: {}. Ignored.",
+                std::current_exception());
+    }
+
+    // Need to stop transport before group0, otherwise RPCs may fail with raft_group_not_found.
     co_await stop_transport();
+
+    // apply() of a strongly consistent group can wait for the group0 barrier of the
+    // migration manager. The drain below joins that barrier, and group0 stops later.
+    // A wait that outlives either of them ends in an internal error, so the groups stop
+    // first. Both stop after the transport: the CQL server lets its requests finish
+    // first, and the other nodes see this node as down before its groups go away.
+    co_await _groups_manager.stop_all_shards();
+
+    slogger.debug("shutting down migration manager");
+    co_await _migration_manager.invoke_on_all(&service::migration_manager::drain);
+
+    // Cancel write handlers that have pending remote targets so they release
+    // their ERMs (and the associated token_metadata versions). Without this,
+    // wait_for_group0_stop below may deadlock: the topology coordinator
+    // fiber calls barrier_and_drain which blocks in stale_versions_in_use()
+    // waiting for stale token_metadata versions held by write handlers
+    // whose MUTATION_DONE responses can no longer arrive (transport is stopped).
+    // Handlers with only local pending targets are left alone — they can
+    // still complete via apply_locally, and group0 needs them for raft commits
+    // until wait_for_group0_stop below.
+    co_await _qp.proxy().container().invoke_on_all([] (storage_proxy& sp) {
+        return sp.cancel_nonlocal_write_response_handlers();
+    });
+
+    // Drain view builder before group0, because the view builder uses group0 to coordinate view building.
+    // Drain after transport is stopped, because view_builder::drain aborts view writes for user writes as well.
+    co_await _view_builder.invoke_on_all(&db::view::view_builder::drain);
+    co_await _view_building_worker.invoke_on_all(&db::view::view_building_worker::drain);
+
+    // group0 persistence relies on local storage, so we need to stop group0 first.
+    // This must be kept in sync with defer_verbose_shutdown for group0 in main.cc to
+    // handle the case when initialization fails before reaching drain_on_shutdown for ss.
+    _sl_controller.local().abort_group0_operations();
+    co_await wait_for_group0_stop();
+    if (_group0) {
+        co_await _group0->abort_and_drain();
+    }
 
     co_await tracing::tracing::tracing_instance().invoke_on_all(&tracing::tracing::shutdown);
 
@@ -2571,40 +3147,523 @@ future<> storage_service::do_drain() {
         return bm.drain();
     });
 
-    set_mode(mode::DRAINING, "shutting down migration manager", false);
-    co_await _migration_manager.invoke_on_all(&service::migration_manager::drain);
+    // Stopping a repair seals the sstable it is writing, which on object
+    // storage needs the sstables registry that system_keyspace shutdown
+    // unplugs.
+    co_await _repair.invoke_on_all(&repair_service::shutdown);
 
-    set_mode(mode::DRAINING, "flushing column families", false);
+    co_await _sys_ks.invoke_on_all(&db::system_keyspace::drain);
     co_await _db.invoke_on_all(&replica::database::drain);
+    co_await _sys_ks.invoke_on_all(&db::system_keyspace::shutdown);
 }
 
-future<> storage_service::rebuild(sstring source_dc) {
-    return run_with_api_lock(sstring("rebuild"), [source_dc] (storage_service& ss) -> future<> {
-        slogger.info("rebuild from dc: {}", source_dc == "" ? "(any dc)" : source_dc);
-        auto tmptr = ss.get_token_metadata_ptr();
-        if (ss.is_repair_based_node_ops_enabled(streaming::stream_reason::rebuild)) {
-            co_await ss._repair.local().rebuild_with_repair(tmptr, std::move(source_dc));
+future<> storage_service::do_clusterwide_vnodes_cleanup() {
+    auto& raft_server = _group0->group0_server();
+    auto holder = _group0->hold_group0_gate();
+    utils::UUID request_id;
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        auto curr_req = _topology_state_machine._topology.global_request;
+        if (!_feature_service.topology_global_request_queue && curr_req && *curr_req != global_topology_request::cleanup) {
+            throw std::runtime_error{
+                "topology coordinator: cluster-wide vnodes cleanup: a different topology request is already pending, try again later"};
+        }
+
+
+        auto it = _topology_state_machine._topology.find(raft_server.id());
+        if (!it) {
+            throw std::runtime_error(::format("local node {} is not a member of the cluster", raft_server.id()));
+        }
+
+        const auto& rs = it->second;
+
+        if (rs.state != node_state::normal) {
+            throw std::runtime_error(::format("local node is not in the normal state (current state: {})", rs.state));
+        }
+
+        rtlogger.info("cluster-wide vnodes cleanup requested");
+        topology_mutation_builder builder(guard.write_timestamp());
+        utils::chunked_vector<canonical_mutation> muts;
+        if (_feature_service.topology_global_request_queue) {
+            request_id = guard.new_group0_state_id();
+            builder.queue_global_topology_request_id(request_id);
+            topology_request_tracking_mutation_builder rtbuilder(request_id, _feature_service.topology_requests_type_column);
+            rtbuilder.set("done", false)
+                     .set("start_time", db_clock::now())
+                     .set("request_type", global_topology_request::cleanup);
+            muts.push_back(rtbuilder.build());
         } else {
-            auto streamer = make_lw_shared<dht::range_streamer>(ss._db, ss._stream_manager, tmptr, ss._abort_source,
-                    ss.get_broadcast_address(), "Rebuild", streaming::stream_reason::rebuild);
-            streamer->add_source_filter(std::make_unique<dht::range_streamer::failure_detector_source_filter>(ss._gossiper.get_unreachable_members()));
-            if (source_dc != "") {
-                streamer->add_source_filter(std::make_unique<dht::range_streamer::single_datacenter_filter>(source_dc));
-            }
-            auto keyspaces = ss._db.local().get_non_system_keyspaces();
-            for (auto& keyspace_name : keyspaces) {
-                co_await streamer->add_ranges(keyspace_name, ss.get_ranges_for_endpoint(keyspace_name, utils::fb_utilities::get_broadcast_address()), ss._gossiper);
-            }
+            builder.set_global_topology_request(global_topology_request::cleanup);
+        }
+        muts.push_back(builder.build());
+        topology_change change{std::move(muts)};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("vnodes cleanup: cluster-wide cleanup requested"));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("cluster-wide vnodes cleanup: concurrent operation is detected, retrying.");
+            continue;
+        }
+        break;
+    }
+
+    if (request_id) {
+        // Wait until request completes
+        auto error = co_await wait_for_topology_request_completion(request_id);
+        if (!error.empty()) {
+            auto err = fmt::format("Cluster-wide vnodes cleanup failed. See earlier errors ({}). Request ID: {}", error, request_id);
+            rtlogger.error("{}", err);
+            throw std::runtime_error(err);
+        }
+    }
+
+    // The wait above only waits until the command is processed by the topology coordinator which start
+    // the vnodes cleanup process, but we still need to wait for it to complete here.
+    co_await _topology_state_machine.event.when([this] {
+        return std::all_of(_topology_state_machine._topology.normal_nodes.begin(), _topology_state_machine._topology.normal_nodes.end(), [] (auto& n) {
+            return n.second.cleanup == cleanup_status::clean;
+        });
+    });
+    rtlogger.info("cluster-wide vnodes cleanup done");
+}
+
+future<> storage_service::reset_cleanup_needed() {
+    auto& server = _group0->group0_server();
+    auto holder = _group0->hold_group0_gate();
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        auto me = _topology_state_machine._topology.find(server.id());
+        if (!me || me->second.state != node_state::normal) {
+            throw std::runtime_error(format("cannot mark the node as clean: local node {} is either not a member of the cluster or is not in a normal state", server.id()));
+        }
+        if (me->second.cleanup != cleanup_status::needed) {
+            rtlogger.info("cannot reset cleanup flag when it is {}", me->second.cleanup);
+            co_return;
+        }
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.with_node(server.id()).set("cleanup_status", cleanup_status::clean);
+
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("cleanup status reset by force for {}", server.id()));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as);
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("cleanup flag clearing: concurrent operation is detected, retrying.");
+            continue;
+        }
+        rtlogger.info("cleanup needed flag is reset by force");
+        break;
+    }
+}
+
+future<sstring> storage_service::wait_for_topology_request_completion(utils::UUID id, bool require_entry,
+                                                                     std::optional<lowres_clock::time_point> deadline,
+                                                                     abort_source* as) {
+    // Lets a test delay the caller between submitting the request and its first
+    // read of system.topology_requests.
+    co_await utils::get_local_injector().inject("topology_request_pause_before_wait",
+            utils::wait_for_message(std::chrono::minutes(5)));
+    abort_source wait_as;
+    const auto group0_sub = utils::chain_abort_source(wait_as, _group0_as);
+    const auto caller_sub = utils::chain_abort_source(wait_as, as);
+    co_return co_await _topology_state_machine.wait_for_request_completion(_sys_ks.local(),
+            _group0->client(), wait_as, id, require_entry, deadline);
+}
+
+future<> storage_service::abort_topology_request(utils::UUID request_id) {
+    co_await container().invoke_on(0, [request_id] (storage_service& ss) {
+        return ss._topology_state_machine.abort_request(*ss._group0, ss._group0_as, ss._feature_service, request_id);
+    });
+}
+
+future<> storage_service::wait_for_topology_not_busy(abort_source* as) {
+    // Must be called on shard 0: the topology state machine is only loaded and signalled there.
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    // Observe the locally applied state. Re-reading through a group0 guard on each wakeup would
+    // advance past the idle moment, which is only milliseconds wide while the coordinator retries
+    // a failed rebuild.
+    abort_source wait_as;
+    const auto group0_sub = utils::chain_abort_source(wait_as, _group0_as);
+    const auto caller_sub = utils::chain_abort_source(wait_as, as);
+    co_await _topology_state_machine.await_not_busy(wait_as);
+}
+
+future<> storage_service::alter_table_with_tablet_hints(table_id tid,
+                                                        std::optional<size_t> min_tablet_count,
+                                                        std::optional<size_t> max_tablet_count,
+                                                        wait_balancer wait_for_balancer,
+                                                        remove_unset erase_unset) {
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.alter_table_with_tablet_hints(tid, min_tablet_count, max_tablet_count, wait_for_balancer, erase_unset);
+        });
+    }
+
+    if (!min_tablet_count && !max_tablet_count && !erase_unset) {
+        slogger.info("alter_table_with_tablet_hints: the tablet hints passed are both nullopt, nothing to update");
+        co_return;
+    }
+
+    if (wait_for_balancer && (!min_tablet_count || !max_tablet_count || *min_tablet_count != *max_tablet_count)) {
+        throw std::invalid_argument(format(
+            "wait_balancer requires both min_tablet_count and max_tablet_count to be provided and equal, got min={} max={}",
+            min_tablet_count ? to_sstring(*min_tablet_count) : "nullopt",
+            max_tablet_count ? to_sstring(*max_tablet_count) : "nullopt"));
+    }
+
+    auto& mm = _migration_manager.local();
+    auto& sp = mm.get_storage_proxy();
+
+    while (true) {
+        auto group0_guard = co_await mm.start_group0_operation();
+
+        auto schema = _db.local().find_schema(tid);
+
+        // Start from existing tablet options to preserve any options
+        // not being modified (e.g. pow2_count).
+        auto tablet_options = schema->raw_tablet_options();
+        if (min_tablet_count) {
+            tablet_options["min_tablet_count"] = to_sstring(*min_tablet_count);
+        } else if (erase_unset) {
+            tablet_options.erase("min_tablet_count");
+        }
+        if (max_tablet_count) {
+            tablet_options["max_tablet_count"] = to_sstring(*max_tablet_count);
+        } else if (erase_unset) {
+            tablet_options.erase("max_tablet_count");
+        }
+
+        schema_builder builder(schema);
+        builder.set_tablet_options(std::move(tablet_options));
+        auto modified_schema = builder.build();
+
+        auto ts = group0_guard.write_timestamp();
+        sstring description = format("Altering table {}.{} with tablet count hints min_tablet_count={} max_tablet_count={}",
+            schema->ks_name(), schema->cf_name(),
+            min_tablet_count ? to_sstring(*min_tablet_count) : (erase_unset ? "removed" : "unchanged"),
+            max_tablet_count ? to_sstring(*max_tablet_count) : (erase_unset ? "removed" : "unchanged"));
+
+        auto mutations = co_await prepare_column_family_update_announcement(sp, modified_schema, /*view_updates=*/{}, ts);
+
+        if (!mutations.empty()) {
             try {
-                co_await streamer->stream_async();
-                slogger.info("Streaming for rebuild successful");
-            } catch (...) {
-                auto ep = std::current_exception();
-                // This is used exclusively through JMX, so log the full trace but only throw a simple RTE
-                slogger.warn("Error while rebuilding node: {}", ep);
-                std::rethrow_exception(std::move(ep));
+                co_await mm.announce(std::move(mutations), std::move(group0_guard), description);
+                break;
+            } catch (group0_concurrent_modification&) {
+                slogger.info("Concurrent operation is detected while starting, retrying.");
             }
         }
+    }
+
+    if (!wait_for_balancer) {
+        co_return;
+    }
+
+    while (true) {
+        auto tmptr = get_token_metadata_ptr();
+        auto& tmap = tmptr->tablets().get_tablet_map(tid);
+        auto tablet_count = tmap.tablet_count();
+
+        // FIXME: Checking tablet_count <= max_tablet_count should be enough, but the restore code currently has a limitation and it cannot handle
+        // any merges or splits until the restore transitions are done
+        if (tablet_count == *max_tablet_count) {
+            break;
+        }
+        co_await _topology_state_machine.event.when();
+        // FIXME: add an abort_source propagated from the root of the restore operation (SCYLLADB-1076)
+    }
+}
+
+future<> storage_service::abort_rf_change(utils::UUID request_id) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.abort_rf_change(request_id);
+        });
+    }
+
+    if (!_feature_service.rack_list_rf) {
+        throw std::runtime_error("The RACK_LIST_RF feature is not enabled on the cluster yet");
+    }
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        utils::chunked_vector<canonical_mutation> updates;
+        if (std::ranges::contains(_topology_state_machine._topology.paused_rf_change_requests, request_id)) {    // keyspace_rf_change_kind::conversion_to_rack_list
+            updates.push_back(canonical_mutation(topology_mutation_builder(guard.write_timestamp())
+                                .resume_rf_change_requests(_topology_state_machine._topology.paused_rf_change_requests, {request_id}).build()));
+            updates.push_back(canonical_mutation(topology_request_tracking_mutation_builder(request_id)
+                                .done("Aborted by user request")
+                                .build()));
+        } else if (std::ranges::contains(_topology_state_machine._topology.ongoing_rf_changes, request_id)) {    // keyspace_rf_change_kind::multi_rf_change
+            auto req_entry = co_await _sys_ks.local().get_topology_request_entry(request_id);
+            if (!req_entry.error.empty()) {
+                slogger.warn("RF change request with id '{}' was already aborted", request_id);
+                co_return;
+            }
+            sstring ks_name = *req_entry.new_keyspace_rf_change_ks_name;
+            if (!_db.local().has_keyspace(ks_name)) {
+                co_return;
+            }
+            auto& ks = _db.local().find_keyspace(ks_name);
+            // Check the tablet maps: if any tablet still has a missing replica
+            // (i.e., needs extending), we can abort. Otherwise, we're in the
+            // replica removal phase and aborting would require a rollback.
+            auto next_replication = ks.metadata()->next_strategy_options_opt().value()
+                | std::views::transform([] (const auto& pair) {
+                    return std::make_pair(pair.first, std::get<locator::rack_list>(pair.second));
+                }) | std::ranges::to<std::unordered_map<sstring, std::vector<sstring>>>();
+
+            const auto& tm = *get_token_metadata_ptr();
+            bool has_missing_replica = false;
+            auto all_tables = ks.metadata()->tables();
+            auto all_views = ks.metadata()->views()
+                | std::views::transform([] (const auto& view) { return schema_ptr(view); })
+                | std::ranges::to<std::vector<schema_ptr>>();
+            all_tables.insert(all_tables.end(), all_views.begin(), all_views.end());
+            for (const auto& table : all_tables) {
+                if (!tm.tablets().has_tablet_map(table->id()) || !tm.tablets().is_base_table(table->id())) {
+                    continue;
+                }
+                const auto& tmap = tm.tablets().get_tablet_map(table->id());
+                for (const auto& ti : tmap.tablets()) {
+                    std::unordered_map<sstring, std::vector<sstring>> dc_to_racks;
+                    for (const auto& r : ti.replicas) {
+                        const auto& node_dc_rack = tm.get_topology().get_node(r.host).dc_rack();
+                        dc_to_racks[node_dc_rack.dc].push_back(node_dc_rack.rack);
+                    }
+                    auto diff = subtract_replication(next_replication, dc_to_racks);
+                    if (!diff.empty()) {
+                        has_missing_replica = true;
+                        break;
+                    }
+                }
+                if (has_missing_replica) {
+                    break;
+                }
+            }
+
+            if (has_missing_replica) {
+                auto ks_md = make_lw_shared<data_dictionary::keyspace_metadata>(*ks.metadata());
+                ks_md->set_next_strategy_options(ks_md->strategy_options());
+                auto schema_muts = prepare_keyspace_update_announcement(_db.local(), ks_md, guard.write_timestamp());
+                for (auto& m : schema_muts) {
+                    updates.push_back(canonical_mutation(m));
+                }
+                updates.push_back(canonical_mutation(topology_request_tracking_mutation_builder(request_id)
+                                    .abort("Aborted by user request")
+                                    .build()));
+            } else {
+                slogger.warn("RF change request with id '{}' is ongoing, but it started removing replicas, so it can't be aborted", request_id);
+                co_return;
+            }
+        } else {
+            slogger.warn("RF change request with id '{}' can't be aborted", request_id);
+            co_return;
+        }
+
+        mixed_change change{std::move(updates)};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+                format("aborting rf change request {}", request_id));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            slogger.info("aborting request {}: concurrent modification, retrying.", request_id);
+            continue;
+        }
+        break;
+    }
+}
+
+bool storage_service::topology_global_queue_empty() const {
+    return !_topology_state_machine._topology.global_request.has_value();
+}
+
+
+future<> storage_service::raft_rebuild(utils::optional_param sdc_param) {
+    auto& raft_server = _group0->group0_server();
+    auto holder = _group0->hold_group0_gate();
+    utils::UUID request_id;
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        auto it = _topology_state_machine._topology.find(raft_server.id());
+        if (!it) {
+            throw std::runtime_error(::format("local node {} is not a member of the cluster", raft_server.id()));
+        }
+
+        const auto& rs = it->second;
+
+        if (rs.state != node_state::normal) {
+            throw std::runtime_error(::format("local node is not in the normal state (current state: {})", rs.state));
+        }
+
+        if (rs.ring.value().tokens.empty()) {
+            rtlogger.warn("local node does not own any tokens, skipping redundant rebuild");
+            co_return;
+        }
+
+        if (_topology_state_machine._topology.normal_nodes.size() == 1) {
+            throw std::runtime_error("Cannot rebuild a single node");
+        }
+
+        rtlogger.info("request rebuild for: {} source_dc={}", raft_server.id(), sdc_param);
+        topology_mutation_builder builder(guard.write_timestamp());
+        sstring source_dc = sdc_param.value_or("");
+        if (sdc_param.force() && !source_dc.empty()) {
+            source_dc += ":force";
+        }
+        builder.with_node(raft_server.id())
+               .set("topology_request", topology_request::rebuild)
+               .set("rebuild_option", source_dc)
+               .set("request_id", guard.new_group0_state_id());
+        topology_request_tracking_mutation_builder rtbuilder(guard.new_group0_state_id(), _feature_service.topology_requests_type_column);
+        rtbuilder.set("initiating_host",_group0->group0_server().id().uuid())
+                 .set("done", false);
+        rtbuilder.set("request_type", topology_request::rebuild);
+        if (_feature_service.topology_requests_target_host_column) {
+            rtbuilder.set("target_host", raft_server.id().uuid());
+        }
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, ::format("rebuild: request rebuild for {} ({})", raft_server.id(), source_dc));
+
+        request_id = guard.new_group0_state_id();
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("rebuild: concurrent operation is detected, retrying.");
+            continue;
+        }
+        break;
+    }
+
+    // Wait until request completes
+    auto err = co_await wait_for_topology_request_completion(request_id);
+    if (!err.empty()) {
+        throw std::runtime_error(::format("rebuild failed: {}", err));
+    }
+}
+
+future<> storage_service::raft_check_and_repair_cdc_streams() {
+    std::optional<cdc::generation_id> last_committed_gen;
+    utils::UUID request_id;
+
+    while (true) {
+        rtlogger.info("request check_and_repair_cdc_streams, refreshing topology");
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+        std::optional<global_topology_request> curr_req;
+        if (_topology_state_machine._topology.global_request) {
+            curr_req = *_topology_state_machine._topology.global_request;
+            request_id = _topology_state_machine._topology.global_request_id.value();
+        } else if (!_topology_state_machine._topology.global_requests_queue.empty()) {
+            request_id = _topology_state_machine._topology.global_requests_queue[0];
+            auto req_entry = co_await _sys_ks.local().get_topology_request_entry(request_id);
+            curr_req = std::get<global_topology_request>(req_entry.request_type);
+        } else {
+            request_id = utils::UUID{};
+        }
+
+        if (curr_req && *curr_req != global_topology_request::new_cdc_generation) {
+            if (!_feature_service.topology_global_request_queue) {
+                throw std::runtime_error{
+                    "check_and_repair_cdc_streams: a different topology request is already pending, try again later"};
+            } else {
+                request_id = utils::UUID{};
+            }
+        }
+
+        if (_topology_state_machine._topology.committed_cdc_generations.empty()) {
+            slogger.error("check_and_repair_cdc_streams: no committed CDC generations, requesting a new one.");
+        } else {
+            last_committed_gen = _topology_state_machine._topology.committed_cdc_generations.back();
+            auto gen = co_await _sys_ks.local().read_cdc_generation(last_committed_gen->id);
+            if (cdc::is_cdc_generation_optimal(gen, get_token_metadata())) {
+                cdc_log.info("CDC generation {} does not need repair", last_committed_gen);
+                co_return;
+            }
+            cdc_log.info("CDC generation {} needs repair, requesting a new one", last_committed_gen);
+        }
+
+        // With global request queue coalescing requests should not be needed, but test_cdc_generation_publishing assumes that multiple new_cdc_generation
+        // commands will be coalesced here, so do that until the test is fixed.
+        if (!request_id) {
+            topology_mutation_builder builder(guard.write_timestamp());
+            utils::chunked_vector<canonical_mutation> muts;
+            if (_feature_service.topology_global_request_queue) {
+                request_id = guard.new_group0_state_id();
+                topology_request_tracking_mutation_builder rtbuilder(request_id, _feature_service.topology_requests_type_column);
+                builder.queue_global_topology_request_id(request_id);
+                rtbuilder.set("done", false)
+                         .set("start_time", db_clock::now())
+                         .set("request_type", global_topology_request::new_cdc_generation);
+                muts.push_back(rtbuilder.build());
+            } else {
+                builder.set_global_topology_request(global_topology_request::new_cdc_generation);
+            }
+            muts.push_back(builder.build());
+            topology_change change{std::move(muts)};
+            group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+                    ::format("request check+repair CDC generation from {}", _group0->group0_server().id()));
+            try {
+                co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            } catch (group0_concurrent_modification&) {
+                rtlogger.info("request check+repair CDC: concurrent operation is detected, retrying.");
+                continue;
+            }
+        }
+        break;
+    }
+
+    if (request_id) {
+        // Wait until request completes
+        auto error = co_await wait_for_topology_request_completion(request_id);
+
+        if (!error.empty()) {
+            auto err = fmt::format("Check and repair cdc stream failed. See earlier errors ({}). Request ID: {}", error, request_id);
+            rtlogger.error("{}", err);
+            throw std::runtime_error(err);
+        }
+
+        auto gen = _topology_state_machine._topology.committed_cdc_generations.empty()
+                ? std::nullopt
+                : std::optional(_topology_state_machine._topology.committed_cdc_generations.back());
+
+        if (last_committed_gen == gen) {
+            on_internal_error(rtlogger, "Wrong generation after completion of check and repair cdc stream");
+        }
+    } else {
+        // Wait until we commit a new CDC generation.
+        co_await _topology_state_machine.event.when([this, &last_committed_gen] {
+            auto gen = _topology_state_machine._topology.committed_cdc_generations.empty()
+                    ? std::nullopt
+                    : std::optional(_topology_state_machine._topology.committed_cdc_generations.back());
+            return last_committed_gen != gen;
+        });
+    }
+}
+
+future<> storage_service::rebuild(utils::optional_param source_dc) {
+    return run_with_api_lock(sstring("rebuild"), [source_dc] (storage_service& ss) -> future<> {
+        if (auto tablets_keyspaces = ss._db.local().get_tablets_keyspaces(); !tablets_keyspaces.empty()) {
+            std::ranges::sort(tablets_keyspaces);
+            slogger.warn("Rebuild is not supported for the following tablets-enabled keyspaces: {}: "
+                    "Rebuild is not required for tablets-enabled keyspace after increasing replication factor. "
+                    "However, recovering from local data loss on this node requires running repair on all nodes in the datacenter", tablets_keyspaces);
+        }
+        co_await ss.raft_rebuild(source_dc);
     });
 }
 
@@ -2617,55 +3676,47 @@ int32_t storage_service::get_exception_count() {
     return 0;
 }
 
-future<bool> storage_service::is_initialized() {
-    return run_with_no_api_lock([] (storage_service& ss) {
-        return ss._initialized;
-    });
-}
-
-// Runs inside seastar::async context
-std::unordered_multimap<dht::token_range, inet_address> storage_service::get_changed_ranges_for_leaving(sstring keyspace_name, inet_address endpoint) {
+future<std::unordered_multimap<dht::token_range, locator::host_id>>
+storage_service::get_changed_ranges_for_leaving(const locator::vnode_effective_replication_map* erm, locator::host_id endpoint) {
     // First get all ranges the leaving endpoint is responsible for
-    auto ranges = get_ranges_for_endpoint(keyspace_name, endpoint);
+    auto ranges = co_await get_ranges_for_endpoint(*erm, endpoint);
 
     slogger.debug("Node {} ranges [{}]", endpoint, ranges);
 
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> current_replica_endpoints;
+    std::unordered_map<dht::token_range, host_id_vector_replica_set> current_replica_endpoints;
 
     // Find (for each range) all nodes that store replicas for these ranges as well
-    auto& ks = _db.local().find_keyspace(keyspace_name);
-    auto erm = ks.get_effective_replication_map();
     for (auto& r : ranges) {
         auto end_token = r.end() ? r.end()->value() : dht::maximum_token();
-        auto eps = erm->get_natural_endpoints(end_token);
+        auto eps = erm->get_natural_replicas(end_token);
         current_replica_endpoints.emplace(r, std::move(eps));
-        seastar::thread::maybe_yield();
+        co_await coroutine::maybe_yield();
     }
 
-    auto temp = get_token_metadata_ptr()->clone_after_all_left().get0();
+    auto temp = co_await get_token_metadata_ptr()->clone_after_all_left();
 
     // endpoint might or might not be 'leaving'. If it was not leaving (that is, removenode
     // command was used), it is still present in temp and must be removed.
-    if (temp.is_member(endpoint)) {
+    if (temp.is_normal_token_owner(endpoint)) {
         temp.remove_endpoint(endpoint);
     }
 
-    std::unordered_multimap<dht::token_range, inet_address> changed_ranges;
+    std::unordered_multimap<dht::token_range, locator::host_id> changed_ranges;
 
     // Go through the ranges and for each range check who will be
     // storing replicas for these ranges when the leaving endpoint
     // is gone. Whoever is present in newReplicaEndpoints list, but
     // not in the currentReplicaEndpoints list, will be needing the
     // range.
-    auto& rs = ks.get_replication_strategy();
+    const auto& rs = erm->get_replication_strategy();
     for (auto& r : ranges) {
         auto end_token = r.end() ? r.end()->value() : dht::maximum_token();
-        auto new_replica_endpoints = rs.calculate_natural_endpoints(end_token, temp).get0();
+        auto new_replica_endpoints = co_await rs.calculate_natural_endpoints(end_token, temp);
 
         auto rg = current_replica_endpoints.equal_range(r);
         for (auto it = rg.first; it != rg.second; it++) {
             const dht::token_range& range_ = it->first;
-            inet_address_vector_replica_set& current_eps = it->second;
+            host_id_vector_replica_set& current_eps = it->second;
             slogger.debug("range={}, current_replica_endpoints={}, new_replica_endpoints={}", range_, current_eps, new_replica_endpoints);
             for (auto ep : it->second) {
                 auto beg = new_replica_endpoints.begin();
@@ -2686,26 +3737,28 @@ std::unordered_multimap<dht::token_range, inet_address> storage_service::get_cha
         }
         // Replication strategy doesn't necessarily yield in calculate_natural_endpoints.
         // E.g. everywhere_replication_strategy
-        seastar::thread::maybe_yield();
+        co_await coroutine::maybe_yield();
     }
-    temp.clear_gently().get();
+    co_await temp.clear_gently();
 
-    return changed_ranges;
+    co_return changed_ranges;
 }
 
-// Runs inside seastar::async context
-void storage_service::unbootstrap() {
-    get_batchlog_manager().local().do_batch_log_replay().get();
-    if (is_repair_based_node_ops_enabled(streaming::stream_reason::decommission)) {
-        _repair.local().decommission_with_repair(get_token_metadata_ptr()).get();
-    } else {
-        std::unordered_map<sstring, std::unordered_multimap<dht::token_range, inet_address>> ranges_to_stream;
+future<> storage_service::unbootstrap() {
+    slogger.info("Started batchlog replay for decommission");
+    co_await get_batchlog_manager().local().do_batch_log_replay(db::batchlog_manager::post_replay_cleanup::yes);
+    slogger.info("Finished batchlog replay for decommission");
 
-        auto non_system_keyspaces = _db.local().get_non_system_keyspaces();
-        for (const auto& keyspace_name : non_system_keyspaces) {
-            auto ranges_mm = get_changed_ranges_for_leaving(keyspace_name, get_broadcast_address());
+    if (is_repair_based_node_ops_enabled(streaming::stream_reason::decommission)) {
+        co_await _repair.local().decommission_with_repair(get_token_metadata_ptr(), null_topology_guard);
+    } else {
+        std::unordered_map<sstring, std::unordered_multimap<dht::token_range, locator::host_id>> ranges_to_stream;
+
+        auto ks_erms = _db.local().get_non_local_strategy_keyspaces_erms();
+        for (const auto& [keyspace_name, erm] : ks_erms) {
+            auto ranges_mm = co_await get_changed_ranges_for_leaving(erm->maybe_as_vnode_effective_replication_map(), my_host_id());
             if (slogger.is_enabled(logging::log_level::debug)) {
-                std::vector<range<token>> ranges;
+                std::vector<wrapping_interval<token>> ranges;
                 for (auto& x : ranges_mm) {
                     ranges.push_back(x.first);
                 }
@@ -2714,43 +3767,36 @@ void storage_service::unbootstrap() {
             ranges_to_stream.emplace(keyspace_name, std::move(ranges_mm));
         }
 
-        set_mode(mode::LEAVING, "replaying batch log and streaming data to other nodes", true);
+        set_mode(mode::LEAVING);
 
-        auto stream_success = stream_ranges(ranges_to_stream);
-        // Wait for batch log to complete before streaming hints.
-        slogger.debug("waiting for batch log processing.");
-        // Start with BatchLog replay, which may create hints but no writes since this is no longer a valid endpoint.
-        get_batchlog_manager().local().do_batch_log_replay().get();
-
-        set_mode(mode::LEAVING, "streaming hints to other nodes", true);
+        auto stream_success = stream_ranges(std::move(ranges_to_stream));
 
         // wait for the transfer runnables to signal the latch.
         slogger.debug("waiting for stream acks.");
         try {
-            stream_success.get();
+            co_await std::move(stream_success);
         } catch (...) {
-            slogger.warn("unbootstrap fails to stream : {}", std::current_exception());
+            slogger.warn("unbootstrap fails to stream : {:t}", std::current_exception());
             throw;
         }
         slogger.debug("stream acks all received.");
     }
-    leave_ring().get();
 }
 
-// Runs inside seastar::async context
-void storage_service::removenode_add_ranges(lw_shared_ptr<dht::range_streamer> streamer, gms::inet_address leaving_node) {
-    auto my_address = get_broadcast_address();
-    auto non_system_keyspaces = _db.local().get_non_system_keyspaces();
-    for (const auto& keyspace_name : non_system_keyspaces) {
-        std::unordered_multimap<dht::token_range, inet_address> changed_ranges = get_changed_ranges_for_leaving(keyspace_name, leaving_node);
+future<> storage_service::removenode_add_ranges(lw_shared_ptr<dht::range_streamer> streamer, locator::host_id leaving_node) {
+    auto my_address = my_host_id();
+    auto ks_erms = _db.local().get_non_local_strategy_keyspaces_erms();
+    for (const auto& [keyspace_name, ermp] : ks_erms) {
+        auto* erm = ermp->maybe_as_vnode_effective_replication_map();
+        std::unordered_multimap<dht::token_range, locator::host_id> changed_ranges = co_await get_changed_ranges_for_leaving(erm, leaving_node);
         dht::token_range_vector my_new_ranges;
         for (auto& x : changed_ranges) {
             if (x.second == my_address) {
                 my_new_ranges.emplace_back(x.first);
             }
         }
-        std::unordered_multimap<inet_address, dht::token_range> source_ranges = get_new_source_ranges(keyspace_name, my_new_ranges);
-        std::unordered_map<inet_address, dht::token_range_vector> ranges_per_endpoint;
+        std::unordered_multimap<locator::host_id, dht::token_range> source_ranges = co_await get_new_source_ranges(erm, my_new_ranges);
+        std::unordered_map<locator::host_id, dht::token_range_vector> ranges_per_endpoint;
         for (auto& x : source_ranges) {
             ranges_per_endpoint[x.first].emplace_back(x.second);
         }
@@ -2758,186 +3804,33 @@ void storage_service::removenode_add_ranges(lw_shared_ptr<dht::range_streamer> s
     }
 }
 
-future<> storage_service::removenode_with_stream(gms::inet_address leaving_node, shared_ptr<abort_source> as_ptr) {
-    return seastar::async([this, leaving_node, as_ptr] {
+future<> storage_service::removenode_with_stream(locator::host_id leaving_node,
+                                                 frozen_topology_guard topo_guard,
+                                                 shared_ptr<abort_source> as_ptr) {
+    return seastar::async([this, leaving_node, as_ptr, topo_guard] {
         auto tmptr = get_token_metadata_ptr();
         abort_source as;
-        auto sub = _abort_source.subscribe([&as] () noexcept {
-            if (!as.abort_requested()) {
-                as.request_abort();
-            }
-        });
+        auto sub = utils::chain_abort_source(as, _abort_source);
         if (!as_ptr) {
             throw std::runtime_error("removenode_with_stream: abort_source is nullptr");
         }
-        auto as_ptr_sub = as_ptr->subscribe([&as] () noexcept {
-            if (!as.abort_requested()) {
-                as.request_abort();
-            }
-        });
-        auto streamer = make_lw_shared<dht::range_streamer>(_db, _stream_manager, tmptr, as, get_broadcast_address(), "Removenode", streaming::stream_reason::removenode);
-        removenode_add_ranges(streamer, leaving_node);
+        auto as_ptr_sub = utils::chain_abort_source(as, *as_ptr);
+        auto streamer = make_lw_shared<dht::range_streamer>(_stream_manager, tmptr, as, tmptr->get_my_id(), _snitch.local()->get_location(), "Removenode", streaming::stream_reason::removenode, topo_guard,
+                _db.local().get_config().consistent_rangemovement(), _db.local().get_config().stream_plan_ranges_fraction());
+        removenode_add_ranges(streamer, leaving_node).get();
         try {
             streamer->stream_async().get();
         } catch (...) {
-            slogger.warn("removenode_with_stream: stream failed: {}", std::current_exception());
+            slogger.warn("removenode_with_stream: stream failed: {:t}", std::current_exception());
             throw;
         }
     });
 }
 
-future<> storage_service::restore_replica_count(inet_address endpoint, inet_address notify_endpoint) {
-    if (is_repair_based_node_ops_enabled(streaming::stream_reason::removenode)) {
-        auto ops_uuid = utils::make_random_uuid();
-        auto ops = seastar::make_shared<node_ops_info>(node_ops_info{ops_uuid, false, std::list<gms::inet_address>()});
-        return _repair.local().removenode_with_repair(get_token_metadata_ptr(), endpoint, ops).finally([this, notify_endpoint] () {
-            return send_replication_notification(notify_endpoint);
-        });
-    }
-  return seastar::async([this, endpoint, notify_endpoint] {
-    auto tmptr = get_token_metadata_ptr();
-    abort_source as;
-    auto sub = _abort_source.subscribe([&as] () noexcept {
-        if (!as.abort_requested()) {
-            as.request_abort();
-        }
-    });
-    auto streamer = make_lw_shared<dht::range_streamer>(_db, _stream_manager, tmptr, as, get_broadcast_address(), "Restore_replica_count", streaming::stream_reason::removenode);
-    removenode_add_ranges(streamer, endpoint);
-    auto status_checker = seastar::async([this, endpoint, &as] {
-        slogger.info("restore_replica_count: Started status checker for removing node {}", endpoint);
-        while (!as.abort_requested()) {
-            auto status = _gossiper.get_gossip_status(endpoint);
-            // If the node to be removed is already in removed status, it has
-            // probably been removed forcely with `nodetool removenode force`.
-            // Abort the restore_replica_count in such case to avoid streaming
-            // attempt since the user has removed the node forcely.
-            if (status == sstring(versioned_value::REMOVED_TOKEN)) {
-                slogger.info("restore_replica_count: Detected node {} has left the cluster, status={}, abort restore_replica_count for removing node {}",
-                        endpoint, status, endpoint);
-                if (!as.abort_requested()) {
-                    as.request_abort();
-                }
-                return;
-            }
-            slogger.debug("restore_replica_count: Sleep and detect removing node {}, status={}", endpoint, status);
-            sleep_abortable(std::chrono::seconds(10), as).get();
-        }
-    });
-    auto stop_status_checker = defer([endpoint, &status_checker, &as] () mutable {
-        try {
-            slogger.info("restore_replica_count: Started to stop status checker for removing node {}", endpoint);
-            if (!as.abort_requested()) {
-                as.request_abort();
-            }
-            status_checker.get();
-        } catch (const seastar::sleep_aborted& ignored) {
-            slogger.debug("restore_replica_count: Got sleep_abort to stop status checker for removing node {}: {}", endpoint, ignored);
-        } catch (...) {
-            slogger.warn("restore_replica_count: Found error in status checker for removing node {}: {}",
-                    endpoint, std::current_exception());
-        }
-        slogger.info("restore_replica_count: Finished to stop status checker for removing node {}", endpoint);
-    });
-
-    streamer->stream_async().then_wrapped([this, streamer, notify_endpoint] (auto&& f) {
-        try {
-            f.get();
-            return this->send_replication_notification(notify_endpoint);
-        } catch (...) {
-            slogger.warn("Streaming to restore replica count failed: {}", std::current_exception());
-            // We still want to send the notification
-            return this->send_replication_notification(notify_endpoint);
-        }
-        return make_ready_future<>();
-    }).get();
-  });
-}
-
-future<> storage_service::excise(std::unordered_set<token> tokens, inet_address endpoint) {
-    slogger.info("Removing tokens {} for {}", tokens, endpoint);
-    // FIXME: HintedHandOffManager.instance.deleteHintsForEndpoint(endpoint);
-    co_await remove_endpoint(endpoint);
-    auto tmlock = std::make_optional(co_await get_token_metadata_lock());
-    auto tmptr = co_await get_mutable_token_metadata_ptr();
-    tmptr->remove_endpoint(endpoint);
-    tmptr->remove_bootstrap_tokens(tokens);
-
-    co_await update_pending_ranges(tmptr, format("excise {}", endpoint));
-    co_await replicate_to_all_cores(std::move(tmptr));
-    tmlock.reset();
-
-    co_await notify_left(endpoint);
-}
-
-future<> storage_service::excise(std::unordered_set<token> tokens, inet_address endpoint, int64_t expire_time) {
-    add_expire_time_if_found(endpoint, expire_time);
-    return excise(tokens, endpoint);
-}
-
-future<> storage_service::send_replication_notification(inet_address remote) {
-    // notify the remote token
-    auto done = make_shared<bool>(false);
-    auto local = get_broadcast_address();
-    auto sent = make_lw_shared<int>(0);
-    slogger.debug("Notifying {} of replication completion", remote);
-    return do_until(
-        [this, done, sent, remote] {
-            // The node can send REPLICATION_FINISHED to itself, in which case
-            // is_alive will be true. If the messaging_service is stopped,
-            // REPLICATION_FINISHED can be sent infinitely here. To fix, limit
-            // the number of retries.
-            return *done || !_gossiper.is_alive(remote) || *sent >= 3;
-        },
-        [this, done, sent, remote, local] {
-            netw::msg_addr id{remote, 0};
-            (*sent)++;
-            return _messaging.local().send_replication_finished(id, local).then_wrapped([id, done] (auto&& f) {
-                try {
-                    f.get();
-                    *done = true;
-                } catch (...) {
-                    slogger.warn("Fail to send REPLICATION_FINISHED to {}: {}", id, std::current_exception());
-                }
-            });
-        }
-    );
-}
-
-future<> storage_service::confirm_replication(inet_address node) {
-    return run_with_no_api_lock([node] (storage_service& ss) {
-        auto removing_node = bool(ss._removing_node) ? format("{}", *ss._removing_node) : "NONE";
-        slogger.info("Got confirm_replication from {}, removing_node {}", node, removing_node);
-        // replicatingNodes can be empty in the case where this node used to be a removal coordinator,
-        // but restarted before all 'replication finished' messages arrived. In that case, we'll
-        // still go ahead and acknowledge it.
-        if (!ss._replicating_nodes.empty()) {
-            ss._replicating_nodes.erase(node);
-        } else {
-            slogger.info("Received unexpected REPLICATION_FINISHED message from {}. Was this node recently a removal coordinator?", node);
-        }
-    });
-}
-
-future<> storage_service::leave_ring() {
-    co_await db::system_keyspace::set_bootstrap_state(db::system_keyspace::bootstrap_state::NEEDS_BOOTSTRAP);
-    co_await mutate_token_metadata([this] (mutable_token_metadata_ptr tmptr) {
-        auto endpoint = get_broadcast_address();
-        tmptr->remove_endpoint(endpoint);
-        return update_pending_ranges(std::move(tmptr), format("leave_ring {}", endpoint));
-    });
-
-    auto expire_time = _gossiper.compute_expire_time().time_since_epoch().count();
-    co_await _gossiper.add_local_application_state(gms::application_state::STATUS,
-            versioned_value::left(co_await db::system_keyspace::get_local_tokens(), expire_time));
-    auto delay = std::max(get_ring_delay(), gms::gossiper::INTERVAL);
-    slogger.info("Announcing that I have left the ring for {}ms", delay.count());
-    co_await sleep_abortable(delay, _abort_source);
-}
-
 future<>
-storage_service::stream_ranges(std::unordered_map<sstring, std::unordered_multimap<dht::token_range, inet_address>> ranges_to_stream_by_keyspace) {
-    auto streamer = make_lw_shared<dht::range_streamer>(_db, _stream_manager, get_token_metadata_ptr(), _abort_source, get_broadcast_address(), "Unbootstrap", streaming::stream_reason::decommission);
+storage_service::stream_ranges(std::unordered_map<sstring, std::unordered_multimap<dht::token_range, locator::host_id>> ranges_to_stream_by_keyspace) {
+    auto streamer = dht::range_streamer(_stream_manager, get_token_metadata_ptr(), _abort_source, get_token_metadata_ptr()->get_my_id(), _snitch.local()->get_location(), "Unbootstrap", streaming::stream_reason::decommission, null_topology_guard,
+            _db.local().get_config().consistent_rangemovement(), _db.local().get_config().stream_plan_ranges_fraction());
     for (auto& entry : ranges_to_stream_by_keyspace) {
         const auto& keyspace = entry.first;
         auto& ranges_with_endpoints = entry.second;
@@ -2946,38 +3839,27 @@ storage_service::stream_ranges(std::unordered_map<sstring, std::unordered_multim
             continue;
         }
 
-        std::unordered_map<inet_address, dht::token_range_vector> ranges_per_endpoint;
+        std::unordered_map<locator::host_id, dht::token_range_vector> ranges_per_endpoint;
         for (auto& end_point_entry : ranges_with_endpoints) {
             dht::token_range r = end_point_entry.first;
-            inet_address endpoint = end_point_entry.second;
+            locator::host_id endpoint = end_point_entry.second;
             ranges_per_endpoint[endpoint].emplace_back(r);
+            co_await coroutine::maybe_yield();
         }
-        streamer->add_tx_ranges(keyspace, std::move(ranges_per_endpoint));
+        streamer.add_tx_ranges(keyspace, std::move(ranges_per_endpoint));
     }
-    return streamer->stream_async().then([streamer] {
+    try {
+        co_await streamer.stream_async();
         slogger.info("stream_ranges successful");
-    }).handle_exception([] (auto ep) {
+    } catch (...) {
+        auto ep = std::current_exception();
         slogger.warn("stream_ranges failed: {}", ep);
-        return make_exception_future<>(std::move(ep));
-    });
-}
-
-future<> storage_service::start_leaving() {
-    return _gossiper.add_local_application_state(application_state::STATUS, versioned_value::leaving(db::system_keyspace::get_local_tokens().get0())).then([this] {
-        return mutate_token_metadata([this] (mutable_token_metadata_ptr tmptr) {
-            auto endpoint = get_broadcast_address();
-            tmptr->add_leaving_endpoint(endpoint);
-            return update_pending_ranges(std::move(tmptr), format("start_leaving {}", endpoint));
-        });
-    });
-}
-
-void storage_service::add_expire_time_if_found(inet_address endpoint, int64_t expire_time) {
-    if (expire_time != 0L) {
-        using clk = gms::gossiper::clk;
-        auto time = clk::time_point(clk::duration(expire_time));
-        _gossiper.add_expire_time_for_endpoint(endpoint, time);
+        std::rethrow_exception(std::move(ep));
     }
+}
+
+bool storage_service::is_raft_leader() const noexcept {
+    return _group0->joined_group0() && _group0->group0_server().is_leader();
 }
 
 future<> storage_service::shutdown_protocol_servers() {
@@ -2994,27 +3876,25 @@ future<> storage_service::shutdown_protocol_servers() {
     }
 }
 
-std::unordered_multimap<inet_address, dht::token_range>
-storage_service::get_new_source_ranges(const sstring& keyspace_name, const dht::token_range_vector& ranges) const {
-    auto my_address = get_broadcast_address();
-    auto& ks = _db.local().find_keyspace(keyspace_name);
-    auto erm = ks.get_effective_replication_map();
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> range_addresses = erm->get_range_addresses();
-    std::unordered_multimap<inet_address, dht::token_range> source_ranges;
+future<std::unordered_multimap<locator::host_id, dht::token_range>>
+storage_service::get_new_source_ranges(const locator::vnode_effective_replication_map* erm, const dht::token_range_vector& ranges) const {
+    auto my_address = my_host_id();
+    std::unordered_map<dht::token_range, host_id_vector_replica_set> range_addresses = co_await erm->get_range_host_ids();
+    std::unordered_multimap<locator::host_id, dht::token_range> source_ranges;
 
     // find alive sources for our new ranges
+    auto tmptr = erm->get_token_metadata_ptr();
     for (auto r : ranges) {
-        inet_address_vector_replica_set possible_nodes;
+        host_id_vector_replica_set sources;
         auto it = range_addresses.find(r);
         if (it != range_addresses.end()) {
-            possible_nodes = it->second;
+            sources = it->second;
         }
 
-        auto& snitch = locator::i_endpoint_snitch::get_local_snitch_ptr();
-        inet_address_vector_replica_set sources = snitch->get_sorted_list_by_proximity(my_address, possible_nodes);
+        tmptr->get_topology().sort_by_proximity(my_address, sources);
 
         if (std::find(sources.begin(), sources.end(), my_address) != sources.end()) {
-            auto err = format("get_new_source_ranges: sources={}, my_address={}", sources, my_address);
+            auto err = ::format("get_new_source_ranges: sources={}, my_address={}", sources, my_address);
             slogger.warn("{}", err);
             throw std::runtime_error(err);
         }
@@ -3026,82 +3906,91 @@ storage_service::get_new_source_ranges(const sstring& keyspace_name, const dht::
                 break;
             }
         }
+
+        co_await coroutine::maybe_yield();
     }
-    return source_ranges;
+    co_return source_ranges;
 }
 
 future<> storage_service::move(token new_token) {
-    return run_with_api_lock(sstring("move"), [new_token] (storage_service& ss) mutable {
-        return make_exception_future<>(std::runtime_error("Move opeartion is not supported only more"));
+    return run_with_api_lock(sstring("move"), [] (storage_service& ss) mutable {
+        return make_exception_future<>(std::runtime_error("Move operation is not supported only more"));
     });
 }
 
-future<std::vector<storage_service::token_range_endpoints>>
+future<utils::chunked_vector<storage_service::token_range_endpoints>>
 storage_service::describe_ring(const sstring& keyspace, bool include_only_local_dc) const {
-    std::vector<token_range_endpoints> ranges;
-    //Token.TokenFactory tf = getPartitioner().getTokenFactory();
+    if (_db.local().find_keyspace(keyspace).uses_tablets()) {
+        throw std::runtime_error(fmt::format("The keyspace {} has tablet table. Query describe_ring with the table parameter!", keyspace));
+    }
+    co_return co_await locator::describe_ring(_db.local(), _gossiper, keyspace, include_only_local_dc);
+}
 
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> range_to_address_map =
-            include_only_local_dc
-                    ? get_range_to_address_map_in_local_dc(keyspace)
-                    : get_range_to_address_map(keyspace);
-    for (auto entry : range_to_address_map) {
-        auto range = entry.first;
-        auto addresses = entry.second;
-        token_range_endpoints tr;
+future<utils::chunked_vector<dht::token_range_endpoints>>
+storage_service::describe_ring_for_table(table_id tid) const {
+    auto& t = _db.local().find_column_family(tid);
+    const auto& schema = *t.schema();
+    slogger.debug("describe_ring for table {}.{}", schema.ks_name(), schema.cf_name());
+    if (!t.uses_tablets()) {
+        auto ranges = co_await describe_ring(schema.ks_name());
+        co_return ranges;
+    }
+    auto erm = t.get_effective_replication_map();
+    auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(tid);
+    const auto& topology = erm->get_topology();
+    utils::chunked_vector<dht::token_range_endpoints> ranges;
+    ranges.reserve(tmap.tablet_count());
+    std::unordered_map<locator::host_id, locator::describe_ring_endpoint_info> host_infos;
+    co_await tmap.for_each_tablet([&] (locator::tablet_id id, const locator::tablet_info& info) -> future<> {
+        auto range = tmap.get_token_range(id);
+        auto& replicas = info.replicas;
+        dht::token_range_endpoints tr;
         if (range.start()) {
             tr._start_token = range.start()->value().to_sstring();
         }
         if (range.end()) {
             tr._end_token = range.end()->value().to_sstring();
         }
-        for (auto endpoint : addresses) {
-            endpoint_details details;
-            details._host = endpoint;
-            details._datacenter = locator::i_endpoint_snitch::get_local_snitch_ptr()->get_datacenter(endpoint);
-            details._rack = locator::i_endpoint_snitch::get_local_snitch_ptr()->get_rack(endpoint);
-            tr._rpc_endpoints.push_back(get_rpc_address(endpoint));
-            tr._endpoints.push_back(boost::lexical_cast<std::string>(details._host));
-            tr._endpoint_details.push_back(details);
+        tr._endpoints.reserve(replicas.size());
+        tr._rpc_endpoints.reserve(replicas.size());
+        tr._endpoint_details.reserve(replicas.size());
+        for (auto& r : replicas) {
+            auto& endpoint = r.host;
+            auto it = host_infos.find(endpoint);
+            if (it == host_infos.end()) {
+                it = host_infos.emplace(endpoint, get_describe_ring_endpoint_info(endpoint, topology, _gossiper)).first;
+            }
+            tr._rpc_endpoints.emplace_back(it->second.rpc_addr);
+            tr._endpoints.emplace_back(fmt::to_string(it->second.details._host));
+            tr._endpoint_details.emplace_back(it->second.details);
         }
-        ranges.push_back(tr);
-        co_await coroutine::maybe_yield();
-    }
-    // Convert to wrapping ranges
-    auto left_inf = boost::find_if(ranges, [] (const token_range_endpoints& tr) {
-        return tr._start_token.empty();
+        ranges.push_back(std::move(tr));
+        return make_ready_future<>();
     });
-    auto right_inf = boost::find_if(ranges, [] (const token_range_endpoints& tr) {
-        return tr._end_token.empty();
-    });
-    using set = std::unordered_set<sstring>;
-    if (left_inf != right_inf
-            && left_inf != ranges.end()
-            && right_inf != ranges.end()
-            && (boost::copy_range<set>(left_inf->_endpoints)
-                 == boost::copy_range<set>(right_inf->_endpoints))) {
-        left_inf->_start_token = std::move(right_inf->_start_token);
-        ranges.erase(right_inf);
-    }
     co_return ranges;
 }
 
-std::unordered_map<dht::token_range, inet_address_vector_replica_set>
-storage_service::construct_range_to_endpoint_map(
-        const sstring& keyspace,
-        const dht::token_range_vector& ranges) const {
-    std::unordered_map<dht::token_range, inet_address_vector_replica_set> res;
-    auto erm = _db.local().find_keyspace(keyspace).get_effective_replication_map();
-    for (auto r : ranges) {
-        res[r] = erm->get_natural_endpoints(
-                r.end() ? r.end()->value() : dht::maximum_token());
+std::map<token, inet_address> storage_service::get_token_to_endpoint_map() {
+    const auto& tm = get_token_metadata();
+    std::map<token, inet_address> result;
+    for (const auto [t, id]: tm.get_token_to_endpoint()) {
+        result.insert({t, _address_map.get(id)});
     }
-    return res;
+    for (const auto [t, id]: tm.get_bootstrap_tokens()) {
+        result.insert({t, _address_map.get(id)});
+    }
+    return result;
 }
 
-
-std::map<token, inet_address> storage_service::get_token_to_endpoint_map() {
-    return get_token_metadata().get_normal_and_bootstrapping_token_to_endpoint_map();
+future<std::map<token, inet_address>> storage_service::get_tablet_to_endpoint_map(table_id table) {
+    const auto& tm = get_token_metadata();
+    const auto& tmap = tm.tablets().get_tablet_map(table);
+    std::map<token, inet_address> result;
+    for (std::optional<locator::tablet_id> tid = tmap.first_tablet(); tid; tid = tmap.next_tablet(*tid)) {
+        result.emplace(tmap.get_last_token(*tid), _address_map.get(tmap.get_primary_replica(*tid, tm.get_topology()).host));
+        co_await coroutine::maybe_yield();
+    }
+    co_return result;
 }
 
 std::chrono::milliseconds storage_service::get_ring_delay() {
@@ -3111,7 +4000,7 @@ std::chrono::milliseconds storage_service::get_ring_delay() {
 }
 
 future<locator::token_metadata_lock> storage_service::get_token_metadata_lock() noexcept {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
     return _shared_token_metadata.get_lock();
 }
 
@@ -3126,7 +4015,7 @@ future<locator::token_metadata_lock> storage_service::get_token_metadata_lock() 
 //
 // Note: must be called on shard 0.
 future<> storage_service::mutate_token_metadata(std::function<future<> (mutable_token_metadata_ptr)> func, acquire_merge_lock acquire_merge_lock) noexcept {
-    assert(this_shard_id() == 0);
+    SCYLLA_ASSERT(this_shard_id() == 0);
     std::optional<token_metadata_lock> tmlock;
 
     if (acquire_merge_lock) {
@@ -3137,379 +4026,3485 @@ future<> storage_service::mutate_token_metadata(std::function<future<> (mutable_
     co_await replicate_to_all_cores(std::move(tmptr));
 }
 
-future<> storage_service::update_pending_ranges(mutable_token_metadata_ptr tmptr, sstring reason) {
-    assert(this_shard_id() == 0);
+future<> storage_service::update_topology_change_info(mutable_token_metadata_ptr tmptr, sstring reason) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
 
-    // long start = System.currentTimeMillis();
-    return do_with(_db.local().get_non_system_keyspaces(), [this, tmptr = std::move(tmptr)] (auto& keyspaces) mutable {
-        return do_for_each(keyspaces, [this, tmptr = std::move(tmptr)] (auto& keyspace_name) mutable {
-            auto& ks = this->_db.local().find_keyspace(keyspace_name);
-            auto& strategy = ks.get_replication_strategy();
-            slogger.debug("Updating pending ranges for keyspace={} starts", keyspace_name);
-            return tmptr->update_pending_ranges(strategy, keyspace_name).finally([&keyspace_name] {
-                slogger.debug("Updating pending ranges for keyspace={} ends", keyspace_name);
-            });
+    try {
+        locator::dc_rack_fn get_dc_rack_by_host_id([this, &tm = *tmptr] (locator::host_id host_id) -> std::optional<locator::endpoint_dc_rack> {
+            const auto server_id = raft::server_id(host_id.uuid());
+            const auto* node = _topology_state_machine._topology.find(server_id);
+            if (node) {
+                return locator::endpoint_dc_rack {
+                    .dc = node->second.datacenter,
+                    .rack = node->second.rack,
+                };
+            }
+            return std::nullopt;
         });
-    }).handle_exception([this, reason = std::move(reason)] (std::exception_ptr ep) mutable {
-        slogger.error("Failed to update pending ranges for {}: {}", reason, ep);
-        return make_exception_future<>(std::move(ep));
-    });
-    // slogger.debug("finished calculation for {} keyspaces in {}ms", keyspaces.size(), System.currentTimeMillis() - start);
+        co_await tmptr->update_topology_change_info(get_dc_rack_by_host_id);
+    } catch (...) {
+        auto ep = std::current_exception();
+        slogger.error("Failed to update topology change info for {}: {}", reason, ep);
+        std::rethrow_exception(std::move(ep));
+    }
 }
 
-future<> storage_service::update_pending_ranges(sstring reason, acquire_merge_lock acquire_merge_lock) {
+future<> storage_service::update_topology_change_info(sstring reason, acquire_merge_lock acquire_merge_lock) {
     return mutate_token_metadata([this, reason = std::move(reason)] (mutable_token_metadata_ptr tmptr) mutable {
-        return update_pending_ranges(std::move(tmptr), std::move(reason));
+        return update_topology_change_info(std::move(tmptr), std::move(reason));
     }, acquire_merge_lock);
 }
 
 future<> storage_service::keyspace_changed(const sstring& ks_name) {
+    // The keyspace_changed notification is called on all shards
+    // after any keyspace schema change, but we need to mutate_token_metadata
+    // once after all shards are done with database::update_keyspace.
+    // mutate_token_metadata (via update_topology_change_info) will update the
+    // token metadata and effective_replication_map on all shards.
+    if (this_shard_id() != 0) {
+        return make_ready_future<>();
+    }
     // Update pending ranges since keyspace can be changed after we calculate pending ranges.
-    sstring reason = format("keyspace {}", ks_name);
-    return container().invoke_on(0, [reason = std::move(reason)] (auto& ss) mutable {
-        return ss.update_pending_ranges(reason, acquire_merge_lock::no).handle_exception([reason = std::move(reason)] (auto ep) {
-            slogger.warn("Failure to update pending ranges for {} ignored", reason);
+    sstring reason = ::format("keyspace {}", ks_name);
+    return update_topology_change_info(reason, acquire_merge_lock::no);
+}
+
+future<locator::mutable_token_metadata_ptr> storage_service::prepare_tablet_metadata(const locator::tablet_metadata_change_hint& hint, mutable_token_metadata_ptr pending_token_metadata) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    if (hint) {
+        co_await replica::update_tablet_metadata(_db.local(), _qp, pending_token_metadata->tablets(), hint);
+    } else {
+        pending_token_metadata->set_tablets(co_await replica::read_tablet_metadata(_qp));
+    }
+    pending_token_metadata->tablets().set_balancing_enabled(_topology_state_machine._topology.tablet_balancing_enabled);
+    co_return pending_token_metadata;
+}
+
+void storage_service::wake_up_topology_state_machine() noexcept {
+    _topology_state_machine.event.broadcast();
+}
+
+future<> storage_service::update_tablet_metadata(const locator::tablet_metadata_change_hint& hint) {
+    auto change = co_await prepare_tablet_metadata(hint,
+            co_await get_mutable_token_metadata_ptr());
+    co_await replicate_to_all_cores(std::move(change));
+    wake_up_topology_state_machine();
+}
+
+future<std::unordered_map<table_id, uint64_t>> storage_service::collect_table_sizes_for_migration(
+    const sstring& ks_name,
+    const locator::static_effective_replication_map_ptr& erm,
+    const locator::tablet_aware_replication_strategy* trs,
+    const std::vector<std::pair<table_id, sstring>>& tables_to_estimate) {
+
+    std::unordered_map<table_id, uint64_t> table_sizes;
+
+    const auto& tm = *erm->get_token_metadata_ptr();
+
+    const auto& local_dc = tm.get_topology().get_location().dc;
+    auto local_rf = trs->get_replication_factor(local_dc);
+    if (local_rf == 0) {
+        throw std::runtime_error(fmt::format(
+            "Cannot estimate table sizes for migration: replication factor for local DC '{}' is zero. Try again on a node with a non-zero replication factor.", local_dc));
+    }
+
+    const auto local_host = tm.get_my_id();
+
+    // Compute the token ring fraction for which this node is a replica.
+    // (Same logic as in storage_service::effective_ownership(), but only for a single node.)
+    double local_fraction = 0.0;
+    const auto token_ownership = dht::token::describe_ownership(tm.sorted_tokens());
+    const auto ranges = co_await erm->get_ranges(local_host);
+    for (const auto& r : ranges) {
+        // Corner case for wrap-around range:
+        // get_ranges() unwraps the wrapping range (t1, t0] as two ranges
+        // (t1, +inf) and (-inf, t0]. Skipping the former yields the same
+        // ownership as if the range were not split.
+        if (!r.end()) {
+            continue;
+        }
+        auto end_token = r.end()->value();
+        auto it = token_ownership.find(end_token);
+        if (it == token_ownership.end()) {
+            on_internal_error(slogger, fmt::format("Cannot find token ownership for token {}", end_token));
+        }
+        local_fraction += it->second;
+    }
+
+    if (local_fraction <= 0) {
+        throw std::runtime_error(fmt::format(
+            "Cannot estimate table sizes for migration: local token ownership fraction is {}", local_fraction));
+    }
+
+    slogger.info("Estimating table sizes for migration of keyspace {} (dc={}, rf={}): "
+            "this node is a replica for {:.2f}% of the token ring",
+            ks_name, local_dc, local_rf, local_fraction * 100);
+
+    for (const auto& [tid, cf_name] : tables_to_estimate) {
+        // Table statistics are per-shard, so the size of the local dataset is
+        // the sum over all shards.
+        auto local_size = co_await _db.map_reduce0([tid] (replica::database& db) {
+            return uint64_t(db.find_column_family(tid).live_disk_space_used().on_disk);
+        }, uint64_t(0), std::plus<uint64_t>());
+        auto estimated_total_size = static_cast<uint64_t>(local_size / local_fraction);
+        table_sizes.emplace(tid, estimated_total_size);
+        slogger.info("Estimated size of {} {}.{}: {} byte(s) (local data set is {} byte(s))",
+                _db.local().find_schema(tid)->is_view() ? "view" : "table", ks_name, cf_name,
+                estimated_total_size, local_size);
+    }
+
+    co_return table_sizes;
+}
+
+future<> storage_service::prepare_for_tablets_migration(const sstring& ks_name) {
+    // Called via run_with_no_api_lock (forwards to shard 0).
+    SCYLLA_ASSERT(this_shard_id() == 0);
+
+    if (!_feature_service.prepare_migration_as_topology_operation) {
+        throw std::runtime_error("vnodes-to-tablets migration requires all nodes to support the"
+                " PREPARE_MIGRATION_AS_TOPOLOGY_OPERATION cluster feature");
+    }
+
+    slogger.info("Preparing vnodes-to-tablets migration for keyspace '{}'", ks_name);
+
+    utils::UUID request_id;
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        auto& db = _db.local();
+        const auto* nts = validate_keyspace_for_migration(db, ks_name, _topology_state_machine._topology);
+        auto& ks = db.find_keyspace(ks_name);
+        const auto& cf_meta_data = ks.metadata()->cf_meta_data();
+
+        // Preparing a keyspace means only one thing, so if a preparation of it is already
+        // queued or running, wait for that one and report how it ends rather than queue
+        // another one behind it.
+        if (auto ongoing = co_await ongoing_prepare_migration(guard, ks_name)) {
+            slogger.info("A preparation of keyspace '{}' is already in progress, waiting for it", ks_name);
+            request_id = *ongoing;
+            break;
+        }
+
+        if (!validate_rf_for_tablets_migration(db, get_token_metadata_ptr(), *nts, ks_name)) {
+            slogger.warn("Keyspace '{}' will not be RF-rack-valid after the migration to tablets: the replication"
+                    " factor doesn't match the rack count in at least one datacenter. A rack failure may reduce"
+                    " availability.", ks_name);
+        }
+        co_await validate_keyspace_views_for_tablets_migration(db, get_system_keyspace(), _topology_state_machine._topology, ks_name);
+
+        // A keyspace whose tables all have a map has nothing left to prepare, so don't
+        // queue a request which would do nothing.
+        const auto& tablet_metadata = get_token_metadata().tablets();
+        if (std::ranges::all_of(cf_meta_data, [&] (const auto& e) {
+                return tablet_metadata.has_tablet_map(e.second->id());
+            })) {
+            slogger.info("All tables of keyspace '{}' already have a tablet map, nothing to do", ks_name);
+            co_return;
+        }
+
+        // Every table which has no tablet map yet, co-located views included: the request
+        // records them, together with their targets.
+        std::vector<std::pair<table_id, sstring>> unmapped_tables;
+        // The views among them which are co-located with their base table, keyed by the
+        // base table. They share its tablet map, so they are sized together with it.
+        std::unordered_map<table_id, std::vector<table_id>> tables_to_colocate;
+        for (const auto& [name, schema] : cf_meta_data) {
+            if (tablet_metadata.has_tablet_map(schema->id())) {
+                continue;
+            }
+            unmapped_tables.push_back({schema->id(), name});
+            if (auto base_id = schema->is_view() ? db.get_base_table_for_tablet_colocation(*schema, {}) : std::nullopt) {
+                tables_to_colocate[*base_id].push_back(schema->id());
+            }
+        }
+
+        // Estimate table sizes when pow2 convergence is enabled.
+        // The estimates are used by the tablet allocator to determine the
+        // target pow2 tablet count per table.
+        // This stays here rather than moving to the coordinator with the rest of the
+        // work: the estimate is this node's share of each table, so a node holding no
+        // replicas of the keyspace cannot make one. The targets travel with the request.
+        target_pow2_per_table_map target_pow2s;
+        bool use_pow2_presplit = bool(_feature_service.tablet_pow2_convergence);
+        if (use_pow2_presplit) {
+            // Co-located tables share a single tablet map, so size each tablet map by the
+            // total size of the whole colocation group.
+            auto erm = ks.get_static_effective_replication_map();
+            auto estimated_sizes = co_await collect_table_sizes_for_migration(ks_name, erm, nts, unmapped_tables);
+            for (const auto& [base_id, colocated] : tables_to_colocate) {
+                for (auto tid : colocated) {
+                    if (estimated_sizes.contains(base_id)) {
+                        estimated_sizes[base_id] += estimated_sizes[tid];
+                    }
+                    estimated_sizes.erase(tid);
+                }
+            }
+            target_pow2s = co_await _tablet_allocator.local().compute_migration_target_pow2s(nts, estimated_sizes);
+        }
+        std::unordered_map<table_id, size_t> tables;
+        for (const auto& [tid, _] : unmapped_tables) {
+            auto it = target_pow2s.find(tid);
+            tables.emplace(tid, it != target_pow2s.end() ? it->second : 0);
+        }
+
+        request_id = guard.new_group0_state_id();
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.queue_global_topology_request_id(request_id);
+
+        topology_request_tracking_mutation_builder rtbuilder(request_id, _feature_service.topology_requests_type_column);
+        rtbuilder.set("done", false)
+                 .set("start_time", db_clock::now())
+                 .set("request_type", global_topology_request::prepare_migration)
+                 .set_prepare_migration_data(ks_name, tables);
+
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+            fmt::format("prepare vnodes-to-tablets migration for keyspace '{}'", ks_name));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            slogger.info("migrate_to_tablets: concurrent modification, retrying");
+            continue;
+        }
+        break;
+    }
+
+    auto error = co_await wait_for_topology_request_completion(request_id);
+    if (!error.empty()) {
+        throw std::runtime_error(fmt::format("Migration preparation failed for keyspace '{}': {}", ks_name, error));
+    }
+
+    slogger.info("Successfully prepared vnodes-to-tablets migration for keyspace '{}'", ks_name);
+}
+
+future<> storage_service::set_node_intended_storage_mode(storage_mode mode) {
+    // Called via run_with_no_api_lock (forwards to shard 0).
+    SCYLLA_ASSERT(this_shard_id() == 0);
+
+    auto& raft_server = _group0->group0_server();
+    auto holder = _group0->hold_group0_gate();
+
+    slogger.info("Setting intended storage mode for node {} to {}", raft_server.id(), mode);
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        // A mark fails a running preparation, dropping its maps: under a node marked for
+        // tablets which may already have moved those tables, or leaving a mark for vnodes
+        // which nothing can clear.
+        if (co_await ongoing_prepare_migration(guard, std::nullopt)) {
+            throw std::runtime_error(::format("Cannot set intended storage mode to {}: a migration is still being prepared."
+                    " Please wait for it to finish and retry.", mode));
+        }
+
+        // Make sure that a migration has been started, i.e.,
+        // prepare_for_tablets_migration() has been called for at least one
+        // keyspace. prepare_for_tablets_migration() will fail if
+        // intended_storage_mode is already set for any node.
+        const auto& tablet_metadata = get_token_metadata().tablets();
+        bool has_any_migrating_table = false;
+        for (const auto& ks : _db.local().get_non_system_keyspaces()) {
+            auto& keyspace = _db.local().find_keyspace(ks);
+            if (!keyspace.uses_tablets()) {
+                for (const auto& schema : keyspace.metadata()->tables()) {
+                    if (tablet_metadata.has_tablet_map(schema->id())) {
+                        has_any_migrating_table = true;
+                        break;
+                    }
+                }
+            }
+            if (has_any_migrating_table) {
+                break;
+            }
+        }
+        if (!has_any_migrating_table) {
+            throw std::runtime_error(::format("Cannot set intended storage mode to {}: no migration is in progress. You need to start a migration first.", mode));
+        }
+
+        auto it = _topology_state_machine._topology.find(raft_server.id());
+        if (!it) {
+            throw std::runtime_error(::format("Node {} is not a member of the cluster", raft_server.id()));
+        }
+
+        const auto& rs = it->second;
+
+        if (rs.state != node_state::normal) {
+            throw std::runtime_error(::format("Node {} is not in the normal state (current state: {})", raft_server.id(), rs.state));
+        }
+
+        if (rs.intended_storage_mode == mode) {
+            slogger.info("Node {} already has intended storage mode set to {}, skipping", raft_server.id(), mode);
+            co_return;
+        }
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.with_node(raft_server.id())
+               .set("intended_storage_mode", mode);
+
+        topology_change change{{builder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+            ::format("set intended storage mode for node {} to {}", raft_server.id(), mode));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as);
+        } catch (group0_concurrent_modification&) {
+            slogger.info("set_node_intended_storage_mode: concurrent modification, retrying");
+            continue;
+        }
+        break;
+    }
+
+    slogger.info("Successfully set intended storage mode for node {} to {}", raft_server.id(), mode);
+}
+
+storage_service::migration_status storage_service::get_tablets_migration_status(const sstring& ks_name) {
+    auto& db = _db.local();
+    auto& ks = db.find_keyspace(ks_name);
+
+    if (ks.uses_tablets()) {
+        return migration_status::tablets;
+    }
+
+    const auto& tm = get_token_metadata();
+    const auto& tablet_metadata = tm.tablets();
+
+    const auto& cf_meta_data = ks.metadata().get()->cf_meta_data();
+
+    // Check whether all tables and views have tablet maps (i.e. migration was started).
+    bool has_tablet_maps = !cf_meta_data.empty() && std::ranges::all_of(cf_meta_data, [&] (const auto& e) {
+        return tablet_metadata.has_tablet_map(e.second->id());
+    });
+
+    if (!has_tablet_maps) {
+        return migration_status::vnodes;
+    }
+
+    return migration_status::migrating_to_tablets;
+}
+
+future<storage_service::keyspace_migration_status> storage_service::get_tablets_migration_status_with_node_details(const sstring& ks_name) {
+    // Called via run_with_no_api_lock (forwards to shard 0).
+    SCYLLA_ASSERT(this_shard_id() == 0);
+
+    keyspace_migration_status result;
+    result.keyspace = ks_name;
+    result.status = get_tablets_migration_status(ks_name);
+
+    // Only finalization sets this, and nothing unsets it, so a local reading of it needs
+    // no confirmation. Answering here keeps an already-migrated keyspace off group0.
+    if (result.status == migration_status::tablets) {
+        co_return result;
+    }
+
+    // The other two answers can be stale, and so can the per-node modes, so they have to
+    // come from one snapshot: a barrier taken after the status was computed would let a
+    // concurrent finalization clear the modes under a status still saying migrating.
+    if (!_group0 || !_group0->joined_group0()) {
+        throw std::runtime_error(::format("Cannot fetch migration status for keyspace '{}': group0 is not yet initialized on this node", ks_name));
+    }
+
+    // A node publishes its current mode before it finishes starting up, so a caller
+    // that just restarted a node expects the next status to show it. Take a read
+    // barrier to make that write visible here instead of waiting for this node to
+    // apply it on its own. Hold the group0 gate meanwhile, to prevent
+    // abort_and_drain() from destroying the raft server under it (SCYLLADB-2071).
+    {
+        auto group0_holder = _group0->hold_group0_gate();
+        co_await _group0->group0_server_with_timeouts().read_barrier(&_group0_as, raft_timeout{});
+    }
+
+    result.status = get_tablets_migration_status(ks_name);
+
+    if (result.status != migration_status::migrating_to_tablets) {
+        co_return result;
+    }
+
+    const auto& topo = _topology_state_machine._topology;
+
+    // Prepare seeds every node, so a node without a mode can only come from a migration
+    // started before the column existed, carried across the upgrade that introduced it.
+    // Answer those the way that release did. The source is keyed by replica and blind to
+    // a node holding none, but those releases support neither zero-token nodes nor RF=0
+    // datacenters.
+    std::unordered_set<locator::host_id> nodes_reporting_tablets;
+    if (std::ranges::any_of(topo.normal_nodes, [] (const auto& e) { return !e.second.current_storage_mode; })) {
+        auto& ks = _db.local().find_keyspace(ks_name);
+        auto tables = ks.metadata()->tables();
+        auto sample_table_id = tables.front()->id();
+
+        auto rows = co_await _qp.execute_internal(
+                "SELECT replicas FROM system.tablet_sizes WHERE table_id = ?",
+                {sample_table_id.uuid()},
+                cql3::query_processor::cache_internal::no);
+
+        for (const auto& row : *rows) {
+            if (row.has("replicas")) {
+                auto replicas_map = row.get_map<utils::UUID, int64_t>("replicas");
+                for (const auto& [host_uuid, size] : replicas_map) {
+                    nodes_reporting_tablets.insert(locator::host_id(host_uuid));
+                }
+            }
+        }
+    }
+
+    for (const auto& [server_id, rs] : topo.normal_nodes) {
+        auto host_id = locator::host_id{server_id.uuid()};
+
+        // A recorded mode is authoritative: the node publishes it once its switch is
+        // complete, resharding included. Rollback is unambiguous too - a node that has
+        // not restarted still holds the tablets it published on the forward pass.
+        auto current_mode = rs.current_storage_mode
+                ? *rs.current_storage_mode
+                : (nodes_reporting_tablets.contains(host_id) ? storage_mode::tablets : storage_mode::vnodes);
+        auto intended_mode = rs.intended_storage_mode.value_or(storage_mode::vnodes);
+
+        auto ip = _address_map.find(host_id);
+
+        result.nodes.push_back(node_migration_status{
+            .host_id = host_id,
+            .endpoint = ip ? sstring(fmt::to_string(*ip)) : sstring(),
+            .current_mode = fmt::format("{}", current_mode),
+            .intended_mode = fmt::format("{}", intended_mode),
         });
+    }
+
+    co_return result;
+}
+
+storage_service::tablets_pow2_convergence_status
+storage_service::get_tablets_pow2_convergence_status(const sstring& ks_name) const {
+    auto& db = _db.local();
+    auto& ks = db.find_keyspace(ks_name);
+
+    if (!ks.uses_tablets()) {
+        throw std::runtime_error(fmt::format("Keyspace '{}' does not use tablets", ks_name));
+    }
+
+    if (!_feature_service.tablet_pow2_convergence) {
+        throw std::runtime_error("TABLET_POW2_CONVERGENCE cluster feature is not enabled");
+    }
+
+    const auto& tm = get_token_metadata();
+    const auto& tablet_metadata = tm.tablets();
+
+    tablets_pow2_convergence_status status;
+    status.tables_converging = 0;
+    status.tables_total = 0;
+
+    for (const auto& schema : tablet_metadata.base_tables(*ks.metadata())) {
+        auto& tmap = tablet_metadata.get_tablet_map(schema->id());
+        bool converging = tmap.is_converging_to_pow2();
+
+        status.tables.push_back(table_pow2_convergence_info{
+            .table_name = schema->cf_name(),
+            .converging = converging,
+            .current_tablet_count = tmap.tablet_count(),
+            .target_pow2_tablet_count = tmap.target_pow2_tablet_count(),
+        });
+        status.tables_total++;
+        if (converging) {
+            status.tables_converging++;
+        }
+    }
+
+    return status;
+}
+
+future<> storage_service::finalize_tablets_migration(const sstring& ks_name) {
+    // Called via run_with_no_api_lock (forwards to shard 0).
+    SCYLLA_ASSERT(this_shard_id() == 0);
+
+    slogger.info("Finalizing vnodes-to-tablets migration for keyspace '{}'", ks_name);
+
+    utils::UUID request_id;
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        auto& db = _db.local();
+        auto& ks = db.find_keyspace(ks_name);
+
+        if (ks.uses_tablets()) {
+            throw std::runtime_error(fmt::format("Keyspace '{}' already uses tablets", ks_name));
+        }
+
+        const auto& tm = get_token_metadata();
+        const auto& tablet_metadata = tm.tablets();
+
+        const auto& tables = ks.metadata()->cf_meta_data();
+        if (tables.empty()) {
+            throw std::runtime_error(fmt::format("Keyspace '{}' has no tables", ks_name));
+        }
+
+        // A finalization queued behind a preparation of the keyspace would, as a rollback,
+        // drop its maps right after it reports success. The check below that every table
+        // has a map stops that too, but with an error which doesn't say why.
+        if (co_await ongoing_prepare_migration(guard, ks_name)) {
+            throw std::runtime_error(fmt::format("Cannot finalize the migration of keyspace '{}': it is still being prepared."
+                    " Please wait for the preparation to finish and retry.", ks_name));
+        }
+
+        for (const auto& schema : tables | std::views::values) {
+            if (!tablet_metadata.has_tablet_map(schema->id())) {
+                throw std::runtime_error(fmt::format("{} {}.{} does not have a tablet map; "
+                    "all tables and views in keyspace '{}' must be prepared for migration before finalizing",
+                    schema->is_view() ? "View" : "Table", ks_name, schema->cf_name(), ks_name));
+            }
+        }
+
+        slogger.info("All {} table(s) and view(s) in keyspace '{}' have tablet maps, submitting finalization request",
+                     tables.size(), ks_name);
+
+        request_id = guard.new_group0_state_id();
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.queue_global_topology_request_id(request_id);
+
+        topology_request_tracking_mutation_builder rtbuilder(request_id, _feature_service.topology_requests_type_column);
+        rtbuilder.set("done", false)
+                 .set("start_time", db_clock::now())
+                 .set("request_type", global_topology_request::finalize_migration)
+                 .set_finalize_migration_data(ks_name);
+
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+            fmt::format("finalize vnodes-to-tablets migration for keyspace '{}'", ks_name));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        } catch (group0_concurrent_modification&) {
+            slogger.info("finalize_tablets_migration: concurrent modification, retrying");
+            continue;
+        }
+        break;
+    }
+
+    auto error = co_await wait_for_topology_request_completion(request_id);
+    if (!error.empty()) {
+        throw std::runtime_error(fmt::format("Migration finalization failed for keyspace '{}': {}", ks_name, error));
+    }
+
+    slogger.info("Successfully finalized vnodes-to-tablets migration for keyspace '{}'", ks_name);
+}
+
+future<> storage_service::process_tablet_split_candidate(table_id table) noexcept {
+    auto tablet_split_task_info = tasks::make_empty_task_info();
+
+    auto all_compaction_groups_split = [&] () mutable {
+        return _db.map_reduce0([table_ = table] (replica::database& db) {
+            auto all_split = db.find_column_family(table_).all_storage_groups_split();
+            return make_ready_future<bool>(all_split);
+        }, bool{true}, std::logical_and<bool>());
+    };
+
+    auto split_all_compaction_groups = [&] () -> future<> {
+        return _db.invoke_on_all([table, tablet_split_task_info] (replica::database& db) -> future<> {
+            return db.find_column_family(table).split_all_storage_groups(tablet_split_task_info);
+        });
+    };
+
+    co_await utils::get_local_injector().inject("tablet_split_monitor_wait", utils::wait_for_message(1min));
+
+    exponential_backoff_retry split_retry = exponential_backoff_retry(std::chrono::seconds(5), std::chrono::seconds(300));
+
+    while (!_async_gate.is_closed() && !_group0_as.abort_requested()) {
+        bool sleep = false;
+        try {
+            // Ensures that latest changes to tablet metadata, in group0, are visible
+            auto guard = co_await _group0->client().start_operation(_group0_as);
+            auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+            if (!tmap.needs_split()) {
+                release_guard(std::move(guard));
+                break;
+            }
+            tablet_split_task_info = tasks::make_cluster_task_info(tasks::task_id{tmap.resize_task_info().tablet_task_id.uuid()});
+
+            if (co_await all_compaction_groups_split()) {
+                slogger.debug("All compaction groups of table {} are split ready.", table);
+                if (_topology_state_machine.on_tablet_split_ready) {
+                    _topology_state_machine.on_tablet_split_ready();
+                }
+                release_guard(std::move(guard));
+                break;
+            } else {
+                release_guard(std::move(guard));
+                co_await split_all_compaction_groups();
+            }
+        } catch (const locator::no_such_tablet_map& ex) {
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
+            break;
+        } catch (const replica::no_such_column_family& ex) {
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
+            break;
+        } catch (const seastar::abort_requested_exception& ex) {
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
+            break;
+        } catch (raft::request_aborted& ex) {
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
+            break;
+        } catch (seastar::gate_closed_exception& ex) {
+            slogger.warn("Failed to complete splitting of table {} due to {:t}", table, ex);
+            break;
+        } catch (...) {
+            slogger.error("Failed to complete splitting of table {} due to {:t}, retrying after {} seconds",
+                          table, std::current_exception(), split_retry.sleep_time());
+            sleep = true;
+        }
+        if (sleep) {
+            try {
+                co_await split_retry.retry(_group0_as);
+            } catch (...) {
+                slogger.warn("Sleep in split monitor failed with {:t}", std::current_exception());
+            }
+        }
+    }
+}
+
+void storage_service::register_tablet_split_candidate(table_id table) noexcept {
+    if (this_shard_id() != 0) {
+        return;
+    }
+    try {
+        if (get_token_metadata().tablets().get_tablet_map(table).needs_split()) {
+            _tablet_split_candidates.push_back(table);
+            _tablet_split_monitor_event.signal();
+        }
+    } catch (...) {
+        slogger.error("Unable to register table {} as candidate for tablet splitting, due to {:t}", table, std::current_exception());
+    }
+}
+
+future<> storage_service::run_tablet_split_monitor() {
+    auto can_proceed = [this] { return !_async_gate.is_closed() && !_group0_as.abort_requested(); };
+    while (can_proceed()) {
+        auto tablet_split_candidates = std::exchange(_tablet_split_candidates, {});
+        for (auto candidate : tablet_split_candidates) {
+            co_await process_tablet_split_candidate(candidate);
+        }
+        co_await utils::clear_gently(tablet_split_candidates);
+        // Returns if there is more work to do, or shutdown was requested.
+        co_await _tablet_split_monitor_event.when([&] {
+            return _tablet_split_candidates.size() > 0 || !can_proceed();
+        });
+    }
+}
+
+void storage_service::start_tablet_split_monitor() {
+    if (this_shard_id() != 0) {
+        return;
+    }
+    slogger.info("Starting the tablet split monitor...");
+    _tablet_split_monitor = run_tablet_split_monitor();
+}
+
+future<> storage_service::snitch_reconfigured() {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    auto& snitch = _snitch.local();
+    co_await mutate_token_metadata([&snitch] (mutable_token_metadata_ptr tmptr) -> future<> {
+        // re-read local rack and DC info
+        tmptr->update_topology(tmptr->get_my_id(), snitch->get_location());
+        return make_ready_future<>();
+    });
+
+    if (_gossiper.is_enabled()) {
+        co_await _gossiper.add_local_application_state(snitch->get_app_states());
+    }
+}
+
+// Decides whether a topology barrier should evict (abort) user repairs
+// which pin stale token metadata versions and thus block the barrier.
+//
+// Evict only when the barrier is part of a node operation (bootstrap,
+// decommission, removenode, replace, cleanup, rollback) or another
+// coordinator-driven transition. The tablet load balancer runs the same
+// barrier continuously (every migration stage bumps the topology version
+// and drains stale versions), so evicting there would keep killing vnode
+// repairs whenever tablets are being balanced, e.g. for the whole duration
+// of a vnodes-to-tablets migration. A balancing-only barrier instead waits
+// for the repair to finish, as before.
+//
+// A pending per-node request counts as a node operation: with parallel
+// tablet draining, decommission and removenode drain tablets through
+// ordinary migration rounds (transition_state::tablet_migration) while the
+// request is still pending, and those drain barriers must evict the repair
+// for the operation to make progress.
+static bool should_abort_repair(const topology& topo) {
+    if (!topo.requests.empty() || !topo.transition_nodes.empty()) {
+        return true;
+    }
+    if (!topo.tstate) {
+        return false;
+    }
+    switch (*topo.tstate) {
+    // Tablet-balancing-only transitions: wait for the repair instead of
+    // aborting it.
+    case topology::transition_state::tablet_migration:
+    case topology::transition_state::tablet_resize_finalization:
+    case topology::transition_state::tablet_split_finalization:
+        return false;
+    // Coordinator-driven transitions: abort user repairs blocking the
+    // barrier.
+    case topology::transition_state::join_group0:
+    case topology::transition_state::commit_cdc_generation:
+    case topology::transition_state::tablet_draining:
+    case topology::transition_state::write_both_read_old:
+    case topology::transition_state::write_both_read_new:
+    case topology::transition_state::left_token_ring:
+    case topology::transition_state::rollback_to_normal:
+    case topology::transition_state::truncate_table:
+    case topology::transition_state::lock:
+    case topology::transition_state::snapshot_tables:
+        return true;
+    }
+}
+
+future<> storage_service::local_topology_barrier() {
+    if (this_shard_id() != 0) {
+        co_await container().invoke_on(0, [] (storage_service& ss) {
+            return ss.local_topology_barrier();
+        });
+        co_return;
+    }
+
+    auto version = _topology_state_machine._topology.version;
+
+    utils::get_local_injector().inject("raft_topology_barrier_and_drain_fail_before", [] {
+        throw std::runtime_error("raft_topology_barrier_and_drain_fail_before injected exception");
+    });
+
+    // share=false: each barrier_and_drain invocation needs its own message
+    // to proceed. Without this, a single message_injection call would release
+    // all past and future handlers sharing the same injection.
+    co_await utils::get_local_injector().inject("pause_before_barrier_and_drain", utils::wait_for_message(std::chrono::minutes(5)), false);
+    if (_topology_state_machine._topology.tstate == topology::transition_state::write_both_read_old) {
+        for (auto& n : _topology_state_machine._topology.transition_nodes) {
+            if (!_address_map.find(locator::host_id{n.first.uuid()})) {
+                rtlogger.error("The topology transition is in a double write state but the IP of the node in transition is not known");
+                break;
+            }
+        }
+    }
+
+    // The topology state used by should_abort_repair() is up to date because
+    // raft_topology_cmd_handler runs a group0 read barrier first.
+    const bool evict_blocking_repairs = should_abort_repair(_topology_state_machine._topology);
+
+    // Once per node at info; per-shard progress is at debug so a barrier costs O(1) lines per node.
+    rtlogger.info("Got raft_topology_cmd::barrier_and_drain, version {}", version);
+    co_await container().invoke_on_all([version, evict_blocking_repairs] (storage_service& ss) -> future<> {
+        const auto current_version = ss._shared_token_metadata.get()->get_version();
+        rtlogger.debug("Got raft_topology_cmd::barrier_and_drain, version {}, "
+                       "current version {}, stale versions (version: use_count): {}",
+                       version, current_version, ss._shared_token_metadata.describe_stale_versions());
+
+        // This shouldn't happen under normal operation, it's only plausible
+        // if the topology change coordinator has
+        // moved to another node and managed to update the topology
+        // parallel to this method. The previous coordinator
+        // should be inactive now, so it won't observe this
+        // exception. By returning exception we aim
+        // to reveal any other conditions where this may arise.
+        if (current_version != version) {
+            co_await coroutine::return_exception(std::runtime_error(
+                    ::format("raft topology: command::barrier_and_drain, the version has changed, "
+                             "version {}, current_version {}, the topology change coordinator "
+                             " had probably migrated to another node",
+                             version, current_version)));
+        }
+
+        rtlogger.debug("raft_topology_cmd::barrier_and_drain version {}: waiting for stale token metadata versions to be released", version);
+        {
+            // A user-requested repair on a vnode keyspace holds its
+            // effective_replication_map, and thus pins a stale token metadata
+            // version, for the entire duration of the repair, which is
+            // unbounded. Abort such repairs instead of stalling the topology
+            // operation behind them; the operator can re-run the repair once
+            // the topology change completes. The abort is retried from the
+            // periodic timer to catch repairs which acquired their
+            // effective_replication_map before the barrier but registered
+            // their per-shard tasks only after the initial call.
+            auto abort_stale_repairs = [&ss, current_version, evict_blocking_repairs] {
+                if (evict_blocking_repairs && ss._repair.local_is_initialized()) {
+                    ss._repair.local().get_repair_module().abort_repairs_pinning_stale_versions(current_version);
+                }
+            };
+            abort_stale_repairs();
+            seastar::timer<lowres_clock> warn_timer([&ss, version, abort_stale_repairs] {
+                rtlogger.warn("raft_topology_cmd::barrier_and_drain version {}: still waiting for stale versions, "
+                              "stale versions (version: use_count): {}",
+                              version, ss._shared_token_metadata.describe_stale_versions());
+                abort_stale_repairs();
+            });
+            warn_timer.arm_periodic(std::chrono::minutes(5));
+            co_await ss._shared_token_metadata.stale_versions_in_use();
+        }
+        rtlogger.debug("raft_topology_cmd::barrier_and_drain version {}: stale versions released, draining closing sessions", version);
+        co_await get_topology_session_manager().drain_closing_sessions();
+
+        rtlogger.debug("raft_topology_cmd::barrier_and_drain version {}: done", version);
+    });
+    rtlogger.info("raft_topology_cmd::barrier_and_drain version {}: done", version);
+}
+
+future<> storage_service::do_streaming_operation(std::optional<shared_future<>>& result,
+        streaming::stream_reason reason,
+        tasks::task_info parent_info,
+        noncopyable_function<future<>()> action,
+        reset_streaming_result reset_result) {
+    // If no operation was previously started - start it now
+    // If previous operation still running - wait for it and return its result
+    // If previous operation completed successfully - return immediately
+    // If previous operation failed - restart it
+    std::exception_ptr ex;
+    if (!result || result->failed()) {
+        if (result) {
+            rtlogger.info("retry streaming after previous attempt failed with {}", result->get_future().get_exception());
+        } else {
+            rtlogger.info("start streaming");
+        }
+        // Publish the future before creating the task, which preempts: a request resent
+        // in the meantime has to join this operation rather than start a second one.
+        // The result follows the action, so that a request which comes once the streaming
+        // is done does not restart it even if the task was failed by an abort which
+        // landed after the action had finished.
+        promise<> p;
+        bool action_started = false;
+        result = p.get_future();
+        try {
+            tasks::task_manager::task_builder task_builder{_node_ops_module, node_ops::streaming_task_type(reason)};
+            task_builder.set_scope("node")
+                        .set_is_internal(tasks::is_internal::no)
+                        .set_parent_info(parent_info);
+            auto task = co_await std::move(task_builder).build([&p, &action_started, action = std::move(action)] (tasks::task_manager::task::impl&) {
+                action_started = true;
+                return futurize_invoke(action).then_wrapped([&p] (future<> f) {
+                    if (f.failed()) {
+                        auto ex = f.get_exception();
+                        p.set_exception(ex);
+                        return make_exception_future<>(std::move(ex));
+                    }
+                    p.set_value();
+                    return make_ready_future<>();
+                });
+            });
+            co_await task->done();
+        } catch (...) {
+            ex = std::current_exception();
+            if (!action_started) {
+                // The task finished without running the action, e.g. because it was
+                // aborted before it started, so nothing else will resolve the result.
+                p.set_exception(ex);
+            }
+        }
+    } else {
+        rtlogger.debug("already streaming");
+        co_await result.value().get_future();
+    }
+    if (ex) {
+        std::rethrow_exception(ex);
+    }
+    if (reset_result && result && result->available() && !result->failed()) {
+        // The operation may be requested again and then it has to stream once more, so a
+        // successful result must not be kept. Only a request which waited for the streaming
+        // successfully resets it, and never a result of an operation which still runs, so
+        // at worst a newer, already finished operation is streamed once more. A result kept
+        // because the task failed once the streaming was done is dropped by the next
+        // request, which joins it and returns without streaming.
+        result.reset();
+    }
+    rtlogger.info("streaming completed");
+}
+
+future<raft_topology_cmd_result> storage_service::raft_topology_cmd_handler(raft::term_t term, uint64_t cmd_index, raft_topology_cmd cmd) {
+    raft_topology_cmd_result result;
+    rtlogger.info("topology cmd rpc {} is called index={}", cmd.cmd, cmd_index);
+
+    try {
+        auto& raft_server = _group0->group0_server();
+        auto group0_holder = _group0->hold_group0_gate();
+        // do barrier to make sure we always see the latest topology
+        rtlogger.info("topology cmd rpc {} index={}: starting read_barrier, term={}", cmd.cmd, cmd_index, term);
+        co_await raft_server.read_barrier(&_group0_as);
+        rtlogger.info("topology cmd rpc {} index={}: read_barrier completed", cmd.cmd, cmd_index);
+        if (raft_server.get_current_term() != term) {
+           // Return an error since the command is from outdated leader
+           co_return result;
+        }
+        auto id = raft_server.id();
+        group0_holder.release();
+
+        {
+            auto& state = _raft_topology_cmd_handler_state;
+            if (state.term != term) {
+                state.term = term;
+            } else if (cmd_index <= state.last_index) {
+                // Return an error since the command is outdated
+                co_return result;
+            }
+            state.last_index = cmd_index;
+        }
+
+        switch (cmd.cmd) {
+            case raft_topology_cmd::command::barrier: {
+                utils::get_local_injector().inject("raft_topology_barrier_fail",
+                                       [] { throw std::runtime_error("raft topology barrier failed due to error injection"); });
+                // This barrier might have been issued by the topology coordinator
+                // as a step in enabling a feature, i.e. it noticed that all
+                // nodes support some feature, then issue the barrier to make
+                // sure that all nodes observed this fact in their local state
+                // (a node cannot revoke support for a feature after that), and
+                // after receiving a confirmation from all nodes it will mark
+                // the feature as enabled.
+                //
+                // However, it might happen that the node handles this request
+                // early in the boot process, before it did the second feature
+                // check that happens when the node updates its metadata
+                // in `system.topology`. The node might have committed a command
+                // that advertises support for a feature as the last node
+                // to do so, crashed and now it doesn't support it. This should
+                // be rare, but it can happen and we can detect it right here.
+                std::exception_ptr ex;
+                try {
+                    const auto& enabled_features = _topology_state_machine._topology.enabled_features;
+                    const auto unsafe_to_disable_features = _topology_state_machine._topology.calculate_not_yet_enabled_features();
+                    _feature_service.check_features(enabled_features, unsafe_to_disable_features);
+                } catch (const gms::unsupported_feature_exception&) {
+                    ex = std::current_exception();
+                }
+                if (ex) {
+                    rtlogger.error("feature check during barrier failed: {}", ex);
+                    co_await drain();
+                    break;
+                }
+
+                // we already did read barrier above
+                result.status = raft_topology_cmd_result::command_status::success;
+            }
+            break;
+            case raft_topology_cmd::command::barrier_and_drain: {
+                co_await local_topology_barrier();
+
+                // Send out the hints while the leaving node can still reach the cluster.
+                // A repeated barrier joins the running drain.
+                if (const auto& t = _topology_state_machine._topology; t.tstate == topology::transition_state::left_token_ring) {
+                    if (const auto* rs = t.find(id); rs && rs->second.state == node_state::decommissioning) {
+                        if (!_decommission_hints_drain) {
+                            _decommission_hints_drain.emplace(drain_hints_before_leaving());
+                        }
+                        co_await _decommission_hints_drain->get_future(_abort_source);
+                    }
+                }
+
+                co_await utils::get_local_injector().inject("raft_topology_barrier_and_drain_fail", [this] (auto& handler) -> future<> {
+                    auto ks = handler.get("keyspace");
+                    auto cf = handler.get("table");
+                    auto last_token = dht::token::from_int64(std::atoll(handler.get("last_token")->data()));
+                    auto table_id = _db.local().find_column_family(*ks, *cf).schema()->id();
+                    auto stage = co_await replica::read_tablet_transition_stage(_qp, table_id, last_token);
+                    if (stage) {
+                        sstring want_stage(handler.get("stage").value());
+                        if (*stage == locator::tablet_transition_stage_from_string(want_stage)) {
+                            rtlogger.info("raft_topology_cmd: barrier handler waits");
+                            co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::minutes{5});
+                            rtlogger.info("raft_topology_cmd: barrier handler continues");
+                        }
+                    }
+                });
+
+                result.status = raft_topology_cmd_result::command_status::success;
+            }
+            break;
+            case raft_topology_cmd::command::stream_ranges: {
+                co_await with_scheduling_group(_stream_manager.local().get_scheduling_group(), coroutine::lambda([&] () -> future<> {
+                    const auto* server_rs = _topology_state_machine._topology.find(id);
+                    if (!server_rs) {
+                        on_internal_error(rtlogger, format("Got {} request for node {} not found in topology", cmd.cmd, id));
+                    }
+                    const auto rs = server_rs->second;
+                    auto tstate = _topology_state_machine._topology.tstate;
+                    auto session = _topology_state_machine._topology.session;
+                    if (!rs.ring || rs.ring->tokens.empty()) {
+                        rtlogger.warn("got {} request but the node does not own any tokens and is in the {} state", cmd.cmd, rs.state);
+                        co_return;
+                    }
+                    if (tstate != topology::transition_state::write_both_read_old && rs.state != node_state::normal && rs.state != node_state::rebuilding) {
+                        rtlogger.warn("got {} request while the topology transition state is {} and node state is {}", cmd.cmd, tstate, rs.state);
+                        co_return;
+                    }
+
+                    utils::get_local_injector().inject("stream_ranges_fail",
+                                           [] { throw std::runtime_error("stream_range failed due to error injection"); });
+
+                    utils::get_local_injector().inject("stop_before_streaming",
+                        [] { std::raise(SIGSTOP); });
+
+                    switch(rs.state) {
+                    case node_state::bootstrapping:
+                    case node_state::replacing: {
+                        set_mode(mode::BOOTSTRAP);
+                        // See issue #4001
+                        co_await _view_builder.local().mark_existing_views_as_built();
+                        co_await _db.invoke_on_all([] (replica::database& db) {
+                            for (auto& cf : db.get_non_system_column_families()) {
+                                cf->notify_bootstrap_or_replace_start();
+                            }
+                        });
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{rs.request_id});
+                        if (rs.state == node_state::bootstrapping) {
+                            if (!_topology_state_machine._topology.normal_nodes.empty()) { // stream only if there is a node in normal state
+                                co_await do_streaming_operation(_bootstrap_result, streaming::stream_reason::bootstrap, parent_info,
+                                        [this, &rs, session] (this auto) -> future<> {
+                                    if (is_repair_based_node_ops_enabled(streaming::stream_reason::bootstrap)) {
+                                        co_await utils::get_local_injector().inject("delay_bootstrap_120s", std::chrono::seconds(120));
+
+                                        co_await _repair.local().bootstrap_with_repair(get_token_metadata_ptr(), rs.ring.value().tokens, session);
+                                    } else {
+                                        dht::boot_strapper bs(_stream_manager, _abort_source, get_token_metadata_ptr()->get_my_id(),
+                                            locator::endpoint_dc_rack{rs.datacenter, rs.rack}, rs.ring.value().tokens, get_token_metadata_ptr(),
+                                            _db.local().get_config().consistent_rangemovement(), _db.local().get_config().stream_plan_ranges_fraction());
+                                        co_await bs.bootstrap(streaming::stream_reason::bootstrap, _gossiper, session,
+                                            _db.local().get_non_local_strategy_keyspaces_erms());
+                                    }
+                                });
+                            }
+                            // Bootstrap did not complete yet, but streaming did
+                            utils::get_local_injector().inject("stop_after_streaming",
+                                [] { std::raise(SIGSTOP); });
+                        } else {
+                            auto replaced_id = std::get<replace_param>(_topology_state_machine._topology.req_param[id]).replaced_id;
+                            co_await do_streaming_operation(_bootstrap_result, streaming::stream_reason::replace, parent_info,
+                                    [this, &rs, &id, replaced_id, session] (this auto) -> future<> {
+                                if (!_topology_state_machine._topology.req_param.contains(id)) {
+                                    on_internal_error(rtlogger, ::format("Cannot find request_param for node id {}", id));
+                                }
+                                if (is_repair_based_node_ops_enabled(streaming::stream_reason::replace)) {
+                                    auto ignored_nodes = _topology_state_machine._topology.ignored_nodes | std::views::transform([] (const auto& id) {
+                                        return locator::host_id(id.uuid());
+                                    }) | std::ranges::to<std::unordered_set<locator::host_id>>();
+                                    auto ks_erms = _db.local().get_non_local_strategy_keyspaces_erms();
+                                    auto tmptr = get_token_metadata_ptr();
+                                    auto replaced_node = locator::host_id(replaced_id.uuid());
+                                    co_await _repair.local().replace_with_repair(std::move(ks_erms), std::move(tmptr), rs.ring.value().tokens, std::move(ignored_nodes), replaced_node, session);
+                                } else {
+                                    dht::boot_strapper bs(_stream_manager, _abort_source, get_token_metadata_ptr()->get_my_id(),
+                                                          locator::endpoint_dc_rack{rs.datacenter, rs.rack}, rs.ring.value().tokens, get_token_metadata_ptr(),
+                                                          _db.local().get_config().consistent_rangemovement(), _db.local().get_config().stream_plan_ranges_fraction());
+                                    co_await bs.bootstrap(streaming::stream_reason::replace, _gossiper, session,
+                                        _db.local().get_non_local_strategy_keyspaces_erms(), locator::host_id{replaced_id.uuid()});
+                                }
+                            });
+                        }
+                        co_await _db.invoke_on_all([] (replica::database& db) {
+                            for (auto& cf : db.get_non_system_column_families()) {
+                                cf->notify_bootstrap_or_replace_end();
+                            }
+                        });
+                        result.status = raft_topology_cmd_result::command_status::success;
+                    }
+                    break;
+                    case node_state::decommissioning: {
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{rs.request_id});
+                        co_await do_streaming_operation(_decommission_result, streaming::stream_reason::decommission, parent_info,
+                                [this] (this auto) -> future<> {
+                            co_await utils::get_local_injector().inject("decommission_streaming_run", utils::wait_for_message(60s));
+                            co_await unbootstrap();
+                            co_await utils::get_local_injector().inject("decommission_streaming_done_wait", utils::wait_for_message(5min));
+                        });
+                        result.status = raft_topology_cmd_result::command_status::success;
+                    }
+                    break;
+                    case node_state::normal: {
+                        // If asked to stream a node in normal state it means that remove operation is running
+                        // Find the node that is been removed
+                        auto it = std::ranges::find_if(_topology_state_machine._topology.transition_nodes, [] (auto& e) { return e.second.state == node_state::removing; });
+                        if (it == _topology_state_machine._topology.transition_nodes.end()) {
+                            rtlogger.warn("got stream_ranges request while my state is normal but cannot find a node that is been removed");
+                            break;
+                        }
+                        auto id = it->first;
+                        rtlogger.debug("streaming to remove node {}", id);
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{it->second.request_id});
+                        co_await do_streaming_operation(_remove_result[id], streaming::stream_reason::removenode, parent_info,
+                                [this, id = locator::host_id{id.uuid()}, session] (this auto) -> future<> {
+                            auto as = make_shared<abort_source>();
+                            auto sub = utils::chain_abort_source(*as, _abort_source);
+                            if (is_repair_based_node_ops_enabled(streaming::stream_reason::removenode)) {
+                                std::list<locator::host_id> ignored_ips = _topology_state_machine._topology.ignored_nodes | std::views::transform([] (const auto& id) {
+                                    return locator::host_id(id.uuid());
+                                }) | std::ranges::to<std::list<locator::host_id>>();
+                                auto ops = seastar::make_shared<node_ops_info>(node_ops_id::create_random_id(), as, std::move(ignored_ips));
+                                co_await _repair.local().removenode_with_repair(get_token_metadata_ptr(), id, ops, session);
+                            } else {
+                                co_await removenode_with_stream(id, session, as);
+                            }
+                        });
+                        result.status = raft_topology_cmd_result::command_status::success;
+                    }
+                    break;
+                    case node_state::rebuilding: {
+                        auto source_dc = std::get<rebuild_param>(_topology_state_machine._topology.req_param[id]).source_dc;
+                        rtlogger.info("rebuild from dc: {}", source_dc == "" ? "(any dc)" : source_dc);
+                        auto parent_info = tasks::make_cluster_task_info(tasks::task_id{rs.request_id});
+                        co_await do_streaming_operation(_rebuild_result, streaming::stream_reason::rebuild, parent_info,
+                                [this, &source_dc, session] (this auto) -> future<> {
+                            auto tmptr = get_token_metadata_ptr();
+                            auto ks_erms = _db.local().get_non_local_strategy_keyspaces_erms();
+                            if (is_repair_based_node_ops_enabled(streaming::stream_reason::rebuild)) {
+                                utils::optional_param sdc_param;
+                                bool force;
+                                if ((force = source_dc.ends_with(":force"))) {
+                                    source_dc.resize(source_dc.size() - 6);
+                                }
+                                if (!source_dc.empty()) {
+                                    sdc_param.emplace(source_dc).set_user_provided().set_force(force);
+                                }
+                                co_await _repair.local().rebuild_with_repair(std::move(ks_erms), tmptr, std::move(sdc_param), session);
+                            } else {
+                                auto streamer = make_lw_shared<dht::range_streamer>(_stream_manager, tmptr, _abort_source,
+                                        tmptr->get_my_id(), _snitch.local()->get_location(), "Rebuild", streaming::stream_reason::rebuild, session,
+                                        _db.local().get_config().consistent_rangemovement(), _db.local().get_config().stream_plan_ranges_fraction());
+                                streamer->add_source_filter(std::make_unique<dht::range_streamer::failure_detector_source_filter>(_gossiper.get_unreachable_members()));
+                                if (source_dc != "") {
+                                    streamer->add_source_filter(std::make_unique<dht::range_streamer::single_datacenter_filter>(source_dc));
+                                }
+                                for (const auto& [keyspace_name, erm] : ks_erms) {
+                                    auto ranges = co_await get_ranges_for_endpoint(*erm, my_host_id());
+                                    co_await streamer->add_ranges(keyspace_name, erm, std::move(ranges), _gossiper, false);
+                                }
+                                try {
+                                    co_await streamer->stream_async();
+                                    rtlogger.info("streaming for rebuild successful");
+                                } catch (...) {
+                                    auto ep = std::current_exception();
+                                    // This is used exclusively through JMX, so log the full trace but only throw a simple RTE
+                                    rtlogger.warn("error while rebuilding node: {}", ep);
+                                    std::rethrow_exception(std::move(ep));
+                                }
+                            }
+                        }, reset_streaming_result::yes);
+                        result.status = raft_topology_cmd_result::command_status::success;
+                    }
+                    break;
+                    case node_state::left:
+                    case node_state::none:
+                    case node_state::removing:
+                        on_fatal_internal_error(rtlogger, ::format("Node {} got streaming request in state {}. It should be either dead or not part of the cluster",
+                                         id, rs.state));
+                    break;
+                    }
+                }));
+            }
+            break;
+            case raft_topology_cmd::command::wait_for_ip: {
+                std::vector<raft::server_id> ids;
+                {
+                    const auto& new_nodes = _topology_state_machine._topology.new_nodes;
+                    ids.reserve(new_nodes.size());
+                    for (const auto& [id, rs]: new_nodes) {
+                        ids.push_back(id);
+                    }
+                }
+                rtlogger.debug("Got raft_topology_cmd::wait_for_ip, new nodes [{}]", ids);
+                for (const auto& id: ids) {
+                    co_await wait_for_gossiper(id, _gossiper, _abort_source);
+                }
+                rtlogger.debug("raft_topology_cmd::wait_for_ip done [{}]", ids);
+                result.status = raft_topology_cmd_result::command_status::success;
+                break;
+            }
+        }
+    } catch (const raft::request_aborted& e) {
+        rtlogger.warn("raft_topology_cmd {} failed with: {:t}", cmd.cmd, e);
+        result.error_message = e.what();
+    } catch (const std::exception& e) {
+        rtlogger.error("raft_topology_cmd {} failed with: {:t}", cmd.cmd, e);
+        result.error_message = e.what();
+    } catch (...) {
+        rtlogger.error("raft_topology_cmd {} failed with: {:t}", cmd.cmd, std::current_exception());
+        result.error_message = "unknown error";
+    }
+
+    rtlogger.info("topology cmd rpc {} completed with status={} index={}",
+        cmd.cmd, (result.status == raft_topology_cmd_result::command_status::success) ? "succeeded" : "failed", cmd_index);
+    co_return result;
+}
+
+future<> storage_service::update_fence_version(token_metadata::version_t new_version) {
+    return container().invoke_on_all([new_version] (storage_service& ss) {
+        ss._qp.proxy().update_fence_version(new_version);
     });
 }
 
-future<> storage_service::update_topology(inet_address endpoint) {
-    return container().invoke_on(0, [endpoint] (auto& ss) {
-        return ss.mutate_token_metadata([&ss, endpoint] (mutable_token_metadata_ptr tmptr) mutable {
-            // re-read local rack and DC info
-            tmptr->update_topology(endpoint);
-            return make_ready_future<>();
+// Performs a replica-side operation for a given tablet.
+// What operation is performed is determined by "op" based on the
+// current state of tablet metadata. The coordinator is supposed to prepare tablet
+// metadata according to his intent and trigger the operation,
+// without passing any transient information.
+//
+// If the operation succeeds, and the coordinator is still valid, it means
+// that the operation intended by the coordinator was performed.
+// If the coordinator is no longer valid, the operation may succeed but
+// the actual operation performed may be different than intended, it may
+// be the one intended by the new coordinator. This is not a problem
+// because the old coordinator should do nothing with such result.
+//
+// The triggers may be retried. They may also be reordered with older triggers, from
+// the same or a different coordinator. There is a protocol which ensures that
+// stale triggers won't cause operations to run beyond the migration stage they were
+// intended for. For example, that streaming is not still running after the coordinator
+// moved past the "streaming" stage, and that it won't be started when the stage is not appropriate.
+// A non-stale trigger is the one which completed successfully and caused the valid coordinator
+// to advance tablet migration to the next stage. Other triggers are called stale.
+// We can divide stale triggers into categories:
+//   (1) Those which start after the tablet was moved to the next stage
+//   Those which start before the tablet was moved to the next stage,
+//     (2) ...but after the non-stale trigger finished
+//     (3) ...but before the non-stale trigger finished
+//
+// By "start" I mean the atomic block which inserts into _tablet_ops, and by "finish" I mean
+// removal from _tablet_ops.
+// So event ordering is local from the perspective of this replica, and is linear because
+// this happens on the same shard.
+//
+// What prevents (1) from running is the fact that triggers check the state of tablet
+// metadata, and will fail immediately if the stage is not appropriate. It can happen
+// that the trigger is so stale that it will match with an appropriate stage of the next
+// migration of the same tablet. This is not a problem because we fall into the same
+// category as a stale trigger which was started in the new migration, so cases (2) or (3) apply.
+//
+// What prevents (2) from running is the fact that after the coordinator moves on to
+// the next stage, it executes a token metadata barrier, which will wait for such triggers
+// to complete as they hold on to erm via tablet_metadata_barrier. They should be aborted
+// soon after the coordinator changes the stage by the means of tablet_metadata_barrier::get_abort_source().
+//
+// What prevents (3) from running is that they will join with the non-stale trigger, or non-stale
+// trigger will join with them, depending on which came first. In that case they finish at the same time.
+//
+// It's very important that the global token metadata barrier involves all nodes which
+// may receive stale triggers started in the previous stage, so that those nodes will
+// see tablet metadata which reflects group0 state. This will cut-off stale triggers
+// as soon as the coordinator moves to the next stage.
+future<tablet_operation_result> storage_service::do_tablet_operation(locator::global_tablet_id tablet,
+                                              sstring op_name,
+                                              std::function<future<tablet_operation_result>(locator::tablet_metadata_guard&)> op) {
+    // The coordinator may not execute global token metadata barrier before triggering the operation, so we need
+    // a barrier here to see the token metadata which is at least as recent as that of the sender.
+    auto& raft_server = _group0->group0_server();
+    co_await raft_server.read_barrier(&_group0_as);
+
+    if (_tablet_ops.contains(tablet)) {
+        rtlogger.debug("{} retry joining with existing session for tablet {}", op_name, tablet);
+        auto result =  co_await _tablet_ops[tablet].done.get_future();
+        co_return result;
+    }
+
+    locator::tablet_metadata_guard guard(_db.local().find_column_family(tablet.table), tablet);
+    auto& as = guard.get_abort_source();
+    auto sub = utils::chain_abort_source(as, _group0_as);
+    // Also follow shutdown, so that operations can rely on the guard's abort source alone.
+    auto shutdown_sub = utils::chain_abort_source(as, _abort_source);
+
+    auto async_gate_holder = _async_gate.hold();
+    promise<tablet_operation_result> p;
+    _tablet_ops.emplace(tablet, tablet_operation {
+        op_name, seastar::shared_future<tablet_operation_result>(p.get_future())
+    });
+    auto erase_registry_entry = seastar::defer([&] noexcept {
+        _tablet_ops.erase(tablet);
+    });
+
+    try {
+        auto result = co_await op(guard);
+        p.set_value(result);
+        rtlogger.debug("{} for tablet migration of {} successful", op_name, tablet);
+        co_return result;
+    } catch (...) {
+        p.set_exception(std::current_exception());
+        rtlogger.warn("{} for tablet migration of {} failed: {:t}", op_name, tablet, std::current_exception());
+        throw;
+    }
+}
+
+future<service::tablet_operation_repair_result> storage_service::repair_tablet(locator::global_tablet_id tablet, service::session_id session_id, std::optional<tablet_repair_flush_info> flush) {
+    auto result = co_await do_tablet_operation(tablet, "Repair", [this, tablet, session_id, flush] (locator::tablet_metadata_guard& guard) -> future<tablet_operation_result> {
+        slogger.debug("Executing repair for tablet={}", tablet);
+        auto& tmap = guard.get_tablet_map();
+        auto* trinfo = tmap.get_tablet_transition_info(tablet.tablet);
+
+        // Check if the request is still valid.
+        // If there is mismatch, it means this repair was canceled and the coordinator moved on.
+        if (!trinfo) {
+            throw std::runtime_error(fmt::format("No transition info for tablet {}", tablet));
+        }
+        if (trinfo->stage != locator::tablet_transition_stage::repair && trinfo->stage != locator::tablet_transition_stage::rebuild_repair) {
+            throw std::runtime_error(fmt::format("Tablet {} stage is not at repair", tablet));
+        }
+        auto session = session_id ? session_id : trinfo->session_id;
+        slogger.debug("repair_tablet: tablet={} session_id={}", tablet, session);
+        // A coordinator too old to send flush expects what the repair did on
+        // its own: flush, except in a rebuild, which has never flushed.
+        auto flush_info = flush.value_or(tablet_repair_flush_info{trinfo->stage == locator::tablet_transition_stage::rebuild_repair
+                ? tablet_repair_flush_mode::skip : tablet_repair_flush_mode::flush});
+
+        auto global_tablet_repair_task_info = tasks::make_empty_task_info();
+        std::optional<locator::tablet_replica_set> replicas = std::nullopt;
+        if (trinfo->stage == locator::tablet_transition_stage::repair) {
+            auto& tinfo = tmap.get_tablet_info(tablet.tablet);
+            // The repair request may have been deleted concurrently (e.g. via the
+            // del_repair_tablet_request API), which clears repair_task_info while
+            // leaving the transition stage at repair. Treat it like a canceled
+            // request instead of dereferencing a null repair_task_info.
+            if (!tinfo.repair_task_info) {
+                throw std::runtime_error(fmt::format("Repair request for tablet {} was deleted", tablet));
+            }
+            global_tablet_repair_task_info = tasks::make_cluster_task_info(tasks::task_id{tinfo.repair_task_info->tablet_task_id.uuid()});
+        } else {
+            auto migration_streaming_info = get_migration_streaming_info(get_token_metadata_ptr()->get_topology(), tmap.get_tablet_info(tablet.tablet), *trinfo);
+            replicas = locator::tablet_replica_set{migration_streaming_info.read_from.begin(), migration_streaming_info.read_from.end()};
+        }
+
+        utils::get_local_injector().inject("repair_tablet_fail_on_rpc_call",
+            [] { throw std::runtime_error("repair_tablet failed due to error injection"); });
+        auto time = co_await _repair.local().repair_tablet(_address_map, guard, tablet, global_tablet_repair_task_info, session, std::move(replicas), trinfo->stage, flush_info);
+        co_return service::tablet_operation_repair_result{time};
+    });
+    if (std::holds_alternative<service::tablet_operation_repair_result>(result)) {
+        co_return std::get<service::tablet_operation_repair_result>(result);
+    }
+    on_internal_error(slogger, "Got wrong tablet_operation_repair_result");
+}
+
+future<> storage_service::clone_locally_tablet_storage(locator::global_tablet_id tablet, locator::tablet_replica leaving, locator::tablet_replica pending) {
+    if (leaving.host != pending.host) {
+        throw std::runtime_error(fmt::format("Leaving and pending tablet replicas belong to different nodes, {} and {} respectively",
+                                             leaving.host, pending.host));
+    }
+
+    // All sstables cloned locally will be left unsealed, until they're loaded into the table.
+    // This is to guarantee no unsplit sstables will be left sealed on disk, which could
+    // cause problems if unsplit sstables are found after split was ACKed to coordinator.
+    bool leave_unsealed = true;
+
+    auto d = co_await smp::submit_to(leaving.shard, [this, tablet, leave_unsealed] () -> future<utils::chunked_vector<sstables::entry_descriptor>> {
+        auto& table = _db.local().find_column_family(tablet.table);
+        auto op = table.stream_in_progress();
+        co_return co_await table.clone_tablet_storage(tablet.tablet, leave_unsealed);
+    });
+    rtlogger.debug("Cloned storage of tablet {} from leaving replica {}, {} sstables were found", tablet, leaving, d.size());
+
+    auto load_sstable = [leave_unsealed] (const dht::sharder& sharder, replica::table& t, sstables::entry_descriptor d) -> future<sstables::shared_sstable> {
+        auto& mng = t.get_sstables_manager();
+        auto sst = mng.make_sstable(t.schema(), t.get_storage_options(), d.generation, d.sid, d.state.value_or(sstables::sstable_state::normal),
+                                    d.version, d.format, db_clock::now(), default_io_error_handler_gen());
+        // The loader will consider current shard as sstable owner, despite the tablet sharder
+        // will still point to leaving replica at this stage in migration. If node goes down,
+        // SSTables will be loaded at pending replica and migration is retried, so correctness
+        // wise, we're good.
+        auto cfg = sstables::sstable_open_config{ .current_shard_as_sstable_owner = true,
+                                                  .unsealed_sstable = leave_unsealed };
+        co_await sst->load(sharder, cfg);
+        co_return sst;
+    };
+
+    co_await smp::submit_to(pending.shard, [this, tablet, load_sstable, d = std::move(d)] () mutable -> future<> {
+        // Loads cloned sstables from leaving replica into pending one.
+        auto& table = _db.local().find_column_family(tablet.table);
+        auto& sstm = table.get_sstables_manager();
+        auto op = table.stream_in_progress();
+        dht::auto_refreshing_sharder sharder(table.shared_from_this());
+
+        std::unordered_set<sstables::shared_sstable> ssts;
+        for (auto&& sst_desc : d) {
+            ssts.insert(co_await load_sstable(sharder, table, std::move(sst_desc)));
+        }
+        auto on_add = [&ssts, &sstm] (sstables::shared_sstable loading_sst) -> future<> {
+            if (ssts.contains(loading_sst)) {
+                auto cfg = sstm.configure_writer(loading_sst->get_origin());
+                co_await loading_sst->seal_sstable(cfg.backup);
+            }
+            co_return;
+        };
+        co_await table.add_new_sstables_and_update_cache(std::vector(ssts.begin(), ssts.end()), on_add);
+    });
+    rtlogger.debug("Successfully loaded storage of tablet {} into pending replica {}", tablet, pending);
+}
+
+// Streams data to the pending tablet replica of a given tablet on this node.
+// The source tablet replica is determined from the current transition info of the tablet.
+future<> storage_service::stream_tablet(locator::global_tablet_id tablet) {
+    co_await utils::get_local_injector().inject("block_tablet_streaming", [this, &tablet] (auto& handler) -> future<> {
+        const auto keyspace = handler.get("keyspace");
+        const auto table = handler.get("table");
+        SCYLLA_ASSERT(keyspace);
+        SCYLLA_ASSERT(table);
+        auto s = _db.local().find_column_family(tablet.table).schema();
+        if (s->ks_name() != *keyspace || s->cf_name() != *table) {
+            co_return;
+        }
+
+        rtlogger.info("block_tablet_streaming: waiting");
+        while (!handler.poll_for_message() && !_async_gate.is_closed()) {
+            co_await sleep(std::chrono::milliseconds(100));
+        }
+    });
+    co_await do_tablet_operation(tablet, "Streaming", [this, tablet] (locator::tablet_metadata_guard& guard) -> future<tablet_operation_result> {
+        auto tm = guard.get_token_metadata();
+        auto& tmap = guard.get_tablet_map();
+        auto* trinfo = tmap.get_tablet_transition_info(tablet.tablet);
+
+        // Check if the request is still valid.
+        // If there is mismatch, it means this streaming was canceled and the coordinator moved on.
+        if (!trinfo) {
+            throw std::runtime_error(fmt::format("No transition info for tablet {}", tablet));
+        }
+        if (trinfo->stage != locator::tablet_transition_stage::streaming) {
+            throw std::runtime_error(fmt::format("Tablet {} stage is not at streaming", tablet));
+        }
+        auto topo_guard = trinfo->session_id;
+        if (!trinfo->session_id) {
+            throw std::runtime_error(fmt::format("Tablet {} session is not set", tablet));
+        }
+        auto pending_replica = trinfo->pending_replica;
+        if (!pending_replica) {
+            throw std::runtime_error(fmt::format("Tablet {} has no pending replica", tablet));
+        }
+        if (pending_replica->host != tm->get_my_id()) {
+            throw std::runtime_error(fmt::format("Tablet {} has pending replica different than this one", tablet));
+        }
+
+        auto& tinfo = tmap.get_tablet_info(tablet.tablet);
+        auto range = tmap.get_token_range(tablet.tablet);
+        std::optional<locator::tablet_replica> leaving_replica = locator::get_leaving_replica(tinfo, *trinfo);
+        locator::tablet_migration_streaming_info streaming_info = get_migration_streaming_info(tm->get_topology(), tinfo, *trinfo);
+        locator::tablet_replica_set read_from{streaming_info.read_from.begin(), streaming_info.read_from.end()};
+        const auto transition = trinfo->transition;
+        if (transition == locator::tablet_transition_kind::rebuild_v2) {
+            auto nearest_hosts = read_from | std::views::transform([] (const auto& tr) {
+                return tr.host;
+            }) | std::ranges::to<host_id_vector_replica_set>();
+            tm->get_topology().sort_by_proximity(trinfo->pending_replica->host, nearest_hosts);
+
+            if (!nearest_hosts.empty()) {
+                auto it = std::find_if(read_from.begin(), read_from.end(), [nearest_host = nearest_hosts[0]] (const auto& tr) { return tr.host == nearest_host; });
+                if (it == read_from.end()) {
+                    on_internal_error(slogger, "Nearest replica not found");
+                }
+                read_from = { *it };
+            } else {
+                read_from = {};
+            }
+        }
+
+        streaming::stream_reason reason = std::invoke([&] {
+            switch (transition) {
+                case locator::tablet_transition_kind::migration: return streaming::stream_reason::tablet_migration;
+                case locator::tablet_transition_kind::intranode_migration: return streaming::stream_reason::tablet_migration;
+                case locator::tablet_transition_kind::rebuild: return streaming::stream_reason::rebuild;
+                case locator::tablet_transition_kind::rebuild_v2: return streaming::stream_reason::rebuild;
+                default:
+                    throw std::runtime_error(fmt::format("stream_tablet(): Invalid tablet transition: {}", transition));
+            }
+        });
+
+        auto& table = _db.local().find_column_family(tablet.table);
+        const bool file_stream_enabled = _feature_service.file_stream && _db.local().get_config().enable_file_stream();
+        if (table.uses_logstor() && !file_stream_enabled) {
+            throw std::runtime_error(fmt::format("Table {}.{} uses logstor, which requires file streaming to be enabled", table.schema()->ks_name(), table.schema()->cf_name()));
+        }
+
+        if (file_stream_enabled && (transition != locator::tablet_transition_kind::intranode_migration || table.uses_logstor())) {
+            co_await utils::get_local_injector().inject("migration_streaming_wait", utils::wait_for_message{std::chrono::minutes(2)});
+
+            auto dst_node = trinfo->pending_replica->host;
+            auto dst_shard_id = trinfo->pending_replica->shard;
+
+            // Release token_metadata_ptr early so it will no block barriers for other migrations
+            // Don't access trinfo after this.
+            tm = {};
+
+            for (auto src : read_from) {
+                // Use file stream for tablet to stream data
+                auto ops_id = streaming::file_stream_id::create_random_id();
+                auto start_time = std::chrono::steady_clock::now();
+                size_t stream_bytes = 0;
+                try {
+                    auto& table = _db.local().find_column_family(tablet.table);
+                    slogger.debug("stream_sstables[{}] Streaming for tablet {} of {} started table={}.{} range={} src={}",
+                            ops_id, transition, tablet, table.schema()->ks_name(), table.schema()->cf_name(), range, src);
+                    auto resp = co_await streaming::tablet_stream_files(ops_id, table, range, src.host, dst_node, dst_shard_id, _messaging.local(), guard.get_abort_source(), topo_guard);
+                    stream_bytes = resp.stream_bytes;
+                    slogger.debug("stream_sstables[{}] Streaming for tablet migration of {} successful", ops_id, tablet);
+                    auto duration = std::chrono::duration<float>(std::chrono::steady_clock::now() - start_time);
+                    auto bw = utils::pretty_printed_throughput(stream_bytes, duration);;
+                    slogger.info("stream_sstables[{}] Streaming for tablet migration of {} finished table={}.{} range={} stream_bytes={} stream_time={} stream_bw={}",
+                            ops_id, tablet, table.schema()->ks_name(), table.schema()->cf_name(), range, stream_bytes, duration, bw);
+                } catch (...) {
+                    slogger.warn("stream_sstables[{}] Streaming for tablet migration of {} from {} failed: {:t}", ops_id, tablet, leaving_replica, std::current_exception());
+                    throw;
+                }
+            }
+      } else { // Caution: following code is intentionally unindented to be in sync with OSS
+
+
+        if (transition == locator::tablet_transition_kind::intranode_migration) {
+            if (!leaving_replica || leaving_replica->host != tm->get_my_id()) {
+                throw std::runtime_error(fmt::format("Invalid leaving replica for intra-node migration, tablet: {}, leaving: {}",
+                                                     tablet, leaving_replica));
+            }
+            tm = nullptr;
+
+            co_await utils::get_local_injector().inject("intranode_migration_streaming_wait", [this] (auto& handler) -> future<> {
+                rtlogger.info("intranode_migration_streaming: waiting");
+                while (!handler.poll_for_message() && !_async_gate.is_closed()) {
+                    co_await sleep(std::chrono::milliseconds(5));
+                }
+                rtlogger.info("intranode_migration_streaming: released");
+            });
+
+            rtlogger.info("Starting intra-node streaming of tablet {} from shard {} to {}", tablet, leaving_replica->shard, pending_replica->shard);
+            co_await clone_locally_tablet_storage(tablet, *leaving_replica, *pending_replica);
+            rtlogger.info("Finished intra-node streaming of tablet {} from shard {} to {}", tablet, leaving_replica->shard, pending_replica->shard);
+        } else {
+            if (leaving_replica && leaving_replica->host == tm->get_my_id()) {
+                throw std::runtime_error(fmt::format("Cannot stream within the same node using regular migration, tablet: {}, shard {} -> {}",
+                                                     tablet, leaving_replica->shard, trinfo->pending_replica->shard));
+            }
+            co_await utils::get_local_injector().inject("migration_streaming_wait", utils::wait_for_message{std::chrono::minutes(2)});
+            auto& table = _db.local().find_column_family(tablet.table);
+            std::vector<sstring> tables = {table.schema()->cf_name()};
+            auto my_id = tm->get_my_id();
+            auto streamer = make_lw_shared<dht::range_streamer>(_stream_manager, std::move(tm),
+                                                                guard.get_abort_source(),
+                                                                my_id, _snitch.local()->get_location(),
+                                                                format("Tablet {}", transition),
+                                                                reason,
+                                                                topo_guard,
+                                                                _db.local().get_config().consistent_rangemovement(),
+                                                                _db.local().get_config().stream_plan_ranges_fraction(),
+                                                                std::move(tables));
+            tm = nullptr;
+            streamer->add_source_filter(std::make_unique<dht::range_streamer::failure_detector_source_filter>(
+                    _gossiper.get_unreachable_members()));
+
+            std::unordered_map<locator::host_id, dht::token_range_vector> ranges_per_endpoint;
+            for (auto r: read_from) {
+                ranges_per_endpoint[r.host].emplace_back(range);
+            }
+            streamer->add_rx_ranges(table.schema()->ks_name(), std::move(ranges_per_endpoint));
+            slogger.debug("Streaming for tablet migration of {} started table={}.{} range={}", tablet, table.schema()->ks_name(), table.schema()->cf_name(), range);
+            co_await streamer->stream_async();
+            slogger.info("Streaming for tablet migration of {} finished table={}.{} range={}", tablet, table.schema()->ks_name(), table.schema()->cf_name(), range);
+        }
+
+      } // Traditional streaming vs file-based streaming.
+        const auto schema = _db.local().find_column_family(tablet.table).schema();
+
+        co_await utils::get_local_injector().inject("pause_after_streaming_tablet_before_fetch_column_mappings",
+                [schema] (auto& handler) -> future<> {
+            const auto ks = handler.get("keyspace");
+            const auto cf = handler.get("table");
+            if (ks == schema->ks_name() && cf == schema->cf_name()) {
+                slogger.info("pause_after_streaming_tablet_before_fetch_column_mappings: waiting for message");
+                co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::minutes{1});
+                slogger.info("pause_after_streaming_tablet_before_fetch_column_mappings: message received");
+            }
+        });
+
+        // After streaming completes, sync column mapping history from the source replicas
+        // to the destination. This ensures that if the migrated $paxos tablet contains
+        // proposals tagged with an old schema version V, the destination also holds
+        // mapping(V) so that upgrade_if_needed can decode those proposals.
+        // Only relevant for $paxos tables (identified by try_get_base_table returning
+        // a non-null result) and not for intranode migrations.
+        if (transition != locator::tablet_transition_kind::intranode_migration) {
+            const auto base_table_name = service::paxos::paxos_store::try_get_base_table(schema->cf_name());
+            if (base_table_name) {
+                co_await _migration_manager.local().fetch_column_mappings(
+                    _db.local().find_uuid(schema->ks_name(), *base_table_name),
+                    read_from
+                        | std::views::transform([] (const auto& tr) { return tr.host;})
+                        | std::ranges::to<host_id_vector_replica_set>(),
+                    false /* ignore_down_replicas */,
+                    _abort_source);
+            }
+        }
+
+        // Split of the pending replica's compaction group is handled by the
+        // split monitor (process_tablet_split_candidate) and by split-on-attach
+        // (maybe_split_new_sstable in add_new_sstable_and_update_cache) which
+        // splits every incoming sstable before it is loaded into the compaction
+        // group.  There is no need to block the streaming stage on a full
+        // compaction-group split here — doing so would hold a streaming slot on
+        // the coordinator while the split compaction runs, preventing it from
+        // scheduling further migrations.
+        co_await utils::get_local_injector().inject("pause_after_streaming_tablet", utils::wait_for_message{std::chrono::minutes(1)});
+        co_return tablet_operation_result();
+    });
+}
+
+future<> storage_service::cleanup_tablet(locator::global_tablet_id tablet) {
+    utils::get_local_injector().inject("cleanup_tablet_crash", [] {
+        slogger.info("Crashing tablet cleanup");
+        _exit(1);
+    });
+
+    co_await do_tablet_operation(tablet, "Cleanup", [this, tablet] (locator::tablet_metadata_guard& guard) -> future<tablet_operation_result> {
+        shard_id shard;
+        std::optional<raft::group_id> group_id;
+
+        {
+            auto tm = guard.get_token_metadata();
+            auto& tmap = guard.get_tablet_map();
+            auto *trinfo = tmap.get_tablet_transition_info(tablet.tablet);
+            if (tmap.has_raft_info()) {
+                group_id = tmap.get_tablet_raft_info(tablet.tablet).group_id;
+            }
+
+            // Check if the request is still valid.
+            // If there is mismatch, it means this cleanup was canceled and the coordinator moved on.
+            if (!trinfo) {
+                throw std::runtime_error(fmt::format("No transition info for tablet {}", tablet));
+            }
+
+            if (trinfo->stage == locator::tablet_transition_stage::cleanup) {
+                auto& tinfo = tmap.get_tablet_info(tablet.tablet);
+                std::optional<locator::tablet_replica> leaving_replica = locator::get_leaving_replica(tinfo, *trinfo);
+                if (!leaving_replica) {
+                    throw std::runtime_error(fmt::format("Tablet {} has no leaving replica", tablet));
+                }
+                if (leaving_replica->host != tm->get_my_id()) {
+                    throw std::runtime_error(fmt::format("Tablet {} has leaving replica different than this one", tablet));
+                }
+                shard = leaving_replica->shard;
+            } else if (trinfo->stage == locator::tablet_transition_stage::cleanup_target) {
+                if (!trinfo->pending_replica) {
+                    throw std::runtime_error(fmt::format("Tablet {} has no pending replica", tablet));
+                }
+                if (trinfo->pending_replica->host != tm->get_my_id()) {
+                    throw std::runtime_error(fmt::format("Tablet {} has pending replica different than this one", tablet));
+                }
+                shard = trinfo->pending_replica->shard;
+            } else {
+                throw std::runtime_error(fmt::format("Tablet {} stage is not at cleanup/cleanup_target", tablet));
+            }
+        }
+        co_await _db.invoke_on(shard, [tablet, group_id, &gm = _groups_manager.container(), &sys_ks = _sys_ks,
+                &vbw = _view_building_worker] (replica::database& db) -> future<> {
+            if (group_id) {
+                // Before the storage cleanup. The raft server must be gone first: an entry
+                // applied to stopped compaction groups kills its applier fiber, a fatal
+                // error. Its teardown was scheduled when the stage that ended this
+                // replica's hosting was applied, which do_tablet_operation()'s read barrier
+                // guarantees here. The persisted raft state goes too, or a later return of
+                // the tablet would rejoin the group claiming a commit index whose entries it
+                // no longer holds. system.raft_groups asks for wait_for_sync_to_commitlog,
+                // so the delete is durable once it returns. Commitlog replay also discards
+                // the entries of a group that hosts_raft_group() says this shard no longer
+                // hosts.
+                co_await gm.local().cleanup_group(tablet, *group_id);
+            }
+            auto& table = db.find_column_family(tablet.table);
+            co_await vbw.local().cleanup_staging_sstables(table.get_effective_replication_map(), tablet.table, tablet.tablet);
+            co_await table.cleanup_tablet(db, sys_ks.local(), tablet.tablet);
+        });
+        co_return tablet_operation_result();
+    });
+}
+
+static bool increases_replicas_per_rack(const locator::topology& topology, const locator::tablet_info& tinfo, sstring dst_rack) {
+    std::unordered_map<sstring, size_t> m;
+    for (auto& replica: tinfo.replicas) {
+        m[topology.get_rack(replica.host)]++;
+    }
+    auto max = *std::ranges::max_element(m | std::views::values);
+    return m[dst_rack] + 1 > max;
+}
+
+static bool has_fixed_replicas_per_rack(const replica::database& db, table_id table, const sstring& dc) {
+    auto& ks = db.find_keyspace(db.find_schema(table)->ks_name());
+    if (db.enforce_rf_rack_validity_for_keyspace(ks)) {
+        return true;
+    }
+    auto* rs = ks.get_replication_strategy().maybe_as_tablet_aware();
+    return rs && rs->is_rack_based(dc);
+}
+
+future<service::group0_guard> storage_service::get_guard_for_tablet_update() {
+    auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+    co_return guard;
+}
+
+future<bool> storage_service::exec_tablet_update(service::group0_guard guard, group0_update_collector uc, sstring reason) {
+    rtlogger.info("{}", reason);
+    auto updates = co_await uc.collect();
+    rtlogger.trace("do update {} reason {}", updates, reason);
+    updates.emplace_back(topology_mutation_builder(guard.write_timestamp())
+            .set_version(_topology_state_machine._topology.version + 1)
+            .build());
+    topology_change change{std::move(updates)};
+    group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, reason);
+    try {
+        co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+        co_return true;
+    } catch (group0_concurrent_modification&) {
+        rtlogger.debug("exec_tablet_update(): concurrent modification, retrying");
+    }
+    co_return false;
+}
+
+replica::tablet_mutation_builder storage_service::tablet_mutation_builder_for_base_table(api::timestamp_type ts, table_id table) {
+    auto base_table = get_token_metadata_ptr()->tablets().get_base_table(table);
+    return replica::tablet_mutation_builder(ts, base_table);
+}
+
+// Repair the tablets contain the tokens and wait for the repair to finish
+// This is used to run a manual repair requested by user from the restful API.
+future<std::unordered_map<sstring, sstring>> storage_service::add_repair_tablet_request(table_id table, std::variant<utils::chunked_vector<dht::token>, all_tokens_tag> tokens_variant,
+        std::unordered_set<locator::host_id> hosts_filter, std::unordered_set<sstring> dcs_filter, bool await_completion, locator::tablet_repair_incremental_mode incremental_mode) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.add_repair_tablet_request(table, std::move(tokens_variant), std::move(hosts_filter), std::move(dcs_filter), await_completion, incremental_mode);
+        });
+    }
+
+    bool all_tokens = std::holds_alternative<all_tokens_tag>(tokens_variant);
+    utils::chunked_vector<dht::token> tokens;
+    if (!all_tokens) {
+        tokens = std::get<utils::chunked_vector<dht::token>>(tokens_variant);
+    }
+
+    if (!_feature_service.tablet_repair_scheduler) {
+        throw std::runtime_error("The TABLET_REPAIR_SCHEDULER feature is not enabled on the cluster yet");
+    }
+
+    auto repair_task_info = locator::tablet_task_info::make_user_repair_request(hosts_filter, dcs_filter, incremental_mode);
+    auto res = std::unordered_map<sstring, sstring>{{sstring("tablet_task_id"), repair_task_info.tablet_task_id.to_sstring()}};
+
+    auto start = std::chrono::steady_clock::now();
+    slogger.info("Starting tablet repair by API request table_id={} tokens={} all_tokens={} tablet_task_id={} hosts_filter={} dcs_filter={} incremental_mode={}",
+            table, tokens, all_tokens, repair_task_info.tablet_task_id, hosts_filter, dcs_filter, incremental_mode);
+
+    while (true) {
+        auto guard = co_await get_guard_for_tablet_update();
+
+        // we don't allow requesting repair on tablets of colocated tables, because the repair task info
+        // is stored on the base table's tablet map which is shared by all the tables that are colocated with it.
+        // we don't have a way currently to store the repair task info for a specific colocated table.
+        // repair can only be requested for the base table, and this will repair the base table's tablets
+        // and all its colocated tablets as well.
+        if (!get_token_metadata().tablets().is_base_table(table)) {
+            auto table_schema = _db.local().find_schema(table);
+            auto base_schema = _db.local().find_schema(get_token_metadata().tablets().get_base_table(table));
+
+            throw std::invalid_argument(::format(
+                "Cannot set repair request on table '{}'.'{}' because it is colocated with the base table '{}'.'{}'. "
+                "Repair requests can be made only on the base table. "
+                "Repairing the base table will also repair all tables colocated with it.",
+                table_schema->ks_name(), table_schema->cf_name(), base_schema->ks_name(), base_schema->cf_name()));
+        }
+
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        group0_update_collector updates;
+
+        if (all_tokens) {
+            tokens.clear();
+            co_await tmap.for_each_tablet([&] (locator::tablet_id tid, const locator::tablet_info& info) -> future<> {
+                auto last_token = tmap.get_last_token(tid);
+                tokens.push_back(last_token);
+                co_return;
+            });
+        }
+
+        auto ts = db_clock::now();
+        auto builder = tablet_mutation_builder_for_base_table(guard.write_timestamp(), table);
+        for (const auto& token : tokens) {
+            auto tid = tmap.get_tablet_id(token);
+            auto& tinfo = tmap.get_tablet_info(tid);
+            if (tinfo.repair_task_info && tinfo.repair_task_info->tablet_task_id) {
+                auto& req_id = tinfo.repair_task_info->tablet_task_id;
+                throw std::runtime_error(fmt::format("Tablet {} is already in repair by tablet_task_id={}",
+                        locator::global_tablet_id{table, tid}, req_id));
+            }
+            auto last_token = tmap.get_last_token(tid);
+            builder.set_repair_task_info(last_token, repair_task_info, _feature_service);
+            db::system_keyspace::repair_task_entry entry{
+                .task_uuid   = tasks::task_id(repair_task_info.tablet_task_id.uuid()),
+                .operation   = db::system_keyspace::repair_task_operation::requested,
+                .first_token = dht::token::to_int64(tmap.get_first_token(tid)),
+                .last_token  = dht::token::to_int64(tmap.get_last_token(tid)),
+                .timestamp   = ts,
+                .table_uuid  = table,
+            };
+            if (_feature_service.tablet_repair_tasks_table) {
+                auto m = co_await _sys_ks.local().get_update_repair_task_mutation(entry, guard.write_timestamp());
+                updates.add_small(std::move(m));
+            }
+        }
+        updates.add_large(builder.build());
+
+        sstring reason = format("Repair tablet by API request tokens={} tablet_task_id={}", tokens, repair_task_info.tablet_task_id);
+        if (co_await exec_tablet_update(std::move(guard), std::move(updates), std::move(reason))) {
+            break;
+        }
+    }
+
+    if (!await_completion) {
+        auto duration = std::chrono::duration<float>(std::chrono::steady_clock::now() - start);
+        slogger.info("Issued tablet repair by API request table_id={} tokens={} all_tokens={} tablet_task_id={} duration={}",
+                table, tokens, all_tokens, repair_task_info.tablet_task_id, duration);
+        co_return res;
+    }
+
+    co_await _topology_state_machine.event.wait([&] {
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        return std::all_of(tokens.begin(), tokens.end(), [&] (const dht::token& token) {
+            auto id = tmap.get_tablet_id(token);
+            return tmap.get_tablet_info(id).repair_task_info == nullptr
+                || tmap.get_tablet_info(id).repair_task_info->tablet_task_id != repair_task_info.tablet_task_id;
         });
     });
+
+    auto duration = std::chrono::duration<float>(std::chrono::steady_clock::now() - start);
+    slogger.info("Finished tablet repair by API request table_id={} tokens={} all_tokens={} tablet_task_id={} duration={}",
+            table, tokens, all_tokens, repair_task_info.tablet_task_id, duration);
+
+    co_return res;
+}
+
+
+// Delete a tablet repair request by the given tablet_task_id
+future<> storage_service::del_repair_tablet_request(table_id table, locator::tablet_task_id tablet_task_id) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.del_repair_tablet_request(table, tablet_task_id);
+        });
+    }
+
+    if (!_feature_service.tablet_repair_scheduler) {
+        throw std::runtime_error("The TABLET_REPAIR_SCHEDULER feature is not enabled on the cluster yet");
+    }
+
+    slogger.info("Deleting tablet repair request by API request table_id={} tablet_task_id={}", table, tablet_task_id);
+    while (true) {
+        auto guard = co_await get_guard_for_tablet_update();
+
+        // see add_repair_tablet_request. repair requests can only be added on base tables.
+        if (!get_token_metadata().tablets().is_base_table(table)) {
+            auto table_schema = _db.local().find_schema(table);
+            auto base_schema = _db.local().find_schema(get_token_metadata().tablets().get_base_table(table));
+
+            throw std::invalid_argument(::format(
+                "Cannot delete repair request on table '{}'.'{}' because it is colocated with the base table '{}'.'{}'. "
+                "Repair requests can be added and deleted only on the base table.",
+                table_schema->ks_name(), table_schema->cf_name(), base_schema->ks_name(), base_schema->cf_name()));
+        }
+
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        group0_update_collector updates;
+
+        auto builder = tablet_mutation_builder_for_base_table(guard.write_timestamp(), table);
+        co_await tmap.for_each_tablet([&] (locator::tablet_id tid, const locator::tablet_info& info) -> future<> {
+            auto& tinfo = tmap.get_tablet_info(tid);
+            if (!tinfo.repair_task_info || tinfo.repair_task_info->tablet_task_id != tablet_task_id) {
+                co_return;
+            }
+            auto last_token = tmap.get_last_token(tid);
+            auto* trinfo = tmap.get_tablet_transition_info(tid);
+            builder.del_repair_task_info(last_token, _feature_service);
+            if (trinfo && trinfo->transition == locator::tablet_transition_kind::repair) {
+                builder.del_session(last_token);
+            }
+        });
+        co_await updates.add(builder.build());
+
+        sstring reason = format("Deleting tablet repair request by API request tablet_id={} tablet_task_id={}", table, tablet_task_id);
+        if (co_await exec_tablet_update(std::move(guard), std::move(updates), std::move(reason))) {
+            break;
+        }
+    }
+    slogger.info("Deleted tablet repair request by API request table_id={} tablet_task_id={}", table, tablet_task_id);
+}
+
+future<> storage_service::move_tablet(table_id table, dht::token token, locator::tablet_replica src, locator::tablet_replica dst, loosen_constraints force) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.move_tablet(table, token, src, dst, force);
+        });
+    }
+
+    co_await transit_tablet(table, token, [=, this] (group0_update_collector& updates, const locator::tablet_map& tmap, api::timestamp_type write_timestamp) {
+        auto tid = tmap.get_tablet_id(token);
+        auto& tinfo = tmap.get_tablet_info(tid);
+        auto last_token = tmap.get_last_token(tid);
+        auto gid = locator::global_tablet_id{table, tid};
+
+        if (!locator::contains(tinfo.replicas, src)) {
+            throw std::runtime_error(seastar::format("Tablet {} has no replica on {}", gid, src));
+        }
+        auto* node = get_token_metadata().get_topology().find_node(dst.host);
+        if (!node) {
+            throw std::runtime_error(seastar::format("Unknown host: {}", dst.host));
+        }
+        if (dst.shard >= node->get_shard_count()) {
+            throw std::runtime_error(seastar::format("Host {} does not have shard {}", *node, dst.shard));
+        }
+
+        if (src == dst) {
+            sstring reason = format("No-op move of tablet {} to {}", gid, dst);
+            return reason;
+        }
+
+        if (src.host != dst.host && locator::contains(tinfo.replicas, dst.host)) {
+            throw std::runtime_error(fmt::format("Tablet {} has replica on {}", gid, dst.host));
+        }
+        auto src_dc_rack = get_token_metadata().get_topology().get_location(src.host);
+        auto dst_dc_rack = get_token_metadata().get_topology().get_location(dst.host);
+        if (src_dc_rack.dc != dst_dc_rack.dc) {
+            if (force) {
+                slogger.warn("Moving tablet {} between DCs ({} and {})", gid, src_dc_rack.dc, dst_dc_rack.dc);
+            } else {
+                throw std::runtime_error(fmt::format("Attempted to move tablet {} between DCs ({} and {})", gid, src_dc_rack.dc, dst_dc_rack.dc));
+            }
+        }
+        if (src_dc_rack.rack != dst_dc_rack.rack && increases_replicas_per_rack(get_token_metadata().get_topology(), tinfo, dst_dc_rack.rack)) {
+            if (force) {
+                slogger.warn("Moving tablet {} between racks ({} and {}) which reduces availability", gid, src_dc_rack.rack, dst_dc_rack.rack);
+            } else {
+                throw std::runtime_error(fmt::format("Attempted to move tablet {} between racks ({} and {}) which would reduce availability", gid, src_dc_rack.rack, dst_dc_rack.rack));
+            }
+        }
+
+        auto migration_task_info = src.host == dst.host ? locator::tablet_task_info::make_intranode_migration_request()
+            : locator::tablet_task_info::make_migration_request();
+        migration_task_info.sched_nr++;
+        migration_task_info.sched_time = db_clock::now();
+        updates.add_small(tablet_mutation_builder_for_base_table(write_timestamp, table)
+            .set_new_replicas(last_token, locator::replace_replica(tinfo.replicas, src, dst))
+            .set_stage(last_token, locator::tablet_transition_stage::allow_write_both_read_old)
+            .set_transition(last_token, src.host == dst.host ? locator::tablet_transition_kind::intranode_migration
+                                                             : locator::tablet_transition_kind::migration)
+            .set_migration_task_info(last_token, std::move(migration_task_info), _feature_service)
+            .build());
+        if (_feature_service.view_building_coordinator) {
+            db::view::abort_view_building_tasks(_view_building_state_machine, updates, write_timestamp, table, src, last_token);
+        }
+
+        sstring reason = format("Moving tablet {} from {} to {}", gid, src, dst);
+
+        return reason;
+    });
+}
+
+future<> storage_service::add_tablet_replica(table_id table, dht::token token, locator::tablet_replica dst, loosen_constraints force) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.add_tablet_replica(table, token, dst, force);
+        });
+    }
+
+    co_await transit_tablet(table, token, [=, this] (group0_update_collector& updates, const locator::tablet_map& tmap, api::timestamp_type write_timestamp) {
+        auto tid = tmap.get_tablet_id(token);
+        auto& tinfo = tmap.get_tablet_info(tid);
+        auto last_token = tmap.get_last_token(tid);
+        auto gid = locator::global_tablet_id{table, tid};
+
+        auto* node = get_token_metadata().get_topology().find_node(dst.host);
+        if (!node) {
+            throw std::runtime_error(format("Unknown host: {}", dst.host));
+        }
+        if (dst.shard >= node->get_shard_count()) {
+            throw std::runtime_error(format("Host {} does not have shard {}", *node, dst.shard));
+        }
+
+        if (locator::contains(tinfo.replicas, dst.host)) {
+            throw std::runtime_error(fmt::format("Tablet {} has replica on {}", gid, dst.host));
+        }
+
+        auto dst_dc_rack = get_token_metadata().get_topology().get_location(dst.host);
+        if (has_fixed_replicas_per_rack(_db.local(), table, dst_dc_rack.dc)) {
+            if (force) {
+                slogger.warn("Adding replica to tablet {} in rack {} which breaks the replication constraints of the keyspace", gid, dst_dc_rack.rack);
+            } else {
+                throw std::runtime_error(fmt::format("Attempted to add replica to tablet {} in rack {} which would break the replication constraints of the keyspace", gid, dst_dc_rack.rack));
+            }
+        } else if (increases_replicas_per_rack(get_token_metadata().get_topology(), tinfo, dst_dc_rack.rack)) {
+            if (force) {
+                slogger.warn("Adding replica to tablet {} in rack {} which reduces availability", gid, dst_dc_rack.rack);
+            } else {
+                throw std::runtime_error(fmt::format("Attempted to add replica to tablet {} in rack {} which would reduce availability", gid, dst_dc_rack.rack));
+            }
+        }
+
+        locator::tablet_replica_set new_replicas(tinfo.replicas);
+        new_replicas.push_back(dst);
+
+        updates.add_small(tablet_mutation_builder_for_base_table(write_timestamp, table)
+            .set_new_replicas(last_token, new_replicas)
+            .set_stage(last_token, locator::tablet_transition_stage::allow_write_both_read_old)
+            .set_transition(last_token, locator::choose_rebuild_transition_kind(_feature_service))
+            .build());
+
+        sstring reason = format("Adding replica to tablet {}, node {}", gid, dst);
+
+        return reason;
+    });
+}
+
+future<> storage_service::del_tablet_replica(table_id table, dht::token token, locator::tablet_replica dst, loosen_constraints force) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.del_tablet_replica(table, token, dst, force);
+        });
+    }
+
+    co_await transit_tablet(table, token, [=, this] (group0_update_collector& updates, const locator::tablet_map& tmap, api::timestamp_type write_timestamp) {
+        auto tid = tmap.get_tablet_id(token);
+        auto& tinfo = tmap.get_tablet_info(tid);
+        auto last_token = tmap.get_last_token(tid);
+        auto gid = locator::global_tablet_id{table, tid};
+
+        auto* node = get_token_metadata().get_topology().find_node(dst.host);
+        if (!node) {
+            throw std::runtime_error(format("Unknown host: {}", dst.host));
+        }
+        if (dst.shard >= node->get_shard_count()) {
+            throw std::runtime_error(format("Host {} does not have shard {}", *node, dst.shard));
+        }
+
+        if (!locator::contains(tinfo.replicas, dst.host)) {
+            throw std::runtime_error(fmt::format("Tablet {} doesn't have replica on {}", gid, dst.host));
+        }
+
+        auto dst_dc_rack = get_token_metadata().get_topology().get_location(dst.host);
+        if (has_fixed_replicas_per_rack(_db.local(), table, dst_dc_rack.dc)) {
+            if (force) {
+                slogger.warn("Removing replica from tablet {} in rack {} which breaks the replication constraints of the keyspace", gid, dst_dc_rack.rack);
+            } else {
+                throw std::runtime_error(fmt::format("Attempted to remove replica from tablet {} in rack {} which would break the replication constraints of the keyspace", gid, dst_dc_rack.rack));
+            }
+        }
+
+        locator::tablet_replica_set new_replicas;
+        new_replicas.reserve(tinfo.replicas.size() - 1);
+        std::copy_if(tinfo.replicas.begin(), tinfo.replicas.end(), std::back_inserter(new_replicas), [&dst] (auto r) { return r != dst; });
+
+        updates.add_small(tablet_mutation_builder_for_base_table(write_timestamp, table)
+            .set_new_replicas(last_token, new_replicas)
+            .set_stage(last_token, locator::tablet_transition_stage::allow_write_both_read_old)
+            .set_transition(last_token, locator::choose_rebuild_transition_kind(_feature_service))
+            .build());
+        if (_feature_service.view_building_coordinator) {
+            db::view::abort_view_building_tasks(_view_building_state_machine, updates, write_timestamp, table, dst, last_token);
+        }
+
+        sstring reason = format("Removing replica from tablet {}, node {}", gid, dst);
+
+        return reason;
+    });
+}
+
+future<> storage_service::abort_restore_tablets(table_id table) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.abort_restore_tablets(table);
+        });
+    }
+
+    slogger.info("Aborting tablet restore for table_id={}", table);
+    while (true) {
+        auto guard = co_await get_guard_for_tablet_update();
+
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        group0_update_collector updates;
+        auto builder = tablet_mutation_builder_for_base_table(guard.write_timestamp(), table);
+        co_await tmap.for_each_tablet([&] (locator::tablet_id tid, const locator::tablet_info& info) -> future<> {
+            auto* trinfo = tmap.get_tablet_transition_info(tid);
+            if (!trinfo || trinfo->transition != locator::tablet_transition_kind::restore || !trinfo->session_id) {
+                co_return;
+            }
+            auto last_token = tmap.get_last_token(tid);
+            // Deleting the session aborts the restore: see the restore handling in the
+            // topology coordinator.
+            builder.del_session(last_token);
+        });
+
+        co_await updates.add(builder.build());
+
+        if (updates.empty()) {
+            break;
+        }
+
+        sstring reason = format("Aborting tablet restore for table_id={}", table);
+        if (co_await exec_tablet_update(std::move(guard), std::move(updates), std::move(reason))) {
+            break;
+        }
+    }
+    slogger.info("Aborted tablet restore for table_id={}", table);
+}
+
+future<> storage_service::restore_tablets(table_id table, sstring snap_name) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.restore_tablets(table, snap_name);
+        });
+    }
+
+    utils::UUID request_id;
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        // If a restore for the same table is already in flight (e.g. started
+        // by a node that has since died), join it instead of starting a new
+        // one. Reject a mismatched snapshot for the same table.
+        std::optional<utils::UUID> ongoing;
+        for (auto req : _topology_state_machine._topology.ongoing_restore_requests) {
+            auto entry = co_await _sys_ks.local().get_topology_request_entry(req);
+            if (entry.restore_table_id == table) {
+                if (entry.restore_snapshot_name != snap_name) {
+                    throw std::runtime_error(fmt::format("Table {} is already being restored from a different snapshot {}", table, *entry.restore_snapshot_name));
+                }
+                ongoing = req;
+                break;
+            }
+        }
+        if (ongoing) {
+            release_guard(std::move(guard));
+            request_id = *ongoing;
+            slogger.info("Restore for {} already in flight, waiting for it", table);
+            break;
+        }
+
+        request_id = guard.new_group0_state_id();
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        topology_request_tracking_mutation_builder trbuilder(request_id, _feature_service.topology_requests_type_column);
+
+        trbuilder.set_restore_tablets_data(table, snap_name)
+                 .set("done", false)
+                 .set("start_time", db_clock::now());
+
+        builder.queue_global_topology_request_id(request_id);
+        trbuilder.set("request_type", global_topology_request::restore_tablets);
+
+        topology_change change{{builder.build(), trbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, "Restore tablets");
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            break;
+        } catch (group0_concurrent_modification&) {
+            slogger.debug("restore_tablets: concurrent modification, retrying");
+        }
+    }
+
+    auto error = co_await wait_for_topology_request_completion(request_id);
+    if (!error.empty()) {
+        throw std::runtime_error(error);
+    }
+
+    slogger.info("Restoring {} finished", table);
+}
+
+future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables() {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // topology coordinator only exists in shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.load_stats_for_tablet_based_tables();
+        });
+    }
+
+    // Refresh is triggered after table creation, need to make sure we see the new tablets.
+    // Hold the group0 gate to prevent abort_and_drain() from destroying the
+    // raft server while read_barrier() is in flight (SCYLLADB-2071).
+    {
+        auto group0_holder = _group0->hold_group0_gate();
+        co_await _group0->group0_server().read_barrier(&_group0_as);
+    }
+
+    using table_ids_t = std::unordered_set<table_id>;
+    const auto table_ids = co_await std::invoke([this] () -> future<table_ids_t> {
+        table_ids_t ids;
+        co_await _db.local().get_tables_metadata().for_each_table_gently([&] (table_id id, lw_shared_ptr<replica::table> table) mutable {
+            if (table->uses_tablets()) {
+                ids.insert(id);
+            }
+            return make_ready_future<>();
+        });
+        co_return std::move(ids);
+    });
+
+    // Helps with intra-node migration by serializing with changes to token metadata, so shards
+    // participating in the migration will see migration in same stage, therefore preventing
+    // double accounting (anomaly) in the reported size.
+    auto tmlock = co_await get_token_metadata_lock();
+
+    const locator::host_id this_host = _db.local().get_token_metadata().get_my_id();
+
+    // Align to 64 bytes to avoid cache line ping-pong when updating size in map_reduce0() below
+    struct alignas(64) shard_load {
+        uint64_t sstable_tablet_sizes = 0;
+        uint64_t logstor_space = 0;
+    };
+    std::vector<shard_load> load_per_shard(this_smp_shard_count());
+
+    // Each node combines a per-table load map from all of its shards and returns it to the coordinator.
+    // So if there are 1k nodes, there will be 1k RPCs in total.
+    auto load_stats = co_await _db.map_reduce0([&table_ids, &this_host, &load_per_shard] (replica::database& db) -> future<locator::load_stats> {
+        locator::load_stats load_stats{};
+        auto& tables_metadata = db.get_tables_metadata();
+
+        for (const auto& id : table_ids) {
+            auto table = tables_metadata.get_table_if_exists(id);
+            if (!table) {
+                continue;
+            }
+
+            locator::combined_load_stats combined_ls { table->table_load_stats() };
+            load_stats.tables.emplace(id, std::move(combined_ls.table_ls));
+            const uint64_t tablet_sizes = load_stats.tablet_stats[this_host].add_tablet_sizes(combined_ls.tablet_ls);
+            if (!table->uses_logstor()) {
+                load_per_shard[this_shard_id()].sstable_tablet_sizes += tablet_sizes;
+            }
+
+            co_await coroutine::maybe_yield();
+        }
+        load_per_shard[this_shard_id()].logstor_space = db.logstor_space_on_disk();
+
+        co_return std::move(load_stats);
+    }, locator::load_stats{}, std::plus<locator::load_stats>());
+
+    load_stats.capacity[this_host] = _disk_space_monitor->space().capacity;
+    load_stats.critical_disk_utilization[this_host] = _disk_space_monitor->disk_utilization() > _db.local().get_config().critical_disk_utilization_level();
+
+    const std::filesystem::space_info si = _disk_space_monitor->space();
+    load_stats.capacity[this_host] = si.capacity;
+
+    locator::tablet_load_stats& tls = load_stats.tablet_stats[this_host];
+    const uint64_t config_capacity = _db.local().get_config().data_file_capacity();
+    if (config_capacity != 0) {
+        tls.effective_capacity = config_capacity;
+    } else if (_db.local().get_config().force_effective_capacity_to_raw_disk_capacity()) {
+        tls.effective_capacity = _disk_space_monitor->space().capacity;
+    } else {
+        uint64_t sum_sstable_tablet_sizes = 0;
+        uint64_t sum_logstor_space = 0;
+        for (const auto& shard : load_per_shard) {
+            sum_sstable_tablet_sizes += shard.sstable_tablet_sizes;
+            sum_logstor_space += shard.logstor_space;
+        }
+        // The capacity is the space the tablets can use: the free space, plus the sstables of the
+        // tablets, plus all of the logstor files.
+        tls.effective_capacity = si.available + sum_sstable_tablet_sizes + sum_logstor_space;
+    }
+
+    co_return std::move(load_stats);
+}
+
+future<> storage_service::transit_tablet(table_id table, dht::token token, noncopyable_function<sstring(group0_update_collector&, const locator::tablet_map&, api::timestamp_type)> prepare_mutations) {
+    auto success = co_await try_transit_tablet(table, token, std::move(prepare_mutations));
+    if (!success) {
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        auto tid = tmap.get_tablet_id(token);
+        throw std::runtime_error(fmt::format("Tablet {} is in transition", locator::global_tablet_id{table, tid}));
+    }
+
+    // Wait for transition to finish.
+    co_await _topology_state_machine.event.when([&] {
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        return !tmap.get_tablet_transition_info(tmap.get_tablet_id(token));
+    });
+}
+
+future<bool> storage_service::try_transit_tablet(table_id table, dht::token token, noncopyable_function<sstring(group0_update_collector&, const locator::tablet_map&, api::timestamp_type)> prepare_mutations) {
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+        bool topology_busy;
+
+        while ((topology_busy = _topology_state_machine._topology.is_busy())) {
+            const auto tstate = *_topology_state_machine._topology.tstate;
+            if (tstate == topology::transition_state::tablet_draining ||
+                tstate == topology::transition_state::tablet_migration) {
+                break;
+            }
+            rtlogger.debug("transit_tablet(): topology state machine is busy: {}", tstate);
+            release_guard(std::move(guard));
+            co_await _topology_state_machine.event.when();
+            guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+        }
+
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        auto tid = tmap.get_tablet_id(token);
+        if (tmap.get_tablet_transition_info(tid)) {
+            co_return false;
+        }
+
+        group0_update_collector uc;
+        auto reason = prepare_mutations(uc, tmap, guard.write_timestamp());
+
+        rtlogger.info("{}", reason);
+
+        {
+            topology_mutation_builder builder(guard.write_timestamp());
+
+            if (topology_busy) {
+                rtlogger.debug("transit_tablet({}): topology busy, keeping transition state", locator::global_tablet_id{table, tid});
+            } else {
+                builder.set_transition_state(topology::transition_state::tablet_migration);
+            }
+            builder.set_version(_topology_state_machine._topology.version + 1);
+            uc.emplace_back(builder.build());
+        }
+
+        auto updates = co_await uc.collect();
+        rtlogger.trace("do update {} reason {}", updates, reason);
+
+        topology_change change{std::move(updates)};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, reason);
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            break;
+        } catch (group0_concurrent_modification&) {
+            rtlogger.debug("transit_tablet(): concurrent modification, retrying");
+        }
+    }
+
+    co_return true;
+}
+
+future<> storage_service::cancel_tablet_transitions() {
+    if (!_feature_service.tablet_transition_cancel) {
+        rtlogger.warn("Not cancelling tablet transitions, the cluster does not support the "
+                      "TABLET_TRANSITION_CANCEL feature yet, waiting for them to finish");
+        co_return;
+    }
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        // Disabling balancing doesn't stop a drain, so a cancelled drain migration would just be
+        // scheduled again. With parallel_tablet_draining, the migrations of a paused drain are
+        // skipped below.
+        if (_topology_state_machine._topology.tstate == topology::transition_state::tablet_draining) {
+            rtlogger.info("Not cancelling tablet transitions, a node is being drained");
+            co_return;
+        }
+
+        // Keeps the command within raft's limit: an RF change puts every tablet of a keyspace
+        // into transition. TODO: move into group0_update_collector (SCYLLADB-4327).
+        constexpr size_t estimated_bytes_per_tablet = 512;
+        const size_t max_tablets_per_pass = std::max<size_t>(1,
+                _group0->group0_server().max_command_size() / 2 / estimated_bytes_per_tablet);
+
+        auto tm = get_token_metadata_ptr();
+        std::unordered_map<table_id, replica::tablet_mutation_builder> builders;
+        size_t cancelled = 0;
+        bool capped = false;
+        for (auto&& [base_table, tables] : tm->tablets().all_table_groups()) {
+            const auto& tmap = tm->tablets().get_tablet_map(base_table);
+            for (auto&& [tid, trinfo] : tmap.transitions()) {
+                co_await coroutine::maybe_yield();
+                if (cancelled >= max_tablets_per_pass) {
+                    capped = true;
+                    break;
+                }
+                const auto& tinfo = tmap.get_tablet_info(tid);
+                if (!locator::can_cancel_tablet_transition(trinfo.stage)
+                        || locator::is_tablet_transition_cancelled(tinfo, trinfo)) {
+                    continue;
+                }
+                auto leaving = locator::get_leaving_replica(tinfo, trinfo);
+                if (leaving && _topology_state_machine._topology.paused_requests.contains(
+                        raft::server_id(leaving->host.uuid()))) {
+                    continue;
+                }
+                auto last_token = tmap.get_last_token(tid);
+                auto i = builders.try_emplace(base_table, guard.write_timestamp(), base_table).first;
+                i->second.cancel_transition(last_token, trinfo, _feature_service);
+                cancelled++;
+                rtlogger.debug("Cancelling {} of tablet {} at stage {}", trinfo.transition,
+                               locator::global_tablet_id{base_table, tid}, trinfo.stage);
+            }
+            if (capped) {
+                break;
+            }
+        }
+        if (!cancelled) {
+            co_return;
+        }
+
+        group0_update_collector updates;
+        for (auto& [table, builder] : builders) {
+            co_await coroutine::maybe_yield();
+            updates.add_large(builder.build());
+        }
+        auto reason = format("Cancelling {} tablet transitions", cancelled);
+        if (co_await exec_tablet_update(std::move(guard), std::move(updates), std::move(reason))
+                && !capped) {
+            co_return;
+        }
+        // Lost a group0 race, or capped. Cancelled tablets are skipped by the next scan.
+    }
+}
+
+future<> storage_service::cancel_tablet_transition(locator::global_tablet_id tablet, locator::tablet_task_id task_id) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [tablet, task_id] (auto& ss) {
+            return ss.cancel_tablet_transition(tablet, task_id);
+        });
+    }
+
+    if (!_feature_service.tablet_transition_cancel) {
+        throw std::runtime_error("Cannot cancel the tablet transition: the cluster does not "
+                                 "support the TABLET_TRANSITION_CANCEL feature yet");
+    }
+
+    // The coordinator writes to group0 concurrently, so bound the retries.
+    auto deadline = lowres_clock::now() + std::chrono::minutes(1);
+
+    while (true) {
+        if (lowres_clock::now() >= deadline) {
+            rtlogger.warn("Gave up cancelling the transition of tablet {}, group0 is busy", tablet);
+            throw seastar::timed_out_error{};
+        }
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        // The migration may have finished, and another transition started, since the task was
+        // looked up.
+        auto tm = get_token_metadata_ptr();
+        const auto* tmap = tm->tablets().has_tablet_map(tablet.table) ? &tm->tablets().get_tablet_map(tablet.table) : nullptr;
+        const auto* task_info = tmap ? tmap->get_tablet_info(tablet.tablet).migration_task_info.get() : nullptr;
+        auto* trinfo = tmap ? tmap->get_tablet_transition_info(tablet.tablet) : nullptr;
+        if (!task_info || task_info->tablet_task_id != task_id || !trinfo) {
+            throw tasks::task_manager::task_not_found(tasks::task_id{task_id.uuid()});
+        }
+        if (trinfo->cancelled) {
+            co_return;
+        }
+        if (!locator::can_cancel_tablet_transition(trinfo->stage)) {
+            throw std::runtime_error(format("Transition of tablet {} is at stage {}, which cannot be "
+                                            "rolled back", tablet,
+                                            locator::tablet_transition_stage_to_string(trinfo->stage)));
+        }
+
+        auto base_table = tm->tablets().get_base_table(tablet.table);
+        replica::tablet_mutation_builder builder(guard.write_timestamp(), base_table);
+        builder.cancel_transition(tmap->get_last_token(tablet.tablet), *trinfo, _feature_service);
+        group0_update_collector updates;
+        updates.add_large(builder.build());
+
+        auto reason = format("Cancelling transition of tablet {}", tablet);
+        if (co_await exec_tablet_update(std::move(guard), std::move(updates), std::move(reason))) {
+            co_return;
+        }
+    }
+}
+
+future<> storage_service::set_tablet_balancing_enabled(bool enabled, std::optional<std::chrono::seconds> grace_period_opt) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.set_tablet_balancing_enabled(enabled, grace_period_opt);
+        });
+    }
+
+    auto grace_period = grace_period_opt.value_or(
+            std::chrono::seconds(_db.local().get_config().tablet_transition_abort_grace_period_in_seconds()));
+
+    utils::UUID request_id;
+    auto reason = format("Setting tablet balancing to {}", enabled);
+
+    while (true) {
+        group0_guard guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+        utils::chunked_vector<canonical_mutation> updates;
+
+        updates.push_back(canonical_mutation(
+                topology_mutation_builder(guard.write_timestamp())
+                     .set_tablet_balancing_enabled(enabled)
+                     .build()));
+
+        if (!enabled
+                && _feature_service.topology_noop_request && _feature_service.topology_global_request_queue) {
+            request_id = guard.new_group0_state_id();
+            updates.push_back(canonical_mutation(
+                topology_mutation_builder(guard.write_timestamp())
+                    .queue_global_topology_request_id(request_id)
+                    .build()));
+            updates.push_back(canonical_mutation(
+                topology_request_tracking_mutation_builder(request_id, _feature_service.topology_requests_type_column)
+                    .set("done", false)
+                    .set("request_type", global_topology_request::noop_request)
+                    .build()));
+        }
+
+        rtlogger.info("{}", reason);
+        topology_change change{std::move(updates)};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard, reason);
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            break;
+        } catch (group0_concurrent_modification&) {
+            rtlogger.debug("set_tablet_balancing_enabled(): concurrent modification");
+        }
+    }
+
+    if (request_id) {
+        auto check = [] (const sstring& error) {
+            if (!error.empty()) {
+                throw std::runtime_error(format("Failed to disable tablet balancing: {}", error));
+            }
+        };
+
+        if (grace_period != std::chrono::seconds::zero()) {
+            // One cancelling pass is enough: the queued request preempts balancing.
+            try {
+                check(co_await wait_for_topology_request_completion(request_id, true,
+                                                                   lowres_clock::now() + grace_period));
+                co_return;
+            } catch (const seastar::timed_out_error&) {
+                rtlogger.info("Tablet transitions did not finish within {}, cancelling the ones "
+                              "which can be rolled back so that disabling tablet balancing can "
+                              "complete", grace_period);
+            }
+            co_await cancel_tablet_transitions();
+        }
+
+        check(co_await wait_for_topology_request_completion(request_id));
+    } else if (!enabled) {
+        if (grace_period != std::chrono::seconds::zero()) {
+            rtlogger.warn("Ignoring the grace period, this cluster does not support queueing the "
+                          "request which disabling tablet balancing waits for");
+        }
+        while (_topology_state_machine._topology.is_busy()) {
+            rtlogger.debug("set_tablet_balancing_enabled(): topology is busy");
+            co_await _topology_state_machine.event.when();
+        }
+    }
+}
+
+future<utils::UUID> storage_service::submit_quiesce_topology_request() {
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+        auto request_id = guard.new_group0_state_id();
+
+        topology_mutation_builder builder(guard.write_timestamp());
+        builder.queue_global_topology_request_id(request_id);
+
+        topology_request_tracking_mutation_builder rtbuilder(request_id, _feature_service.topology_requests_type_column);
+        rtbuilder.set("done", false)
+                 .set("request_type", global_topology_request::quiesce);
+
+        topology_change change{{builder.build(), rtbuilder.build()}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+            ::format("quiesce topology request from {}", _group0->group0_server().id()));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            co_return request_id;
+        } catch (group0_concurrent_modification&) {
+            slogger.debug("quiesce: concurrent modification while submitting request, retrying");
+        }
+    }
+}
+
+// Submit a topology request and retry until the coordinator observes an empty tablet
+// balance plan with fresh stats. Runs as _quiesce_topology, so at most one of these is
+// in flight at a time, see await_topology_quiesced().
+future<> storage_service::do_await_topology_quiesced() {
+    // This loop can retry for a long time: on a cluster whose tablet load
+    // never settles within size_based_balance_threshold_percentage, the
+    // coordinator keeps deferring the request and the caller (e.g.
+    // load-and-stream) makes no progress at all. Report that at info level so
+    // the wait is diagnosable from a default-level log rather than only from
+    // the coordinator's own deferral messages.
+    const auto start_time = lowres_clock::now();
+    unsigned attempts = 0;
+    auto elapsed_s = [start_time] {
+        return std::chrono::duration_cast<std::chrono::seconds>(lowres_clock::now() - start_time).count();
+    };
+    while (true) {
+        ++attempts;
+        auto request_id = co_await submit_quiesce_topology_request();
+        auto error = co_await wait_for_topology_request_completion(request_id);
+        if (error.empty()) {
+            if (attempts > 1) {
+                slogger.info("quiesce request {}: topology quiesced after {} attempts in {} s",
+                             request_id, attempts, elapsed_s());
+            }
+            co_return;
+        }
+        if (error.starts_with("quiesce request failed")) {
+            slogger.warn("quiesce request {}: {}", request_id, error);
+        } else if (attempts == 1) {
+            // Always report the first attempt of a run. The rate limiter below
+            // is shared by successive runs of _quiesce_topology, so an
+            // unconditional line here is what guarantees that each run is
+            // recorded as having started; otherwise a fresh run could be
+            // silently swallowed by the tail of a preceding one.
+            slogger.info("quiesce request {}: topology not idle: {}", request_id, error);
+        } else {
+            // Retries are rate-limited, and add the attempt count and elapsed
+            // time: a bare "not idle" line is not actionable, whereas
+            // "attempt 812, waiting for 2700 s" tells an operator that the
+            // topology is never going to quiesce.
+            static thread_local logging::logger::rate_limit rate_limit{std::chrono::seconds(30)};
+            slogger.log(logging::log_level::info, rate_limit,
+                        "quiesce request {}: topology not idle: {} (attempt {}, waiting for {} s)",
+                        request_id, error, attempts, elapsed_s());
+        }
+        // Wait locally for topology to settle before resubmitting.
+        co_await _topology_state_machine.await_not_busy(_group0_as);
+        co_await _topology_state_machine.event.when([this] {
+            return get_token_metadata_ptr()->tablets().is_idle();
+        });
+    }
+}
+
+future<> storage_service::await_topology_quiesced() {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.await_topology_quiesced();
+        });
+        co_return;
+    }
+
+    if (!_feature_service.quiesce_topology_enhanced
+            || !_feature_service.topology_global_request_queue) {
+        // Old behavior — fallback for mixed-version clusters.
+        co_await _group0->group0_server().read_barrier(&_group0_as);
+        co_await _topology_state_machine.await_not_busy(_group0_as);
+        co_return;
+    }
+
+    // Whether the topology has quiesced is a question about the cluster, so concurrent
+    // callers all want the same answer. load_and_stream() asks it from every shard at
+    // once, which used to put smp::count requests into the cluster-wide group0 queue,
+    // each one costing the coordinator a load stats collection and a full balance.
+    //
+    // trigger_later() defers the run briefly so that callers forwarded from other shards
+    // join the same one. Callers which arrive once a run has already started are served
+    // by the next run rather than by that one, so nobody is given an answer which was
+    // computed before it asked.
+    co_await _quiesce_topology.trigger_later();
+}
+
+future<bool> storage_service::verify_topology_quiesced(token_metadata::version_t expected_version) {
+    auto holder = _async_gate.hold();
+
+    if (this_shard_id() != 0) {
+        // group0 is only set on shard 0.
+        co_return co_await container().invoke_on(0, [&] (auto& ss) {
+            return ss.verify_topology_quiesced(expected_version);
+        });
+    }
+
+    co_await _group0->group0_server().read_barrier(&_group0_as);
+    co_return _topology_state_machine._topology.version == expected_version && !_topology_state_machine._topology.is_busy();
+}
+
+future<join_node_request_result> storage_service::join_node_request_handler(join_node_request_params params) {
+    join_node_request_result result;
+    rtlogger.info("received request to join from host_id: {}", params.host_id);
+
+    if (params.cluster_name != _db.local().get_config().cluster_name()) {
+        result.result = join_node_request_result::rejected{
+            .reason = ::format("Cluster name check failed. This node cannot join the cluster "
+                                "because it expected cluster name \"{}\" and not \"{}\"",
+                                params.cluster_name,
+                                _db.local().get_config().cluster_name()),
+        };
+        co_return result;
+    }
+
+    if (params.snitch_name != _db.local().get_snitch_name()) {
+        result.result = join_node_request_result::rejected{
+            .reason = ::format("Snitch name check failed. This node cannot join the cluster "
+                                "because it uses \"{}\" and not \"{}\"",
+                                params.snitch_name,
+                                _db.local().get_snitch_name()),
+        };
+        co_return result;
+    }
+
+    co_await _topology_state_machine.event.when([this] {
+        // The first node defines the cluster and inserts its entry to the
+        // `system.topology` without checking anything. It is possible that the
+        // `join_node_request_handler` fires before the first node sets itself
+        // as a normal node, therefore we might need to wait until that happens,
+        // here. If we didn't do it, the topology coordinator could handle the
+        // joining node as the first one and skip the necessary join node
+        // handshake.
+        return !_topology_state_machine._topology.normal_nodes.empty();
+    });
+
+    auto& g0_server = _group0->group0_server();
+    auto g0_holder = _group0->hold_group0_gate();
+    if (params.replaced_id && *params.replaced_id == g0_server.current_leader()) {
+        // There is a peculiar case that can happen if the leader is killed
+        // and then replaced very quickly:
+        //
+        // - Cluster with nodes `A`, `B`, `C` - `A` is the topology
+        //   coordinator/group0 leader,
+        // - `A` is killed,
+        // - New node `D` attempts to replace `A` with the same IP as `A`,
+        //   sends `join_node_request` rpc to node `B`,
+        // - Node `B` handles the RPC and wants to perform group0 operation
+        //   and wants to perform a barrier - still thinks that `A`
+        //   is the leader and is alive, sends an RPC to its IP,
+        // - `D` accidentally receives the request that was meant to `A`
+        //   but throws an exception because of host_id mismatch,
+        // - Failure is propagated back to `B`, and then to `D` - and `D`
+        //   fails the replace operation.
+        //
+        // We can try to detect if this failure might happen: if the new node
+        // is going to replace but the ID of the replaced node is the same
+        // as the leader, wait for a short while until a reelection happens.
+        // If replaced ID == leader ID, then this indicates either the situation
+        // above or an operator error (actually trying to replace a live node).
+
+        const auto timeout = std::chrono::seconds(10);
+
+        rtlogger.warn("the node {} which was requested to be"
+                " replaced has the same ID as the current group 0 leader ({});"
+                " this looks like an attempt to join a node with the same IP"
+                " as a leader which might have just crashed; waiting for"
+                " a reelection",
+                params.host_id, g0_server.current_leader());
+
+        abort_source as;
+        timer<lowres_clock> t;
+        t.set_callback([&as] {
+            as.request_abort();
+        });
+        t.arm(timeout);
+
+        try {
+            while (*params.replaced_id == g0_server.current_leader()) {
+                // FIXME: Wait for the next term instead of sleeping in a loop
+                // Waiting for state change is not enough because a new leader
+                // might be chosen without us going through the candidate state.
+                co_await sleep_abortable(std::chrono::milliseconds(100), as);
+            }
+        } catch (abort_requested_exception&) {
+            rtlogger.warn("the node {} tries to replace the"
+                    " current leader {} but the leader didn't change within"
+                    " {}s. Rejecting the node",
+                    params.host_id,
+                    *params.replaced_id,
+                    std::chrono::duration_cast<std::chrono::seconds>(timeout).count());
+
+            result.result = join_node_request_result::rejected{
+                .reason = format(
+                        "It is only allowed to replace dead nodes, however the"
+                        " node that was requested to be replaced is still seen"
+                        " as the group0 leader after {}s, which indicates that"
+                        " it might be still alive. You are either trying to replace"
+                        " a live node or trying to replace a node very quickly"
+                        " after it went down and reelection didn't happen within"
+                        " the timeout. Refusing to continue",
+                        std::chrono::duration_cast<std::chrono::seconds>(timeout).count()),
+            };
+            co_return result;
+        }
+    }
+
+    while (true) {
+        auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
+
+        if (const auto *p = _topology_state_machine._topology.find(params.host_id)) {
+            const auto& rs = p->second;
+            if (rs.state == node_state::left) {
+                rtlogger.warn("the node {} attempted to join but it was removed from the cluster. Rejecting the node", params.host_id);
+                result.result = join_node_request_result::rejected{
+                    .reason = "The node has already been removed from the cluster",
+                };
+            } else {
+                rtlogger.warn("the node {} attempted to join again after an unfinished attempt but it is no longer allowed to do so. Rejecting the node", params.host_id);
+                result.result = join_node_request_result::rejected{
+                    .reason = "The node requested to join before but didn't finish the procedure. "
+                              "Please clear the data directory and restart.",
+                };
+            }
+            co_return result;
+        }
+
+        utils::UUID old_request_id;
+
+        if (params.replaced_id) {
+            auto rhid = locator::host_id{params.replaced_id->uuid()};
+            if (is_me(rhid) || _gossiper.is_alive(rhid)) {
+                result.result = join_node_request_result::rejected{
+                    .reason = fmt::format("tried to replace alive node {}", *params.replaced_id),
+                };
+                co_return result;
+            }
+
+            auto replaced_it = _topology_state_machine._topology.normal_nodes.find(*params.replaced_id);
+            if (replaced_it == _topology_state_machine._topology.normal_nodes.end()) {
+                result.result = join_node_request_result::rejected{
+                    .reason = ::format("Cannot replace node {} because it is not in the 'normal' state", *params.replaced_id),
+                };
+                co_return result;
+            }
+
+            if (replaced_it->second.datacenter != params.datacenter || replaced_it->second.rack != params.rack) {
+                result.result = join_node_request_result::rejected{
+                    .reason = fmt::format("Cannot replace node in {}/{} with node in {}/{}", replaced_it->second.datacenter, replaced_it->second.rack, params.datacenter, params.rack),
+                };
+                co_return result;
+            }
+
+            auto is_zero_token = params.num_tokens == 0 && params.tokens_string.empty();
+            if (replaced_it->second.ring.value().tokens.empty() && !is_zero_token) {
+                result.result = join_node_request_result::rejected{
+                    .reason = fmt::format("Cannot replace the zero-token node {} with a token-owning node", *params.replaced_id),
+                };
+                co_return result;
+            }
+            if (!replaced_it->second.ring.value().tokens.empty() && is_zero_token) {
+                result.result = join_node_request_result::rejected{
+                    .reason = fmt::format("Cannot replace the token-owning node {} with a zero-token node", *params.replaced_id),
+                };
+                co_return result;
+            }
+
+            auto ignored_nodes = ignored_nodes_from_join_params(params);
+            for (auto ignored_id : ignored_nodes) {
+                if (_gossiper.is_alive(locator::host_id(ignored_id.uuid()))) {
+                    result.result = join_node_request_result::rejected{
+                        .reason = fmt::format("Cannot replace node {} because ignored node {} is alive", *params.replaced_id, ignored_id),
+                    };
+                    co_return result;
+                }
+            }
+
+            for (auto& [node_id, _] : _topology_state_machine._topology.normal_nodes) {
+                bool is_excluded = node_id == *params.replaced_id
+                        || ignored_nodes.contains(node_id)
+                        || _topology_state_machine._topology.excluded_tablet_nodes.contains(node_id);
+                if (!is_excluded && !_gossiper.is_alive(locator::host_id(node_id.uuid()))) {
+                    result.result = join_node_request_result::rejected{
+                        .reason = fmt::format(
+                            "Cannot replace node {} because node {} is down and not ignored; "
+                            "if the node is down, restart it before retrying replacement; "
+                            "if the node is unrecoverable, retry replacement with the node added to the ignore list",
+                            *params.replaced_id, node_id),
+                    };
+                    co_return result;
+                }
+            }
+
+            if (_topology_state_machine._topology.requests.find(*params.replaced_id) != _topology_state_machine._topology.requests.end()) {
+                old_request_id = replaced_it->second.request_id;
+            }
+        }
+
+        auto mutation = build_mutation_from_join_params(params, guard.write_timestamp(), old_request_id);
+
+        topology_change change{{std::move(mutation)}};
+        group0_command g0_cmd = _group0->client().prepare_command(std::move(change), guard,
+                format("raft topology: placing join request for {}", params.host_id));
+
+        co_await utils::get_local_injector().inject("join-node-before-add-entry", utils::wait_for_message(5min));
+
+        try {
+            co_await _group0->client().add_entry(std::move(g0_cmd), std::move(guard), _group0_as, raft_timeout{});
+            break;
+        } catch (group0_concurrent_modification&) {
+            rtlogger.info("join_node_request: concurrent operation is detected, retrying.");
+        }
+    }
+
+    rtlogger.info("placed join request for {}", params.host_id);
+
+    // Success
+    result.result = join_node_request_result::ok {};
+    co_return result;
+}
+
+future<join_node_response_result> storage_service::join_node_response_handler(join_node_response_params params) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+
+    // Usually this handler will only run once, but there are some cases where we might get more than one RPC,
+    // possibly happening at the same time, e.g.:
+    //
+    // - Another node becomes the topology coordinator while the old one waits for the RPC,
+    // - Topology coordinator finished the RPC but failed to update the group 0 state.
+
+    // Serialize handling the responses.
+    auto lock = co_await get_units(_join_node_response_handler_mutex, 1);
+
+    // Wait until we sent and completed the join_node_request RPC
+    co_await _join_node_request_done.get_shared_future(_group0_as);
+
+    if (_join_node_response_done.available()) {
+        // We already handled this RPC. No need to retry it.
+        rtlogger.info("the node got join_node_response RPC for the second time, ignoring");
+
+        if (std::holds_alternative<join_node_response_params::accepted>(params.response)
+                &&  _join_node_response_done.failed()) {
+            // The topology coordinator accepted the node that was rejected before or failed while handling
+            // the response. Inform the coordinator about it so it moves the node to the left state.
+            co_await coroutine::return_exception_ptr(_join_node_response_done.get_shared_future().get_exception());
+        }
+
+        co_return join_node_response_result{};
+    }
+
+    if (utils::get_local_injector().enter("join_node_response_drop_expiring")) {
+        _gossiper.get_mutable_address_map().force_drop_expiring_entries();
+    }
+
+    try {
+        co_return co_await std::visit(overloaded_functor {
+            [&] (const join_node_response_params::accepted& acc) -> future<join_node_response_result> {
+                co_await utils::get_local_injector().inject("join-node-response_handler-before-read-barrier", utils::wait_for_message(5min));
+
+                // Do a read barrier to read/initialize the topology state
+                co_await _group0->group0_server_with_timeouts().read_barrier(&_group0_as, raft_timeout{});
+
+                // Calculate nodes to ignore
+                // TODO: ignore_dead_nodes setting for bootstrap
+                std::unordered_set<raft::server_id> ignored_ids = _topology_state_machine._topology.ignored_nodes;
+                auto my_request_it =
+                        _topology_state_machine._topology.req_param.find(_group0->load_my_id());
+                if (my_request_it != _topology_state_machine._topology.req_param.end()) {
+                    if (auto* replace = std::get_if<service::replace_param>(&my_request_it->second)) {
+                        ignored_ids.insert(replace->replaced_id);
+                    }
+                }
+
+                // After this RPC finishes, repair or streaming will be run, and
+                // both of them require this node to see the normal nodes as UP.
+                // This condition might not be true yet as this information is
+                // propagated through gossip. In order to reduce the chance of
+                // repair/streaming failure, wait here until we see normal nodes
+                // as UP (or the timeout elapses).
+                auto sync_nodes = _topology_state_machine._topology.normal_nodes | std::views::keys
+                             | std::ranges::views::filter([ignored_ids] (raft::server_id id) { return !ignored_ids.contains(id); })
+                             | std::views::transform([] (raft::server_id id) { return locator::host_id{id.uuid()}; })
+                             | std::ranges::to<std::vector<locator::host_id>>();
+                rtlogger.info("coordinator accepted request to join, "
+                        "waiting for nodes {} to be alive before responding and continuing",
+                        sync_nodes);
+                co_await _gossiper.wait_alive(sync_nodes, wait_for_live_nodes_timeout);
+                rtlogger.info("nodes {} are alive", sync_nodes);
+
+                // Unblock waiting join_node_rpc_handshaker::post_server_start,
+                // which will start the raft server and continue
+                _join_node_response_done.set_value();
+
+                co_return join_node_response_result{};
+            },
+            [&] (const join_node_response_params::rejected& rej) -> future<join_node_response_result> {
+                auto eptr = std::make_exception_ptr(std::runtime_error(
+                        format("the topology coordinator rejected request to join the cluster: {}", rej.reason)));
+                _join_node_response_done.set_exception(std::move(eptr));
+
+                co_return join_node_response_result{};
+            },
+        }, params.response);
+    } catch (...) {
+        auto eptr = std::current_exception();
+        rtlogger.warn("error while handling the join response from the topology coordinator. "
+                "The node will not join the cluster. Error: {}", eptr);
+        _join_node_response_done.set_exception(std::move(eptr));
+
+        throw;
+    }
+}
+
+future<utils::chunked_vector<canonical_mutation>> storage_service::get_system_mutations(schema_ptr schema) {
+    utils::chunked_vector<canonical_mutation> result;
+    auto rs = co_await db::system_keyspace::query_mutations(_db, schema);
+    result.reserve(rs->partitions().size());
+    for (const auto& p : rs->partitions()) {
+        result.emplace_back(co_await make_canonical_mutation_gently(co_await unfreeze_gently(p.mut(), schema)));
+    }
+    co_return result;
+}
+
+future<utils::chunked_vector<canonical_mutation>> storage_service::get_system_mutations(const sstring& ks_name, const sstring& cf_name) {
+    auto s = _db.local().find_schema(ks_name, cf_name);
+    return get_system_mutations(s);
+}
+
+node_state storage_service::get_node_state(locator::host_id id) {
+    if (this_shard_id() != 0) {
+        on_internal_error(rtlogger, "cannot access node state on non zero shard");
+    }
+    auto rid = raft::server_id{id.uuid()};
+    if (!_topology_state_machine._topology.contains(rid)) {
+        on_internal_error(rtlogger, format("unknown node {}", rid));
+    }
+    auto p = _topology_state_machine._topology.find(rid);
+    if (!p) {
+        return node_state::left;
+    }
+    return p->second.state;
+}
+
+void storage_service::check_raft_rpc(raft::server_id dst_id) {
+    if (!_group0 || !_group0->joined_group0()) {
+        throw std::runtime_error("The node did not join group 0 yet");
+    }
+    if (_group0->load_my_id() != dst_id) {
+        throw raft_destination_id_not_correct(_group0->load_my_id(), dst_id);
+    }
 }
 
 void storage_service::init_messaging_service() {
-    _messaging.local().register_replication_finished([this] (gms::inet_address from) {
-        return confirm_replication(from);
-    });
-
-    _messaging.local().register_node_ops_cmd([this] (const rpc::client_info& cinfo, node_ops_cmd_request req) {
+    ser::node_ops_rpc_verbs::register_node_ops_cmd(&_messaging.local(), [this] (const rpc::client_info& cinfo, node_ops_cmd_request req) {
         auto coordinator = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
-        return container().invoke_on(0, [coordinator, req = std::move(req)] (auto& ss) mutable {
-            return ss.node_ops_cmd_handler(coordinator, std::move(req));
+        std::optional<locator::host_id> coordinator_host_id;
+        if (const auto* id = cinfo.retrieve_auxiliary_opt<locator::host_id>("host_id")) {
+            coordinator_host_id = *id;
+        }
+        return container().invoke_on(0, [coordinator, coordinator_host_id, req = std::move(req)] (auto& ss) mutable {
+            return ss.node_ops_cmd_handler(coordinator, coordinator_host_id, std::move(req));
         });
     });
+    ser::streaming_rpc_verbs::register_tablet_stream_files(&_messaging.local(),
+            [this] (const rpc::client_info& cinfo, streaming::stream_files_request req) -> future<streaming::stream_files_response> {
+        streaming::stream_files_response resp;
+        resp.stream_bytes = co_await container().map_reduce0([req] (storage_service& ss) -> future<size_t> {
+            auto res = co_await streaming::tablet_stream_files_handler(ss._db.local(), ss._view_building_worker.local(), ss._messaging.local(), req);
+            co_return res.stream_bytes;
+        },
+        size_t(0),
+        std::plus<size_t>());
+        co_return resp;
+    });
+    ser::streaming_rpc_verbs::register_clone_sstable(&_messaging.local(),
+            [this] (const rpc::client_info& cinfo, streaming::clone_sstable_request req) -> future<streaming::stream_files_response> {
+        co_return co_await streaming::clone_sstable_handler(_db.local(), _view_building_worker.local(), _feature_service, req);
+    });
+    ser::storage_service_rpc_verbs::register_raft_topology_cmd(&_messaging.local(), [this] (raft::server_id dst_id, raft::term_t term, uint64_t cmd_index, raft_topology_cmd cmd) {
+        return handle_raft_rpc(dst_id, [cmd = std::move(cmd), term, cmd_index] (auto& ss) {
+            check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "raft_topology_cmd");
+            return ss.raft_topology_cmd_handler(term, cmd_index, cmd);
+        });
+    });
+    ser::storage_service_rpc_verbs::register_raft_pull_snapshot(&_messaging.local(), [this] (raft::server_id dst_id, raft_snapshot_pull_params params) {
+        return handle_raft_rpc(dst_id, [params = std::move(params)] (storage_service& ss) -> future<raft_snapshot> {
+            check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "raft_pull_snapshot");
+            utils::chunked_vector<canonical_mutation> mutations;
+            // FIXME: make it an rwlock, here we only need to lock for reads,
+            // might be useful if multiple nodes are trying to pull concurrently.
+            auto read_apply_mutex_holder = co_await ss._group0->client().hold_read_apply_mutex(ss._abort_source);
 
-    auto group0_peer_exchange_impl = [this](const rpc::client_info& cinfo, rpc::opt_time_point timeout,
-            discovery::peer_list peers) -> future<group0_peer_exchange> {
-
-        return container().invoke_on(0 /* group 0 is on shard 0 */, [peers = std::move(peers)] (
-                storage_service& self) -> future<group0_peer_exchange> {
-
-            if (self._group0) {
-                return self._group0->peer_exchange(std::move(peers));
-            } else {
-                return make_ready_future<group0_peer_exchange>(group0_peer_exchange{std::monostate{}});
+            // We may need to send additional raft-based tables to the requester that
+            // are not indicated in the parameter.
+            // For example, when a node joins, it requests a snapshot before it knows
+            // which features are enabled, so it doesn't know yet if these tables exist
+            // on other nodes.
+            // In the current "legacy" mode we assume the requesting node sends 2 RPCs - one for
+            // topology tables and one for auth tables, service levels, and additional tables.
+            // When we detect it's the second RPC, we add additional tables based on our feature flags.
+            // In the future we want to deprecate this parameter, so this condition should
+            // apply only for "legacy" snapshot pull RPCs.
+            std::vector<table_id> additional_tables;
+            if (params.tables.size() > 0 && params.tables[0] != db::system_keyspace::topology()->id()) {
+                additional_tables.push_back(db::system_keyspace::view_build_status_v2()->id());
+                if (ss._feature_service.compression_dicts) {
+                    additional_tables.push_back(db::system_keyspace::dicts()->id());
+                }
+                if (ss._feature_service.view_building_coordinator) {
+                    additional_tables.push_back(db::system_keyspace::view_building_tasks()->id());
+                }
+                if (ss._feature_service.cdc_with_tablets) {
+                    additional_tables.push_back(db::system_keyspace::cdc_streams_state()->id());
+                    additional_tables.push_back(db::system_keyspace::cdc_streams_history()->id());
+                }
+                if (ss._feature_service.client_routes) {
+                    additional_tables.push_back(db::system_keyspace::client_routes()->id());
+                }
             }
+
+            for (const auto& table : std::views::concat(params.tables, additional_tables)) {
+                auto schema = ss._db.local().find_schema(table);
+                auto muts = co_await ss.get_system_mutations(schema);
+
+                if (table == db::system_keyspace::cdc_generations_v3()->id()) {
+                    utils::get_local_injector().inject("cdc_generation_mutations_topology_snapshot_replication",
+                        [target_size=ss._db.local().schema_commitlog()->max_record_size() * 2, &muts] {
+                            // Copy mutations n times, where n is picked so that the memory size of all mutations
+                            // together exceeds `schema_commitlog()->max_record_size()`.
+                            // We multiply by two to account for all possible deltas (like segment::entry_overhead_size).
+
+                            size_t current_size = 0;
+                            for (const auto& m: muts) {
+                                current_size += m.representation().size();
+                            }
+                            const auto number_of_copies = (target_size / current_size + 1) * 2;
+                            muts.reserve(muts.size() * number_of_copies);
+                            const auto it_begin = muts.begin();
+                            const auto it_end = muts.end();
+                            for (unsigned i = 0; i < number_of_copies; ++i) {
+                                std::copy(it_begin, it_end, std::back_inserter(muts));
+                            }
+                        });
+                }
+
+                mutations.reserve(mutations.size() + muts.size());
+                std::move(muts.begin(), muts.end(), std::back_inserter(mutations));
+            }
+
+            auto sl_driver_created_mut = co_await ss._sys_ks.local().get_service_level_driver_created_mutation();
+            if (sl_driver_created_mut) {
+                mutations.push_back(canonical_mutation(*sl_driver_created_mut));
+            }
+
+            auto sl_version_mut = co_await ss._sys_ks.local().get_service_levels_version_mutation();
+            if (sl_version_mut) {
+                mutations.push_back(canonical_mutation(*sl_version_mut));
+            }
+
+            auto auth_version_mut = co_await ss._sys_ks.local().get_auth_version_mutation();
+            if (auth_version_mut) {
+                mutations.emplace_back(*auth_version_mut);
+            }
+
+            auto view_builder_version_mut = co_await ss._sys_ks.local().get_view_builder_version_mutation();
+            if (view_builder_version_mut) {
+                mutations.emplace_back(*view_builder_version_mut);
+            }
+
+            auto vb_processing_base_mut = co_await ss._sys_ks.local().get_view_building_processing_base_id_mutation();
+            if (vb_processing_base_mut) {
+                mutations.emplace_back(*vb_processing_base_mut);
+            }
+
+            co_return raft_snapshot{
+                .mutations = std::move(mutations),
+            };
         });
-    };
-
-    _messaging.local().register_group0_peer_exchange(group0_peer_exchange_impl);
-
-    auto group0_modify_config_impl = [this](const rpc::client_info& cinfo, rpc::opt_time_point timeout,
-            raft::group_id gid, std::vector<raft::server_address> add, std::vector<raft::server_id> del) -> future<> {
-
-        return container().invoke_on(0, [gid, add = std::move(add), del = std::move(del)] (
-                storage_service& self) -> future<> {
-
-            return self._raft_gr.get_server(gid).modify_config(std::move(add), std::move(del));
+    });
+    ser::storage_service_rpc_verbs::register_tablet_stream_data(&_messaging.local(), [this] (raft::server_id dst_id, locator::global_tablet_id tablet) {
+        return handle_raft_rpc(dst_id, [tablet] (auto& ss) {
+            return ss.stream_tablet(tablet);
         });
-    };
-    _messaging.local().register_group0_modify_config(group0_modify_config_impl);
+    });
+    ser::storage_service_rpc_verbs::register_tablet_repair(&_messaging.local(), [this] (raft::server_id dst_id, locator::global_tablet_id tablet, rpc::optional<service::session_id> session_id, rpc::optional<tablet_repair_flush_info> flush) {
+        if (utils::get_local_injector().enter("tablet_repair_ignore_flush_mode")) {
+            flush = std::nullopt;
+        }
+        return handle_raft_rpc(dst_id, [tablet, session_id = session_id.value_or(service::session_id::create_null_id()), flush] (auto& ss) -> future<service::tablet_operation_repair_result> {
+            auto res = co_await ss.repair_tablet(tablet, session_id, flush);
+            co_return res;
+        });
+    });
+    ser::storage_service_rpc_verbs::register_tablet_cleanup(&_messaging.local(), [this] (raft::server_id dst_id, locator::global_tablet_id tablet) {
+        return handle_raft_rpc(dst_id, [tablet] (auto& ss) {
+            return ss.cleanup_tablet(tablet);
+        });
+    });
+    ser::storage_service_rpc_verbs::register_table_load_stats(&_messaging.local(), [this] (raft::server_id dst_id) {
+        return handle_raft_rpc(dst_id, [] (auto& ss) mutable {
+            return ss.load_stats_for_tablet_based_tables();
+        });
+    });
+    ser::storage_service_rpc_verbs::register_table_load_stats_v1(&_messaging.local(), [this] (raft::server_id dst_id) {
+        return handle_raft_rpc(dst_id, [] (auto& ss) mutable {
+            return ss.load_stats_for_tablet_based_tables().then([] (auto stats) {
+                return locator::load_stats_v1{ .tables = std::move(stats.tables) };
+            });
+        });
+    });
+    ser::join_node_rpc_verbs::register_join_node_request(&_messaging.local(), [this] (raft::server_id dst_id, service::join_node_request_params params) {
+        return handle_raft_rpc(dst_id, [params = std::move(params)] (auto& ss) mutable {
+            check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "join_node_request");
+            return ss.join_node_request_handler(std::move(params));
+        });
+    });
+    ser::join_node_rpc_verbs::register_join_node_response(&_messaging.local(), [this] (raft::server_id dst_id, service::join_node_response_params params) {
+        return container().invoke_on(0, [dst_id, params = std::move(params)] (auto& ss) mutable -> future<join_node_response_result> {
+            check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "join_node_response");
+            co_await ss._join_node_group0_started.get_shared_future(ss._group0_as);
+            if (ss._group0->load_my_id() != dst_id) {
+                throw raft_destination_id_not_correct(ss._group0->load_my_id(), dst_id);
+            }
+            co_return co_await ss.join_node_response_handler(std::move(params));
+        });
+    });
+    ser::join_node_rpc_verbs::register_join_node_query(&_messaging.local(), [this] (raft::server_id dst_id, service::join_node_query_params) {
+        return handle_raft_rpc(dst_id, [] (auto& ss) -> future<join_node_query_result> {
+            check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "join_node_query");
+            auto result = join_node_query_result{
+                .topo_mode = join_node_query_result::topology_mode::raft
+            };
+            return make_ready_future<join_node_query_result>(std::move(result));
+        });
+    });
+    ser::join_node_rpc_verbs::register_notify_banned(&_messaging.local(), [this] (const rpc::client_info& cinfo, raft::server_id dst_id) {
+        auto src_id = cinfo.retrieve_auxiliary<locator::host_id>("host_id");
+        return container().invoke_on(0, [src_id, dst_id] (auto& ss) -> future<rpc::no_wait_type> {
+            if (ss.my_host_id() != locator::host_id{dst_id.uuid()}) {
+                rtlogger.warn("received notify_banned from {} for {}, but my id is {}, ignoring", src_id, dst_id, ss.my_host_id());
+            } else if (ss._topology_state_machine._topology.tstate != topology::transition_state::left_token_ring &&
+                    !ss._topology_state_machine._topology.left_nodes.contains(dst_id) && !ss._group0_as.abort_requested()) {
+                // Ignore rpc if the node is already shutting down or during decommissioning because
+                // the node is expected to shut itself down after being banned.
+                rtlogger.info("received notification of being banned from the cluster from {}, terminating.", src_id);
+                _exit(0);
+            }
+            co_return rpc::no_wait_type{};
+        });
+    });
 }
 
 future<> storage_service::uninit_messaging_service() {
     return when_all_succeed(
-        _messaging.local().unregister_replication_finished(),
-        _messaging.local().unregister_node_ops_cmd(),
-        _messaging.local().unregister_group0_peer_exchange(),
-        _messaging.local().unregister_group0_modify_config()
+        ser::node_ops_rpc_verbs::unregister(&_messaging.local()),
+        ser::storage_service_rpc_verbs::unregister(&_messaging.local()),
+        ser::join_node_rpc_verbs::unregister(&_messaging.local()),
+        ser::streaming_rpc_verbs::unregister_tablet_stream_files(&_messaging.local()),
+        ser::streaming_rpc_verbs::unregister_clone_sstable(&_messaging.local())
     ).discard_result();
+}
+
+static const char* disk_error_to_string(disk_error type) {
+    switch (type) {
+    case disk_error::commit:
+        return "Commitlog";
+    case disk_error::logstor:
+        return "Logstor";
+    case disk_error::regular:
+        break;
+    }
+    return "Disk";
 }
 
 void storage_service::do_isolate_on_error(disk_error type)
 {
-    static std::atomic<bool> isolated = { false };
-
-    if (!isolated.exchange(true)) {
-        slogger.error("Shutting down communications due to I/O errors until operator intervention: {} error: {}", type == disk_error::commit ? "Commitlog" : "Disk", std::current_exception());
-        // isolated protect us against multiple stops
+    if (!std::exchange(_isolated, true)) {
+        slogger.error("Shutting down communications due to I/O errors until operator intervention: {} error: {:t}", disk_error_to_string(type), std::current_exception());
+        // isolated protect us against multiple stops on _this_ shard
         //FIXME: discarded future.
         (void)isolate();
     }
 }
 
 future<> storage_service::isolate() {
-    return run_with_no_api_lock([] (storage_service& ss) {
-        return ss.stop_transport();
+    auto src_shard = this_shard_id();
+    // this invokes on shard 0. So if we get here _from_ shard 0,
+    // we _should_ do the stop. If we call from another shard, we
+    // should test-and-set again to avoid double shutdown.
+    return run_with_no_api_lock([src_shard] (storage_service& ss) {
+        // check again to ensure secondary shard does not race
+        if (src_shard == this_shard_id() || !std::exchange(ss._isolated, true)) {
+            return ss.stop_transport();
+        }
+        return make_ready_future<>();
     });
 }
 
 future<sstring> storage_service::get_removal_status() {
     return run_with_no_api_lock([] (storage_service& ss) {
-        if (!ss._removing_node) {
-            return make_ready_future<sstring>(sstring("No token removals in process."));
-        }
-        auto tokens = ss.get_token_metadata().get_tokens(*ss._removing_node);
-        if (tokens.empty()) {
-            return make_ready_future<sstring>(sstring("Node has no token"));
-        }
-        auto status = format("Removing token ({}). Waiting for replication confirmation from [{}].",
-                tokens.front(), join(",", ss._replicating_nodes));
-        return make_ready_future<sstring>(status);
+        return make_ready_future<sstring>(sstring("No token removals in process."));
     });
 }
 
 future<> storage_service::force_remove_completion() {
-    return run_with_no_api_lock([] (storage_service& ss) {
-        return seastar::async([&ss] {
-            while (!ss._operation_in_progress.empty()) {
-                if (ss._operation_in_progress != sstring("removenode")) {
-                    throw std::runtime_error(format("Operation {} is in progress, try again", ss._operation_in_progress));
-                }
-
-                // This flag will make removenode stop waiting for the confirmation,
-                // wait it to complete
-                slogger.info("Operation removenode is in progress, wait for it to complete");
-                sleep_abortable(std::chrono::seconds(1), ss._abort_source).get();
-            }
-            ss._operation_in_progress = sstring("removenode_force");
-
-            try {
-                const auto& tm = ss.get_token_metadata();
-                if (!ss._replicating_nodes.empty() || !tm.get_leaving_endpoints().empty()) {
-                    auto leaving = tm.get_leaving_endpoints();
-                    slogger.warn("Removal not confirmed for {}, Leaving={}", join(",", ss._replicating_nodes), leaving);
-                    for (auto endpoint : leaving) {
-                        utils::UUID host_id;
-                        auto tokens = tm.get_tokens(endpoint);
-                        try {
-                            host_id = tm.get_host_id(endpoint);
-                        } catch (...) {
-                            slogger.warn("No host_id is found for endpoint {}", endpoint);
-                            continue;
-                        }
-                        ss._gossiper.advertise_token_removed(endpoint, host_id).get();
-                        std::unordered_set<token> tokens_set(tokens.begin(), tokens.end());
-                        ss.excise(tokens_set, endpoint).get();
-                        ss._group0->leave_group0(endpoint).get();
-                    }
-                    ss._replicating_nodes.clear();
-                    ss._removing_node = std::nullopt;
-                } else {
-                    slogger.warn("No tokens to force removal on, call 'removenode' first");
-                }
-                ss._operation_in_progress = {};
-            } catch (...) {
-                ss._operation_in_progress = {};
-                throw;
-            }
-        });
-    });
+    return make_exception_future<>(std::runtime_error("The unsafe nodetool removenode force is not supported anymore"));
 }
 
-/**
- * Takes an ordered list of adjacent tokens and divides them in the specified number of ranges.
- */
-static std::vector<std::pair<dht::token_range, uint64_t>>
-calculate_splits(std::vector<dht::token> tokens, uint64_t split_count, replica::column_family& cf) {
-    auto sstables = cf.get_sstables();
-    const double step = static_cast<double>(tokens.size() - 1) / split_count;
-    auto prev_token_idx = 0;
-    std::vector<std::pair<dht::token_range, uint64_t>> splits;
-    splits.reserve(split_count);
-    for (uint64_t i = 1; i <= split_count; ++i) {
-        auto index = static_cast<uint32_t>(std::round(i * step));
-        dht::token_range range({{ std::move(tokens[prev_token_idx]), false }}, {{ tokens[index], true }});
-        // always return an estimate > 0 (see CASSANDRA-7322)
-        uint64_t estimated_keys_for_range = 0;
-        for (auto&& sst : *sstables) {
-            estimated_keys_for_range += sst->estimated_keys_for_range(range);
-        }
-        splits.emplace_back(std::move(range), std::max(static_cast<uint64_t>(cf.schema()->min_index_interval()), estimated_keys_for_range));
-        prev_token_idx = index;
-    }
-    return splits;
-};
-
-std::vector<std::pair<dht::token_range, uint64_t>>
-storage_service::get_splits(const sstring& ks_name, const sstring& cf_name, range<dht::token> range, uint32_t keys_per_split) {
-    using range_type = dht::token_range;
-    auto& cf = _db.local().find_column_family(ks_name, cf_name);
-    auto schema = cf.schema();
-    auto sstables = cf.get_sstables();
-    uint64_t total_row_count_estimate = 0;
-    std::vector<dht::token> tokens;
-    std::vector<range_type> unwrapped;
-    if (range.is_wrap_around(dht::token_comparator())) {
-        auto uwr = range.unwrap();
-        unwrapped.emplace_back(std::move(uwr.second));
-        unwrapped.emplace_back(std::move(uwr.first));
-    } else {
-        unwrapped.emplace_back(std::move(range));
-    }
-    tokens.push_back(std::move(unwrapped[0].start().value_or(range_type::bound(dht::minimum_token()))).value());
-    for (auto&& r : unwrapped) {
-        std::vector<dht::token> range_tokens;
-        for (auto &&sst : *sstables) {
-            total_row_count_estimate += sst->estimated_keys_for_range(r);
-            auto keys = sst->get_key_samples(*cf.schema(), r);
-            std::transform(keys.begin(), keys.end(), std::back_inserter(range_tokens), [](auto&& k) { return std::move(k.token()); });
-        }
-        std::sort(range_tokens.begin(), range_tokens.end());
-        std::move(range_tokens.begin(), range_tokens.end(), std::back_inserter(tokens));
-    }
-    tokens.push_back(std::move(unwrapped[unwrapped.size() - 1].end().value_or(range_type::bound(dht::maximum_token()))).value());
-
-    // split_count should be much smaller than number of key samples, to avoid huge sampling error
-    constexpr uint32_t min_samples_per_split = 4;
-    uint64_t max_split_count = tokens.size() / min_samples_per_split + 1;
-    uint64_t split_count = std::max(uint64_t(1), std::min(max_split_count, total_row_count_estimate / keys_per_split));
-
-    return calculate_splits(std::move(tokens), split_count, cf);
-};
-
-dht::token_range_vector
-storage_service::get_ranges_for_endpoint(const sstring& name, const gms::inet_address& ep) const {
-    return _db.local().find_keyspace(name).get_effective_replication_map()->get_ranges(ep);
-}
-
-dht::token_range_vector
-storage_service::get_all_ranges(const std::vector<token>& sorted_tokens) const {
-    if (sorted_tokens.empty())
-        return dht::token_range_vector();
-    int size = sorted_tokens.size();
-    dht::token_range_vector ranges;
-    ranges.push_back(dht::token_range::make_ending_with(range_bound<token>(sorted_tokens[0], true)));
-    for (int i = 1; i < size; ++i) {
-        dht::token_range r(range<token>::bound(sorted_tokens[i - 1], false), range<token>::bound(sorted_tokens[i], true));
-        ranges.push_back(r);
-    }
-    ranges.push_back(dht::token_range::make_starting_with(range_bound<token>(sorted_tokens[size-1], false)));
-
-    return ranges;
+future<dht::token_range_vector>
+storage_service::get_ranges_for_endpoint(const locator::effective_replication_map& erm, const locator::host_id& ep) const {
+    return erm.get_ranges(ep);
 }
 
 inet_address_vector_replica_set
-storage_service::get_natural_endpoints(const sstring& keyspace,
-        const sstring& cf, const sstring& key) const {
-    auto schema = _db.local().find_schema(keyspace, cf);
-    partition_key pk = partition_key::from_nodetool_style_string(schema, key);
+storage_service::get_natural_endpoints(const sstring& keyspace, const sstring& cf, const sstring& key) const {
+    auto& table = _db.local().find_column_family(keyspace, cf);
+    const auto schema = table.schema();
+    auto pk = partition_key::from_nodetool_style_string(schema, key);
+    return get_natural_endpoints(keyspace, schema, table, pk);
+}
+
+inet_address_vector_replica_set
+storage_service::get_natural_endpoints(const sstring& keyspace, const sstring& cf, const std::vector<sstring>& key_components) const {
+    auto& table = _db.local().find_column_family(keyspace, cf);
+    const auto schema = table.schema();
+    auto pk = partition_key::from_string_components(schema, key_components);
+    return get_natural_endpoints(keyspace, schema, table, pk);
+}
+
+inet_address_vector_replica_set
+storage_service::get_natural_endpoints(const sstring& keyspace, const schema_ptr& schema, const replica::column_family& cf, const partition_key& pk) const {
     dht::token token = schema->get_partitioner().get_token(*schema, pk.view());
-    return get_natural_endpoints(keyspace, token);
+    const auto& ks = _db.local().find_keyspace(keyspace);
+    host_id_vector_replica_set replicas;
+    if (ks.uses_tablets()) {
+        replicas = cf.get_effective_replication_map()->get_natural_replicas(token);
+    } else {
+        replicas = ks.get_static_effective_replication_map()->get_natural_replicas(token);
+    }
+    return replicas | std::views::transform([&] (locator::host_id id) { return _address_map.get(id); }) | std::ranges::to<inet_address_vector_replica_set>();
 }
 
-inet_address_vector_replica_set
-storage_service::get_natural_endpoints(const sstring& keyspace, const token& pos) const {
-    return _db.local().find_keyspace(keyspace).get_effective_replication_map()->get_natural_endpoints(pos);
-}
-
-future<> endpoint_lifecycle_notifier::notify_down(gms::inet_address endpoint) {
-    return seastar::async([this, endpoint] {
-        _subscribers.thread_for_each([endpoint] (endpoint_lifecycle_subscriber* subscriber) {
+future<> endpoint_lifecycle_notifier::notify_down(gms::inet_address endpoint, locator::host_id hid) {
+    return seastar::async([this, endpoint, hid] {
+        _subscribers.thread_for_each([endpoint, hid] (endpoint_lifecycle_subscriber* subscriber) {
             try {
-                subscriber->on_down(endpoint);
+                subscriber->on_down(endpoint, hid);
             } catch (...) {
-                slogger.warn("Down notification failed {}: {}", endpoint, std::current_exception());
+                slogger.warn("Down notification failed {}/{}: {:t}", endpoint, hid, std::current_exception());
             }
         });
     });
 }
 
-future<> storage_service::notify_down(inet_address endpoint) {
-    co_await container().invoke_on_all([endpoint] (auto&& ss) {
-        ss._messaging.local().remove_rpc_client(netw::msg_addr{endpoint, 0});
-        return ss._lifecycle_notifier.notify_down(endpoint);
+future<> storage_service::notify_down(inet_address endpoint, locator::host_id hid) {
+    co_await container().invoke_on_all([endpoint, hid] (auto&& ss) {
+        ss._messaging.local().remove_rpc_client(netw::msg_addr{endpoint, 0}, hid);
+        return ss._lifecycle_notifier.notify_down(endpoint, hid);
     });
-    slogger.debug("Notify node {} has been down", endpoint);
+    slogger.debug("Notify node {}/{} has been down", endpoint, hid);
 }
 
-future<> endpoint_lifecycle_notifier::notify_left(gms::inet_address endpoint) {
-    return seastar::async([this, endpoint] {
-        _subscribers.thread_for_each([endpoint] (endpoint_lifecycle_subscriber* subscriber) {
+future<> endpoint_lifecycle_notifier::notify_left(gms::inet_address endpoint, locator::host_id hid) {
+    return seastar::async([this, endpoint, hid] {
+        _subscribers.thread_for_each([endpoint, hid] (endpoint_lifecycle_subscriber* subscriber) {
             try {
-                subscriber->on_leave_cluster(endpoint);
+                subscriber->on_leave_cluster(endpoint, hid);
             } catch (...) {
-                slogger.warn("Leave cluster notification failed {}: {}", endpoint, std::current_exception());
+                slogger.warn("Leave cluster notification failed {}/{}: {:t}", endpoint, hid, std::current_exception());
             }
         });
     });
 }
 
-future<> storage_service::notify_left(inet_address endpoint) {
-    co_await container().invoke_on_all([endpoint] (auto&& ss) {
-        return ss._lifecycle_notifier.notify_left(endpoint);
+future<> endpoint_lifecycle_notifier::notify_released(locator::host_id hid) {
+    return seastar::async([this, hid] {
+        _subscribers.thread_for_each([hid] (endpoint_lifecycle_subscriber* subscriber) {
+            try {
+                subscriber->on_released(hid);
+            } catch (...) {
+                slogger.warn("Node released notification failed {}: {:t}", hid, std::current_exception());
+            }
+        });
+    });
+}
+
+future<> storage_service::notify_left(inet_address endpoint, locator::host_id hid) {
+    co_await container().invoke_on_all([endpoint, hid] (auto&& ss) {
+        return ss._lifecycle_notifier.notify_left(endpoint, hid);
     });
     slogger.debug("Notify node {} has left the cluster", endpoint);
 }
 
-future<> endpoint_lifecycle_notifier::notify_up(gms::inet_address endpoint) {
-    return seastar::async([this, endpoint] {
-        _subscribers.thread_for_each([endpoint] (endpoint_lifecycle_subscriber* subscriber) {
+future<> storage_service::notify_released(locator::host_id hid) {
+    co_await container().invoke_on_all([hid] (auto&& ss) {
+        return ss._lifecycle_notifier.notify_released(hid);
+    });
+    slogger.debug("Notify node {} been released from the cluster and no longer owns any tokens", hid);
+}
+
+future<> endpoint_lifecycle_notifier::notify_up(gms::inet_address endpoint, locator::host_id hid) {
+    return seastar::async([this, endpoint, hid] {
+        _subscribers.thread_for_each([endpoint, hid] (endpoint_lifecycle_subscriber* subscriber) {
             try {
-                subscriber->on_up(endpoint);
+                subscriber->on_up(endpoint, hid);
             } catch (...) {
-                slogger.warn("Up notification failed {}: {}", endpoint, std::current_exception());
+                slogger.warn("Up notification failed {}/{}: {:t}", endpoint, hid, std::current_exception());
             }
         });
     });
 }
 
-future<> storage_service::notify_up(inet_address endpoint) {
-    if (!_gossiper.is_cql_ready(endpoint) || !_gossiper.is_alive(endpoint)) {
+future<> storage_service::notify_up(inet_address endpoint, locator::host_id hid) {
+    if (!_gossiper.is_cql_ready(hid) || !_gossiper.is_alive(hid)) {
         co_return;
     }
-    co_await container().invoke_on_all([endpoint] (auto&& ss) {
-        return ss._lifecycle_notifier.notify_up(endpoint);
+    co_await container().invoke_on_all([endpoint, hid] (auto&& ss) {
+        return ss._lifecycle_notifier.notify_up(endpoint, hid);
     });
-    slogger.debug("Notify node {} has been up", endpoint);
+    slogger.debug("Notify node {}/{} has been up", endpoint, hid);
 }
 
-future<> endpoint_lifecycle_notifier::notify_joined(gms::inet_address endpoint) {
-    return seastar::async([this, endpoint] {
-        _subscribers.thread_for_each([endpoint] (endpoint_lifecycle_subscriber* subscriber) {
+future<> endpoint_lifecycle_notifier::notify_joined(gms::inet_address endpoint, locator::host_id hid) {
+    return seastar::async([this, endpoint, hid] {
+        _subscribers.thread_for_each([endpoint, hid] (endpoint_lifecycle_subscriber* subscriber) {
             try {
-                subscriber->on_join_cluster(endpoint);
+                subscriber->on_join_cluster(endpoint, hid);
             } catch (...) {
-                slogger.warn("Join cluster notification failed {}: {}", endpoint, std::current_exception());
+                slogger.warn("Join cluster notification failed {}/{}: {:t}", endpoint, hid,std::current_exception());
             }
         });
     });
 }
 
-future<> storage_service::notify_joined(inet_address endpoint) {
-    if (!_gossiper.is_normal(endpoint)) {
-        co_return;
-    }
-
-    co_await container().invoke_on_all([endpoint] (auto&& ss) {
-        return ss._lifecycle_notifier.notify_joined(endpoint);
+future<> endpoint_lifecycle_notifier::notify_client_routes_change(const client_routes_service::client_route_keys& client_route_keys) {
+    co_await seastar::async([this, &client_route_keys] {
+        _subscribers.thread_for_each([&client_route_keys] (endpoint_lifecycle_subscriber* subscriber) {
+            try {
+                subscriber->on_client_routes_change(client_route_keys);
+            } catch (...) {
+                slogger.warn("Client routes notification failed: {:t}", std::current_exception());
+            }
+        });
     });
-    slogger.debug("Notify node {} has joined the cluster", endpoint);
 }
 
-future<> storage_service::notify_cql_change(inet_address endpoint, bool ready) {
+future<> storage_service::notify_joined(inet_address endpoint, locator::host_id hid) {
+    co_await utils::get_local_injector().inject(
+        "storage_service_notify_joined_sleep", std::chrono::milliseconds{500});
+
+    co_await container().invoke_on_all([endpoint, hid] (auto&& ss) {
+        return ss._lifecycle_notifier.notify_joined(endpoint, hid);
+    });
+    slogger.debug("Notify node {}/{} has joined the cluster", endpoint, hid);
+}
+
+future<> storage_service::remove_rpc_client_with_ignored_topology(inet_address endpoint, locator::host_id id) {
+    return container().invoke_on_all([endpoint, id] (auto&& ss) {
+        ss._messaging.local().remove_rpc_client_with_ignored_topology(netw::msg_addr{endpoint, 0}, id);
+    });
+}
+
+future<> storage_service::notify_cql_change(inet_address endpoint, locator::host_id hid, bool ready) {
     if (ready) {
-        co_await notify_up(endpoint);
+        co_await notify_up(endpoint, hid);
     } else {
-        co_await notify_down(endpoint);
+        co_await notify_down(endpoint, hid);
     }
 }
 
-future<bool> storage_service::is_cleanup_allowed(sstring keyspace) {
-    return container().invoke_on(0, [keyspace = std::move(keyspace)] (storage_service& ss) {
-        auto my_address = ss.get_broadcast_address();
-        auto pending_ranges = ss.get_token_metadata().has_pending_ranges(keyspace, my_address);
-        bool is_bootstrap_mode = ss._is_bootstrap_mode;
-        slogger.debug("is_cleanup_allowed: keyspace={}, is_bootstrap_mode={}, pending_ranges={}",
-                keyspace, is_bootstrap_mode, pending_ranges);
-        return !is_bootstrap_mode && !pending_ranges;
-    });
+future<> storage_service::notify_client_routes_change(const client_routes_service::client_route_keys& client_route_keys) {
+    co_await _client_routes.local().notify_client_routes_change(client_route_keys);
 }
 
 bool storage_service::is_repair_based_node_ops_enabled(streaming::stream_reason reason) {
@@ -3520,147 +7515,62 @@ bool storage_service::is_repair_based_node_ops_enabled(streaming::stream_reason 
         {"removenode", streaming::stream_reason::removenode},
         {"rebuild", streaming::stream_reason::rebuild},
     };
-    std::vector<sstring> enabled_list;
+    const sstring& enabled_list_str = _db.local().get_config().allowed_repair_based_node_ops();
+    std::vector<sstring> enabled_list = utils::split_comma_separated_list(enabled_list_str);
     std::unordered_set<streaming::stream_reason> enabled_set;
-    auto enabled_list_str = _db.local().get_config().allowed_repair_based_node_ops();
-    boost::trim_all(enabled_list_str);
-    std::replace(enabled_list_str.begin(), enabled_list_str.end(), '\"', ' ');
-    std::replace(enabled_list_str.begin(), enabled_list_str.end(), '\'', ' ');
-    boost::split(enabled_list, enabled_list_str, boost::is_any_of(","));
-    for (sstring op : enabled_list) {
+    for (const sstring& op : enabled_list) {
         try {
-            if (!op.empty()) {
-                auto it = reason_map.find(op);
-                if (it != reason_map.end()) {
-                    enabled_set.insert(it->second);
-                } else {
-                    throw std::invalid_argument(format("unsupported operation name: {}", op));
-                }
+            auto it = reason_map.find(op);
+            if (it != reason_map.end()) {
+                enabled_set.insert(it->second);
+            } else {
+                throw std::invalid_argument(::format("unsupported operation name: {}", op));
             }
         } catch (...) {
-            throw std::invalid_argument(format("Failed to parse allowed_repair_based_node_ops parameter [{}]: {}",
+            throw std::invalid_argument(::format("Failed to parse allowed_repair_based_node_ops parameter [{}]: {}",
                     enabled_list_str, std::current_exception()));
         }
     }
     bool global_enabled = _db.local().get_config().enable_repair_based_node_ops();
-    slogger.info("enable_repair_based_node_ops={}, allowed_repair_based_node_ops={}", global_enabled, enabled_set);
+    slogger.info("enable_repair_based_node_ops={}, allowed_repair_based_node_ops={{{}}}", global_enabled, fmt::join(enabled_set, ", "));
     return global_enabled && enabled_set.contains(reason);
 }
 
-node_ops_meta_data::node_ops_meta_data(
-        utils::UUID ops_uuid,
-        gms::inet_address coordinator,
-        shared_ptr<node_ops_info> ops,
-        std::function<future<> ()> abort_func,
-        std::function<void ()> signal_func)
-    : _ops_uuid(std::move(ops_uuid))
-    , _coordinator(std::move(coordinator))
-    , _abort(std::move(abort_func))
-    , _abort_source(seastar::make_shared<abort_source>())
-    , _signal(std::move(signal_func))
-    , _ops(std::move(ops))
-    , _watchdog([sig = _signal] { sig(); }) {
-    _watchdog.arm(_watchdog_interval);
+future<> storage_service::start_maintenance_mode() {
+    set_mode(mode::MAINTENANCE);
+
+    return mutate_token_metadata([this] (mutable_token_metadata_ptr token_metadata) -> future<> {
+        token_metadata->update_topology(my_host_id(), _snitch.local()->get_location(), locator::node::state::normal, this_smp_shard_count());
+        return token_metadata->update_normal_tokens({ dht::token{} }, my_host_id());
+    }, acquire_merge_lock::yes);
 }
 
-future<> node_ops_meta_data::abort() {
-    slogger.debug("node_ops_meta_data: ops_uuid={} abort", _ops_uuid);
-    _aborted = true;
-    if (_ops) {
-        _ops->abort = true;
-    }
-    _watchdog.cancel();
-    return _abort();
-}
-
-void node_ops_meta_data::update_watchdog() {
-    slogger.debug("node_ops_meta_data: ops_uuid={} update_watchdog", _ops_uuid);
-    if (_aborted) {
-        return;
-    }
-    _watchdog.cancel();
-    _watchdog.arm(_watchdog_interval);
-}
-
-void node_ops_meta_data::cancel_watchdog() {
-    slogger.debug("node_ops_meta_data: ops_uuid={} cancel_watchdog", _ops_uuid);
-    _watchdog.cancel();
-}
-
-shared_ptr<node_ops_info> node_ops_meta_data::get_ops_info() {
-    return _ops;
-}
-
-shared_ptr<abort_source> node_ops_meta_data::get_abort_source() {
-    return _abort_source;
-}
-
-void storage_service::node_ops_update_heartbeat(utils::UUID ops_uuid) {
-    slogger.debug("node_ops_update_heartbeat: ops_uuid={}", ops_uuid);
-    auto permit = seastar::get_units(_node_ops_abort_sem, 1).get0();
-    auto it = _node_ops.find(ops_uuid);
-    if (it != _node_ops.end()) {
-        node_ops_meta_data& meta = it->second;
-        meta.update_watchdog();
+future<> storage_service::register_protocol_server(protocol_server& server, bool start_instantly) {
+    _protocol_servers.push_back(&server);
+    if (start_instantly) {
+        co_await server.start_server();
     }
 }
 
-void storage_service::node_ops_done(utils::UUID ops_uuid) {
-    slogger.debug("node_ops_done: ops_uuid={}", ops_uuid);
-    auto permit = seastar::get_units(_node_ops_abort_sem, 1).get0();
-    auto it = _node_ops.find(ops_uuid);
-    if (it != _node_ops.end()) {
-        node_ops_meta_data& meta = it->second;
-        meta.cancel_watchdog();
-        _node_ops.erase(it);
-    }
+std::vector<table_id> storage_service::get_tables_with_cdc_tablet_streams() const {
+    return _cdc_gens.local().get_cdc_metadata().get_tables_with_cdc_tablet_streams();
 }
 
-void storage_service::node_ops_abort(utils::UUID ops_uuid) {
-    slogger.debug("node_ops_abort: ops_uuid={}", ops_uuid);
-    auto permit = seastar::get_units(_node_ops_abort_sem, 1).get0();
-    auto it = _node_ops.find(ops_uuid);
-    if (it != _node_ops.end()) {
-        node_ops_meta_data& meta = it->second;
-        meta.abort().get();
-        auto as = meta.get_abort_source();
-        if (as && !as->abort_requested()) {
-            as->request_abort();
+future<> storage_service::query_cdc_timestamps(table_id table, bool ascending, noncopyable_function<future<>(db_clock::time_point)> f) {
+    return _cdc_gens.local().query_cdc_timestamps(table, ascending, std::move(f));
+}
+
+future<> storage_service::query_cdc_streams(table_id table, noncopyable_function<future<>(db_clock::time_point, const utils::chunked_vector<cdc::stream_id>& current, cdc::cdc_stream_diff)> f) {
+    return _cdc_gens.local().query_cdc_streams(table, std::move(f));
+}
+
+future<> storage_service::on_cleanup_for_drop_table(const table_id& id) {
+    co_await container().invoke_on_all([id] (storage_service& ss) {
+        if (ss._repair.local_is_initialized()) {
+            ss._repair.local().on_cleanup_for_drop_table(id);
         }
-        _repair.local().abort_repair_node_ops(ops_uuid).get();
-        _node_ops.erase(it);
-    }
-}
-
-void storage_service::node_ops_singal_abort(std::optional<utils::UUID> ops_uuid) {
-    slogger.debug("node_ops_singal_abort: ops_uuid={}", ops_uuid);
-    _node_ops_abort_queue.push_back(ops_uuid);
-    _node_ops_abort_cond.signal();
-}
-
-future<> storage_service::node_ops_abort_thread() {
-    return seastar::async([this] {
-        slogger.info("Started node_ops_abort_thread");
-        for (;;) {
-            _node_ops_abort_cond.wait([this] { return !_node_ops_abort_queue.empty(); }).get();
-            slogger.debug("Awoke node_ops_abort_thread: node_ops_abort_queue={}", _node_ops_abort_queue);
-            while (!_node_ops_abort_queue.empty()) {
-                auto uuid_opt = _node_ops_abort_queue.front();
-                _node_ops_abort_queue.pop_front();
-                if (!uuid_opt) {
-                    return;
-                }
-                try {
-                    storage_service::node_ops_abort(*uuid_opt);
-                } catch (...) {
-                    slogger.warn("Failed to abort node operation ops_uuid={}: {}", *uuid_opt, std::current_exception());
-                }
-            }
-        }
-        slogger.info("Stopped node_ops_abort_thread");
     });
+    co_return;
 }
-
 
 } // namespace service
-

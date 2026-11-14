@@ -3,38 +3,47 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
-#include <experimental/source_location>
-
-#include <boost/range/irange.hpp>
-#include <boost/range/adaptor/uniqued.hpp>
-
 #include <seastar/core/thread.hh>
 
+#undef SEASTAR_TESTING_MAIN
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
-#include "test/lib/test_services.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/dummy_sharder.hh"
 #include "test/lib/reader_lifecycle_policy.hh"
-#include "test/lib/log.hh"
 
-#include "dht/sharder.hh"
-#include "mutation_reader.hh"
-#include "schema_registry.hh"
-#include "service/priority_manager.hh"
+
+#include "schema/schema_registry.hh"
+#include "readers/forwardable.hh"
+#include "replica/memtable.hh"
+
+BOOST_AUTO_TEST_SUITE(multishard_combining_reader_as_mutation_source_test)
 
 // It has to be a container that does not invalidate pointers
 static std::list<dummy_sharder> keep_alive_sharder;
 
+class evicting_semaphore_factory : public test_reader_lifecycle_policy::semaphore_factory {
+    bool _evict_paused_readers;
+public:
+    explicit evicting_semaphore_factory(bool evict_paused_readers) : _evict_paused_readers(evict_paused_readers) { }
+    virtual lw_shared_ptr<reader_concurrency_semaphore> create(sstring name) override {
+        if (!_evict_paused_readers) {
+            return test_reader_lifecycle_policy::semaphore_factory::create(std::move(name));
+        }
+        // Create with no memory, so all inactive reads are immediately evicted.
+        return make_lw_shared<reader_concurrency_semaphore>(reader_concurrency_semaphore::for_tests{}, std::move(name), 1, 0);
+    }
+};
+
 static auto make_populate(bool evict_paused_readers, bool single_fragment_buffer) {
-    return [evict_paused_readers, single_fragment_buffer] (schema_ptr s, const std::vector<mutation>& mutations, gc_clock::time_point) mutable {
+    return [evict_paused_readers, single_fragment_buffer] (schema_ptr s, const utils::chunked_vector<mutation>& mutations, gc_clock::time_point) mutable {
         // We need to group mutations that have the same token so they land on the same shard.
-        std::map<dht::token, std::vector<frozen_mutation>> mutations_by_token;
+        std::map<dht::token, utils::chunked_vector<frozen_mutation>> mutations_by_token;
 
         for (const auto& mut : mutations) {
             mutations_by_token[mut.token()].push_back(freeze(mut));
@@ -42,22 +51,28 @@ static auto make_populate(bool evict_paused_readers, bool single_fragment_buffer
 
         dummy_sharder sharder(s->get_sharder(), mutations_by_token);
 
-        auto merged_mutations = boost::copy_range<std::vector<std::vector<frozen_mutation>>>(mutations_by_token | boost::adaptors::map_values);
+        std::unordered_map<shard_id, utils::chunked_vector<frozen_mutation>> mutations_by_shard;
+        for (shard_id shard = 0; shard < sharder.shard_count(); ++shard) {
+            mutations_by_shard.emplace(shard, utils::chunked_vector<frozen_mutation>());
+        }
+        for (auto& [token, muts] : mutations_by_token) {
+            auto shard = sharder.shard_of(token);
+            std::move(std::make_move_iterator(muts.begin()), std::make_move_iterator(muts.end()),
+                    std::back_inserter(mutations_by_shard[shard]));
+        }
 
-        auto remote_memtables = make_lw_shared<std::vector<foreign_ptr<lw_shared_ptr<memtable>>>>();
+        auto remote_memtables = make_lw_shared<std::vector<foreign_ptr<lw_shared_ptr<replica::memtable>>>>();
         for (unsigned shard = 0; shard < sharder.shard_count(); ++shard) {
-            auto remote_mt = smp::submit_to(shard, [shard, gs = global_schema_ptr(s), &merged_mutations, sharder] {
-                auto s = gs.get();
-                auto mt = make_lw_shared<memtable>(s);
+            auto remote_mt = smp::submit_to(shard, [shard, gs = global_schema_ptr(s), &mutations_by_shard, sharder] () -> future<foreign_ptr<lw_shared_ptr<replica::memtable>>> {
+                auto s = co_await gs.get(db::no_timeout);
+                auto mt = make_lw_shared<replica::memtable>(s);
 
-                for (unsigned i = shard; i < merged_mutations.size(); i += sharder.shard_count()) {
-                    for (auto& mut : merged_mutations[i]) {
-                        mt->apply(mut.unfreeze(s));
-                    }
+                for (auto& mut : mutations_by_shard[shard]) {
+                    mt->apply(mut.unfreeze(s));
                 }
 
-                return make_foreign(mt);
-            }).get0();
+                co_return make_foreign(mt);
+            }).get();
             remote_memtables->emplace_back(std::move(remote_mt));
         }
         keep_alive_sharder.push_back(sharder);
@@ -66,7 +81,6 @@ static auto make_populate(bool evict_paused_readers, bool single_fragment_buffer
                 reader_permit permit,
                 const dht::partition_range& range,
                 const query::partition_slice& slice,
-                const io_priority_class& pc,
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding fwd_sm,
                 mutation_reader::forwarding fwd_mr) mutable {
@@ -75,10 +89,9 @@ static auto make_populate(bool evict_paused_readers, bool single_fragment_buffer
                     reader_permit permit,
                     const dht::partition_range& range,
                     const query::partition_slice& slice,
-                    const io_priority_class& pc,
                     tracing::trace_state_ptr trace_state,
                     mutation_reader::forwarding fwd_mr) {
-                    auto reader = remote_memtables->at(this_shard_id())->make_flat_reader(s, std::move(permit), range, slice, pc, std::move(trace_state),
+                    auto reader = remote_memtables->at(this_shard_id())->make_mutation_reader(s, std::move(permit), range, slice, std::move(trace_state),
                             streamed_mutation::forwarding::no, fwd_mr);
                     if (single_fragment_buffer) {
                         reader.set_max_buffer_size(1);
@@ -86,9 +99,9 @@ static auto make_populate(bool evict_paused_readers, bool single_fragment_buffer
                     return reader;
             };
 
-            auto lifecycle_policy = seastar::make_shared<test_reader_lifecycle_policy>(std::move(factory), evict_paused_readers);
+            auto lifecycle_policy = seastar::make_shared<test_reader_lifecycle_policy>(std::move(factory), std::make_unique<evicting_semaphore_factory>(evict_paused_readers));
             auto mr = make_multishard_combining_reader_for_tests(keep_alive_sharder.back(), std::move(lifecycle_policy), s,
-                    std::move(permit), range, slice, pc, trace_state, fwd_mr);
+                    std::move(permit), range, slice, trace_state, fwd_mr);
             if (fwd_sm == streamed_mutation::forwarding::yes) {
                 return make_forwardable(std::move(mr));
             }
@@ -99,8 +112,8 @@ static auto make_populate(bool evict_paused_readers, bool single_fragment_buffer
 
 // Best run with SMP >= 2
 SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader) {
-    if (smp::count < 2) {
-        std::cerr << "Cannot run test " << get_name() << " with smp::count < 2" << std::endl;
+    if (this_smp_shard_count() < 2) {
+        std::cerr << "Cannot run test " << get_name() << " with this_smp_shard_count() < 2" << std::endl;
         return;
     }
 
@@ -111,8 +124,8 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_evict_paused) {
-    if (smp::count < 2) {
-        std::cerr << "Cannot run test " << get_name() << " with smp::count < 2" << std::endl;
+    if (this_smp_shard_count() < 2) {
+        std::cerr << "Cannot run test " << get_name() << " with this_smp_shard_count() < 2" << std::endl;
         return;
     }
 
@@ -126,8 +139,8 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_evict_paused) {
 // run_mutation_source_tests execution is split
 
 SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_with_tiny_buffer) {
-    if (smp::count < 2) {
-        std::cerr << "Cannot run test " << get_name() << " with smp::count < 2" << std::endl;
+    if (this_smp_shard_count() < 2) {
+        std::cerr << "Cannot run test " << get_name() << " with this_smp_shard_count() < 2" << std::endl;
         return;
     }
 
@@ -137,33 +150,9 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_with_tiny_buffer) {
     }).get();
 }
 
-SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_with_tiny_buffer_dowgrade) {
-    if (smp::count < 2) {
-        std::cerr << "Cannot run test " << get_name() << " with smp::count < 2" << std::endl;
-        return;
-    }
-
-    do_with_cql_env_thread([&] (cql_test_env& env) -> future<> {
-        run_mutation_source_tests_downgrade(make_populate(true, true), true);
-        return make_ready_future<>();
-    }).get();
-}
-
-SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_with_tiny_buffer_upgrade) {
-    if (smp::count < 2) {
-        std::cerr << "Cannot run test " << get_name() << " with smp::count < 2" << std::endl;
-        return;
-    }
-
-    do_with_cql_env_thread([&] (cql_test_env& env) -> future<> {
-        run_mutation_source_tests_upgrade(make_populate(true, true), true);
-        return make_ready_future<>();
-    }).get();
-}
-
 SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_with_tiny_buffer_reverse) {
-    if (smp::count < 2) {
-        std::cerr << "Cannot run test " << get_name() << " with smp::count < 2" << std::endl;
+    if (this_smp_shard_count() < 2) {
+        std::cerr << "Cannot run test " << get_name() << " with this_smp_shard_count() < 2" << std::endl;
         return;
     }
 
@@ -172,3 +161,5 @@ SEASTAR_THREAD_TEST_CASE(test_multishard_combining_reader_with_tiny_buffer_rever
         return make_ready_future<>();
     }).get();
 }
+
+BOOST_AUTO_TEST_SUITE_END()

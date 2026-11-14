@@ -1,19 +1,18 @@
 /*
- */
-
-/*
  * Copyright (C) 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #include <seastar/core/metrics.hh>
+#include <seastar/core/coroutine.hh>
 #include "tracing/tracing.hh"
 #include "tracing/trace_state.hh"
-#include "tracing/tracing_backend_registry.hh"
+#include "tracing/trace_keyspace_helper.hh"
+#include "utils/UUID_gen.hh"
 
 namespace tracing {
 
@@ -28,10 +27,9 @@ std::vector<sstring> trace_type_names = {
     "REPAIR"
 };
 
-tracing::tracing(const backend_registry& br, sstring tracing_backend_helper_class_name)
+tracing::tracing(sstring tracing_backend_helper_class_name)
         : _write_timer([this] { write_timer_callback(); })
         , _thread_name(seastar::format("shard {:d}", this_shard_id()))
-        , _backend_registry(br)
         , _tracing_backend_helper_class_name(std::move(tracing_backend_helper_class_name))
         , _gen(std::random_device()())
         , _slow_query_duration_threshold(default_slow_query_duraion_threshold)
@@ -39,19 +37,19 @@ tracing::tracing(const backend_registry& br, sstring tracing_backend_helper_clas
     namespace sm = seastar::metrics;
 
     _metrics.add_group("tracing", {
-        sm::make_derive("dropped_sessions", stats.dropped_sessions,
+        sm::make_counter("dropped_sessions", stats.dropped_sessions,
                         sm::description("Counts a number of dropped sessions due to too many pending sessions/records. "
-                                        "High value indicates that backend is saturated with the rate with which new tracing records are created.")),
+                                        "High value indicates that backend is saturated with the rate with which new tracing records are created.")).set_skip_when_empty(),
 
-        sm::make_derive("dropped_records", stats.dropped_records,
+        sm::make_counter("dropped_records", stats.dropped_records,
                         sm::description("Counts a number of dropped records due to too many pending records. "
-                                        "High value indicates that backend is saturated with the rate with which new tracing records are created.")),
+                                        "High value indicates that backend is saturated with the rate with which new tracing records are created.")).set_skip_when_empty(),
 
-        sm::make_derive("trace_records_count", stats.trace_records_count,
+        sm::make_counter("trace_records_count", stats.trace_records_count,
                         sm::description("This metric is a rate of tracing records generation.")),
 
-        sm::make_derive("trace_errors", stats.trace_errors,
-                        sm::description("Counts a number of trace records dropped due to an error (e.g. OOM).")),
+        sm::make_counter("trace_errors", stats.trace_errors,
+                        sm::description("Counts a number of trace records dropped due to an error (e.g. OOM).")).set_skip_when_empty(),
 
         sm::make_gauge("active_sessions", _active_sessions,
                         sm::description("Holds a number of a currently active tracing sessions.")),
@@ -70,21 +68,24 @@ tracing::tracing(const backend_registry& br, sstring tracing_backend_helper_clas
     });
 }
 
-future<> tracing::create_tracing(const backend_registry& br, sstring tracing_backend_class_name) {
-    return tracing_instance().start(std::ref(br), std::move(tracing_backend_class_name));
-}
+bool tracing::may_create_new_session(const std::optional<utils::UUID>& session_id) {
+    // Don't create a session if its records are likely to be dropped
+    if (!have_records_budget(exp_trace_events_per_session) || _active_sessions >= max_pending_sessions + write_event_sessions_threshold) {
+        if (session_id) {
+            tracing_logger.trace("{}: Too many outstanding tracing records or sessions. Dropping a secondary session", *session_id);
+        } else {
+            tracing_logger.trace("Too many outstanding tracing records or sessions. Dropping a primary session");
+        }
 
-future<> tracing::start_tracing(sharded<cql3::query_processor>& qp) {
-    return tracing_instance().invoke_on_all([&qp] (tracing& local_tracing) {
-        return local_tracing.start(qp.local());
-    });
-}
+        if (++stats.dropped_sessions % tracing::log_warning_period == 1) {
+            tracing_logger.warn("Dropped {} sessions: open_sessions {}, cached_records {} pending_for_write_records {}, flushing_records {}",
+                        stats.dropped_sessions, _active_sessions, _cached_records, _pending_for_write_records_count, _flushing_records);
+        }
 
-future<> tracing::stop_tracing() {
-    return tracing_instance().invoke_on_all([] (tracing& local_tracing) {
-        // It might have been shut down while draining
-        return local_tracing._down ? make_ready_future<>() : local_tracing.shutdown();
-    });
+        return false;
+    }
+
+    return true;
 }
 
 trace_state_ptr tracing::create_session(trace_type type, trace_state_props_set props) noexcept {
@@ -102,7 +103,7 @@ trace_state_ptr tracing::create_session(trace_type type, trace_state_props_set p
         props.set_if<trace_state_props::ignore_events>(!props.contains<trace_state_props::full_tracing>() && ignore_trace_events_enabled());
 
         ++_active_sessions;
-        return make_lw_shared<trace_state>(type, props);
+        return make_lw_shared<trace_state>(*this, type, props);
     } catch (...) {
         // return an uninitialized state in case of any error (OOM?)
         return nullptr;
@@ -121,27 +122,24 @@ trace_state_ptr tracing::create_session(const trace_info& secondary_session_info
         }
 
         ++_active_sessions;
-        return make_lw_shared<trace_state>(secondary_session_info);
+        return make_lw_shared<trace_state>(*this, secondary_session_info);
     } catch (...) {
         // return an uninitialized state in case of any error (OOM?)
         return nullptr;
     }
 }
 
-future<> tracing::start(cql3::query_processor& qp) {
-    try {
-        _tracing_backend_helper_ptr = _backend_registry.create_backend(_tracing_backend_helper_class_name, *this);
-    } catch (no_such_tracing_backend& e) {
+future<> tracing::start(cql3::query_processor& qp, service::migration_manager& mm) {
+    if (_tracing_backend_helper_class_name == "trace_keyspace_helper") {
+        _tracing_backend_helper_ptr = std::make_unique<trace_keyspace_helper>(*this);
+    } else {
         tracing_logger.error("Can't create tracing backend helper {}: not supported", _tracing_backend_helper_class_name);
-        throw;
-    } catch (...) {
-        throw;
+        throw std::invalid_argument(seastar::format("Tracing backend helper {} is not supported", _tracing_backend_helper_class_name));
     }
 
-    return _tracing_backend_helper_ptr->start(qp).then([this] {
-        _down = false;
-        _write_timer.arm(write_period);
-    });
+    co_await _tracing_backend_helper_ptr->start(qp, mm);
+    _down = false;
+    _write_timer.arm(write_period);
 }
 
 void tracing::write_timer_callback() {
@@ -155,25 +153,20 @@ void tracing::write_timer_callback() {
 }
 
 future<> tracing::shutdown() {
-    tracing_logger.info("Asked to shut down");
     if (_down) {
-        throw std::logic_error("tracing: shutdown() called for the service that is already down");
+        co_return;
     }
 
+    tracing_logger.info("Asked to shut down");
     write_pending_records();
     _down = true;
     _write_timer.cancel();
-    return _tracing_backend_helper_ptr->stop().then([] {
-        tracing_logger.info("Tracing is down");
-    });
+    co_await _tracing_backend_helper_ptr->shutdown();
+    tracing_logger.info("Tracing is down");
 }
 
 future<> tracing::stop() {
-    if (!_down) {
-        throw std::logic_error("tracing: stop() called before shutdown()");
-    }
-
-    return make_ready_future<>();
+    co_await shutdown();
 }
 
 void tracing::set_trace_probability(double p) {
@@ -187,13 +180,17 @@ void tracing::set_trace_probability(double p) {
     tracing_logger.info("Setting tracing probability to {} (normalized {})", _trace_probability, _normalized_trace_probability);
 }
 
-one_session_records::one_session_records()
-    : _local_tracing_ptr(tracing::get_local_tracing_instance().shared_from_this())
+one_session_records::one_session_records(tracing& tr, trace_type type, std::chrono::seconds slow_query_ttl, std::chrono::seconds slow_query_rec_ttl,
+            std::optional<utils::UUID> session_id_, span_id parent_id_)
+    : _local_tracing_ptr(tr.shared_from_this())
+    , session_id(session_id_ ? *session_id_ : utils::UUID_gen::get_time_UUID())
+    , session_rec(type, slow_query_rec_ttl)
+    , ttl(slow_query_ttl)
     , backend_state_ptr(_local_tracing_ptr->allocate_backend_session_state())
-    , budget_ptr(_local_tracing_ptr->get_cached_records_ptr()) {}
-
-std::ostream& operator<<(std::ostream& os, const span_id& id) {
-    return os << id.get_id();
+    , budget_ptr(_local_tracing_ptr->get_cached_records_ptr())
+    , parent_id(parent_id_)
+    , my_span_id(span_id::make_span_id(tr))
+{
 }
-}
 
+}

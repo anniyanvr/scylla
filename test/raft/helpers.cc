@@ -3,12 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 //
 // Helper functions for raft tests
 //
+
+#include "raft/raft.hh"
+#include "utils/assert.hh"
+#include <seastar/core/sharded.hh>
 
 #include "helpers.hh"
 
@@ -33,7 +37,7 @@ void election_timeout(raft::fsm& fsm) {
 }
 
 void make_candidate(raft::fsm& fsm) {
-    assert(fsm.is_follower());
+    SCYLLA_ASSERT(fsm.is_follower());
     // NOTE: single node skips candidate state
     while (fsm.is_follower()) {
         fsm.tick();
@@ -52,11 +56,11 @@ bool compare_log_entry(raft::log_entry_ptr le1, raft::log_entry_ptr le2) {
     return true;
 }
 
-bool compare_log_entries(raft::log& log1, raft::log& log2, size_t from, size_t to) {
-    assert(to <= log1.last_idx());
-    assert(to <= log2.last_idx());
-    for (size_t i = from; i <= to; ++i) {
-        if (!compare_log_entry(log1[i], log2[i])) {
+bool compare_log_entries(raft::log& log1, raft::log& log2, raft::index_t from, raft::index_t to) {
+    SCYLLA_ASSERT(to <= log1.last_idx());
+    SCYLLA_ASSERT(to <= log2.last_idx());
+    for (raft::index_t i = from; i <= to; ++i) {
+        if (!compare_log_entry(log1[i.value()], log2[i.value()])) {
             return false;
         }
     }
@@ -76,7 +80,7 @@ bool deliver(raft_routing_map& routes, raft::server_id from,
     return true;
 }
 
-void deliver(raft_routing_map& routes, raft::server_id from, std::vector<std::pair<raft::server_id, raft::rpc_message>> msgs) {
+void deliver(raft_routing_map& routes, raft::server_id from, utils::chunked_vector<std::pair<raft::server_id, raft::rpc_message>> msgs) {
     for (auto& m: msgs) {
         deliver(routes, from, std::move(m));
     }
@@ -92,8 +96,8 @@ communicate_impl(std::function<bool()> stop_pred, raft_routing_map& map) {
         has_traffic = false;
         for (auto e : map) {
             raft::fsm& from = *e.second;
-            bool has_output;
-            for (auto output = from.get_output(); !output.empty(); output = from.get_output()) {
+            for (bool has_output = from.has_output(); has_output; has_output = from.has_output()) {
+                auto output = from.get_output();
                 if (stop_pred()) {
                     return;
                 }
@@ -116,7 +120,15 @@ raft::server_id id() {
 raft::server_address_set address_set(std::vector<raft::server_id> ids) {
     raft::server_address_set set;
     for (auto id : ids) {
-        set.emplace(raft::server_address{.id = id});
+        set.emplace(server_addr_from_id(id));
+    }
+    return set;
+}
+
+raft::config_member_set config_set(std::vector<raft::server_id> ids) {
+    raft::config_member_set set;
+    for (auto id : ids) {
+        set.emplace(config_member_from_id(id));
     }
     return set;
 }
@@ -136,9 +148,12 @@ raft::server_id to_raft_id(size_t int_id) {
     return raft::server_id{to_raft_uuid(int_id)};
 }
 
-// NOTE: can_vote = true
 raft::server_address to_server_address(size_t int_id) {
-    return raft::server_address{raft::server_id{to_raft_uuid(int_id)}};
+    return server_addr_from_id(raft::server_id{to_raft_uuid(int_id)});
+}
+
+raft::config_member to_config_member(size_t int_id) {
+    return {to_server_address(int_id), raft::is_voter::yes};
 }
 
 size_t to_int_id(utils::UUID uuid) {
@@ -148,4 +163,61 @@ size_t to_int_id(utils::UUID uuid) {
 // Return true upon a random event with given probability
 bool rolladice(float probability) {
     return tests::random::get_real(0.0, 1.0) < probability;
+}
+
+future<> invoke_abortable_on(unsigned shard, noncopyable_function<future<>(abort_source&)> f, abort_source& as) {
+    auto foreign_abort_source = co_await smp::submit_to(shard, [] {
+        return make_foreign(std::make_unique<abort_source>());
+    });
+
+    std::optional<future<>> abort_on_foreign;
+    auto sub = as.subscribe([shard, &abort_on_foreign, &as = *foreign_abort_source] () noexcept {
+        // Not sure if submit_to can't really throw exceptions (e.g. bad_alloc?), but this is test code so whatever.
+        abort_on_foreign = smp::submit_to(shard, [&as] {
+            as.request_abort();
+        });
+    });
+
+    if (!sub) {
+        throw abort_requested_exception{};
+    }
+
+    std::exception_ptr ep;
+    try {
+        co_await smp::submit_to(shard, std::bind_front(std::move(f), std::ref(*foreign_abort_source)));
+
+        if (abort_on_foreign) {
+            // Abort was requested in the meantime.
+            // Wait for the abort future to resolve so it's safe to destroy `foreign_abort_source`.
+            // Ignore any exceptions from `submit_to`.
+            try {
+                co_await std::move(*abort_on_foreign);
+            } catch (...) {}
+        }
+
+        co_return;
+    } catch (...) {
+        ep = std::current_exception();
+    }
+
+    if (abort_on_foreign) {
+        // As above.
+        try {
+            co_await std::move(*abort_on_foreign);
+        } catch (...) {}
+    }
+
+    std::rethrow_exception(ep);
+}
+
+raft::server_address server_addr_from_id(raft::server_id id) {
+    return raft::server_address{id, {}};
+}
+
+raft::config_member config_member_from_id(raft::server_id id) {
+    return raft::config_member{server_addr_from_id(id), raft::is_voter::yes};
+}
+
+raft::configuration config_from_ids(std::vector<raft::server_id> ids) {
+    return raft::configuration{config_set(std::move(ids))};
 }

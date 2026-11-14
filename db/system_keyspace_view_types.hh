@@ -3,12 +3,11 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include <seastar/core/seastar.hh>
 #include <seastar/core/sstring.hh>
 #include <utility>
 #include <optional>
@@ -27,7 +26,7 @@ using system_keyspace_view_name = std::pair<sstring, sstring>;
 
 struct system_keyspace_view_build_progress {
     system_keyspace_view_name view;
-    dht::token first_token;
+    std::optional<dht::token> first_token;
     std::optional<dht::token> next_token;
     shard_id cpu_id;
 };

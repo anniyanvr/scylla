@@ -5,18 +5,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#undef SEASTAR_TESTING_MAIN
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
-#include "test/lib/test_services.hh"
 #include "test/lib/cql_test_env.hh"
-
 #include "db/virtual_table.hh"
 #include "db/system_keyspace.hh"
 #include "db/config.hh"
+#include "schema/schema_builder.hh"
 #include "test/lib/cql_assertions.hh"
+#include "replica/database.hh"
 
 namespace db {
 
@@ -26,11 +27,10 @@ public:
 
     static schema_ptr build_schema() {
         auto id = generate_legacy_id(system_keyspace::NAME, "test");
-        return schema_builder(system_keyspace::NAME, "test", std::make_optional(id))
+        return schema_builder(this_smp_shard_count(), system_keyspace::NAME, "test", std::make_optional(id))
             .with_column("pk", int32_type, column_kind::partition_key)
             .with_column("ck", int32_type, column_kind::clustering_key)
             .with_column("v", int32_type)
-            .with_version(system_keyspace::generate_schema_version(id))
             .build();
     }
 
@@ -55,6 +55,8 @@ public:
 
 }
 
+BOOST_AUTO_TEST_SUITE(virtual_table_test)
+
 SEASTAR_TEST_CASE(test_set_cell) {
     auto table = db::test_table();
     table.test_set_cell();
@@ -64,18 +66,28 @@ SEASTAR_TEST_CASE(test_set_cell) {
 
 SEASTAR_THREAD_TEST_CASE(test_system_config_table_read) {
     do_with_cql_env_thread([] (cql_test_env& env) {
-        auto res = env.execute_cql("SELECT * FROM system.config WHERE name = 'partitioner';").get0();
+        auto res = env.execute_cql("SELECT * FROM system.config WHERE name = 'partitioner';").get();
         assert_that(res).is_rows().with_size(1).with_row({
             { utf8_type->decompose(sstring("partitioner")) },
             { utf8_type->decompose(sstring("default")) },
+            { utf8_type->decompose(sstring("used")) },
             { utf8_type->decompose(sstring("string")) },
             { utf8_type->decompose(format("\"{}\"", env.local_db().get_config().partitioner())) }
         });
     }).get();
 }
 
+SEASTAR_THREAD_TEST_CASE(test_system_config_table_status) {
+    do_with_cql_env_thread([] (cql_test_env& env) {
+        auto res = env.execute_cql("SELECT status FROM system.config WHERE name = 'commitlog_use_hard_size_limit';").get();
+        assert_that(res).is_rows().with_size(1).with_row({
+            { utf8_type->decompose(sstring("deprecated")) },
+        });
+    }).get();
+}
+
 SEASTAR_THREAD_TEST_CASE(test_system_config_table_update) {
-    if (smp::count < 2) {
+    if (this_smp_shard_count() < 2) {
         fmt::print("This test should be run with at least 2 CPUs\n");
         return;
     }
@@ -94,6 +106,13 @@ SEASTAR_THREAD_TEST_CASE(test_system_config_table_update) {
     }).get();
 }
 
+SEASTAR_THREAD_TEST_CASE(test_system_config_table_set_empty) {
+    do_with_cql_env_thread([] (cql_test_env& env) {
+        env.execute_cql(format("UPDATE system.config SET value = '' WHERE name = 'allowed_repair_based_node_ops';")).get();
+        BOOST_REQUIRE_EQUAL(env.local_db().get_config().allowed_repair_based_node_ops(), sstring());
+    }).get();
+}
+
 SEASTAR_THREAD_TEST_CASE(test_system_config_table_no_live_update) {
     do_with_cql_env_thread([] (cql_test_env& env) {
         BOOST_REQUIRE_THROW(
@@ -102,3 +121,5 @@ SEASTAR_THREAD_TEST_CASE(test_system_config_table_no_live_update) {
         );
     }).get();
 }
+
+BOOST_AUTO_TEST_SUITE_END()

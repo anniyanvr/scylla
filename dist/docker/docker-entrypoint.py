@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import sys
 import signal
 import subprocess
@@ -25,9 +24,10 @@ try:
     setup.developerMode()
     setup.cpuSet()
     setup.io()
+    setup.coredumpSetup()
     setup.cqlshrc()
+    setup.write_rackdc_properties()
     setup.arguments()
-    setup.set_housekeeping()
     supervisord = subprocess.Popen(["/usr/bin/supervisord", "-c",  "/etc/supervisord.conf"])
     supervisord.wait()
 except Exception:

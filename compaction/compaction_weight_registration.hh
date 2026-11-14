@@ -4,10 +4,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
+
+namespace compaction {
 
 class compaction_manager;
 
@@ -31,3 +33,5 @@ public:
 
     int weight() const;
 };
+
+}

@@ -3,21 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include <limits>
 #include <type_traits>
 #include <concepts>
 #include <seastar/core/future.hh>
 #include "gc_clock.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "sstables/types.hh"
 #include "sstables/exceptions.hh"
-#include "clustering_bounds_comparator.hh"
-#include "sstables/mx/types.hh"
 
 namespace sstables {
 
@@ -49,10 +46,10 @@ inline api::timestamp_type parse_timestamp(const serialization_header& header,
 inline gc_clock::duration parse_ttl(int64_t value) {
     if (!is_expired_liveness_ttl(value)) {
         if (value < 0) {
-            throw malformed_sstable_exception(format("Negative ttl: {}", value));
+            throw_malformed_sstable_exception(format("Negative ttl: {}", value));
         }
         if (value > max_ttl.count()) {
-            throw malformed_sstable_exception(format("Too big ttl: {}", value));
+            throw_malformed_sstable_exception(format("Too big ttl: {}", value));
         }
     }
     return gc_clock::duration(value);

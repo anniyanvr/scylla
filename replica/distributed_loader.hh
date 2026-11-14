@@ -3,21 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 
 #include <seastar/core/future.hh>
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
-#include <seastar/core/file.hh>
 #include <vector>
 #include <functional>
-#include <filesystem>
 #include "seastarx.hh"
 #include "compaction/compaction_descriptor.hh"
+#include "db/system_keyspace.hh"
+#include "sstables/sstable_directory.hh"
+#include "service/topology_state_machine_fwd.hh"
 
 namespace replica {
 class database;
@@ -27,9 +28,11 @@ using column_family = table;
 
 namespace db {
 class config;
-class system_distributed_keyspace;
+class system_keyspace;
 namespace view {
-class view_update_generator;
+enum class sstable_destination_decision;
+class view_builder;
+class view_building_worker;
 }
 }
 
@@ -37,54 +40,65 @@ namespace sstables {
 
 class entry_descriptor;
 class foreign_sstable_open_info;
-class sstable_directory;
 
 }
 
 namespace service {
 
 class storage_proxy;
-class storage_service;
+class raft_group0_client;
 
 }
 
-namespace gms {
-class gossiper;
+namespace locator {
+class effective_replication_map_factory;
 }
 
 class distributed_loader_for_tests;
 
 namespace replica {
 
+class table_populator;
+class global_table_ptr;
+
 class distributed_loader {
     friend class ::distributed_loader_for_tests;
+    friend class table_populator;
 
-    static future<> reshape(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, sstables::reshape_mode mode,
-            sstring ks_name, sstring table_name, sstables::compaction_sstable_creator_fn creator, std::function<bool (const sstables::shared_sstable&)> filter);
-    static future<> reshard(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, sstring ks_name, sstring table_name, sstables::compaction_sstable_creator_fn creator);
-    static future<> process_sstable_dir(sharded<sstables::sstable_directory>& dir, bool sort_sstables_according_to_owner = true);
-    static future<> lock_table(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, sstring ks_name, sstring cf_name);
+    static future<> reshape(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, compaction::reshape_mode mode,
+            sstring ks_name, sstring table_name, compaction::compaction_sstable_creator_fn creator, std::function<bool (const sstables::shared_sstable&)> filter);
+    static future<> reshard(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, sstring ks_name, sstring table_name, compaction::compaction_sstable_creator_fn creator,
+            compaction::owned_ranges_ptr owned_ranges_ptr = nullptr, bool vnodes_resharding = false, tasks::task_info parent_info = tasks::make_empty_task_info());
+    static future<> process_sstable_dir(sharded<sstables::sstable_directory>& dir, sstables::sstable_directory::process_flags flags);
+    static future<> lock_table(global_table_ptr&, sharded<sstables::sstable_directory>& dir);
     static future<size_t> make_sstables_available(sstables::sstable_directory& dir,
-            sharded<replica::database>& db, sharded<db::view::view_update_generator>& view_update_generator,
-            std::filesystem::path datadir, sstring ks, sstring cf);
-    static future<> populate_column_family(distributed<replica::database>& db, sstring sstdir, sstring ks, sstring cf, bool must_exist = true);
-    static future<> populate_keyspace(distributed<replica::database>& db, sstring datadir, sstring ks_name);
-    static future<> cleanup_column_family_temp_sst_dirs(sstring sstdir);
-    static future<> handle_sstables_pending_delete(sstring pending_deletes_dir);
+            sharded<replica::database>& db, sharded<db::view::view_builder>& vb, sharded<db::view::view_building_worker>& vbw,
+            db::view::sstable_destination_decision needs_view_update, sstring ks, sstring cf);
+    static future<> populate_keyspace(sharded<replica::database>& db, sharded<db::system_keyspace>& sys_ks, keyspace& ks, sstring ks_name,
+            std::optional<service::storage_mode> storage_mode = std::nullopt);
+    static future<std::tuple<table_id, std::vector<std::vector<sstables::shared_sstable>>>>
+        get_sstables_from(sharded<replica::database>& db, sstring ks, sstring cf, sstables::sstable_open_config cfg,
+        noncopyable_function<future<>(global_table_ptr&, sharded<sstables::sstable_directory>&)> start_dir,
+        bool need_mutate_level);
 
 public:
-    static future<> init_system_keyspace(distributed<replica::database>& db, distributed<service::storage_service>& ss, sharded<gms::gossiper>& g, db::config& cfg);
-    static future<> init_non_system_keyspaces(distributed<replica::database>& db, distributed<service::storage_proxy>& proxy);
-    static future<> ensure_system_table_directories(distributed<replica::database>& db);
+    static future<> init_system_keyspace(sharded<db::system_keyspace>&, sharded<locator::effective_replication_map_factory>&, sharded<replica::database>&);
+    static future<> init_non_system_keyspaces(sharded<replica::database>& db, sharded<service::storage_proxy>& proxy, sharded<db::system_keyspace>& sys_ks,
+            service::raft_group0_client& group0_client, abort_source& as);
 
-    // Scan sstables under upload directory. Return a vector with smp::count entries.
+    // Scan sstables under upload directory. Return a vector with this_smp_shard_count() entries.
     // Each entry with index of idx should be accessed on shard idx only.
     // Each entry contains a vector of sstables for this shard.
     // The table UUID is returned too.
-    static future<std::tuple<utils::UUID, std::vector<std::vector<sstables::shared_sstable>>>>
-            get_sstables_from_upload_dir(distributed<replica::database>& db, sstring ks, sstring cf);
-    static future<> process_upload_dir(distributed<replica::database>& db, distributed<db::system_distributed_keyspace>& sys_dist_ks,
-            distributed<db::view::view_update_generator>& view_update_generator, sstring ks_name, sstring cf_name);
+    static future<std::tuple<table_id, std::vector<std::vector<sstables::shared_sstable>>>>
+            get_sstables_from_upload_dir(sharded<replica::database>& db, sstring ks, sstring cf, sstables::sstable_open_config cfg);
+    // Returns the storage options to open the sstables with. Called on every shard,
+    // so that each shard can give its options its own abort source.
+    using storage_options_maker = std::function<data_dictionary::storage_options()>;
+    static future<std::tuple<table_id, std::vector<std::vector<sstables::shared_sstable>>>>
+            get_sstables_from_object_store(sharded<replica::database>& db, sstring ks, sstring cf, std::vector<sstring> sstables,
+                    storage_options_maker make_storage_options, sstables::sstable_open_config cfg);
+    static future<> process_upload_dir(sharded<replica::database>& db, sharded<db::view::view_builder>& vb, sharded<db::view::view_building_worker>& vbw, sstring ks_name, sstring cf_name, bool skip_cleanup, bool skip_reshape);
 };
 
 }

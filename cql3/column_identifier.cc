@@ -3,15 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "cql3/column_identifier.hh"
-#include "exceptions/exceptions.hh"
 #include "cql3/util.hh"
-#include "cql3/query_options.hh"
-
-#include <regex>
+#include "utils/chunked_string.hh"
 
 namespace cql3 {
 
@@ -85,27 +82,19 @@ column_identifier_raw::prepare_column_identifier(const schema& schema) const {
         return ::make_shared<column_identifier>(std::move(text_bytes), _text);
     }
 
-    return ::make_shared<column_identifier>(schema.regular_column_name_type()->from_string(_raw_text), _text);
-}
-
-bool column_identifier_raw::processes_selection() const {
-    return false;
+    return ::make_shared<column_identifier>(to_bytes(schema.regular_column_name_type()->from_string(_raw_text)), _text);
 }
 
 bool column_identifier_raw::operator==(const column_identifier_raw& other) const {
     return _text == other._text;
 }
 
-bool column_identifier_raw::operator!=(const column_identifier_raw& other) const {
-    return !operator==(other);
+const sstring& column_identifier_raw::text() const {
+    return _text;
 }
 
 sstring column_identifier_raw::to_string() const {
     return _text;
-}
-
-std::ostream& operator<<(std::ostream& out, const column_identifier_raw& id) {
-    return out << id._text;
 }
 
 }

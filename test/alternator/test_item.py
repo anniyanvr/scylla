@@ -1,13 +1,13 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the CRUD item operations: PutItem, GetItem, UpdateItem, DeleteItem
 
 import pytest
 from botocore.exceptions import ClientError
 from decimal import Decimal
-from util import random_string, random_bytes
+from test.alternator.util import random_string, random_bytes
 
 # Basic test for creating a new item with a random name, and reading it back
 # with strong consistency.
@@ -125,7 +125,6 @@ def test_basic_string_more_update(test_table):
     val1 = random_string()
     val2 = random_string()
     val3 = random_string()
-    val4 = random_string()
     test_table.update_item(Key={'p': p, 'c': c}, AttributeUpdates={'a3': {'Value': val1, 'Action': 'PUT'}})
     test_table.update_item(Key={'p': p, 'c': c}, AttributeUpdates={'a1': {'Value': val1, 'Action': 'PUT'}})
     test_table.update_item(Key={'p': p, 'c': c}, AttributeUpdates={'a2': {'Value': val2, 'Action': 'PUT'}})
@@ -143,6 +142,23 @@ def test_basic_string_more_update(test_table):
 def test_item_operations_nonexistent_table(dynamodb):
     with pytest.raises(ClientError, match='ResourceNotFoundException'):
         dynamodb.meta.client.put_item(TableName='non_existent_table',
+            Item={'a':{'S':'b'}})
+
+# DynamoDB documentation specifies that table names must be 3-255 characters,
+# and match the regex [a-zA-Z0-9._-]+. If an item operation like PutItem
+# is given a TableName not matching these rules, it would make sense to treat
+# it as just another case of a non-existent table (ResourceNotFoundException),
+# but it turns out that DynamoDB returns a ValidationError in that case.
+# Saying for example that "Value 'non!existent!table' at 'tableName' failed
+# to satisfy constraint: Member must satisfy regular expression pattern:
+# [a-zA-Z0-9_.-]+".".
+# This test suggests that issue #12538 should not be done.
+def test_item_operations_improper_named_table(dynamodb):
+    with pytest.raises(ClientError, match='ValidationException'):
+        dynamodb.meta.client.put_item(TableName='non!existent!table',
+            Item={'a':{'S':'b'}})
+    with pytest.raises(ClientError, match='ValidationException'):
+        dynamodb.meta.client.put_item(TableName='xx',
             Item={'a':{'S':'b'}})
 
 # Fetching a non-existent item. According to the DynamoDB doc, "If there is no
@@ -361,6 +377,14 @@ def test_getitem_attributes_to_get_duplicate(dynamodb, test_table):
     with pytest.raises(ClientError, match='ValidationException.*Duplicate'):
         test_table.get_item(Key={'p': p, 'c': c}, AttributesToGet=['a', 'a'], ConsistentRead=True)
 
+# Verify that it is forbidden to ask for an empty AttributesToGet
+# Reproduces issue #10332.
+def test_getitem_attributes_to_get_empty(dynamodb, test_table):
+    p = random_string()
+    c = random_string()
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table.get_item(Key={'p': p, 'c': c}, AttributesToGet=[], ConsistentRead=True)
+
 # Basic test for DeleteItem, with hash key only
 def test_delete_item_hash(test_table_s):
     p = random_string()
@@ -379,6 +403,21 @@ def test_delete_item_sort(test_table):
     test_table.delete_item(Key=key)
     assert not 'Item' in test_table.get_item(Key=key, ConsistentRead=True)
 
+# DeleteItem should return an empty response object if none of the options
+# ReturnValues, ReturnConsumedCapacity or ReturnItemCollectionMetrics are requested.
+# We have tests elsewhere (see test_returnvalues.py, test_returnconsumedcapacity.py)
+# for testing DeleteItem with those optional features.
+def test_delete_item_return(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p})
+    assert 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    ret = test_table_s.delete_item(Key={'p': p})
+    assert not 'Item' in test_table_s.get_item(Key={'p': p}, ConsistentRead=True)
+    # boto3 always adds a "ResponseMetadata" item to the reponse object. Remove
+    # it and verify an empty object is left:
+    del ret['ResponseMetadata']
+    assert ret == {}
+
 # Test that PutItem completely replaces an existing item. It shouldn't merge
 # it with a previously existing value, as UpdateItem does!
 # We test for a table with just hash key, and for a table with both hash and
@@ -394,6 +433,21 @@ def test_put_item_replace(test_table_s, test_table):
     assert test_table.get_item(Key={'p': p, 'c': c}, ConsistentRead=True)['Item'] == {'p': p, 'c': c, 'a': 'hi'}
     test_table.put_item(Item={'p': p, 'c': c, 'b': 'hello'})
     assert test_table.get_item(Key={'p': p, 'c': c}, ConsistentRead=True)['Item'] == {'p': p, 'c': c, 'b': 'hello'}
+
+# Test that UpdateItem merges the change with a previously existing item -
+# it doesn't outright replace it like PutItem does in test_put_item_replace()
+def test_update_item_merge(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': 'hi'})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hi'}
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'b': {'Value': 'hello', 'Action': 'PUT'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hi', 'b': 'hello'}
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'a': {'Value': 'hey', 'Action': 'PUT'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hey', 'b': 'hello'}
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'a': {'Action': 'DELETE'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'b': 'hello'}
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'b': {'Action': 'DELETE'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p}
 
 # Test what UpdateItem does on a non-existent item. An operation that puts an
 # attribute, creates this item. Even an empty operation creates an item
@@ -475,7 +529,7 @@ def test_update_item_delete(test_table_s):
     with pytest.raises(ClientError, match='ValidationException.*empty'):
         test_table_s.update_item(Key={'p': p},
             AttributeUpdates={'a': {'Action': 'DELETE', 'Value': set([])}})
-    # Deleting all the elments from a set doesn't leave an empty set
+    # Deleting all the elements from a set doesn't leave an empty set
     # (which DynamoDB doesn't allow) but rather deletes the attribute:
     test_table_s.update_item(Key={'p': p},
         AttributeUpdates={'a': {'Action': 'DELETE', 'Value': set([1, 2, 3])}})
@@ -703,7 +757,7 @@ def test_unused_entries_no_expression(test_table_s):
 def test_null_in_string(test_table_s):
     p = random_string() + '\x00' + random_string()
     val = random_string() + '\x00' + random_string()
-    # sanity check: varify that Python actually put the null in the strings...
+    # sanity check: verify that Python actually put the null in the strings...
     assert 0 in p.encode('utf-8')
     assert 0 in val.encode('utf-8')
     test_table_s.put_item(Item={'p': p, 'val': val})
@@ -712,7 +766,7 @@ def test_null_in_string(test_table_s):
 def test_null_in_bytes(test_table_b):
     p = random_bytes() + bytes([0]) + random_bytes()
     val = random_bytes() + bytes([0]) + random_bytes()
-    # sanity check: varify that Python actually put the null in the bytes...
+    # sanity check: verify that Python actually put the null in the bytes...
     assert 0 in p
     assert 0 in val
     test_table_b.put_item(Item={'p': p, 'val': val})
@@ -734,6 +788,17 @@ def test_key_empty_string_value(test_table):
         test_table.put_item(Item={'p': '', 'c': c})
     with pytest.raises(ClientError, match='ValidationException.*empty string'):
         test_table.put_item(Item={'p': p, 'c': ''})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        test_table.update_item(Key={'p': '', 'c': c}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        test_table.update_item(Key={'p': p, 'c': ''}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        with test_table.batch_writer() as batch:
+            batch.put_item({'p': '', 'c': c})
+    with pytest.raises(ClientError, match='ValidationException.*empty string'):
+        with test_table.batch_writer() as batch:
+            batch.put_item({'p': p, 'c': ''})
+
 def test_key_empty_bytes_value(test_table_b, test_table_sb):
     p = random_string()
     # Interestingly, Scylla reports an "empty string" in the bytes case as well,
@@ -743,3 +808,83 @@ def test_key_empty_bytes_value(test_table_b, test_table_sb):
         test_table_b.put_item(Item={'p': b''})
     with pytest.raises(ClientError, match='ValidationException.*empty'):
         test_table_sb.put_item(Item={'p': p, 'c': b''})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_b.update_item(Key={'p': b''}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        test_table_sb.update_item(Key={'p': p, 'c': b''}, AttributeUpdates={'x': {'Value': 3, 'Action': 'PUT'}})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        with test_table_b.batch_writer() as batch:
+            batch.put_item({'p': b''})
+    with pytest.raises(ClientError, match='ValidationException.*empty'):
+        with test_table_sb.batch_writer() as batch:
+            batch.put_item({'p': p, 'c': b''})
+
+def test_nonkey_empty_value(test_table_s):
+    p = random_string()
+    # PutItem:
+    test_table_s.put_item(Item={'p': p, 'a': '', 'b': b''})
+    item = test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']
+    assert '' == item['a']
+    assert b'' == item['b']
+    # UpdateItem:
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'c': {'Value': '', 'Action': 'PUT'}})
+    assert '' == test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c']
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'c': {'Value': b'', 'Action': 'PUT'}})
+    assert b'' == test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['c']
+    # BatchWriteItem:
+    with test_table_s.batch_writer() as batch:
+        batch.put_item({'p': p, 'x': '', 'y': b''})
+    item = test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']
+    assert '' == item['x']
+    assert b'' == item['y']
+
+# And UpdateItem's AttributeUpdates may specify an operation on more than
+# one attribute. Note that because AttributeUpdates is a map, by definition
+# these are operations on *different* attributes.
+def test_update_item_multiple(test_table_s):
+    p = random_string()
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'a': {'Value': 'hello', 'Action': 'PUT'},
+                          'b': {'Value': 'hi', 'Action': 'PUT'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hello', 'b': 'hi'}
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={'a': {'Action': 'DELETE'},
+                          'b': {'Action': 'DELETE'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p}
+
+# Using UpdateItem DELETE on a non-existent attribute of an existing item
+# succeeds but does nothing. Note that we have a separate test for the case
+# the whole item doesn't exist (test_update_item_non_existent)
+def test_update_item_delete_nonexistent_attribute(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': 'hello'})
+    test_table_s.update_item(Key={'p': p}, AttributeUpdates={'b': {'Action': 'DELETE'}})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hello'}
+
+# Tests above all used just a few attributes in each item. This test verifies
+# that we can have any number of attributes (e.g., 400) and everything still
+# works well.
+def test_many_attributes(test_table_s):
+    N = 200
+    # PutItem of an item with N attributes:
+    attributes = { 'attr'+str(i): i for i in range(N) }
+    p = random_string()
+    item = {'p': p, **attributes}
+    test_table_s.put_item(Item=item)
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == item
+    # UpdateItem adding N more attributes to the same item:
+    more_attributes = { 'more'+str(i): i for i in range(N) }
+    test_table_s.update_item(Key={'p': p},
+        AttributeUpdates={key: {'Value': more_attributes[key], 'Action': 'PUT'} for key in more_attributes.keys()})
+    item = {**item, **more_attributes}
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == item
+
+# Test that attribute names can contain basically any character - even things
+# like backslashes, quotes, spaces, newlines, and even null (!).
+def test_attribute_allowed_chars(test_table_s):
+    p = random_string()
+    s = bytes(range(256)).decode('latin-1')
+    for chars in ['abc', ' ', "-\\\"'_.:/#&", s]:
+        test_table_s.update_item(Key={'p': p},
+            AttributeUpdates={chars: {'Value': chars, 'Action': 'PUT'}})
+        assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'][chars] == chars

@@ -3,13 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <boost/test/unit_test.hpp>
-#include "range_tombstone_list.hh"
+#include "mutation/range_tombstone_list.hh"
 
 class range_tombstone_list_assertions {
     const schema& _s;

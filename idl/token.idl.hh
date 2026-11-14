@@ -1,3 +1,15 @@
+/*
+ * Copyright 2016-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#include "dht/token.hh"
+
+#include "idl/keys.idl.hh"
+
 namespace dht {
 class token {
     enum class kind : int {

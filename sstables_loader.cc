@@ -3,30 +3,77 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <fmt/ranges.h>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/map_reduce.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/shared_mutex.hh>
+#include <seastar/core/timer.hh>
+#include <seastar/core/units.hh>
+#include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/coroutine/switch_to.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/rpc/rpc.hh>
+#include <seastar/util/short_streams.hh> 
 #include "sstables_loader.hh"
+#include "db/config.hh"
+#include "dht/auto_refreshing_sharder.hh"
 #include "replica/distributed_loader.hh"
 #include "replica/database.hh"
+#include "sstables/sstables_manager.hh"
 #include "sstables/sstables.hh"
+#include "sstables/storage.hh"
 #include "gms/inet_address.hh"
+#include "gms/feature_service.hh"
 #include "streaming/stream_mutation_fragments_cmd.hh"
+#include "streaming/stream_reason.hh"
+#include "readers/mutation_fragment_v1_stream.hh"
 #include "locator/abstract_replication_strategy.hh"
+#include "locator/network_topology_strategy.hh"
 #include "message/messaging_service.hh"
+#include "service/storage_service.hh"
+#include "utils/error_injection.hh"
+#include "sstables_loader_helpers.hh"
+#include "db/system_distributed_keyspace.hh"
+#include "db/snapshot/cluster_backup.hh"
+#include "idl/sstables_loader.dist.hh"
+
+#include "sstables/object_storage_client.hh"
+#include "utils/rjson.hh"
+#include "table_helper.hh"
 
 #include <cfloat>
+#include <algorithm>
+#include <set>
+#include "utils/assert.hh"
 
 static logging::logger llog("sstables_loader");
 
 namespace {
 
+// Helper for conversion to dht::token
+dht::token to_token(const rjson::value& v) {
+    if (!v.IsInt64()) {
+        throw std::runtime_error(fmt::format("to_token expects a 64-bit signed integer value, got: {}", rjson::type_name(v.GetType())));
+    }
+    return dht::token::from_int64(v.GetInt64());
+}
+// Helper for conversion to sstables::sstable_id
+sstables::sstable_id to_sstable_id(const rjson::value& v) {
+    if (!v.IsString()) {
+        throw std::runtime_error(fmt::format("to_sstable_id expects a string value, got: {}", rjson::type_name(v.GetType())));
+    }
+    return sstables::sstable_id(utils::UUID(rjson::to_string_view(v)));
+}
+
 class send_meta_data {
-    gms::inet_address _node;
+    locator::host_id _node;
     seastar::rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd> _sink;
     seastar::rpc::source<int32_t> _source;
+    const bool _abort_supported = false;
     bool _error_from_peer = false;
     size_t _num_partitions_sent = 0;
     size_t _num_bytes_sent = 0;
@@ -48,12 +95,13 @@ private:
         co_return;
     }
 public:
-    send_meta_data(gms::inet_address node,
+    send_meta_data(locator::host_id node,
             seastar::rpc::sink<frozen_mutation_fragment, streaming::stream_mutation_fragments_cmd> sink,
-            seastar::rpc::source<int32_t> source)
+            seastar::rpc::source<int32_t> source, bool abort_supported)
         : _node(std::move(node))
         , _sink(std::move(sink))
         , _source(std::move(source))
+        , _abort_supported(abort_supported)
         , _receive_done(make_ready_future<>()) {
     }
     void receive() {
@@ -71,10 +119,12 @@ public:
         llog.trace("send_meta_data: send mf to node={}, size={}", _node, size);
         co_return co_await _sink(fmf, streaming::stream_mutation_fragments_cmd::mutation_fragment_data);
     }
-    future<> finish(bool failed) {
+    future<> finish(bool failed, bool aborted) {
         std::exception_ptr eptr;
         try {
-            if (failed) {
+            if (_abort_supported && aborted) {
+                co_await _sink(frozen_mutation_fragment(bytes_ostream()), streaming::stream_mutation_fragments_cmd::abort);
+            } else if (failed) {
                 co_await _sink(frozen_mutation_fragment(bytes_ostream()), streaming::stream_mutation_fragments_cmd::error);
             } else {
                 co_await _sink(frozen_mutation_fragment(bytes_ostream()), streaming::stream_mutation_fragments_cmd::end_of_stream);
@@ -111,159 +161,1485 @@ public:
 
 } // anonymous namespace
 
-future<> sstables_loader::load_and_stream(sstring ks_name, sstring cf_name,
-        utils::UUID table_id, std::vector<sstables::shared_sstable> sstables, bool primary_replica_only) {
-    const auto full_partition_range = dht::partition_range::make_open_ended_both_sides();
-    const auto full_token_range = dht::token_range::make_open_ended_both_sides();
-    auto& table = _db.local().find_column_family(table_id);
-    auto s = table.schema();
-    const auto cf_id = s->id();
-    const auto reason = streaming::stream_reason::repair;
-    auto erm = _db.local().find_keyspace(ks_name).get_effective_replication_map();
+using primary_replica_only = bool_class<struct primary_replica_only_tag>;
+using unlink_sstables = bool_class<struct unlink_sstables_tag>;
+using defer_unlinking = bool_class<struct defer_unlinking_tag>;
 
+class sstable_streamer {
+protected:
+    using stream_scope = sstables_loader::stream_scope;
+    netw::messaging_service& _ms;
+    replica::database& _db;
+    replica::table& _table;
+    locator::effective_replication_map_ptr _erm;
+    std::vector<sstables::shared_sstable> _sstables;
+    const primary_replica_only _primary_replica_only;
+    const unlink_sstables _unlink_sstables;
+    const stream_scope _stream_scope;
+public:
+    sstable_streamer(netw::messaging_service& ms, replica::database& db, ::table_id table_id, locator::effective_replication_map_ptr erm,
+                     std::vector<sstables::shared_sstable> sstables, primary_replica_only primary, unlink_sstables unlink, stream_scope scope)
+            : _ms(ms)
+            , _db(db)
+            , _table(db.find_column_family(table_id))
+            , _erm(std::move(erm))
+            , _sstables(std::move(sstables))
+            , _primary_replica_only(primary)
+            , _unlink_sstables(unlink)
+            , _stream_scope(scope)
+    {
+        // By sorting SSTables by their primary key, we allow SSTable runs to be
+        // incrementally streamed.
+        // Overlapping run fragments can have their content deduplicated, reducing
+        // the amount of data we need to put on the wire.
+        // Elements are popped off from the back of the vector, therefore we're sorting
+        // it in descending order, to start from the smaller tokens.
+        std::ranges::sort(_sstables, [] (const sstables::shared_sstable& x, const sstables::shared_sstable& y) {
+            return x->compare_by_first_key(*y) > 0;
+        });
+    }
+
+    virtual ~sstable_streamer() {}
+
+    virtual future<> stream(shared_ptr<stream_progress> progress);
+    host_id_vector_replica_set get_endpoints(const dht::token& token) const;
+    future<> stream_sstable_mutations(streaming::plan_id, const dht::partition_range&, std::vector<sstables::shared_sstable>, defer_unlinking defer);
+protected:
+    virtual host_id_vector_replica_set get_primary_endpoints(const dht::token& token, std::function<bool(const locator::host_id&)> filter) const;
+    future<> stream_sstables(const dht::partition_range&, std::vector<sstables::shared_sstable>, shared_ptr<stream_progress> progress, defer_unlinking defer);
+private:
+    host_id_vector_replica_set get_all_endpoints(const dht::token& token) const;
+};
+
+class tablet_sstable_streamer : public sstable_streamer {
+    sharded<replica::database>& _db;
+    const locator::tablet_map& _tablet_map;
+public:
+    tablet_sstable_streamer(netw::messaging_service& ms, sharded<replica::database>& db, ::table_id table_id, locator::effective_replication_map_ptr erm,
+                            std::vector<sstables::shared_sstable> sstables, primary_replica_only primary, unlink_sstables unlink, stream_scope scope)
+        : sstable_streamer(ms, db.local(), table_id, std::move(erm), std::move(sstables), primary, unlink, scope)
+        , _db(db)
+        , _tablet_map(_erm->get_token_metadata().tablets().get_tablet_map(table_id)) {
+    }
+
+    virtual future<> stream(shared_ptr<stream_progress> on_streamed) override;
+    virtual host_id_vector_replica_set get_primary_endpoints(const dht::token& token, std::function<bool(const locator::host_id&)> filter) const override;
+
+private:
+    host_id_vector_replica_set to_replica_set(const locator::tablet_replica_set& replicas) const {
+        host_id_vector_replica_set result;
+        result.reserve(replicas.size());
+        for (auto&& replica : replicas) {
+            result.push_back(replica.host);
+        }
+        return result;
+    }
+
+    using sst_classification_info = std::vector<std::vector<minimal_sst_info>>;
+
+    future<> attach_sstable(shard_id from_shard, const sstring& ks, const sstring& cf, const minimal_sst_info& min_info) const {
+        llog.debug("Adding downloaded SSTable gen={} to the table {}.{} on shard {}, submitted from shard {}", min_info.generation, _table.schema()->ks_name(), _table.schema()->cf_name(), this_shard_id(), from_shard);
+        auto& db = _db.local();
+        auto& table = db.find_column_family(ks, cf);
+        // DROP waits for streams before truncating, so this guard is what makes it wait
+        // for the attach rather than remove the directory under sst->load(). Must be
+        // taken in the same continuation as the lookup: `table` is unpinned, and a
+        // suspension between the two reopens the race.
+        auto stream_guard = table.stream_in_progress();
+        auto& sst_manager = table.get_sstables_manager();
+        auto sst = sst_manager.make_sstable(
+            table.schema(), table.get_storage_options(), min_info.generation, sstables::sstable_state::normal, min_info.version, min_info.format);
+        sst->set_sstable_level(0);
+        auto units = co_await sst_manager.dir_semaphore().get_units(1);
+        // The sstable was downloaded for this shard, which is why it was submitted
+        // here, so there is nothing to work out: declare this shard its owner. Letting
+        // load() recompute it would also drag in an ERM, and _erm belongs to the shard
+        // which created the streamer, not to this one.
+        sstables::sstable_open_config cfg {
+            .current_shard_as_sstable_owner = true,
+            .unsealed_sstable = true,
+        };
+        // Unused given current_shard_as_sstable_owner, but load() wants a sharder.
+        dht::auto_refreshing_sharder sharder(table.shared_from_this());
+        co_await sst->load(sharder, cfg);
+        co_await table.add_new_sstable_and_update_cache(sst, [&sst_manager, sst] (sstables::shared_sstable loading_sst) -> future<> {
+            if (loading_sst == sst) {
+                auto writer_cfg = sst_manager.configure_writer(loading_sst->get_origin());
+                co_await loading_sst->seal_sstable(writer_cfg.backup);
+            }
+        });
+    }
+
+    future<>
+    stream_fully_contained_sstables(const dht::partition_range& pr, std::vector<sstables::shared_sstable> sstables, shared_ptr<stream_progress> progress) {
+        if (_stream_scope != stream_scope::node) {
+            co_return co_await stream_sstables(pr, std::move(sstables), std::move(progress), defer_unlinking::no);
+        }
+        llog.debug("Directly downloading {} fully contained SSTables to local node from object storage.", sstables.size());
+        auto downloaded_ssts = co_await download_fully_contained_sstables(std::move(sstables));
+
+        co_await smp::invoke_on_all(
+            [this, &downloaded_ssts, from = this_shard_id(), ks = _table.schema()->ks_name(), cf = _table.schema()->cf_name()] -> future<> {
+                auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
+                for (const auto& min_info : shard_ssts) {
+                    co_await attach_sstable(from, ks, cf, min_info);
+                }
+            });
+        if (progress) {
+            progress->advance(std::accumulate(downloaded_ssts.cbegin(), downloaded_ssts.cend(), 0., [](float acc, const auto& v) { return acc + v.size(); }));
+        }
+    }
+
+    future<sst_classification_info> download_fully_contained_sstables(std::vector<sstables::shared_sstable> sstables) const {
+        sst_classification_info downloaded_sstables(this_smp_shard_count());
+        for (const auto& sstable : sstables) {
+            // For now, tablet-aware restore doesn't need to mutate sstable level to 0
+            // since we support only restoring to empty tables and so we can keep the sstable levels on backup.
+            // Once we support restoring onto live tables we may want to mutate the ingested sstables' level to 0.
+            auto min_info = co_await download_sstable(_table, sstable, llog);
+            downloaded_sstables[min_info.shard].emplace_back(min_info);
+        }
+        co_return downloaded_sstables;
+    }
+
+    future<> unlink_marked_sstables() {
+        co_await coroutine::parallel_for_each(_sstables, [] (sstables::shared_sstable& sst) -> future<> {
+            if (sst->marked_for_deletion()) {
+                co_await sst->unlink();
+            }
+        });
+    }
+
+    bool tablet_in_scope(locator::tablet_id) const;
+
+    friend future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_tests(const std::vector<sstables::shared_sstable>& sstables,
+                                                                                             std::vector<dht::token_range>&& tablets_ranges);
+    // Pay attention, while working with tablet ranges, the `erm` must be held alive as long as we retrieve (and use here) tablet ranges from
+    // the tablet map. This is already done when using `tablet_sstable_streamer` class but tread carefully if you plan to use this method somewhere else.
+    static future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets(const std::vector<sstables::shared_sstable>& sstables,
+                                                                                   std::vector<dht::token_range>&& tablets_ranges);
+};
+
+host_id_vector_replica_set sstable_streamer::get_endpoints(const dht::token& token) const {
+    auto host_filter = [&topo = _erm->get_topology(), scope = _stream_scope] (const locator::host_id& ep) {
+        switch (scope) {
+        case stream_scope::all:
+            return true;
+        case stream_scope::dc:
+            return topo.get_datacenter(ep) == topo.get_datacenter();
+        case stream_scope::rack:
+            return topo.get_location(ep) == topo.get_location();
+        case stream_scope::node:
+            return topo.is_me(ep);
+        }
+    };
+
+    if (_primary_replica_only) {
+        if (_stream_scope == stream_scope::node) {
+            throw std::runtime_error("Node scoped streaming of primary replica only is not supported");
+        }
+        return get_primary_endpoints(token, std::move(host_filter));
+    }
+    return get_all_endpoints(token) | std::views::filter(std::move(host_filter)) | std::ranges::to<host_id_vector_replica_set>();
+}
+
+host_id_vector_replica_set sstable_streamer::get_all_endpoints(const dht::token& token) const {
+    auto current_targets = _erm->get_natural_replicas(token);
+    auto pending = _erm->get_pending_replicas(token);
+    std::move(pending.begin(), pending.end(), std::back_inserter(current_targets));
+    return current_targets;
+}
+
+host_id_vector_replica_set sstable_streamer::get_primary_endpoints(const dht::token& token, std::function<bool(const locator::host_id&)> filter) const {
+    auto current_targets = _erm->get_natural_replicas(token) | std::views::filter(std::move(filter)) | std::ranges::to<host_id_vector_replica_set>();
+    current_targets.resize(1);
+    return current_targets;
+}
+
+host_id_vector_replica_set tablet_sstable_streamer::get_primary_endpoints(const dht::token& token, std::function<bool(const locator::host_id&)> filter) const {
+    auto tid = _tablet_map.get_tablet_id(token);
+    auto replicas = locator::get_primary_replicas(_tablet_map, tid, _erm->get_topology(), [filter = std::move(filter)] (const locator::tablet_replica& replica) {
+        return filter(replica.host);
+    });
+    return to_replica_set(replicas);
+}
+
+future<> sstable_streamer::stream(shared_ptr<stream_progress> progress) {
+    if (progress) {
+        progress->start(_sstables.size());
+    }
+    const auto full_partition_range = dht::partition_range::make_open_ended_both_sides();
+
+    co_await stream_sstables(full_partition_range, std::move(_sstables), std::move(progress), defer_unlinking::no);
+}
+
+bool tablet_sstable_streamer::tablet_in_scope(locator::tablet_id tid) const {
+    if (_stream_scope == stream_scope::all) {
+        return true;
+    }
+
+    const auto& topo = _erm->get_topology();
+    for (const auto& r : _tablet_map.get_tablet_info(tid).replicas) {
+        switch (_stream_scope) {
+        case stream_scope::node:
+            if (topo.is_me(r.host)) {
+                return true;
+            }
+            break;
+        case stream_scope::rack:
+            if (topo.get_location(r.host) == topo.get_location()) {
+                return true;
+            }
+            break;
+        case stream_scope::dc:
+            if (topo.get_datacenter(r.host) == topo.get_datacenter()) {
+                return true;
+            }
+            break;
+        case stream_scope::all: // checked above already, but still need it here
+            return true;
+        }
+    }
+    return false;
+}
+
+// The tablet_sstable_streamer implements a hierarchical streaming strategy:
+//
+// 1. Top Level (Per-Tablet Streaming):
+//    - Unlike vnode streaming, this streams sstables on a tablet-by-tablet basis
+//    - For a table with M tablets, each tablet[i] maps to its own set of SSTable files
+//      stored in tablet_to_sstables[i]
+//    - If tablet_to_sstables[i] is empty, that tablet's streaming is considered complete
+//    - Progress tracking advances by 1.0 unit when an entire tablet completes streaming
+//
+// 2. Inner Level (Per-SSTable Streaming):
+//    - Within each tablet's batch, individual SSTables are streamed in smaller sub-batches
+//    - The per_tablet_stream_progress class tracks streaming progress at this level:
+//      - Updates when a set of SSTables completes streaming
+//      - For n completed SSTables, advances by (n / total_sstables_in_current_tablet)
+//      - Provides granular tracking for the inner level streaming operations
+//      - Helps estimate completion time for the current tablet's batch
+//
+// Progress Tracking:
+// The streaming progress is monitored at two granularity levels:
+//    - Tablet level: Overall progress where each tablet contributes 1.0 units
+//    - SSTable level: Progress of individual SSTable transfers within a tablet,
+//                     managed by the per_tablet_stream_progress class
+//
+// Note: For simplicity, we assume uniform streaming time across tablets, even though
+// tablets may vary significantly in their SSTable count or size. This assumption
+// helps in progress estimation without requiring prior knowledge of SSTable
+// distribution across tablets.
+struct per_tablet_stream_progress : public stream_progress {
+private:
+    shared_ptr<stream_progress> _per_table_progress;
+    const size_t _num_sstables_mapped;
+public:
+    per_tablet_stream_progress(shared_ptr<stream_progress> per_table_progress,
+                               size_t num_sstables_mapped)
+    : _per_table_progress(std::move(per_table_progress))
+    , _num_sstables_mapped(num_sstables_mapped) {
+        if (_per_table_progress && _num_sstables_mapped == 0) {
+            // consider this tablet completed if nothing to stream
+            _per_table_progress->advance(1.0);
+        }
+    }
+    void advance(float num_sstable_streamed) override {
+        // we should not move backward
+        SCYLLA_ASSERT(num_sstable_streamed >= 0.);
+        // we should call advance() only if the current tablet maps to at least
+        // one sstable.
+        SCYLLA_ASSERT(_num_sstables_mapped > 0);
+        if (_per_table_progress) {
+            _per_table_progress->advance(num_sstable_streamed / _num_sstables_mapped);
+        }
+    }
+};
+
+future<std::vector<tablet_sstable_collection>> tablet_sstable_streamer::get_sstables_for_tablets(const std::vector<sstables::shared_sstable>& sstables,
+                                                                                                 std::vector<dht::token_range>&& tablets_ranges) {
+    auto tablets_sstables =
+        tablets_ranges | std::views::transform([](auto range) { return tablet_sstable_collection{.tablet_range = range}; }) | std::ranges::to<std::vector>();
+    if (sstables.empty() || tablets_sstables.empty()) {
+        co_return std::move(tablets_sstables);
+    }
+    // sstables are sorted by first key in reverse order.
+    auto reversed_sstables = sstables | std::views::reverse;
+
+    for (auto& [tablet_range, sstables_fully_contained, sstables_partially_contained] : tablets_sstables) {
+        auto [fully, partially] = co_await get_sstables_for_tablet(reversed_sstables, tablet_range, [](const auto& sst) { return sst->get_first_decorated_key().token(); }, [](const auto& sst) { return sst->get_last_decorated_key().token(); });
+        sstables_fully_contained = std::move(fully);
+        sstables_partially_contained = std::move(partially);
+    }
+    co_return std::move(tablets_sstables);
+}
+
+future<> tablet_sstable_streamer::stream(shared_ptr<stream_progress> progress) {
+    if (progress) {
+        progress->start(_tablet_map.tablet_count());
+    }
+
+    auto classified_sstables = co_await get_sstables_for_tablets(
+        _sstables, _tablet_map.tablet_ids() | std::views::filter([this](auto tid) { return tablet_in_scope(tid); }) | std::views::transform([this](auto tid) {
+                       return _tablet_map.get_token_range(tid);
+                   }) | std::ranges::to<std::vector>());
+
+    for (auto& [tablet_range, sstables_fully_contained, sstables_partially_contained] : classified_sstables) {
+        auto per_tablet_progress = make_shared<per_tablet_stream_progress>(
+            progress,
+            sstables_fully_contained.size() + sstables_partially_contained.size());
+        auto tablet_pr = dht::to_partition_range(tablet_range);
+        if (!sstables_partially_contained.empty()) {
+            llog.debug("Streaming {} partially contained SSTables.",sstables_partially_contained.size());
+            co_await stream_sstables(tablet_pr, std::move(sstables_partially_contained), per_tablet_progress, defer_unlinking::yes);
+        }
+        if (!sstables_fully_contained.empty()) {
+            llog.debug("Streaming {} fully contained SSTables.",sstables_fully_contained.size());
+            co_await stream_fully_contained_sstables(tablet_pr, std::move(sstables_fully_contained), per_tablet_progress);
+        }
+    }
+
+    co_await unlink_marked_sstables();
+}
+
+future<> sstable_streamer::stream_sstables(const dht::partition_range& pr, std::vector<sstables::shared_sstable> sstables, shared_ptr<stream_progress> progress, defer_unlinking defer) {
     size_t nr_sst_total = sstables.size();
     size_t nr_sst_current = 0;
+
     while (!sstables.empty()) {
-        auto ops_uuid = utils::make_random_uuid();
-        auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s,
-                make_lw_shared<sstable_list>(sstable_list{}), false));
-        size_t batch_sst_nr = 16;
-        std::vector<sstring> sst_names;
-        std::vector<sstables::shared_sstable> sst_processed;
-        size_t estimated_partitions = 0;
-        while (batch_sst_nr-- && !sstables.empty()) {
-            auto sst = sstables.back();
-            estimated_partitions += sst->estimated_keys_for_range(full_token_range);
-            sst_names.push_back(sst->get_filename());
-            sst_set->insert(sst);
-            sst_processed.push_back(sst);
-            sstables.pop_back();
-        }
+        co_await utils::get_local_injector().inject("load_and_stream_before_streaming_batch",
+            utils::wait_for_message(60s));
 
-        llog.info("load_and_stream: started ops_uuid={}, process [{}-{}] out of {} sstables={}",
-                ops_uuid, nr_sst_current, nr_sst_current + sst_processed.size(), nr_sst_total, sst_names);
+        const size_t batch_sst_nr = std::min(16uz, sstables.size());
+        auto sst_processed = sstables
+            | std::views::reverse
+            | std::views::take(batch_sst_nr)
+            | std::ranges::to<std::vector>();
+        sstables.erase(sstables.end() - batch_sst_nr, sstables.end());
 
-        auto start_time = std::chrono::steady_clock::now();
-        inet_address_vector_replica_set current_targets;
-        std::unordered_map<gms::inet_address, send_meta_data> metas;
-        size_t num_partitions_processed = 0;
-        size_t num_bytes_read = 0;
+        auto ops_uuid = streaming::plan_id{utils::make_random_uuid()};
+        llog.info("load_and_stream: started ops_uuid={}, process [{}-{}] out of {} sstables=[{}]",
+            ops_uuid, nr_sst_current, nr_sst_current + sst_processed.size(), nr_sst_total,
+            fmt::join(sst_processed | std::views::transform([] (auto sst) { return sst->get_filename(); }), ", "));
         nr_sst_current += sst_processed.size();
-        auto permit = co_await _db.local().obtain_reader_permit(table, "sstables_loader::load_and_stream()", db::no_timeout);
-        auto reader = downgrade_to_v1(table.make_streaming_reader(s, std::move(permit), full_partition_range, sst_set));
-        std::exception_ptr eptr;
-        bool failed = false;
-        try {
-            netw::messaging_service& ms = _messaging;
-            while (auto mf = co_await reader()) {
-                bool is_partition_start = mf->is_partition_start();
-                if (is_partition_start) {
-                    ++num_partitions_processed;
-                    auto& start = mf->as_partition_start();
-                    const auto& current_dk = start.key();
+        co_await stream_sstable_mutations(ops_uuid, pr, std::move(sst_processed), defer);
+        if (progress) {
+            progress->advance(batch_sst_nr);
+        }
+    }
+}
 
-                    current_targets = erm->get_natural_endpoints(current_dk.token());
-                    if (primary_replica_only && current_targets.size() > 1) {
-                        current_targets.resize(1);
-                    }
-                    llog.trace("load_and_stream: ops_uuid={}, current_dk={}, current_targets={}", ops_uuid,
-                            current_dk.token(), current_targets);
-                    for (auto& node : current_targets) {
-                        if (!metas.contains(node)) {
-                            auto [sink, source] = co_await ms.make_sink_and_source_for_stream_mutation_fragments(reader.schema()->version(),
-                                    ops_uuid, cf_id, estimated_partitions, reason, netw::messaging_service::msg_addr(node));
-                            llog.debug("load_and_stream: ops_uuid={}, make sink and source for node={}", ops_uuid, node);
-                            metas.emplace(node, send_meta_data(node, std::move(sink), std::move(source)));
-                            metas.at(node).receive();
-                        }
+future<> sstable_streamer::stream_sstable_mutations(streaming::plan_id ops_uuid, const dht::partition_range& pr, std::vector<sstables::shared_sstable> sstables, defer_unlinking defer) {
+    const auto token_range = pr.transform(std::mem_fn(&dht::ring_position::token));
+    auto s = _table.schema();
+    const auto cf_id = s->id();
+    const auto reason = streaming::stream_reason::repair;
+
+    auto sst_set = make_lw_shared<sstables::sstable_set>(sstables::make_partitioned_sstable_set(s));
+    size_t estimated_partitions = 0;
+    for (auto& sst : sstables) {
+        estimated_partitions += co_await sst->estimated_keys_for_range(token_range);
+        sst_set->insert(sst);
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+    host_id_vector_replica_set current_targets;
+    std::unordered_map<locator::host_id, send_meta_data> metas;
+    size_t num_partitions_processed = 0;
+    size_t num_bytes_read = 0;
+    auto permit = co_await _db.obtain_reader_permit(_table, "sstables_loader::load_and_stream()", db::no_timeout, {});
+    auto reader = mutation_fragment_v1_stream(_table.make_streaming_reader(s, std::move(permit), pr, sst_set, gc_clock::now()));
+    std::exception_ptr eptr;
+    bool failed = false;
+
+    try {
+        while (auto mf = co_await reader()) {
+            bool is_partition_start = mf->is_partition_start();
+            if (is_partition_start) {
+                ++num_partitions_processed;
+                auto& start = mf->as_partition_start();
+                const auto& current_dk = start.key();
+
+                current_targets = get_endpoints(current_dk.token());
+                llog.trace("load_and_stream: ops_uuid={}, current_dk={}, current_targets={}", ops_uuid,
+                        current_dk.token(), current_targets);
+                for (auto& node : current_targets) {
+                    if (!metas.contains(node)) {
+                        auto [sink, source] = co_await _ms.make_sink_and_source_for_stream_mutation_fragments(reader.schema()->version(),
+                                ops_uuid, cf_id, estimated_partitions, reason, service::default_session_id, node);
+                        bool abort_supported = _ms.supports_load_and_stream_abort_rpc_message();
+                        llog.debug("load_and_stream: ops_uuid={}, make sink and source for node={}", ops_uuid, node);
+                        metas.emplace(node, send_meta_data(node, std::move(sink), std::move(source), abort_supported));
+                        metas.at(node).receive();
                     }
                 }
-                frozen_mutation_fragment fmf = freeze(*s, *mf);
-                num_bytes_read += fmf.representation().size();
-                co_await parallel_for_each(current_targets, [&metas, &fmf, is_partition_start] (const gms::inet_address& node) {
-                    return metas.at(node).send(fmf, is_partition_start);
-                });
             }
-        } catch (...) {
-            failed = true;
-            eptr = std::current_exception();
-            llog.warn("load_and_stream: ops_uuid={}, ks={}, table={}, send_phase, err={}",
-                    ops_uuid, ks_name, cf_name, eptr);
+            frozen_mutation_fragment fmf = freeze(*s, *mf);
+            num_bytes_read += fmf.representation().size();
+            co_await coroutine::parallel_for_each(current_targets, [&metas, &fmf, is_partition_start] (const locator::host_id& node) {
+                return metas.at(node).send(fmf, is_partition_start);
+            });
         }
-        co_await reader.close();
+    } catch (...) {
+        failed = true;
+        eptr = std::current_exception();
+        llog.warn("load_and_stream: ops_uuid={}, ks={}, table={}, send_phase, err={}",
+                ops_uuid, s->ks_name(), s->cf_name(), eptr);
+    }
+    co_await reader.close();
+    try {
+        co_await coroutine::parallel_for_each(metas.begin(), metas.end(), [failed, eptr] (std::pair<const locator::host_id, send_meta_data>& pair) {
+            auto& meta = pair.second;
+            if (eptr) {
+                try {
+                    std::rethrow_exception(eptr);
+                } catch (const abort_requested_exception&) {
+                    return meta.finish(failed, true);
+                } catch (...) {
+                    // just fall through
+                }
+            }
+            return meta.finish(failed, false);
+        });
+    } catch (...) {
+        failed = true;
+        eptr = std::current_exception();
+        llog.warn("load_and_stream: ops_uuid={}, ks={}, table={}, finish_phase, err={}",
+                ops_uuid, s->ks_name(), s->cf_name(), eptr);
+    }
+    if (!failed && _unlink_sstables) {
         try {
-            co_await parallel_for_each(metas.begin(), metas.end(), [failed] (std::pair<const gms::inet_address, send_meta_data>& pair) {
-                auto& meta = pair.second;
-                return meta.finish(failed);
+            co_await coroutine::parallel_for_each(sstables, [&] (sstables::shared_sstable& sst) {
+                llog.debug("load_and_stream: ops_uuid={}, ks={}, table={}, remove sst={}",
+                        ops_uuid, s->ks_name(), s->cf_name(), sst->toc_filename());
+                if (defer) {
+                    sst->mark_for_deletion();
+                    return make_ready_future<>();
+                } else {
+                    return sst->unlink();
+                }
             });
         } catch (...) {
             failed = true;
             eptr = std::current_exception();
-            llog.warn("load_and_stream: ops_uuid={}, ks={}, table={}, finish_phase, err={}",
-                    ops_uuid, ks_name, cf_name, eptr);
-        }
-        if (!failed) {
-            try {
-                co_await parallel_for_each(sst_processed, [&] (sstables::shared_sstable& sst) {
-                    llog.debug("load_and_stream: ops_uuid={}, ks={}, table={}, remove sst={}",
-                            ops_uuid, ks_name, cf_name, sst->component_filenames());
-                    return sst->unlink();
-                });
-            } catch (...) {
-                failed = true;
-                eptr = std::current_exception();
-                llog.warn("load_and_stream: ops_uuid={}, ks={}, table={}, del_sst_phase, err={}",
-                        ops_uuid, ks_name, cf_name, eptr);
-            }
-        }
-        auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::steady_clock::now() - start_time).count();
-        for (auto& [node, meta] : metas) {
-            llog.info("load_and_stream: ops_uuid={}, ks={}, table={}, target_node={}, num_partitions_sent={}, num_bytes_sent={}",
-                    ops_uuid, ks_name, cf_name, node, meta.num_partitions_sent(), meta.num_bytes_sent());
-        }
-        auto partition_rate = std::fabs(duration) > FLT_EPSILON ? num_partitions_processed / duration : 0;
-        auto bytes_rate = std::fabs(duration) > FLT_EPSILON ? num_bytes_read / duration / 1024 / 1024 : 0;
-        auto status = failed ? "failed" : "succeeded";
-        llog.info("load_and_stream: finished ops_uuid={}, ks={}, table={}, partitions_processed={} partitions, bytes_processed={} bytes, partitions_per_second={} partitions/s, bytes_per_second={} MiB/s, duration={} s, status={}",
-                ops_uuid, ks_name, cf_name, num_partitions_processed, num_bytes_read, partition_rate, bytes_rate, duration, status);
-        if (failed) {
-            std::rethrow_exception(eptr);
+            llog.warn("load_and_stream: ops_uuid={}, ks={}, table={}, del_sst_phase, err={}",
+                    ops_uuid, s->ks_name(), s->cf_name(), eptr);
         }
     }
-    co_return;
+    auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(std::chrono::steady_clock::now() - start_time).count();
+    for (auto& [node, meta] : metas) {
+        llog.info("load_and_stream: ops_uuid={}, ks={}, table={}, target_node={}, num_partitions_sent={}, num_bytes_sent={}",
+                ops_uuid, s->ks_name(), s->cf_name(), node, meta.num_partitions_sent(), meta.num_bytes_sent());
+    }
+    auto partition_rate = std::fabs(duration) > FLT_EPSILON ? num_partitions_processed / duration : 0;
+    auto bytes_rate = std::fabs(duration) > FLT_EPSILON ? num_bytes_read / duration / 1024 / 1024 : 0;
+    auto status = failed ? "failed" : "succeeded";
+    llog.info("load_and_stream: finished ops_uuid={}, ks={}, table={}, partitions_processed={} partitions, bytes_processed={} bytes, partitions_per_second={} partitions/s, bytes_per_second={} MiB/s, duration={} s, status={}",
+            ops_uuid, s->ks_name(), s->cf_name(), num_partitions_processed, num_bytes_read, partition_rate, bytes_rate, duration, status);
+    if (failed) {
+        std::rethrow_exception(eptr);
+    }
 }
 
-// For more details, see the commends on column_family::load_new_sstables
+future<locator::effective_replication_map_ptr> sstables_loader::await_topology_quiesced_and_get_erm(::table_id table_id) {
+    // By waiting for topology to quiesce, we guarantee load-and-stream will not start in the middle
+    // of a topology operation that changes the token range boundaries, e.g. split or merge.
+    // Split, for example, first executes the barrier and then splits the tablets.
+    // So it can happen a sstable is generated between those steps and will incorrectly span two
+    // tablets. We want to serialize load-and-stream and split finalization (a topology op).
+
+    locator::effective_replication_map_ptr erm;
+    while (true) {
+        auto& t = _db.local().find_column_family(table_id);
+        erm = t.get_effective_replication_map();
+        auto expected_topology_version = erm->get_token_metadata().get_version();
+        auto& ss = _ss.local();
+
+        // The awaiting only works with raft enabled, and we only need it with tablets,
+        // so let's bypass the awaiting when tablet is disabled.
+        if (!t.uses_tablets()) {
+            break;
+        }
+        // optimistically attempt to grab an erm on quiesced topology
+        if (co_await ss.verify_topology_quiesced(expected_topology_version)) {
+            break;
+        }
+        erm = nullptr;
+        co_await _ss.local().await_topology_quiesced();
+    }
+
+    co_return std::move(erm);
+}
+
+future<> sstables_loader::load_and_stream(sstring ks_name, sstring cf_name,
+        ::table_id table_id, std::vector<sstables::shared_sstable> sstables, primary_replica_only primary, bool unlink, stream_scope scope,
+        shared_ptr<stream_progress> progress) {
+    // streamer guarantees topology stability, for correctness, by holding effective_replication_map
+    // throughout its lifetime.
+    auto erm = co_await await_topology_quiesced_and_get_erm(table_id);
+
+    // Obtain a phaser guard to prevent the table from being destroyed
+    // while streaming is in progress.  table::stop() calls
+    // _pending_streams_phaser.close() which blocks until all outstanding
+    // stream_in_progress() guards are released, so holding this guard
+    // keeps the table alive for the entire streaming operation.
+    // find_column_family throws no_such_column_family if the table was
+    // already dropped before we got here.
+    auto& tbl = _db.local().find_column_family(table_id);
+    auto stream_guard = tbl.stream_in_progress();
+
+    std::unique_ptr<sstable_streamer> streamer;
+    if (tbl.uses_tablets()) {
+        streamer =
+            std::make_unique<tablet_sstable_streamer>(_messaging, _db, table_id, std::move(erm), std::move(sstables), primary, unlink_sstables(unlink), scope);
+    } else {
+        streamer =
+            std::make_unique<sstable_streamer>(_messaging, _db.local(), table_id, std::move(erm), std::move(sstables), primary, unlink_sstables(unlink), scope);
+    }
+
+    co_await streamer->stream(progress);
+}
+
+// For more details, see distributed_loader::process_upload_dir().
 // All the global operations are going to happen here, and just the reloading happens
 // in there.
 future<> sstables_loader::load_new_sstables(sstring ks_name, sstring cf_name,
-    bool load_and_stream, bool primary_replica_only) {
+    bool load_and_stream, bool primary, bool skip_cleanup, bool skip_reshape, stream_scope scope) {
     if (_loading_new_sstables) {
         throw std::runtime_error("Already loading SSTables. Try again later");
     } else {
         _loading_new_sstables = true;
     }
-    llog.info("Loading new SSTables for keyspace={}, table={}, load_and_stream={}, primary_replica_only={}",
-            ks_name, cf_name, load_and_stream, primary_replica_only);
+
+    co_await coroutine::switch_to(_sched_group);
+
+    sstring load_and_stream_desc = fmt::format("{}", load_and_stream);
+    const auto& rs = _db.local().find_keyspace(ks_name).get_replication_strategy();
+    if (rs.is_per_table() && !load_and_stream) {
+        load_and_stream = true;
+        load_and_stream_desc = "auto-enabled-for-tablets";
+    }
+
+    if (load_and_stream && skip_cleanup) {
+        throw std::runtime_error("Skipping cleanup is not possible when doing load-and-stream");
+    }
+
+    if (load_and_stream && skip_reshape) {
+        throw std::runtime_error("Skipping reshape is not possible when doing load-and-stream");
+    }
+
+    llog.info("Loading new SSTables for keyspace={}, table={}, load_and_stream={}, primary_replica_only={}, skip_cleanup={}, skip_reshape={}, scope={}",
+            ks_name, cf_name, load_and_stream_desc, primary, skip_cleanup, skip_reshape, scope);
     try {
         if (load_and_stream) {
-            utils::UUID table_id;
+            ::table_id table_id;
             std::vector<std::vector<sstables::shared_sstable>> sstables_on_shards;
-            std::tie(table_id, sstables_on_shards) = co_await replica::distributed_loader::get_sstables_from_upload_dir(_db, ks_name, cf_name);
-            co_await container().invoke_on_all([&sstables_on_shards, ks_name, cf_name, table_id, primary_replica_only] (sstables_loader& loader) mutable -> future<> {
-                co_await loader.load_and_stream(ks_name, cf_name, table_id, std::move(sstables_on_shards[this_shard_id()]), primary_replica_only);
+            // Load-and-stream reads the entire content from SSTables, therefore it can afford to discard the bloom filter
+            // that might otherwise consume a significant amount of memory.
+            sstables::sstable_open_config cfg {
+                .load_bloom_filter = false,
+            };
+            std::tie(table_id, sstables_on_shards) = co_await replica::distributed_loader::get_sstables_from_upload_dir(_db, ks_name, cf_name, cfg);
+            co_await container().invoke_on_all([&sstables_on_shards, ks_name, cf_name, table_id, primary, scope] (sstables_loader& loader) mutable -> future<> {
+                co_await loader.load_and_stream(ks_name, cf_name, table_id, std::move(sstables_on_shards[this_shard_id()]), primary_replica_only(primary), true, scope, {});
             });
         } else {
-            co_await replica::distributed_loader::process_upload_dir(_db, _sys_dist_ks, _view_update_generator, ks_name, cf_name);
+            co_await replica::distributed_loader::process_upload_dir(_db, _view_builder, _view_building_worker, ks_name, cf_name, skip_cleanup, skip_reshape);
         }
     } catch (...) {
         llog.warn("Done loading new SSTables for keyspace={}, table={}, load_and_stream={}, primary_replica_only={}, status=failed: {}",
-                ks_name, cf_name, load_and_stream, primary_replica_only, std::current_exception());
+                ks_name, cf_name, load_and_stream, primary, std::current_exception());
         _loading_new_sstables = false;
         throw;
     }
     llog.info("Done loading new SSTables for keyspace={}, table={}, load_and_stream={}, primary_replica_only={}, status=succeeded",
-            ks_name, cf_name, load_and_stream, primary_replica_only);
+            ks_name, cf_name, load_and_stream, primary);
     _loading_new_sstables = false;
     co_return;
+}
+
+static constexpr auto download_sstables_task_type = "download_sstables";
+
+// The progress of a download task: one stream_progress per shard, fed by
+// load_and_stream(), reduced on demand.
+class download_progress {
+    struct progress_holder {
+        // Wrap stream_progress in a smart pointer to enable polymorphism.
+        // This allows derived progress types to be passed down for per-tablet
+        // progress tracking while maintaining the base interface.
+        shared_ptr<stream_progress> progress = make_shared<stream_progress>();
+    };
+    mutable shared_mutex _progress_mutex;
+    // user could query for the progress even before _progress_per_shard
+    // is completed started, and the task's state does not reflect the
+    // state of progress, so we have to track it separately.
+    enum class progress_state {
+        uninitialized,
+        initialized,
+        finalized,
+    } _progress_state = progress_state::uninitialized;
+    sharded<progress_holder> _progress_per_shard;
+
+public:
+    future<> start() {
+        co_await _progress_per_shard.start();
+        _progress_state = progress_state::initialized;
+    }
+
+    // This shard's progress; valid between start() and stop().
+    shared_ptr<stream_progress> local() const {
+        return _progress_per_shard.local().progress;
+    }
+
+    // The final progress is read before stop(), so get() has nothing to report afterwards.
+    future<> stop() noexcept {
+        co_await with_lock(_progress_mutex, [this] -> future<> {
+            if (std::exchange(_progress_state, progress_state::finalized) == progress_state::initialized) {
+                co_await _progress_per_shard.stop();
+            }
+        });
+    }
+
+    future<tasks::task_manager::task::progress> get() const {
+        co_return co_await with_shared(_progress_mutex, [this] -> future<tasks::task_manager::task::progress> {
+            switch (_progress_state) {
+            case progress_state::uninitialized:
+            case progress_state::finalized:
+                co_return tasks::task_manager::task::progress{};
+            case progress_state::initialized:
+                break;
+            }
+            auto p = co_await _progress_per_shard.map_reduce(
+                adder<stream_progress>{},
+                [] (const progress_holder& holder) -> stream_progress {
+                  auto p = holder.progress;
+                  SCYLLA_ASSERT(p);
+                  return *p;
+                });
+            co_return tasks::task_manager::task::progress {
+                .completed = p.completed,
+                .total = p.total,
+            };
+        });
+    }
+};
+
+future<> sstables_loader::download_and_stream(download_progress& progress, const sstring& endpoint, const sstring& bucket, const sstring& ks, const sstring& cf,
+        const sstring& prefix, const std::vector<sstring>& sstable_names, stream_scope scope, primary_replica_only primary_replica, abort_source& as) {
+    // Load-and-stream reads the entire content from SSTables, therefore it can afford to discard the bloom filter
+    // that might otherwise consume a significant amount of memory.
+    sstables::sstable_open_config cfg {
+        .load_bloom_filter = false,
+    };
+    llog.debug("Loading sstables from {}({}/{})", endpoint, bucket, prefix);
+
+    auto ep_type = _storage_manager.get_endpoint_type(endpoint);
+    std::vector<seastar::abort_source> shard_aborts(this_smp_shard_count());
+    auto [ table_id, sstables_on_shards ] = co_await replica::distributed_loader::get_sstables_from_object_store(_db, ks, cf, sstable_names, [&] {
+        return data_dictionary::make_object_storage_options(endpoint, ep_type, bucket, prefix, &shard_aborts[this_shard_id()]);
+    }, cfg);
+    llog.debug("Streaming sstables from {}({}/{})", endpoint, bucket, prefix);
+    std::exception_ptr ex;
+    named_gate g("sstables_loader::download_and_stream");
+    try {
+        as.check();
+
+        auto s = as.subscribe([&]() noexcept {
+            try {
+                auto h = g.hold();
+                (void)smp::invoke_on_all([&shard_aborts, ex = as.abort_requested_exception_ptr()] {
+                    shard_aborts[this_shard_id()].request_abort_ex(ex);
+                }).finally([h = std::move(h)] {});
+            } catch (...) {
+            }
+        });
+        co_await progress.start();
+        co_await container().invoke_on_all([&, table_id] (sstables_loader& loader) mutable -> future<> {
+            co_await loader.load_and_stream(ks, cf, table_id, std::move(sstables_on_shards[this_shard_id()]), primary_replica, false, scope,
+                                            progress.local());
+        });
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    co_await g.close();
+
+    if (as.abort_requested()) {
+        if (!ex) {
+            ex = as.abort_requested_exception_ptr();
+        }
+    }
+
+    if (ex) {
+        co_await container().invoke_on_all([&sstables_on_shards] (sstables_loader&) {
+            sstables_on_shards[this_shard_id()] = {}; // clear on correct shard
+        });
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+}
+
+sstables_loader::sstables_loader(sharded<replica::database>& db,
+        sharded<service::storage_service>& ss,
+        netw::messaging_service& messaging,
+        sharded<db::view::view_builder>& vb,
+        sharded<db::view::view_building_worker>& vbw,
+        tasks::task_manager& tm,
+        sstables::storage_manager& sstm,
+        db::system_distributed_keyspace& sys_dist_ks,
+        seastar::scheduling_group sg)
+    : _db(db)
+    , _ss(ss)
+    , _messaging(messaging)
+    , _view_builder(vb)
+    , _view_building_worker(vbw)
+    , _task_manager_module(make_shared<task_manager_module>(tm))
+    , _storage_manager(sstm)
+    , _sys_dist_ks(sys_dist_ks)
+    , _sched_group(std::move(sg))
+{
+    tm.register_module("sstables_loader", _task_manager_module);
+    ser::sstables_loader_rpc_verbs::register_restore_tablet(&_messaging, [this] (raft::server_id dst_id, locator::global_tablet_id gid) -> future<restore_result> {
+        return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), gid] (auto& ss) {
+            return ss.do_tablet_operation(gid, "Restore", [&sl, gid] (locator::tablet_metadata_guard& guard) -> future<service::tablet_operation_result> {
+                co_await sl.local().download_tablet_sstables(gid, guard);
+                co_return service::tablet_operation_empty_result{};
+            }).then([] (auto res) {
+                return make_ready_future<restore_result>();
+            });
+        });
+    });
+}
+
+future<> sstables_loader::stop() {
+    co_await ser::sstables_loader_rpc_verbs::unregister(&_messaging),
+    co_await _task_manager_module->stop();
+}
+
+future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, sstring cf_name,
+            sstring prefix, std::vector<sstring> sstables,
+            sstring endpoint, sstring bucket, stream_scope scope, bool primary_replica) {
+    if (!_storage_manager.is_known_endpoint(endpoint)) {
+        throw std::invalid_argument(format("endpoint {} not found", endpoint));
+    }
+    // For now, only the tablet-aware restore supports a table on object storage.
+    if (_db.local().find_column_family(ks_name, cf_name).get_storage_options().is_object_storage_type()) {
+        throw std::invalid_argument(format("Cannot restore {}.{} with /storage_service/restore: the table keeps its sstables on object storage, use /storage_service/tablets/restore",
+                ks_name, cf_name));
+    }
+    llog.info("Restore sstables from {}({}) to {}.{} using scope={}, primary_replica={}", endpoint, prefix, ks_name, cf_name, scope, primary_replica);
+
+    auto progress = make_lw_shared<download_progress>();
+    tasks::task_manager::task_builder task_builder{_task_manager_module, download_sstables_task_type};
+    task_builder.set_scope("node")
+                .set_keyspace(ks_name)
+                .set_progress_units("batches")
+                .set_is_abortable(tasks::is_abortable::yes)
+                .set_is_internal(tasks::is_internal::no)
+                .set_is_user_task(tasks::is_user_task::yes)
+                .set_progress_fn([progress] (const tasks::task_manager::task::impl&) {
+                    return progress->get();
+                })
+                .set_finalizer([progress] () noexcept {
+                    return progress->stop();
+                });
+    auto task = co_await std::move(task_builder).build([this, progress, endpoint = std::move(endpoint), bucket = std::move(bucket), ks_name = std::move(ks_name), cf_name = std::move(cf_name),
+            prefix = std::move(prefix), sstables = std::move(sstables), scope, primary_replica] (tasks::task_manager::task::impl& self) {
+        return download_and_stream(*progress, endpoint, bucket, ks_name, cf_name, prefix, sstables, scope, primary_replica_only(primary_replica), self.get_abort_source());
+    });
+    co_return task->id();
+}
+
+future<sstables::shared_sstable> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& min_info) const {
+    auto& db = _db.local();
+    auto& table = db.find_column_family(tid);
+    // DROP waits for streams before truncating, so this guard is what makes it wait
+    // for the attach rather than remove the directory under sst->load(). Must be
+    // taken in the same continuation as the lookup: `table` is unpinned, and a
+    // suspension between the two reopens the race.
+    auto stream_guard = table.stream_in_progress();
+    // After the guard on purpose: the test needs the DROP to meet a guarded attach.
+    co_await utils::get_local_injector().inject("pause_attach_sstable", utils::wait_for_message(60s));
+    llog.debug("Adding downloaded SSTable gen={} to the table {}.{} on shard {}", min_info.generation, table.schema()->ks_name(), table.schema()->cf_name(), this_shard_id());
+    auto& sst_manager = table.get_sstables_manager();
+    auto sst = sst_manager.make_sstable(
+        table.schema(), table.get_storage_options(), min_info.generation, min_info.sid, sstables::sstable_state::normal, min_info.version, min_info.format);
+    sst->set_sstable_level(0);
+    // The sstable was downloaded for this shard, which is why it was submitted here,
+    // so there is nothing to work out: declare this shard its owner. The tablet is
+    // mid-restore, with its tablet count pinned, so the mapping which chose the shard
+    // cannot have moved since.
+    sstables::sstable_open_config cfg {
+        .current_shard_as_sstable_owner = true,
+        .unsealed_sstable = true,
+    };
+    // Unused given current_shard_as_sstable_owner, but load() wants a sharder.
+    dht::auto_refreshing_sharder sharder(table.shared_from_this());
+    co_await sst->load(sharder, cfg);
+    if (!sst->sstable_identifier()) {
+        on_internal_error(llog, "sstable identifier is required for tablet restore");
+    }
+    co_await table.add_new_sstable_and_update_cache(sst, [&sst_manager, sst] (sstables::shared_sstable loading_sst) -> future<> {
+        if (loading_sst == sst) {
+            auto writer_cfg = sst_manager.configure_writer(loading_sst->get_origin());
+            co_await loading_sst->seal_sstable(writer_cfg.backup);
+        }
+    });
+    co_return sst;
+}
+
+// Joins a backup location's prefix with a path that is relative to it, the same
+// way cluster-wide backup composes its object keys (db/snapshot/cluster_backup.cc).
+static sstring join_path(std::string_view prefix, std::string_view relative_path) {
+    if (prefix.empty()) {
+        return sstring(relative_path);
+    }
+    return fmt::format("{}/{}", prefix, relative_path);
+}
+
+future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard& guard) {
+    auto& tmap = guard.get_tablet_map();
+
+    auto* trinfo = tmap.get_tablet_transition_info(tid.tablet);
+    if (!trinfo) {
+        throw std::runtime_error(fmt::format("No transition info for tablet {}", tid));
+    }
+    if (!trinfo->session_id) {
+        throw std::runtime_error(fmt::format("Restore of tablet {} was aborted", tid));
+    }
+    if (trinfo->snapshot_name.empty()) {
+        throw std::runtime_error(format("No snapshot name for tablet {} restore transition", tid));
+    }
+
+    // Aborting the restore closes the session, which fires this guard's abort source and
+    // interrupts the downloads below.
+    service::session_topology_guard session_guard(trinfo->session_id);
+
+    sstring snapshot_name = trinfo->snapshot_name;
+
+    auto s = _db.local().find_schema(tid.table);
+    auto tablet_range = tmap.get_token_range(tid.tablet);
+    const auto& topo = guard.get_token_metadata()->get_topology();
+    auto keyspace_name = s->ks_name();
+    auto table_name = s->cf_name();
+    auto datacenter = topo.get_datacenter();
+    auto rack = topo.get_rack();
+
+    db::snapshot_table_helper sth(_sys_dist_ks.qp());
+
+    auto snapshot_info = co_await sth.get_snapshot_remote_location(snapshot_name, datacenter);
+    llog.info("Downloading sstables for tablet {} from {}@{}/{}", tid, snapshot_name, snapshot_info.endpoint, snapshot_info.bucket);
+    auto sst_infos = co_await sth.get_snapshot_sstables(snapshot_name, keyspace_name, table_name, datacenter, rack,
+            db::consistency_level::QUORUM, tablet_range.start().transform([] (auto& v) { return v.value(); }), tablet_range.end().transform([] (auto& v) { return v.value(); }));
+    llog.debug("{} SSTables found for tablet {}", sst_infos.size(), tid);
+    if (sst_infos.empty()) {
+        // It can happen when the restored table has more tablets than the original.
+        // Some tablets simply have no data in their token range.
+        llog.info("No SSTables found for tablet {}, skipping", tid);
+        co_return;
+    }
+
+    // Skip sstables either not uploaded (de-duplicated by backup) or a previous restore attempt 
+    // already fetched so a re-entered or retried restore doesn't re-download what's already in place.
+    auto pending = sst_infos | std::views::filter([] (const auto& si) { 
+        return si.state >= db::snapshot_state::remote_and_local && si.downloaded == db::is_downloaded::no; 
+    });
+    auto [ fully, partially ] = co_await get_sstables_for_tablet(pending, tablet_range, [] (const auto& si) { return si.first_token; }, [] (const auto& si) { return si.last_token; });
+    if (!partially.empty()) {
+        llog.debug("Sstable {} is partially contained", partially.front().sstable_id);
+        throw std::logic_error("sstables_partially_contained");
+    }
+    llog.debug("{} SSTables filtered by range {} for tablet {}", fully.size(), tablet_range, tid);
+    co_await utils::get_local_injector().inject("pause_tablet_restore", utils::wait_for_message(60s));
+
+    if (fully.empty()) {
+        // It can happen that a tablet exists and contains no data. Just skip it
+        co_return;
+    }
+
+    // A backup uses one of two layouts:
+    // - Flat layout, used by older backups. The component names contain the
+    //   generation, for example "me-3gqe_1lnj_4sbpc-big-Data.db".
+    // - Unified layout. A backup of a table on object storage copies nothing, so the
+    //   components stay where the table wrote them: "{prefix}/{sstable_id}/Data.db".
+    // Only a backup in the unified layout has the same endpoint, bucket and prefix as
+    // the restored table. For such a backup, name each entry "{sstable_id}/{toc_name}"
+    // and read it in the unified layout. The toc_name gives the generation, version
+    // and format, which are not in the object names.
+    const auto* dst_os = std::get_if<data_dictionary::storage_options::object_storage>(&_db.local().find_column_family(tid.table).get_storage_options().value);
+    const bool in_place = dst_os
+            && snapshot_info.endpoint == dst_os->endpoint
+            && snapshot_info.bucket == dst_os->bucket
+            && snapshot_info.prefix == sstables::object_storage_default_prefix;
+
+    std::unordered_map<sstring, std::vector<sstring>> toc_names_by_prefix;
+    for (const auto& e : fully) {
+        if (in_place) {
+            // e.prefix is the directory of the manifest. In the unified layout, the
+            // objects are under the prefix of the table, not under e.prefix.
+            toc_names_by_prefix[snapshot_info.prefix].emplace_back(seastar::format("{}/{}", e.sstable_id, e.toc_name));
+            continue;
+        }
+        // e.prefix is relative to the backup location's own prefix (snapshot_remote_locations.prefix).
+        toc_names_by_prefix[join_path(snapshot_info.prefix, e.prefix)].emplace_back(e.toc_name);
+    }
+
+    auto ep_type = _storage_manager.get_endpoint_type(snapshot_info.endpoint);
+    sstables::sstable_open_config cfg {
+        .load_bloom_filter = false,
+    };
+
+    using sstables_col = std::vector<sstables::shared_sstable>;
+    using prefix_sstables = std::vector<sstables_col>;
+
+    // Per-shard abort sources for the object-store download pipeline (cf. download_and_stream()).
+    // They are wired to the session abort only after the sstables are opened (see below).
+    std::vector<seastar::abort_source> shard_aborts(this_smp_shard_count());
+
+    auto sstables_on_shards = co_await map_reduce(toc_names_by_prefix, [&] (auto ent) {
+        return replica::distributed_loader::get_sstables_from_object_store(_db, s->ks_name(), s->cf_name(),
+                std::move(ent.second), [&, prefix = std::move(ent.first)] {
+                    return data_dictionary::make_object_storage_options(snapshot_info.endpoint, ep_type, snapshot_info.bucket, prefix,
+                            &shard_aborts[this_shard_id()],
+                            in_place ? data_dictionary::storage_options::object_storage_layout::unified
+                                     : data_dictionary::storage_options::object_storage_layout::foreign);
+                }, cfg).then_unpack([] (table_id, auto sstables) {
+                    return make_ready_future<std::vector<sstables_col>>(std::move(sstables));
+                });
+    }, std::vector<prefix_sstables>(this_smp_shard_count()), [&] (std::vector<prefix_sstables> a, std::vector<sstables_col> b) {
+        // We can't move individual elements of b[i], because these
+        // are lw_shared_ptr-s collected on another shard. So we move
+        // the whole sstables_col here so that subsequent code will
+        // walk over it and move the pointers where it wants on proper
+        // shard.
+        for (unsigned i = 0; i < this_smp_shard_count(); i++) {
+            a[i].push_back(std::move(b[i]));
+        }
+        return a;
+    });
+
+    // Wire the session abort into the download sources only now, after opening: an aborted
+    // metadata read would be misreported as sstable corruption, so opening above must stay
+    // non-abortable.
+    named_gate g("sstables_loader::download_tablet_sstables");
+    std::exception_ptr ex;
+    try {
+        auto& session_as = session_guard.abort_source();
+        session_as.check();
+        auto sub = session_as.subscribe([&shard_aborts, &g, &session_as] () noexcept {
+            try {
+                auto h = g.hold();
+                (void)smp::invoke_on_all([&shard_aborts, ex = session_as.abort_requested_exception_ptr()] {
+                    shard_aborts[this_shard_id()].request_abort_ex(ex);
+                }).finally([h = std::move(h)] {});
+            } catch (...) {
+            }
+        });
+
+        auto downloaded_ssts = co_await container().map_reduce0(
+            [tid, &sstables_on_shards, &snapshot_name](auto& loader) -> future<std::vector<std::vector<minimal_sst_info>>> {
+                sstables_col sst_chunk;
+                for (auto& psst : sstables_on_shards[this_shard_id()]) {
+                    for (auto&& sst : psst) {
+                        sst_chunk.push_back(std::move(sst));
+                    }
+                }
+                std::vector<std::vector<minimal_sst_info>> local_min_infos(this_smp_shard_count());
+                co_await max_concurrent_for_each(sst_chunk, 16, [&loader, tid, &local_min_infos, &snapshot_name](const auto& sst) -> future<> {
+                    auto& table = loader._db.local().find_column_family(tid.table);
+                    auto stream_guard = table.stream_in_progress();
+                    auto min_info = table.get_storage_options().is_object_storage_type()
+                            ? co_await clone_backup_sstable(table, sst, snapshot_name, llog)
+                            : co_await download_sstable(table, sst, llog);
+                    local_min_infos[min_info.shard].emplace_back(std::move(min_info));
+                });
+                co_return local_min_infos;
+            },
+            std::vector<std::vector<minimal_sst_info>>(this_smp_shard_count()),
+            [](auto init, auto&& item) -> std::vector<std::vector<minimal_sst_info>> {
+                for (std::size_t i = 0; i < item.size(); ++i) {
+                    init[i].append_range(std::move(item[i]));
+                }
+                return init;
+            });
+
+        co_await container().invoke_on_all([tid, &downloaded_ssts, snap_name = snapshot_name, keyspace_name, table_name, datacenter, rack] (auto& loader) -> future<> {
+            auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
+            db::snapshot_table_helper sth(loader._sys_dist_ks.qp());
+            co_await max_concurrent_for_each(shard_ssts, 16, [&sth, &loader, tid, snap_name, keyspace_name, table_name, datacenter, rack](const auto& min_info) -> future<> {
+                sstables::shared_sstable attached_sst = co_await loader.attach_sstable(tid.table, min_info);
+                // Use the sstable_id of the backup sstable, not of the clone. A retried
+                // restore looks for this sstable_id to skip the sstables which are
+                // already restored.
+                co_await sth.update_sstable_download_status(snap_name,
+                                                            keyspace_name,
+                                                            table_name,
+                                                            datacenter,
+                                                            rack,
+                                                            min_info.source_sid,
+                                                            attached_sst->get_first_decorated_key().token(),
+                                                            db::is_downloaded::yes);
+            });
+        });
+    } catch (...) {
+        ex = std::current_exception();
+    }
+
+    // Drain any in-flight abort dispatch before shard_aborts/session_as go out of scope.
+    co_await g.close();
+
+    if (ex) {
+        // An aborted download leaves unconsumed sstables in sstables_on_shards. These are
+        // lw_shared_ptr-s owned by their respective shards, so they must be released there
+        // rather than while this coroutine frame unwinds on the home shard.
+        co_await container().invoke_on_all([&sstables_on_shards] (sstables_loader&) {
+            sstables_on_shards[this_shard_id()] = {}; // clear on correct shard
+        });
+        std::rethrow_exception(ex);
+    }
+}
+
+future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_tests(const std::vector<sstables::shared_sstable>& sstables,
+                                                                                  std::vector<dht::token_range>&& tablets_ranges) {
+    return tablet_sstable_streamer::get_sstables_for_tablets(sstables, std::move(tablets_ranges));
+}
+
+static future<manifest_summary> process_manifest(input_stream<char>& is, sstring keyspace, sstring table,
+                                 const sstring& expected_snapshot_name, const sstring& expected_datacenter,
+                                 const sstring& manifest_prefix, db::system_distributed_keyspace& sys_dist_ks,
+                                 db::consistency_level cl) {
+    // Read the entire JSON content
+    rjson::chunked_content content = co_await util::read_entire_stream(is);
+
+    rjson::value parsed = rjson::parse(std::move(content));
+
+    // Basic validation that tablet_count is a power of 2, as expected by our restore process
+    auto& table_obj = rjson::get(parsed, "table");
+    size_t tablet_count = rjson::get<uint64_t>(table_obj, "tablet_count");
+
+    if (!std::has_single_bit(tablet_count)) {
+        on_internal_error(llog, fmt::format("Invalid tablet_count {} in manifest {}, expected a power of 2", tablet_count, manifest_prefix));
+    }
+
+    // Extract the necessary fields from the manifest
+    // Expected JSON structure documented in docs/dev/object_storage.md
+    auto& snapshot_obj = rjson::get(parsed, "snapshot");
+    auto snapshot_name = rjson::get<std::string>(snapshot_obj, "name");
+    if (snapshot_name != expected_snapshot_name) {
+        throw std::runtime_error(fmt::format("Manifest {} belongs to snapshot '{}', expected '{}'",
+            manifest_prefix, snapshot_name, expected_snapshot_name));
+    }
+    if (keyspace.empty()) {
+        keyspace = rjson::get<std::string>(table_obj, "keyspace_name");
+    }
+    if (table.empty()) {
+        table = rjson::get<std::string>(table_obj, "table_name");
+    }
+
+    std::unordered_map<std::string, db::snapshot_node_entry> nodemap;
+    std::string datacenter, rack;
+
+    if (auto node_obj = rjson::find(parsed, "node")) {
+        datacenter = rjson::get<std::string>(*node_obj, "datacenter");
+        rack = rjson::get<std::string>(*node_obj, "rack");
+
+        if (datacenter != expected_datacenter) {
+            throw std::runtime_error(fmt::format("Manifest {} belongs to datacenter '{}', expected '{}'",
+                        manifest_prefix, datacenter, expected_datacenter));            
+        }
+    } else if (auto nodes_obj = rjson::find(parsed, "nodes")) {
+        if (!nodes_obj->IsArray()) {
+            throw std::runtime_error("Malformed manifest, 'nodes' is not array");
+        }
+        for (auto& n : nodes_obj->GetArray()) {
+            if (!n.IsObject()) {
+                throw std::runtime_error("Malformed manifest, the entry in the 'nodes' array is not an object");
+            }
+            db::snapshot_node_entry sn;
+
+            auto id = rjson::get<std::string>(n, "host_id");
+
+            sn.datacenter = rjson::get<std::string>(n, "datacenter");
+            sn.node = locator::host_id { utils::UUID{std::string_view(id)} };
+            sn.rack = rjson::get<std::string>(n, "rack");
+
+            nodemap.emplace(id, sn);
+        }
+    }
+
+    // Process each sstable entry in the manifest
+    // FIXME: cleanup of the snapshot-related rows is needed in case anything throws in here.
+    auto sstables = rjson::find(parsed, "sstables");
+    if (!sstables) {
+        co_return manifest_summary{tablet_count, 0};
+    }
+    if (!sstables->IsArray()) {
+        throw std::runtime_error("Malformed manifest, 'sstables' is not array");
+    }
+
+    db::snapshot_table_helper sth(sys_dist_ks.qp());
+
+    auto legacy_prefix = sstring(std::filesystem::path(manifest_prefix).parent_path().string());
+    std::string global_snapshot_prefix;
+
+    for (auto& sstable_entry : sstables->GetArray()) {
+        // rjson::get functions assert if the passed value is not an object
+        if (!sstable_entry.IsObject()) {
+            throw std::runtime_error("Malformed manifest, the entry in the 'sstables' array is not an object");
+        }
+        auto id = to_sstable_id(rjson::get(sstable_entry, "id"));
+        auto first_token = to_token(rjson::get(sstable_entry, "first_token"));
+        auto last_token = to_token(rjson::get(sstable_entry, "last_token"));
+        auto toc_name = rjson::to_sstring(rjson::get(sstable_entry, "toc_name"));
+        auto tablet_id = rjson::get<uint64_t>(sstable_entry, "tablet_id");
+        // The fields below are not needed to restore the sstable, they are only recorded
+        // in system_distributed.snapshot_sstables for informational purposes.
+        auto repaired_at = rjson::get_opt<int64_t>(sstable_entry, "repaired_at").value_or(0);
+        auto data_size = rjson::get_opt<int64_t>(sstable_entry, "data_size").value_or(0);
+        auto index_size = rjson::get_opt<int64_t>(sstable_entry, "index_size").value_or(0);
+        auto prefix = legacy_prefix;
+        auto node = rjson::get_opt<std::string>(sstable_entry, "node");
+
+        std::string_view tdc, trc;
+        auto host = locator::host_id::create_null_id();
+
+        if (node) {
+            if (!nodemap.contains(*node)) {
+                throw std::runtime_error(fmt::format("Malformed manifest: node attribute {} of sstable {} not in node list", *node, id));
+            }
+            auto& sn = nodemap.at(*node);
+            host = sn.node;
+            tdc = sn.datacenter;
+            trc = sn.rack;
+
+            if (global_snapshot_prefix.empty()) {
+                global_snapshot_prefix = db::snapshot::sstables_location(db::snapshot::snapshot_prefix_from_manifest(manifest_prefix));
+            }
+
+            prefix = fmt::format("{}/{}", global_snapshot_prefix, id);
+        } else {
+            tdc = datacenter;
+            trc = rack;
+        }
+        if (tdc.empty() || trc.empty()) {
+            throw std::runtime_error(fmt::format("Malformed manifest: Could not resolve datacenter and rack for table {}", id));
+        }
+
+        // only insert sstable to main rack if this is the expected datacenter
+        if (tdc == expected_datacenter) {
+            // Insert the snapshot sstable metadata into system_distributed.snapshot_sstables with a TTL of 3 days, that should be enough
+            // for any snapshot restore operation to complete, and after that the metadata will be automatically cleaned up from the table
+            co_await sth.insert_snapshot_sstable(snapshot_name, keyspace, table, sstring(tdc), sstring(trc), id, first_token, last_token,
+                                                 toc_name, prefix, host, tablet_id, db::snapshot_state::remote,
+                                                 repaired_at, data_size, index_size, cl);
+        }
+
+        if (auto additional_nodes = rjson::find(sstable_entry, "additional_nodes")) {
+            if (!additional_nodes->IsArray()) {
+                throw std::runtime_error("Malformed manifest, 'additional_nodes' is not array");
+            }
+
+            for (auto& t : additional_nodes->GetArray()) {
+                if (!t.IsString()) {
+                    throw std::runtime_error("Malformed manifest, the entry in the 'additional_nodes' array is not a string");
+                }
+                auto redup_node = t.Get<std::string>();
+                if (!nodemap.contains(redup_node)) {
+                    throw std::runtime_error(fmt::format("Malformed manifest: additional node {} of sstable {} not in node list", redup_node, id));
+                }
+
+                auto& sn = nodemap.at(redup_node);
+                if (sn.datacenter != expected_datacenter) {
+                    continue; // skip re-dup. wrong dc
+                }
+
+                llog.debug("Re-duplicating sstable {} to {}:{}", id, sn.datacenter, sn.rack);
+                co_await sth.insert_snapshot_sstable(snapshot_name, keyspace, table, sn.datacenter, sn.rack, id, first_token, last_token,
+                                                    toc_name, prefix, sn.node, tablet_id, db::snapshot_state::remote,
+                                                    repaired_at, data_size, index_size, cl);
+            }
+        }
+    }
+
+    co_return manifest_summary{tablet_count, sstables->Size()};
+}
+
+future<manifest_summary> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring keyspace, sstring table, sstring endpoint, sstring bucket, sstring prefix, sstring expected_snapshot_name, sstring expected_datacenter, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl) {
+    if (manifest_prefixes.empty()) {
+        throw std::invalid_argument("manifest prefixes list must not be empty");
+    }
+
+    // Download manifests in parallel and populate system_distributed.snapshot_sstables
+    // with the content extracted from each manifest
+    auto client = sm.get_endpoint_client(endpoint);
+
+    // tablet_count to be returned by this function, we also validate that all manifests passed contain the same tablet count
+    std::optional<size_t> tablet_count;
+    size_t nr_sstables = 0;
+
+    co_await seastar::max_concurrent_for_each(manifest_prefixes, 16, [&] (const sstring& manifest_prefix) {
+        // Manifest entries are relative to the backup location's prefix, same as start_restore.
+        sstables::object_name name(bucket, join_path(prefix, manifest_prefix));
+        auto source = client->make_download_source(name);
+        return seastar::with_closeable(input_stream<char>(std::move(source)), [&] (input_stream<char>& is) {
+            return process_manifest(is, keyspace, table, expected_snapshot_name, expected_datacenter, manifest_prefix, sys_dist_ks, cl).then([&](manifest_summary ms) {
+                size_t count = ms.tablet_count;
+                if (!tablet_count) {
+                    tablet_count = count;
+                } else if (*tablet_count != count) {
+                    throw std::runtime_error(fmt::format("Inconsistent tablet_count values in manifest {}: expected {}, got {}", manifest_prefix, *tablet_count, count));
+                }
+                nr_sstables += ms.nr_sstables;
+            });
+        });
+    });
+
+    co_return manifest_summary{
+        .tablet_count = *tablet_count,
+        .nr_sstables = nr_sstables,
+    };
+}
+
+static constexpr auto restore_tablets_task_type = "restore_tablets";
+
+class tablet_restore_progress {
+    replica::database& _db;
+    db::system_distributed_keyspace& _sys_dist_ks;
+    table_id _tid;
+    sstring _snap_name;
+    tasks::task_manager::task::progress _progress;
+    seastar::named_gate _gate{"progress_updater"};
+    timer<seastar::lowres_clock> _progress_update_timer;
+
+    future<> update_progress() {
+        auto s = _db.find_schema(_tid);
+        // Copy the racks instead of holding the token metadata across the reads
+        // below: a global topology barrier waits until every node releases all
+        // older versions of the token metadata, so holding one during a slow read
+        // would block the topology coordinator - which also has to finish the
+        // restore that we are tracking.
+        std::vector<std::pair<sstring, sstring>> dc_racks;
+        for (const auto& [dc, racks] : _db.get_token_metadata().get_topology().get_datacenter_racks()) {
+            for (const auto& rack : racks | std::views::keys) {
+                dc_racks.emplace_back(dc, rack);
+            }
+        }
+
+        db::snapshot_table_helper sth(_sys_dist_ks.qp());
+        tasks::task_manager::task::progress progress = {};
+        co_await max_concurrent_for_each(dc_racks, 16, [&](const auto& dc_rack) -> future<> {
+            auto p = co_await sth.get_snapshot_sstables_progress(_snap_name, s->ks_name(), s->cf_name(), dc_rack.first, dc_rack.second);
+            progress.total += p.nr_sstables;
+            progress.completed += p.nr_downloaded_sstables;
+        });
+        _progress = progress;
+    }
+
+public:
+    tablet_restore_progress(replica::database& db, db::system_distributed_keyspace& sys_dist_ks, table_id tid, sstring snap_name, size_t total)
+        : _db(db)
+        , _sys_dist_ks(sys_dist_ks)
+        , _tid(std::move(tid))
+        , _snap_name(std::move(snap_name))
+        , _progress_update_timer([this] {
+            if (auto gh = _gate.try_hold()) {
+                std::ignore = update_progress().handle_exception([] (std::exception_ptr ep) {
+                    llog.warn("Failed to update the progress of a tablet restore, will retry: {}", ep);
+                }).finally([this, gh = std::move(*gh)] {
+                    if (!_gate.is_closed()) {
+                        _progress_update_timer.rearm(lowres_clock::now() + 5s);
+                    }
+                });
+            }
+        })
+    {
+        _progress.total = total;
+    }
+
+    tasks::task_manager::task::progress get() const noexcept {
+        return _progress;
+    }
+
+    void start() noexcept {
+        _progress_update_timer.arm(lowres_clock::now());
+    }
+
+    // Waits for a poll in flight; only complete() may touch the progress afterwards.
+    future<> stop() noexcept {
+        _progress_update_timer.cancel();
+        co_await _gate.close();
+    }
+
+    // The total was known upfront. Must be called after stop(), or a late poll could undo it.
+    void complete() noexcept {
+        _progress.completed = _progress.total;
+    }
+};
+
+future<> sstables_loader::do_restore_tablets(tablet_restore_progress& progress, table_id tid, const sstring& snap_name, size_t tablet_count,
+        std::optional<size_t> original_min_tablet_count, std::optional<size_t> original_max_tablet_count) {
+    progress.start();
+    std::exception_ptr eptr;
+    try {
+        co_await _ss.local().alter_table_with_tablet_hints(tid, tablet_count, tablet_count);
+
+        try {
+            co_await _ss.local().restore_tablets(tid, snap_name);
+        } catch (...) {
+            llog.error("Failed to restore tablets for table_id {}. Error: {:t}", tid, std::current_exception());
+            eptr = std::current_exception();
+        }
+
+        try {
+            llog.info("Restoring table with tid {} to the original schema", tid);
+            // remove_unset: the table saved nullopt because it had no hint of its own, and
+            // passing nullopt back would leave it pinned at min == max forever.
+            co_await _ss.local().alter_table_with_tablet_hints(tid, original_min_tablet_count, original_max_tablet_count,
+                    service::wait_balancer::no, service::remove_unset::yes);
+        } catch (...) {
+            llog.error("Failed to restore original schema for table_id {}. Error: {:t}", tid, std::current_exception());
+        }
+    } catch (...) {
+        eptr = std::current_exception();
+    }
+
+    co_await progress.stop();
+
+    if (eptr) {
+        std::rethrow_exception(eptr);
+    }
+
+    progress.complete();
+}
+
+// Every datacenter the table replicates to restores from its own backup location,
+// so the locations must map one-to-one to the replicated-to datacenters.
+static void check_datacenter_coverage(const replica::table& t, const std::vector<tablet_restore_location>& locations) {
+    auto& rs = t.get_effective_replication_map()->get_replication_strategy();
+    const auto* nts = dynamic_cast<const locator::network_topology_strategy*>(&rs);
+    if (!nts) {
+        throw std::invalid_argument(fmt::format("Table {}.{} does not use NetworkTopologyStrategy", t.schema()->ks_name(), t.schema()->cf_name()));
+    }
+
+    auto replicated_dcs = nts->get_datacenters()
+        | std::views::filter([nts] (const sstring& dc) { return nts->get_replication_factor(dc) > 0; })
+        | std::ranges::to<std::set<sstring>>();
+
+    auto location_dcs = locations
+        | std::views::transform(&tablet_restore_location::datacenter)
+        | std::ranges::to<std::set<sstring>>();
+    if (location_dcs.size() != locations.size()) {
+        throw std::invalid_argument("Duplicate datacenters in backup locations");
+    }
+
+    if (location_dcs != replicated_dcs) {
+        throw std::invalid_argument(fmt::format("Backup locations datacenters [{}] don't match the datacenters [{}] keyspace {} replicates to",
+            fmt::join(location_dcs, ", "), fmt::join(replicated_dcs, ", "), t.schema()->ks_name()));
+    }
+}
+
+// Restore into a table on object storage copies the backup sstables inside the
+// object storage. An object storage can copy an object only inside one endpoint,
+// so every backup location must use the endpoint of the table.
+static void check_endpoints(const replica::table& t, const std::vector<tablet_restore_location>& locations) {
+    auto* os = std::get_if<data_dictionary::storage_options::object_storage>(&t.get_storage_options().value);
+    if (!os) {
+        return;
+    }
+    for (const auto& loc : locations) {
+        if (loc.endpoint != os->endpoint) {
+            throw std::invalid_argument(fmt::format("Backup location of datacenter '{}' uses endpoint {}, but table {}.{} keeps its sstables on endpoint {}. An object storage cannot copy across endpoints",
+                loc.datacenter, loc.endpoint, t.schema()->ks_name(), t.schema()->cf_name(), os->endpoint));
+        }
+    }
+}
+
+future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations) {
+    if (!_db.local().features().tablet_aware_restore) {
+        throw std::runtime_error("Cannot restore tablets. Feature 'TABLET_AWARE_RESTORE' is not available in cluster");
+    }
+
+    if (!_db.local().find_column_family(tid).uses_tablets()) {
+        throw std::invalid_argument(fmt::format("Table {}.{} does not use tablets", keyspace, table));
+    }
+
+    check_datacenter_coverage(_db.local().find_column_family(tid), locations);
+    check_endpoints(_db.local().find_column_family(tid), locations);
+
+    db::snapshot_table_helper sth(_sys_dist_ks.qp());
+    manifest_summary summary = { .tablet_count = 0, .nr_sstables = 0 };
+
+    for (auto& loc : locations) {
+        auto loc_summary = co_await populate_snapshot_sstables_from_manifests(_storage_manager, _sys_dist_ks, keyspace, table, loc.endpoint, loc.bucket, loc.prefix, snap_name, loc.datacenter, std::move(loc.manifests));
+        if (summary.tablet_count == 0) {
+            summary.tablet_count = loc_summary.tablet_count;
+        } else if (summary.tablet_count != loc_summary.tablet_count) {
+            throw std::runtime_error(fmt::format("Inconsistent tablet_count values across backup locations: expected {}, datacenter '{}' has {}",
+                summary.tablet_count, loc.datacenter, loc_summary.tablet_count));
+        }
+        summary.nr_sstables += loc_summary.nr_sstables;
+
+        // TODO: update state when all restored...
+        co_await sth.insert_snapshot_remote_location(snap_name, loc.datacenter, loc.endpoint, loc.bucket, loc.prefix, db::snapshot_state::remote);
+    }
+
+    // Persist the schema of the target table in system_distributed.snapshot_tables
+    // before the restore task pins the tablet hints, so the original hints survive a
+    // crash of this node. If an entry for this snapshot and table already exists, this
+    // restore either resumes an earlier attempt that may have already pinned the
+    // hints, or restores into the same table the snapshot was taken from; in both
+    // cases the original hints are recovered from the persisted schema instead of
+    // the live one.
+    auto entries = co_await sth.get_snapshot_tables(snap_name, keyspace, table, db::consistency_level::QUORUM);
+    auto t = _db.local().get_tables_metadata().get_table_if_exists(tid);
+    if (!t) {
+        throw replica::no_such_column_family(tid);
+    }
+    schema_ptr original_schema;
+    if (entries.empty()) {
+        original_schema = t->schema();
+        auto entry = sth.make_snapshot_table_entry(snap_name, *t);
+        co_await sth.insert_snapshot_tables(std::span(&entry, 1));
+    } else {
+        const auto& entry = entries.front();
+        if (entry.type != db::snapshot_table_type::cql_table) {
+            throw std::runtime_error(fmt::format("Failed to recover the pre-restore schema of table {}.{} stored for snapshot {}: the entry does not describe a CQL table (type={})",
+                keyspace, table, snap_name, static_cast<int32_t>(entry.type)));
+        }
+        try {
+            original_schema = table_helper::parse_new_cf_statement(_sys_dist_ks.qp(), entry.table_schema);
+        } catch (...) {
+            throw std::runtime_error(fmt::format("Failed to recover the pre-restore schema of table {}.{} stored for snapshot {}: {}",
+                keyspace, table, snap_name, std::current_exception()));
+        }
+        // Refresh the TTL of the entry so that repeated crash/re-issue cycles
+        // spanning a long time do not outlive it.
+        co_await sth.insert_snapshot_tables(std::span(&entry, 1));
+    }
+    auto original_hints = original_schema->tablet_options();
+
+    auto progress = make_lw_shared<tablet_restore_progress>(_db.local(), _sys_dist_ks, tid, snap_name, summary.nr_sstables);
+    tasks::task_manager::task_builder task_builder{_task_manager_module, restore_tablets_task_type};
+    task_builder.set_scope("node")
+                .set_keyspace(keyspace)
+                .set_progress_units("sstables")
+                .set_is_abortable(tasks::is_abortable::yes)
+                .set_is_internal(tasks::is_internal::no)
+                .set_is_user_task(tasks::is_user_task::yes)
+                .set_progress_fn([progress] (const tasks::task_manager::task::impl&) {
+                    return make_ready_future<tasks::task_manager::task::progress>(progress->get());
+                })
+                .set_abort_fn([this, tid] (abort_source&) noexcept {
+                    // Closing the restore sessions makes the in-flight download RPCs fail and the
+                    // topology coordinator clear the restore transitions, which lets the action (waiting
+                    // on the topology request) return. Fire-and-forget: the task's own abort source,
+                    // already triggered, surfaces the abort_requested error to the caller.
+                    (void)_ss.local().abort_restore_tablets(tid).handle_exception([tid] (std::exception_ptr ex) {
+                        llog.warn("Failed to abort restore for table {}: {}", tid, ex);
+                    });
+                });
+    auto task = co_await std::move(task_builder).build([this, progress, tid, snap_name = std::move(snap_name), tablet_count = summary.tablet_count,
+            original_min_tablet_count = original_hints.min_tablet_count, original_max_tablet_count = original_hints.max_tablet_count] (tasks::task_manager::task::impl&) {
+        return do_restore_tablets(*progress, tid, snap_name, tablet_count, original_min_tablet_count, original_max_tablet_count);
+    });
+    co_return task->id();
 }

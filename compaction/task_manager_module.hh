@@ -1,0 +1,142 @@
+/*
+ * Copyright (C) 2023-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#pragma once
+
+#include "compaction/compaction.hh"
+#include "replica/database_fwd.hh"
+#include "schema/schema_fwd.hh"
+#include "tasks/task_manager.hh"
+
+#include <optional>
+
+namespace sstables {
+class sstable_directory;
+}
+
+namespace replica {
+class reshard_shard_descriptor;
+}
+
+namespace compaction {
+
+using current_task_type = tasks::task_manager::task_ptr;
+
+// The state through which a task waits for its turn among its siblings.
+struct compaction_turn {
+    seastar::condition_variable& cv;
+    current_task_type& current_task;
+};
+
+enum class flush_mode {
+    skip,               // Skip flushing.  Useful when application explicitly flushes all tables prior to compaction
+    already_flushed,    // An enclosing task just flushed all tables; flush this one, but not the database again
+    compacted_tables,   // Flush only the compacted keyspace/tables
+    all_tables          // Flush all tables in the database prior to compaction
+};
+
+inline constexpr auto major_compaction_task_type = "major compaction";
+
+inline constexpr auto cleanup_compaction_task_type = "cleanup compaction";
+
+inline constexpr auto global_cleanup_compaction_task_type = "global cleanup compaction";
+
+inline constexpr auto offstrategy_compaction_task_type = "offstrategy compaction";
+
+inline constexpr auto upgrade_sstables_compaction_task_type = "upgrade sstables compaction";
+
+inline constexpr auto scrub_sstables_compaction_task_type = "scrub sstables compaction";
+
+inline constexpr auto reshaping_compaction_task_type = "reshaping compaction";
+
+inline constexpr auto resharding_compaction_task_type = "resharding compaction";
+
+class task_manager_module : public tasks::task_manager::module {
+public:
+    task_manager_module(tasks::task_manager& tm) noexcept : tasks::task_manager::module(tm, "compaction") {}
+
+    // Starts a major compaction of all the tables on the node.
+    future<tasks::task_manager::task_ptr> start_global_major_compaction(sharded<replica::database>& db, std::optional<flush_mode> fm, bool consider_only_existing_data);
+
+    // Starts a major compaction of the given tables of a keyspace on all the shards.
+    future<tasks::task_manager::task_ptr> start_major_keyspace_compaction(sharded<replica::database>& db, std::string keyspace, std::vector<table_info> table_infos, std::optional<flush_mode> fm, bool consider_only_existing_data, compaction_turn* turn = nullptr, tasks::task_info parent_info = tasks::make_empty_task_info());
+
+    // Starts a major compaction of the given tables of a keyspace on this shard.
+    future<tasks::task_manager::task_ptr> start_shard_major_compaction(replica::database& db, std::string keyspace, const std::vector<table_info>& table_infos, flush_mode fm, bool consider_only_existing_data, tasks::task_info parent_info);
+
+    // Starts a major compaction of a single table on this shard, once the turn is taken by the created task.
+    future<tasks::task_manager::task_ptr> start_table_major_compaction(replica::database& db, std::string keyspace, const table_info& info, compaction_turn& turn, flush_mode fm, bool consider_only_existing_data, tasks::task_info parent_info);
+
+    // Starts a cleanup compaction of all the vnode based keyspaces on the node.
+    future<tasks::task_manager::task_ptr> start_global_cleanup_compaction(sharded<replica::database>& db);
+
+    // Starts a cleanup compaction of the given tables of a keyspace on all the shards.
+    future<tasks::task_manager::task_ptr> start_cleanup_keyspace_compaction(sharded<replica::database>& db, std::string keyspace, const std::vector<table_info>& table_infos, flush_mode fm, tasks::is_user_task is_user_task);
+
+    // Starts a cleanup compaction of the given tables of a keyspace on this shard.
+    future<tasks::task_manager::task_ptr> start_shard_cleanup_compaction(replica::database& db, std::string keyspace, const std::vector<table_info>& table_infos, tasks::task_info parent_info);
+
+    // Starts a cleanup compaction of a single table on this shard, once the turn is taken by the created task.
+    future<tasks::task_manager::task_ptr> start_table_cleanup_compaction(replica::database& db, std::string keyspace, const table_info& info, compaction_turn& turn, tasks::task_info parent_info);
+
+    // Starts an offstrategy compaction of the given tables of a keyspace on all the shards.
+    // If needed is set, it receives whether any table had sstables to compact.
+    future<tasks::task_manager::task_ptr> start_offstrategy_keyspace_compaction(sharded<replica::database>& db, std::string keyspace, std::vector<table_info> table_infos, bool* needed);
+
+    // Starts an offstrategy compaction of the given tables of a keyspace on this shard.
+    // needed is set if any table had sstables to compact.
+    future<tasks::task_manager::task_ptr> start_shard_offstrategy_compaction(replica::database& db, std::string keyspace, const std::vector<table_info>& table_infos, bool& needed, tasks::task_info parent_info);
+
+    // Starts an offstrategy compaction of a single table on this shard, once the turn is taken by the created task.
+    // needed is set if the table had sstables to compact.
+    future<tasks::task_manager::task_ptr> start_table_offstrategy_compaction(replica::database& db, std::string keyspace, const table_info& info, compaction_turn& turn, bool& needed, tasks::task_info parent_info);
+
+    // Starts an sstable upgrade of the given tables of a keyspace on all the shards.
+    future<tasks::task_manager::task_ptr> start_upgrade_sstables_keyspace_compaction(sharded<replica::database>& db, std::string keyspace, std::vector<table_info> table_infos, bool exclude_current_version);
+
+    // Starts an sstable upgrade of the given tables of a keyspace on this shard.
+    future<tasks::task_manager::task_ptr> start_shard_upgrade_sstables_compaction(replica::database& db, std::string keyspace, const std::vector<table_info>& table_infos, bool exclude_current_version, tasks::task_info parent_info);
+
+    // Starts an sstable upgrade of a single table on this shard, once the turn is taken by the created task.
+    future<tasks::task_manager::task_ptr> start_table_upgrade_sstables_compaction(replica::database& db, std::string keyspace, const table_info& info, compaction_turn& turn, bool exclude_current_version, tasks::task_info parent_info);
+
+    // Starts a scrub of the given tables of a keyspace on all the shards.
+    // If stats is set, it receives the scrub's result.
+    future<tasks::task_manager::task_ptr> start_scrub_sstables_keyspace_compaction(sharded<replica::database>& db, std::string keyspace, std::vector<sstring> column_families, compaction_type_options::scrub opts, compaction_stats* stats);
+
+    // Starts a scrub of the given tables of a keyspace on this shard.
+    // stats receives the scrub's result.
+    future<tasks::task_manager::task_ptr> start_shard_scrub_sstables_compaction(replica::database& db, std::string keyspace, const std::vector<sstring>& column_families, compaction_type_options::scrub opts, compaction_stats& stats, tasks::task_info parent_info);
+
+    // Starts a scrub of a single table on this shard.
+    // The scrub's result is added to stats.
+    future<tasks::task_manager::task_ptr> start_table_scrub_sstables_compaction(replica::database& db, std::string keyspace, std::string table, compaction_type_options::scrub opts, compaction_stats& stats, tasks::task_info parent_info);
+
+    // Starts a reshape of a table's sstables collected by the directory, on all the shards.
+    future<tasks::task_manager::task_ptr> start_table_reshaping_compaction(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, std::string keyspace, std::string table, reshape_mode mode, compaction_sstable_creator_fn creator, std::function<bool (const sstables::shared_sstable&)> filter);
+
+    // Starts a reshape of a table's sstables collected by the directory, on this shard.
+    // total_shard_size is increased by the size of the reshaped sstables.
+    future<tasks::task_manager::task_ptr> start_shard_reshaping_compaction(sstables::sstable_directory& dir, sharded<replica::database>& db, std::string keyspace, std::string table, reshape_mode mode, compaction_sstable_creator_fn creator, std::function<bool (const sstables::shared_sstable&)> filter, uint64_t& total_shard_size, tasks::task_info parent_info);
+
+    // Starts a reshard of a table's sstables collected by the directory, on all the shards.
+    // The shared sstables are resharded, and so are those that need cleanup if owned_ranges_ptr is set.
+    future<tasks::task_manager::task_ptr> start_table_resharding_compaction(sharded<sstables::sstable_directory>& dir, sharded<replica::database>& db, std::string keyspace, std::string table, compaction_sstable_creator_fn creator, compaction::owned_ranges_ptr owned_ranges_ptr, bool vnodes_resharding, tasks::task_info parent_info);
+
+    // Starts a reshard of the sstables that destinations assigns to this shard.
+    // The sstables are moved out of this shard's entry of destinations.
+    future<tasks::task_manager::task_ptr> start_shard_resharding_compaction(sharded<sstables::sstable_directory>& dir, replica::database& db, std::string keyspace, std::string table, compaction_sstable_creator_fn creator, compaction::owned_ranges_ptr local_owned_ranges_ptr, bool vnodes_resharding, std::vector<replica::reshard_shard_descriptor>& destinations, tasks::task_info parent_info);
+};
+
+} // namespace compaction
+
+template <>
+struct fmt::formatter<compaction::flush_mode> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(compaction::flush_mode, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

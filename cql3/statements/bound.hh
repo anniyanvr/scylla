@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include <cstdint>
@@ -21,22 +18,22 @@ namespace statements {
 
 enum class bound : int32_t { START = 0, END };
 
-static inline
+inline
 int32_t get_idx(bound b) {
     return (int32_t)b;
 }
 
-static inline
+inline
 bound reverse(bound b) {
     return bound((int32_t)b ^ 1);
 }
 
-static inline
+inline
 bool is_start(bound b) {
     return b == bound::START;
 }
 
-static inline
+inline
 bool is_end(bound b) {
     return b == bound::END;
 }

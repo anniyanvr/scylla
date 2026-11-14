@@ -1,14 +1,14 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the UpdateItem operations with an UpdateExpression parameter
 
-import random
-import string
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string
+
+from test.alternator.util import random_string
+
 
 # The simplest test of using UpdateExpression to set a top-level attribute,
 # instead of the older AttributeUpdates parameter.
@@ -37,6 +37,18 @@ def test_update_expression_set_multi(test_table_s):
         ExpressionAttributeValues={':val1': 4})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'x': 4, 'y': 4}
 
+# Test that UpdateItem merges the change with a previously existing item -
+# it doesn't outright replace it like PutItem does. This merge is done
+# even if the expression doesn't need to read the old value of the item.
+def test_update_expression_set_merge(test_table_s):
+    p = random_string()
+    test_table_s.put_item(Item={'p': p, 'a': 'hi'})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hi'}
+    test_table_s.update_item(Key={'p': p}, UpdateExpression='SET b = :val', ExpressionAttributeValues={':val': 'hello'})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hi', 'b': 'hello'}
+    test_table_s.update_item(Key={'p': p}, UpdateExpression='SET a = :val', ExpressionAttributeValues={':val': 'hey'})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 'hey', 'b': 'hello'}
+
 # SET can be used to copy an existing attribute to a new one
 def test_update_expression_set_copy(test_table_s):
     p = random_string()
@@ -47,6 +59,10 @@ def test_update_expression_set_copy(test_table_s):
     # Copying an non-existing attribute generates an error
     with pytest.raises(ClientError, match='ValidationException'):
         test_table_s.update_item(Key={'p': p}, UpdateExpression='SET c = z')
+    # Same thing happens if the item doesn't exist at all
+    p1 = random_string()
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p1}, UpdateExpression='SET c = z')
     # It turns out that attributes to be copied are read before the SET
     # starts to write, so "SET x = :val1, y = x" does not work...
     with pytest.raises(ClientError, match='ValidationException'):
@@ -84,7 +100,7 @@ def test_update_expression_set_nested_copy(test_table_s):
 # Test for getting a key value with read-before-write
 def test_update_expression_set_key(test_table_sn):
     p = random_string()
-    test_table_sn.update_item(Key={'p': p, 'c': 7});
+    test_table_sn.update_item(Key={'p': p, 'c': 7})
     test_table_sn.update_item(Key={'p': p, 'c': 7}, UpdateExpression='SET #n = #p',
          ExpressionAttributeNames={'#n': 'n', '#p': 'p'})
     test_table_sn.update_item(Key={'p': p, 'c': 7}, UpdateExpression='SET #nn = #c + #c',
@@ -371,36 +387,36 @@ def test_update_expression_spurious_name(test_table_s):
 
 # Test that the key attributes (hash key or sort key) cannot be modified
 # by an update
-def test_update_expression_cannot_modify_key(test_table):
+def test_update_expression_cannot_modify_key(test_table_ss):
     p = random_string()
     c = random_string()
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c},
+        test_table_ss.update_item(Key={'p': p, 'c': c},
             UpdateExpression='SET p = :val1', ExpressionAttributeValues={':val1': 4})
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c},
+        test_table_ss.update_item(Key={'p': p, 'c': c},
             UpdateExpression='SET c = :val1', ExpressionAttributeValues={':val1': 4})
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c}, UpdateExpression='REMOVE p')
+        test_table_ss.update_item(Key={'p': p, 'c': c}, UpdateExpression='REMOVE p')
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c}, UpdateExpression='REMOVE c')
+        test_table_ss.update_item(Key={'p': p, 'c': c}, UpdateExpression='REMOVE c')
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c},
+        test_table_ss.update_item(Key={'p': p, 'c': c},
             UpdateExpression='ADD p :val1', ExpressionAttributeValues={':val1': 4})
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c},
+        test_table_ss.update_item(Key={'p': p, 'c': c},
             UpdateExpression='ADD c :val1', ExpressionAttributeValues={':val1': 4})
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c},
+        test_table_ss.update_item(Key={'p': p, 'c': c},
             UpdateExpression='DELETE p :val1', ExpressionAttributeValues={':val1': set(['cat', 'mouse'])})
     with pytest.raises(ClientError, match='ValidationException.*key'):
-        test_table.update_item(Key={'p': p, 'c': c},
+        test_table_ss.update_item(Key={'p': p, 'c': c},
             UpdateExpression='DELETE c :val1', ExpressionAttributeValues={':val1': set(['cat', 'mouse'])})
     # As sanity check, verify we *can* modify a non-key column
-    test_table.update_item(Key={'p': p, 'c': c}, UpdateExpression='SET a = :val1', ExpressionAttributeValues={':val1': 4})
-    assert test_table.get_item(Key={'p': p, 'c': c}, ConsistentRead=True)['Item'] == {'p': p, 'c': c, 'a': 4}
-    test_table.update_item(Key={'p': p, 'c': c}, UpdateExpression='REMOVE a')
-    assert test_table.get_item(Key={'p': p, 'c': c}, ConsistentRead=True)['Item'] == {'p': p, 'c': c}
+    test_table_ss.update_item(Key={'p': p, 'c': c}, UpdateExpression='SET a = :val1', ExpressionAttributeValues={':val1': 4})
+    assert test_table_ss.get_item(Key={'p': p, 'c': c}, ConsistentRead=True)['Item'] == {'p': p, 'c': c, 'a': 4}
+    test_table_ss.update_item(Key={'p': p, 'c': c}, UpdateExpression='REMOVE a')
+    assert test_table_ss.get_item(Key={'p': p, 'c': c}, ConsistentRead=True)['Item'] == {'p': p, 'c': c}
 
 # Test that trying to start an expression with some nonsense like HELLO
 # instead of SET, REMOVE, ADD or DELETE, fails.
@@ -535,6 +551,49 @@ def test_update_expression_list_append(test_table_s):
         ExpressionAttributeNames={'#name1': 'a', '#name2': 'a'})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['a'] == ['dog', 'hi', 2, 4, 'hello', 8]
 
+# A list_append() function requires both its arguments to be lists. If one
+# of them isn't, we get a ValidationException. This also includes the case
+# that one of the arguments is an attribute which doesn't exist, or the
+# entire item doesn't exist.
+# The specific error message returned by Alternator and DynamoDB are not
+# identical - e.g., when an attribute is missing DynamoDB says that ""The
+# provided expression refers to an attribute that does not exist in the item"
+# and Alternator says "list_append() given a non-list" - but the error
+# type, ValidationException, is the same.
+def test_update_expression_list_append_non_list_arguments(test_table_s):
+    p = random_string()
+    val1 = ['hi', 2]
+    def try_list_append(args):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression=f'SET a = list_append({args})',
+            ExpressionAttributeValues={':val1': val1})
+    # The item p doesn't exist at all, so in particular the attribute "b" is
+    # missing, so in particular b is not a list
+    for args in ['b, :val1', ':val1, b']:
+        with pytest.raises(ClientError, match='ValidationException'):
+            try_list_append(args)
+    # The item p does exist, but it doesn't have an attribute b, so
+    # in particular b is not a list:
+    test_table_s.put_item(Item={'p': p, 'a': 2})
+    for args in ['b, :val1', ':val1, b']:
+        with pytest.raises(ClientError, match='ValidationException'):
+            try_list_append(args)
+    # Attribute b does exist, but it's not a list:
+    for b in [7, 'hello', b'hi', set([1,2,3]), {'a': 3, 'b': 4}]:
+        test_table_s.put_item(Item={'p': p, 'b': b})
+        for args in ['b, :val1', ':val1, b']:
+            with pytest.raises(ClientError, match='ValidationException'):
+                try_list_append(args)
+    # Sanity check: when b does exist and *is* a list, things finally work.
+    # Let's try a few lists, including an empty one and list including
+    # nested list items - they are all fine:
+    for b in [[1,2,3], [], ['x', ['hi', 'hello']]]:
+        test_table_s.put_item(Item={'p': p, 'b': b})
+        try_list_append('b, :val1')
+        assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['a'] == b + val1
+        try_list_append(':val1, b')
+        assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['a'] == val1 + b
+
 # Test the "if_not_exists" function in SET
 # The test also checks additional features of function-call parsing.
 def test_update_expression_if_not_exists(test_table_s):
@@ -614,6 +673,15 @@ def test_update_expression_function_nesting(test_table_s):
         UpdateExpression='SET a = list_append(if_not_exists(a, :val1), :val2)',
             ExpressionAttributeValues={':val1': ['a', 'b'], ':val2': ['1', '2']})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['a'] == ['a', 'b', 'cat', 'dog', '1', '2']
+    # It's even fine to nest two calls of the same if_not_exists function:
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET a = if_not_exists(b, if_not_exists(c, :val1))',
+            ExpressionAttributeValues={':val1': 3})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['a'] == 3
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET x = if_not_exists(b, if_not_exists(a, :val1))',
+            ExpressionAttributeValues={':val1': 4})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item']['x'] == 3
     # I don't understand why the following expression isn't accepted, but it
     # isn't! It produces a "Invalid UpdateExpression: The function is not
     # allowed to be used this way in an expression; function: list_append".
@@ -1030,6 +1098,20 @@ def test_nested_attribute_remove_from_missing_item(test_table_s):
     test_table_s.update_item(Key={'p': p}, UpdateExpression='REMOVE x.y')
     test_table_s.update_item(Key={'p': p}, UpdateExpression='REMOVE x[0]')
 
+# Though in an above test (test_nested_attribute_update_bad_path_dot) we
+# showed that DynamoDB does not allow REMOVE x.y if attribute x doesn't
+# exist - and generates a ValidationException, if x *does* exist but y
+# doesn't, it's fine and the removal should just be silently ignored.
+def test_nested_attribute_remove_missing_leaf(test_table_s):
+    p = random_string()
+    item = {'p': p, 'a': {'x': 3}, 'b': ['hi']}
+    test_table_s.put_item(Item=item)
+    test_table_s.update_item(Key={'p': p}, UpdateExpression='REMOVE a.y')
+    test_table_s.update_item(Key={'p': p}, UpdateExpression='REMOVE b[7]')
+    test_table_s.update_item(Key={'p': p}, UpdateExpression='REMOVE c')
+    # The above UpdateItem calls didn't change anything...
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == item
+
 # Similarly for other types of bad paths - using [0] on something which
 # doesn't exist or isn't an array.
 def test_nested_attribute_update_bad_path_array(test_table_s):
@@ -1074,26 +1156,50 @@ def test_update_expression_empty_attribute(test_table_s):
         ExpressionAttributeValues={':v1': [], ':v2': {}, ':v3': '', ':v4': b''})
     assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'd': [], 'e': {}, 'f': '', 'g': b''}
 
-# Verify which kind of update operations require a read-before-write (a.k.a
-# read-modify-write, or RMW). We test this by using a table configured with
-# "forbid_rmw" isolation mode and checking which writes succeed or pass.
-# This is a Scylla-only test (the test_table_s_forbid_rmw implies scylla_only).
-def test_update_expression_when_rmw(test_table_s_forbid_rmw):
-    table = test_table_s_forbid_rmw
+# The DynamoDB documentation for UpdateExpression says about "ADD" that:
+# "In general, we recommend using SET rather than ADD". However, it's worth
+# noting that unlike ADD which can treat an attribute or an item that doesn't
+# yet exist as zero (we tested this in test_update_expression_add_numbers_new)
+# SET can't do this and must be combined together with is_not_exists() to do
+# what ADD does. In this test we'll check that the SET alternative works as
+# it does in DynamoDB.
+def test_update_expression_set_implement_add(test_table_s):
     p = random_string()
-    # A write with a RHS (right-hand side) being a constant from the query
-    # doesn't need RMW:
-    table.update_item(Key={'p': p},
-        UpdateExpression='SET a = :val',
-        ExpressionAttributeValues={':val': 3})
-    # But if the LHS (left-hand side) of the assignment is a document path,
-    # it *does* need RMW:
-    with pytest.raises(ClientError, match='ValidationException.*write isolation policy'):
-        table.update_item(Key={'p': p},
-            UpdateExpression='SET a.b = :val',
-            ExpressionAttributeValues={':val': 3})
-    assert table.get_item(Key={'p': p}, ConsistentRead=True)['Item']['a'] == 3
-    # A write with a path in the RHS of a SET also needs RMW
-    with pytest.raises(ClientError, match='ValidationException.*write isolation policy'):
-        table.update_item(Key={'p': p},
-            UpdateExpression='SET b = a')
+    # "SET a = a + :val" works when a is already set
+    test_table_s.put_item(Item={'p': p, 'a': 42})
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET a = a + :val',
+        ExpressionAttributeValues={':val': 7})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 49}
+    # But "SET b = b + :val" doesn't work (resulting in ValidationException)
+    # if an attribute "b" is not set in the item. It also doesn't work if
+    # the whole item doesn't exist.
+    # We tested something similar in test_update_expression_set_copy.
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p},
+            UpdateExpression='SET b = b + :val',
+            ExpressionAttributeValues={':val': 7})
+    p1 = random_string()
+    with pytest.raises(ClientError, match='ValidationException'):
+        test_table_s.update_item(Key={'p': p1},
+            UpdateExpression='SET b = b + :val',
+            ExpressionAttributeValues={':val': 7})
+    # Finally, we can use the trick "SET a = if_not_exists(a, :zero) + :val"
+    # to allow us to treat a non-existent attribute (or even non-existent item)
+    # as zero, and the same expression will work for both the existing and
+    # non-existing cases, and behave like "ADD" does.
+    # Case 1. p's a exists and its value (49) is used:
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET a = if_not_exists(a, :zero) + :val',
+        ExpressionAttributeValues={':val': 3, ':zero': 0})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 52}
+    # Case 2. p's b does not exist so zero will be used. a=52 isn't modified.
+    test_table_s.update_item(Key={'p': p},
+        UpdateExpression='SET b = if_not_exists(b, :zero) + :val',
+        ExpressionAttributeValues={':val': 5, ':zero': 0})
+    assert test_table_s.get_item(Key={'p': p}, ConsistentRead=True)['Item'] == {'p': p, 'a': 52, 'b': 5}
+    # Case 3. Item p1 doesn't exist at all, so zero will be used
+    test_table_s.update_item(Key={'p': p1},
+        UpdateExpression='SET a = if_not_exists(a, :zero) + :val',
+        ExpressionAttributeValues={':val': 7, ':zero': 0})
+    assert test_table_s.get_item(Key={'p': p1}, ConsistentRead=True)['Item'] == {'p': p1, 'a': 7}

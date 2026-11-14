@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the KeyConditions parameter of the Query operation.
 # KeyConditions is the older version of the newer "KeyConditionExpression"
@@ -9,7 +9,10 @@
 
 import pytest
 from botocore.exceptions import ClientError
-from util import random_string, random_bytes, full_query, multiset
+from decimal import Decimal
+
+from test.alternator.util import random_string, random_bytes, full_query, multiset
+
 
 # The test_table_{sn,ss,sb}_with_sorted_partition fixtures are the regular
 # test_table_{sn,ss,sb} fixture with a partition inserted with many items.
@@ -61,7 +64,7 @@ def test_key_conditions_partition(test_table_sn_with_sorted_partition):
 # The "ComparisonOperator" is case sensitive, "EQ" works but "eq" does not:
 def test_key_conditions_comparison_operator_case(test_table_sn_with_sorted_partition):
     table, p, items = test_table_sn_with_sorted_partition
-    with pytest.raises(ClientError, match='ValidationException.*eq'):
+    with pytest.raises(ClientError, match='ValidationException.*comparison'):
         full_query(table, KeyConditions={
             'p' : {'AttributeValueList': [p], 'ComparisonOperator': 'eq'}})
 
@@ -82,7 +85,7 @@ def test_key_conditions_partition_only_eq(test_table_sn_with_sorted_partition):
             'p' : {'AttributeValueList': [p, p], 'ComparisonOperator': 'BETWEEN'}})
     # An unknown operator, e.g., "DOG", is also not allowed, but with a
     # different error message.
-    with pytest.raises(ClientError, match='ValidationException.*DOG'):
+    with pytest.raises(ClientError, match='ValidationException.*comparison'):
         full_query(table, KeyConditions={
             'p' : {'AttributeValueList': [p, p], 'ComparisonOperator': 'DOG'}})
     # The operators 'NULL', 'NOT_NULL', 'IN', 'CONTAINS', 'NOT_CONTAINS', 'NE'
@@ -364,7 +367,7 @@ def test_key_conditions_sort_unsupported(test_table_sn_with_sorted_partition):
                 'p' : {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
                 'c' : {'AttributeValueList': [], 'ComparisonOperator': op}})
     # An unknown operator, e.g., "DOG", is also not allowed.
-    with pytest.raises(ClientError, match='ValidationException.*DOG'):
+    with pytest.raises(ClientError, match='ValidationException.*comparison'):
         full_query(table, KeyConditions={
             'p' : {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'},
             'c' : {'AttributeValueList': [p], 'ComparisonOperator': 'DOG'}})
@@ -414,7 +417,20 @@ def test_key_conditions_hash_only_b(test_table_b):
         'p' : {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})
     assert(got_items == [item])
 
-# TODO: add a test_table_n fixture, and test this case too.
+# Reproduces SCYLLADB-1575
+@pytest.mark.xfail(reason="SCYLLADB-1575")
+def test_key_conditions_hash_only_n(test_table_n):
+    p = 1000
+    item = {'p': p, 'val': 'hello'}
+    test_table_n.put_item(Item=item)
+    got_items = full_query(test_table_n, KeyConditions={
+        'p' : {'AttributeValueList': [p], 'ComparisonOperator': 'EQ'}})
+    assert(got_items == [item])
+    # Decimal('1e3') is serialized by boto3 as "1E+3" on the wire, a
+    # different representation of the same number 1000.
+    got_items = full_query(test_table_n, KeyConditions={
+        'p' : {'AttributeValueList': [Decimal('1e3')], 'ComparisonOperator': 'EQ'}})
+    assert(got_items == [item])
 
 # Demonstrate that issue #6573 was not a bug for KeyConditions: binary
 # strings are ordered as unsigned bytes, i.e., byte 128 comes after 127,

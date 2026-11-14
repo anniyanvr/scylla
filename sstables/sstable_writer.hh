@@ -3,16 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <memory>
-#include <seastar/core/io_priority_class.hh>
 #include <seastar/core/smp.hh>
-#include "schema_fwd.hh"
-#include "mutation_fragment.hh"
+#include "schema/schema_fwd.hh"
+#include "mutation/mutation_fragment.hh"
+#include "mutation/mutation_fragment_v2.hh"
 
 struct encoding_stats;
 
@@ -29,7 +29,7 @@ private:
 public:
     sstable_writer(sstable& sst, const schema& s, uint64_t estimated_partitions,
             const sstable_writer_config&, encoding_stats enc_stats,
-            const io_priority_class& pc, shard_id shard = this_shard_id());
+            shard_id shard = this_shard_id());
 
     sstable_writer(sstable_writer&& o);
     sstable_writer& operator=(sstable_writer&& o);
@@ -40,9 +40,11 @@ public:
     void consume(tombstone t);
     stop_iteration consume(static_row&& sr);
     stop_iteration consume(clustering_row&& cr);
-    stop_iteration consume(range_tombstone&& rt);
+    stop_iteration consume(range_tombstone_change&& rtc);
     stop_iteration consume_end_of_partition();
     void consume_end_of_stream();
+    void set_repaired_at(int64_t repaired_at);
+    uint64_t data_file_position_for_tests() const;
 };
 
 } // namespace sstables

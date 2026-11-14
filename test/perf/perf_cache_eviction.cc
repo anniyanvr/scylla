@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <boost/range/irange.hpp>
+#include <fmt/ranges.h>
 #include "seastarx.hh"
 #include "test/lib/simple_schema.hh"
 #include "test/lib/cql_test_env.hh"
@@ -19,6 +19,7 @@
 #include "utils/int_range.hh"
 #include "utils/div_ceil.hh"
 #include <seastar/core/reactor.hh>
+#include <seastar/util/defer.hh>
 
 static thread_local bool cancelled = false;
 
@@ -50,6 +51,10 @@ int main(int argc, char** argv) {
         ;
 
     return app.run(argc, argv, [&app] {
+        if (this_smp_shard_count() != 1) {
+            throw std::runtime_error("This test has to be run with --smp=1");
+        }
+
         if (app.configuration().contains("trace")) {
             testlog.set_level(seastar::log_level::trace);
         }
@@ -63,9 +68,8 @@ int main(int argc, char** argv) {
             auto reads_enabled = !app.configuration().contains("no-reads");
             auto seconds = app.configuration()["seconds"].as<unsigned>();
 
-            engine().at_exit([] {
+            auto stop_test = defer([] noexcept {
                 cancelled = true;
-                return make_ready_future();
             });
 
             timer<> completion_timer;
@@ -79,7 +83,7 @@ int main(int argc, char** argv) {
             replica::database& db = env.local_db();
             auto s = db.find_schema("ks", "cf");
             replica::column_family& cf = db.find_column_family(s->id());
-            cf.set_compaction_strategy(sstables::compaction_strategy_type::null);
+            cf.set_compaction_strategy(compaction::compaction_strategy_type::null);
 
             uint64_t mutations = 0;
             uint64_t reads = 0;
@@ -141,7 +145,7 @@ int main(int argc, char** argv) {
                 if (!reads_enabled) {
                     return;
                 }
-                auto id = env.prepare("select * from ks.cf where pk = 'key1' limit 10;").get0();
+                auto id = env.prepare("select * from ks.cf where pk = 'key1' limit 10;").get();
                 while (!cancelled) {
                     auto t0 = clock::now();
                     env.execute_prepared(id, {}).get();

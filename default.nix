@@ -2,87 +2,123 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
 #
-# * At present this is not very useful for nix-build, just for nix-shell
+# * "nix build" is unsupported (or rather supported up to and not including
+#   installPhase), so basically all this is just for "nix develop"
 #
 # * IMPORTANT: to avoid using up ungodly amounts of disk space under
-#   /nix/store/, make sure the actual build directory is physically
-#   outside this tree, and make ./build a symlink to it
+#   /nix/store/ when you are not using flakes, make sure to move the
+#   actual build directory outside this tree and make ./build a
+#   symlink to it.  Or use flakes (seriously, just use flakes).
 #
 
-{
-  pkgs ? import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/4cb48cc25622334f17ec6b9bf56e83de0d521fb7.tar.gz") {},
-  mode ? "release",
-  verbose ? false,
-  useCcache ? false, # can't get this to work, see https://github.com/NixOS/nixpkgs/issues/49894
-  testInputsFrom ? (_: []),
-  gitPkg ? (pkgs: pkgs.gitMinimal),
+{ flake ? false
+, shell ? false
+, pkgs ? import <nixpkgs> { system = builtins.currentSystem; overlays = [ (import ./dist/nix/overlay.nix <nixpkgs>) ]; }
+, srcPath ? builtins.path { path = ./.; name = "scylla"; }
+, repl ? null
+, mode ? "release"
+, verbose ? false
+
+# shell env will want to add stuff to the environment, and the way
+# for it to do so is to pass us a function with this signatire:
+, devInputs ? ({ pkgs, llvm }: [])
 }:
 
-with pkgs; let
+let
   inherit (builtins)
     baseNameOf
-    fetchurl
+    head
     match
-    readFile
-    toString
-    trace;
+    split
+  ;
 
-  antlr3Patched = antlr3.overrideAttrs (_: {
-    patches = [
-      (fetchurl {
-        url = "https://src.fedoraproject.org/rpms/antlr3/raw/f1bb8d639678047935e1761c3bf3c1c7da8d0f1d/f/0006-antlr3memory.hpp-fix-for-C-20-mode.patch";
-      })
-    ];
-  });
-  rapidjsonPatched = rapidjson.overrideAttrs (_: {
-    patches = [
-      (fetchurl {
-        url = "https://src.fedoraproject.org/rpms/rapidjson/raw/48402da9f19d060ffcd40bf2b2e6987212c58b0c/f/rapidjson-1.1.0-c++20.patch";
-      })
-    ];
-  });
-  zstdStatic = zstd.overrideAttrs (_: {
-    cmakeFlags = [
-      "-DZSTD_BUILD_SHARED:BOOL=OFF"
-      "-DZSTD_BUILD_STATIC:BOOL=ON"
-      "-DZSTD_PROGRAMS_LINK_SHARED:BOOL=OFF"
-      "-DZSTD_LEGACY_SUPPORT:BOOL=ON"
-      "-DZSTD_BUILD_TESTS:BOOL=OFF"
-    ];
-  });
+  inherit (import (builtins.fetchTarball {
+    url = "https://github.com/hercules-ci/gitignore/archive/5b9e0ff9d3b551234b4f3eb3983744fa354b17f1.tar.gz";
+    sha256 = "01l4phiqgw9xgaxr6jr456qmww6kzghqrnbc7aiiww3h6db5vw53";
+  }) { inherit (pkgs) lib; })
+    gitignoreSource;
 
-  llvmBundle = llvmPackages_11;
+  # all later Boost versions are problematic one way or another
+  boost = pkgs.boost175;
 
-  stdenv =
-    if useCcache
-    then (overrideCC llvmBundle.stdenv (ccacheWrapper.override { cc = llvmBundle.clang; }))
-    else llvmBundle.stdenv;
+  llvm = pkgs.llvmPackages_15;
 
-in stdenv.mkDerivation {
-  name = "scylladb";
-  nativeBuildInputs = [
+  stdenvUnwrapped = llvm.stdenv;
+
+  # define custom ccache- and distcc-aware wrappers for all relevant
+  # compile drivers (used only in shell env)
+  cc-wrappers = pkgs.callPackage ./dist/nix/pkg/custom/ccache-distcc-wrap {
+    cc = stdenvUnwrapped.cc;
+    clang = llvm.clang;
+    inherit (pkgs) gcc;
+  };
+
+  stdenv = if shell then pkgs.overrideCC stdenvUnwrapped cc-wrappers
+           else stdenvUnwrapped;
+
+  noNix = path: type: type != "regular" || (match ".*\.nix" path) == null;
+  src = builtins.filterSource noNix (if flake then srcPath
+                                     else gitignoreSource srcPath);
+
+  derive = if shell then pkgs.mkShell.override { inherit stdenv; }
+           else stdenv.mkDerivation;
+
+in derive ({
+  name = "scylla";
+  inherit src;
+
+  # since Scylla build, as it exists, is not cross-capable, the
+  # nativeBuildInputs/buildInputs distinction below ranges, depending
+  # on how charitable one feels, from "pedantic" through
+  # "aspirational" all the way to "cargo cult ritual" -- i.e. not
+  # expected to be actually correct or verifiable.  but it's the
+  # thought that counts!
+  nativeBuildInputs = with pkgs; [
     ant
-    antlr3Patched
-    boost17x.dev
+    antlr3
+    boost
+    cargo
     cmake
+    cxx-rs
     gcc
-    (gitPkg pkgs)
+    openjdk11_headless
     libtool
-    llvmBundle.lld
+    llvm.bintools
     maven
     ninja
     pkg-config
-    python3
+    python2
+    (python3.withPackages (ps: with ps; [
+      aiohttp
+      boto3
+      colorama
+      distro
+      magic
+      psutil
+      pyparsing
+      pytest
+      pytest-asyncio
+      pyudev
+      pyyaml
+      requests
+      scylla-driver
+      setuptools
+      tabulate
+      urwid
+    ]))
     ragel
+    rustc
     stow
-  ];
-  buildInputs = [
-    antlr3Patched
-    boost17x
+  ] ++ (devInputs { inherit pkgs llvm; });
+
+  buildInputs = with pkgs; [
+    abseil-cpp
+    antlr3
+    boost
     c-ares
     cryptopp
     fmt
@@ -91,76 +127,75 @@ in stdenv.mkDerivation {
     hwloc
     icu
     jsoncpp
+    libdeflate
+    libidn2
     libp11
     libsystemtap
     libtasn1
     libunistring
+    liburing
+    libxcrypt
     libxfs
     libxml2
     libyamlcpp
+    llvm.compiler-rt
     lksctp-tools
-    lua53Packages.lua
+    lua54Packages.lua
     lz4
     nettle
     numactl
     openssl
     p11-kit
     protobuf
-    python3Packages.cassandra-driver
-    python3Packages.distro
-    python3Packages.psutil
-    python3Packages.pyparsing
-    python3Packages.pyudev
-    python3Packages.pyyaml
-    python3Packages.requests
-    python3Packages.setuptools
-    python3Packages.urwid
-    rapidjsonPatched
+    rapidjson
     snappy
     systemd
-    thrift
     valgrind
     xorg.libpciaccess
     xxHash
     zlib
-    zstdStatic
-  ] ++ (testInputsFrom pkgs);
+    zstd
+  ];
 
-  src = lib.cleanSourceWith {
-    filter = name: type:
-      let baseName = baseNameOf (toString name); in
-      !((type == "symlink" && baseName == "build") ||
-        (type == "directory" &&
-         (baseName == "build" ||
-          baseName == ".cache" ||
-          baseName == ".direnv" ||
-          baseName == ".github" ||
-          baseName == ".pytest_cache" ||
-          baseName == "__pycache__")));
-    src = ./.;
-  };
+  JAVA8_HOME = "${pkgs.openjdk8_headless}/lib/openjdk";
+  JAVA_HOME = "${pkgs.openjdk11_headless}/lib/openjdk";
+
+}
+// (if shell then {
+
+  configurePhase = "./configure.py${if verbose then " --verbose" else ""} --disable-dpdk";
+
+} else {
+
+  # sha256 of the filtered source tree:
+  SCYLLA_RELEASE = head (split "-" (baseNameOf src));
 
   postPatch = ''
     patchShebangs ./configure.py
-    patchShebangs ./merge-compdb.py
     patchShebangs ./seastar/scripts/seastar-json2code.py
     patchShebangs ./seastar/cooking.sh
   '';
 
-  IMPLICIT_CFLAGS = ''
-    ${readFile (llvmBundle.stdenv.cc + "/nix-support/libcxx-cxxflags")} ${readFile (llvmBundle.stdenv.cc + "/nix-support/libc-cflags")}
-  '';
-
-  configurePhase = ''
-    ./configure.py ${if verbose then "--verbose " else ""}--mode=${mode}
-  '';
+  configurePhase = "./configure.py${if verbose then " --verbose" else ""} --mode=${mode}";
 
   buildPhase = ''
-    ${ninja}/bin/ninja build/${mode}/scylla
+    ${pkgs.ninja}/bin/ninja \
+      build/${mode}/scylla \
+      build/${mode}/iotune \
+
   '';
+   #   build/${mode}/dist/tar/scylla-tools-package.tar.gz \
+   #   build/${mode}/dist/tar/scylla-jmx-package.tar.gz \
 
   installPhase = ''
-    mkdir $out
-    cp -r * $out/
+    echo not implemented 1>&2
+    exit 1
   '';
-}
+
+})
+// (if !shell || repl == null then {} else {
+
+  REPL = repl;
+
+})
+)

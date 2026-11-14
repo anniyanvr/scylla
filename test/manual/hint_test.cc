@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
@@ -11,26 +11,18 @@
 
 #include <stdlib.h>
 #include <iostream>
-#include <list>
-#include <unordered_set>
 
-#include "test/lib/test_services.hh"
 #include <seastar/testing/test_case.hh>
-
-#include "test/lib/mutation_source_test.hh"
-#include "test/lib/mutation_assertions.hh"
 
 #include <seastar/core/future-util.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/scollectd_api.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include "utils/UUID_gen.hh"
+#include "test/lib/test_utils.hh"
 #include "test/lib/tmpdir.hh"
 #include "db/commitlog/commitlog.hh"
 #include "db/commitlog/rp_set.hh"
-#include "log.hh"
-#include "schema.hh"
 
 using namespace db;
 
@@ -55,7 +47,7 @@ SEASTAR_TEST_CASE(test_commitlog_new_segment_custom_prefix){
     cfg.commitlog_segment_size_in_mb = 1;
     return cl_test(cfg, [](commitlog& log) {
         return do_with(rp_set(), [&log](auto& set) {
-            auto uuid = utils::UUID_gen::get_time_UUID();
+            auto uuid = table_id(utils::UUID_gen::get_time_UUID());
             return do_until([&set]() { return set.size() > 1; }, [&log, &set, uuid]() {
                 sstring tmp = "hej bubba cow";
                 return log.add_mutation(uuid, tmp.size(), db::commitlog::force_sync::no, [tmp](db::commitlog::output& dst) {

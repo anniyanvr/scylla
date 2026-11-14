@@ -5,49 +5,82 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
+#include "db/view/view_building_worker.hh"
 #include "gms/gossiper.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_result_future.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include "streaming/stream_session_state.hh"
 #include <seastar/core/metrics.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
+#include "db/config.hh"
+#include "utils/labels.hh"
 
 namespace streaming {
 
 extern logging::logger sslog;
 
-stream_manager::stream_manager(sharded<replica::database>& db,
-            sharded<db::system_distributed_keyspace>& sys_dist_ks,
-            sharded<db::view::view_update_generator>& view_update_generator,
+stream_manager::stream_manager(db::config& cfg,
+            sharded<replica::database>& db,
+            db::view::view_builder& view_builder,
+            sharded<db::view::view_building_worker>& view_building_worker,
             sharded<netw::messaging_service>& ms,
             sharded<service::migration_manager>& mm,
-            gms::gossiper& gossiper)
+            gms::gossiper& gossiper, scheduling_group sg)
         : _db(db)
-        , _sys_dist_ks(sys_dist_ks)
-        , _view_update_generator(view_update_generator)
+        , _view_builder(view_builder)
+        , _view_building_worker(view_building_worker)
         , _ms(ms)
         , _mm(mm)
         , _gossiper(gossiper)
+        , _streaming_group(std::move(sg))
+        , _io_throughput_mbs(cfg.stream_io_throughput_mb_per_sec)
 {
     namespace sm = seastar::metrics;
 
+    _finished_percentage[streaming::stream_reason::bootstrap] = 1;
+    _finished_percentage[streaming::stream_reason::decommission] = 1;
+    _finished_percentage[streaming::stream_reason::removenode] = 1;
+    _finished_percentage[streaming::stream_reason::rebuild] = 1;
+    _finished_percentage[streaming::stream_reason::repair] = 1;
+    _finished_percentage[streaming::stream_reason::replace] = 1;
+
+    auto ops_label_type = sm::label("ops");
     _metrics.add_group("streaming", {
-        sm::make_derive("total_incoming_bytes", [this] { return _total_incoming_bytes; },
+        sm::make_counter("total_incoming_bytes", [this] { return _total_incoming_bytes; },
                         sm::description("Total number of bytes received on this shard.")),
 
-        sm::make_derive("total_outgoing_bytes", [this] { return _total_outgoing_bytes; },
+        sm::make_counter("total_outgoing_bytes", [this] { return _total_outgoing_bytes; },
                         sm::description("Total number of bytes sent on this shard.")),
+
+        sm::make_gauge("finished_percentage", [this] { return _finished_percentage[streaming::stream_reason::bootstrap]; },
+                sm::description("Finished percentage of node operation on this shard"), {ops_label_type("bootstrap"), basic_level}),
+
+        sm::make_gauge("finished_percentage", [this] { return _finished_percentage[streaming::stream_reason::decommission]; },
+                sm::description("Finished percentage of node operation on this shard"), {ops_label_type("decommission"), basic_level}),
+
+        sm::make_gauge("finished_percentage", [this] { return _finished_percentage[streaming::stream_reason::removenode]; },
+                sm::description("Finished percentage of node operation on this shard"), {ops_label_type("removenode"), basic_level}),
+
+        sm::make_gauge("finished_percentage", [this] { return _finished_percentage[streaming::stream_reason::rebuild]; },
+                sm::description("Finished percentage of node operation on this shard"), {ops_label_type("rebuild"), basic_level}),
+
+        sm::make_gauge("finished_percentage", [this] { return _finished_percentage[streaming::stream_reason::repair]; },
+                sm::description("Finished percentage of node operation on this shard"), {ops_label_type("repair"), basic_level}),
+
+        sm::make_gauge("finished_percentage", [this] { return _finished_percentage[streaming::stream_reason::replace]; },
+                sm::description("Finished percentage of node operation on this shard"), {ops_label_type("replace"), basic_level}),
     });
 }
 
-future<> stream_manager::start() {
+future<> stream_manager::start(abort_source& as) {
     _gossiper.register_(shared_from_this());
-    init_messaging_service_handler();
+    init_messaging_service_handler(as);
     return make_ready_future<>();
 }
 
@@ -86,7 +119,7 @@ void stream_manager::register_receiving(shared_ptr<stream_result_future> result)
     _receiving_streams[result->plan_id] = std::move(result);
 }
 
-shared_ptr<stream_result_future> stream_manager::get_sending_stream(UUID plan_id) const {
+shared_ptr<stream_result_future> stream_manager::get_sending_stream(streaming::plan_id plan_id) const {
     auto it = _initiated_streams.find(plan_id);
     if (it != _initiated_streams.end()) {
         return it->second;
@@ -94,7 +127,7 @@ shared_ptr<stream_result_future> stream_manager::get_sending_stream(UUID plan_id
     return {};
 }
 
-shared_ptr<stream_result_future> stream_manager::get_receiving_stream(UUID plan_id) const {
+shared_ptr<stream_result_future> stream_manager::get_receiving_stream(streaming::plan_id plan_id) const {
     auto it = _receiving_streams.find(plan_id);
     if (it != _receiving_streams.end()) {
         return it->second;
@@ -102,7 +135,7 @@ shared_ptr<stream_result_future> stream_manager::get_receiving_stream(UUID plan_
     return {};
 }
 
-void stream_manager::remove_stream(UUID plan_id) {
+void stream_manager::remove_stream(streaming::plan_id plan_id) {
     sslog.debug("stream_manager: removing plan_id={}", plan_id);
     _initiated_streams.erase(plan_id);
     _receiving_streams.erase(plan_id);
@@ -132,8 +165,8 @@ std::vector<shared_ptr<stream_result_future>> stream_manager::get_all_streams() 
     return result;
 }
 
-void stream_manager::update_progress(UUID cf_id, gms::inet_address peer, progress_info::direction dir, size_t fm_size) {
-    auto& sbytes = _stream_bytes[cf_id];
+void stream_manager::update_progress(streaming::plan_id plan_id, locator::host_id peer, progress_info::direction dir, size_t fm_size) {
+    auto& sbytes = _stream_bytes[plan_id];
     if (dir == progress_info::direction::OUT) {
         sbytes[peer].bytes_sent += fm_size;
         _total_outgoing_bytes += fm_size;
@@ -153,11 +186,11 @@ future<> stream_manager::update_all_progress_info() {
     });
 }
 
-void stream_manager::remove_progress(UUID plan_id) {
+void stream_manager::remove_progress(streaming::plan_id plan_id) {
     _stream_bytes.erase(plan_id);
 }
 
-stream_bytes stream_manager::get_progress(UUID plan_id, gms::inet_address peer) const {
+stream_bytes stream_manager::get_progress(streaming::plan_id plan_id, locator::host_id peer) const {
     auto it = _stream_bytes.find(plan_id);
     if (it == _stream_bytes.end()) {
         return stream_bytes();
@@ -170,7 +203,7 @@ stream_bytes stream_manager::get_progress(UUID plan_id, gms::inet_address peer) 
     return i->second;
 }
 
-stream_bytes stream_manager::get_progress(UUID plan_id) const {
+stream_bytes stream_manager::get_progress(streaming::plan_id plan_id) const {
     auto it = _stream_bytes.find(plan_id);
     if (it == _stream_bytes.end()) {
         return stream_bytes();
@@ -182,13 +215,13 @@ stream_bytes stream_manager::get_progress(UUID plan_id) const {
     return ret;
 }
 
-future<> stream_manager::remove_progress_on_all_shards(UUID plan_id) {
+future<> stream_manager::remove_progress_on_all_shards(streaming::plan_id plan_id) {
     return container().invoke_on_all([plan_id] (auto& sm) {
         sm.remove_progress(plan_id);
     });
 }
 
-future<stream_bytes> stream_manager::get_progress_on_all_shards(UUID plan_id, gms::inet_address peer) const {
+future<stream_bytes> stream_manager::get_progress_on_all_shards(streaming::plan_id plan_id, locator::host_id peer) const {
     return container().map_reduce0(
         [plan_id, peer] (auto& sm) {
             return sm.get_progress(plan_id, peer);
@@ -198,7 +231,7 @@ future<stream_bytes> stream_manager::get_progress_on_all_shards(UUID plan_id, gm
     );
 }
 
-future<stream_bytes> stream_manager::get_progress_on_all_shards(UUID plan_id) const {
+future<stream_bytes> stream_manager::get_progress_on_all_shards(streaming::plan_id plan_id) const {
     return container().map_reduce0(
         [plan_id] (auto& sm) {
             return sm.get_progress(plan_id);
@@ -208,7 +241,7 @@ future<stream_bytes> stream_manager::get_progress_on_all_shards(UUID plan_id) co
     );
 }
 
-future<stream_bytes> stream_manager::get_progress_on_all_shards(gms::inet_address peer) const {
+future<stream_bytes> stream_manager::get_progress_on_all_shards(locator::host_id peer) const {
     return container().map_reduce0(
         [peer] (auto& sm) {
             stream_bytes ret;
@@ -222,6 +255,10 @@ future<stream_bytes> stream_manager::get_progress_on_all_shards(gms::inet_addres
         stream_bytes(),
         std::plus<stream_bytes>()
     );
+}
+
+future<stream_bytes> stream_manager::get_progress_on_all_shards(gms::inet_address peer) const {
+    return get_progress_on_all_shards(_gossiper.get_host_id(peer));
 }
 
 future<stream_bytes> stream_manager::get_progress_on_all_shards() const {
@@ -250,10 +287,10 @@ stream_bytes stream_manager::get_progress_on_local_shard() const {
     return ret;
 }
 
-bool stream_manager::has_peer(inet_address endpoint) const {
+bool stream_manager::has_peer(locator::host_id id) const {
     for (auto sr : get_all_streams()) {
         for (auto session : sr->get_coordinator()->get_all_stream_sessions()) {
-            if (session->peer == endpoint) {
+            if (session->peer == id) {
                 return true;
             }
         }
@@ -261,10 +298,24 @@ bool stream_manager::has_peer(inet_address endpoint) const {
     return false;
 }
 
-void stream_manager::fail_sessions(inet_address endpoint) {
+future<> stream_manager::fail_stream_plan(streaming::plan_id plan_id) {
+    return container().invoke_on_all([plan_id] (auto& sm) -> future<> {
+        for (auto sr : sm.get_all_streams()) {
+            for (auto session : sr->get_coordinator()->get_all_stream_sessions()) {
+                co_await seastar::coroutine::maybe_yield();
+                if (session->plan_id() == plan_id) {
+                    sslog.info("stream_manager: Failed stream_session for stream_plan plan_id={}", plan_id);
+                    session->close_session(stream_session_state::FAILED);
+                }
+            }
+        }
+    });
+}
+
+void stream_manager::fail_sessions(locator::host_id id) {
     for (auto sr : get_all_streams()) {
         for (auto session : sr->get_coordinator()->get_all_stream_sessions()) {
-            if (session->peer == endpoint) {
+            if (session->peer == id) {
                 session->close_session(stream_session_state::FAILED);
             }
         }
@@ -279,46 +330,46 @@ void stream_manager::fail_all_sessions() {
     }
 }
 
-future<> stream_manager::on_remove(inet_address endpoint) {
-    if (has_peer(endpoint)) {
-        sslog.info("stream_manager: Close all stream_session with peer = {} in on_remove", endpoint);
+future<> stream_manager::on_remove(inet_address endpoint, locator::host_id id, gms::permit_id) {
+    if (has_peer(id)) {
+        sslog.info("stream_manager: Close all stream_session with peer = {}/{} in on_remove", endpoint, id);
         //FIXME: discarded future.
-        (void)container().invoke_on_all([endpoint] (auto& sm) {
-            sm.fail_sessions(endpoint);
-        }).handle_exception([endpoint] (auto ep) {
-            sslog.warn("stream_manager: Fail to close sessions peer = {} in on_remove", endpoint);
+        (void)container().invoke_on_all([id] (auto& sm) {
+            sm.fail_sessions(id);
+        }).handle_exception([endpoint, id] (auto ep) {
+            sslog.warn("stream_manager: Fail to close sessions peer = {}/{} in on_remove", endpoint, id);
         });
     }
     return make_ready_future();
 }
 
-future<> stream_manager::on_restart(inet_address endpoint, endpoint_state ep_state) {
-    if (has_peer(endpoint)) {
-        sslog.info("stream_manager: Close all stream_session with peer = {} in on_restart", endpoint);
+future<> stream_manager::on_restart(inet_address endpoint, locator::host_id id, endpoint_state_ptr ep_state, gms::permit_id) {
+    if (has_peer(id)) {
+        sslog.info("stream_manager: Close all stream_session with peer = {}/{} in on_restart", endpoint, id);
         //FIXME: discarded future.
-        (void)container().invoke_on_all([endpoint] (auto& sm) {
-            sm.fail_sessions(endpoint);
-        }).handle_exception([endpoint] (auto ep) {
-            sslog.warn("stream_manager: Fail to close sessions peer = {} in on_restart", endpoint);
+        (void)container().invoke_on_all([id] (auto& sm) {
+            sm.fail_sessions(id);
+        }).handle_exception([endpoint, id] (auto ep) {
+            sslog.warn("stream_manager: Fail to close sessions peer = {}/{} in on_restart", endpoint, id);
         });
     }
     return make_ready_future();
 }
 
-future<> stream_manager::on_dead(inet_address endpoint, endpoint_state ep_state) {
-    if (has_peer(endpoint)) {
-        sslog.info("stream_manager: Close all stream_session with peer = {} in on_dead", endpoint);
+future<> stream_manager::on_dead(inet_address endpoint, locator::host_id id, endpoint_state_ptr ep_state, gms::permit_id) {
+    if (has_peer(id)) {
+        sslog.info("stream_manager: Close all stream_session with peer = {}/{} in on_dead", endpoint, id);
         //FIXME: discarded future.
-        (void)container().invoke_on_all([endpoint] (auto& sm) {
-            sm.fail_sessions(endpoint);
-        }).handle_exception([endpoint] (auto ep) {
-            sslog.warn("stream_manager: Fail to close sessions peer = {} in on_dead", endpoint);
+        (void)container().invoke_on_all([id] (auto& sm) {
+            sm.fail_sessions(id);
+        }).handle_exception([endpoint, id] (auto ep) {
+            sslog.warn("stream_manager: Fail to close sessions peer = {}/{} in on_dead", endpoint, id);
         });
     }
     return make_ready_future();
 }
 
-shared_ptr<stream_session> stream_manager::get_session(utils::UUID plan_id, gms::inet_address from, const char* verb, std::optional<utils::UUID> cf_id) {
+shared_ptr<stream_session> stream_manager::get_session(streaming::plan_id plan_id, locator::host_id from, const char* verb, std::optional<table_id> cf_id) {
     if (cf_id) {
         sslog.debug("[Stream #{}] GOT {} from {}: cf_id={}", plan_id, verb, from, *cf_id);
     } else {
@@ -340,6 +391,10 @@ shared_ptr<stream_session> stream_manager::get_session(utils::UUID plan_id, gms:
         throw std::runtime_error(err);
     }
     return coordinator->get_or_create_session(*this, from);
+}
+
+void stream_manager::update_finished_percentage(streaming::stream_reason reason, float percentage) {
+    _finished_percentage[reason] = percentage;
 }
 
 } // namespace streaming

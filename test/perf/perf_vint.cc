@@ -3,12 +3,11 @@
  */
 
 /*
- * This file is part of Scylla.
- *
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include "seastar/include/seastar/testing/perf_tests.hh"
+#include <seastar/testing/perf_tests.hh>
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_runner.hh>
 
 #include <random>
@@ -17,7 +16,7 @@
 
 class vint {
 public:
-    static constexpr size_t count = 1000;
+    static constexpr size_t count = 100000;
 private:
     std::vector<uint64_t> _integers;
     bytes _serialized;
@@ -27,8 +26,8 @@ public:
         , _serialized(bytes::initialized_later{}, count * max_vint_length)
     {
         auto eng = seastar::testing::local_random_engine;
-        auto dist = std::uniform_int_distribution<uint64_t>{};
-        std::generate_n(_integers.begin(), count, [&] { return dist(eng); });
+        auto dist = std::uniform_real_distribution<long double>{0, 64};
+        std::generate_n(_integers.begin(), count, [&] { return std::exp2(dist(eng)); });
 
         auto dst = _serialized.data();
         for (auto v : _integers) {

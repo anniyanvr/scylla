@@ -5,16 +5,85 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  *
  * Copyright (C) 2020-present ScyllaDB
  */
 
-#include <boost/range/adaptors.hpp>
+#include <algorithm>
+#include <stdexcept>
+#include <unordered_set>
+
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/on_internal_error.hh>
+#include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/coroutine/switch_to.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
 #include "db/snapshot-ctl.hh"
+#include "db/snapshot/backup_task.hh"
+#include "db/snapshot/cluster_backup.hh"
+#include "db/schema_tables.hh"
+#include "db/system_distributed_keyspace.hh"
+#include "index/secondary_index_manager.hh"
 #include "replica/database.hh"
+#include "replica/schema_describe_helper.hh"
+#include "sstables/sstables_manager.hh"
+#include "sstables/object_storage_client.hh"
+#include "service/storage_proxy.hh"
+#include "idl/snapshot_backup.dist.hh"
+
+using namespace std::chrono_literals;
+
+logging::logger snap_log("snapshots");
+
+template <>
+struct fmt::formatter<db::snapshot_dc_location> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const db::snapshot_dc_location& e, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), 
+            "{{ {}, {}, {} }}",
+            e.endpoint, e.bucket, e.prefix
+        );
+    }
+};
 
 namespace db {
+
+snapshot_ctl::snapshot_ctl(sharded<replica::database>& db, sharded<service::storage_proxy>& sp, sharded<cql3::query_processor>& qp, netw::messaging_service& ms, tasks::task_manager& tm, sstables::storage_manager& sstm, config cfg)
+    : _config(std::move(cfg))
+    , _db(db)
+    , _sp(sp)
+    , _qp(qp)
+    , _ms(ms)
+    , _ops("snapshot_ctl")
+    , _task_manager_module(make_shared<snapshot::task_manager_module>(tm))
+    , _storage_manager(sstm)
+{
+    tm.register_module("snapshot", _task_manager_module);
+    // FIXME: scan existing snapshots on disk and schedule expiration for those with ttl.
+    if (this_shard_id() == 0) {
+        _delete_expired_snapshots = delete_expired_snapshots();
+    }
+    ser::snapshot_backup_rpc_verbs::register_backup_snapshot_sstables(&_ms, std::bind_front(&snapshot_ctl::backup_sstables, this));
+}
+
+future<> snapshot_ctl::stop() {
+    co_await ser::snapshot_backup_rpc_verbs::unregister_backup_snapshot_sstables(&_ms);
+    co_await disable_all_operations();
+    co_await _task_manager_module->stop();
+}
+
+future<> snapshot_ctl::disable_all_operations() {
+    if (!_ops.is_closed()) {
+        if (_ops.get_count()) {
+            snap_log.info("Waiting for snapshot/backup tasks to finish");
+        }
+        co_await _ops.close();
+    }
+    // Wake up the expiration task and await for it to finish.
+    _expiration_cond.signal();
+    co_await std::exchange(_delete_expired_snapshots, make_ready_future<>());
+}
 
 future<> snapshot_ctl::check_snapshot_not_exist(sstring ks_name, sstring name, std::optional<std::vector<sstring>> filter) {
     auto& ks = _db.local().find_keyspace(ks_name);
@@ -32,51 +101,49 @@ future<> snapshot_ctl::check_snapshot_not_exist(sstring ks_name, sstring name, s
     });
 }
 
-template <typename Func>
-std::result_of_t<Func()> snapshot_ctl::run_snapshot_modify_operation(Func&& f) {
-    return with_gate(_ops, [f = std::move(f), this] () {
+future<> snapshot_ctl::run_snapshot_modify_operation(noncopyable_function<future<>()>&& f, seastar::abort_source* as) {
+    if (as && this_shard_id() != 0) {
+        on_internal_error(snap_log, "run_snapshot_modify_operation() can only be aborted from shard 0");
+    }
+    auto gh = _ops.hold();
+    co_await container().invoke_on(0, [f = std::move(f), as] (snapshot_ctl& snap) mutable -> future<> {
+        auto holder = co_await (as ? snap._lock.hold_write_lock(*as) : snap._lock.hold_write_lock());
+        co_await f();
+    });
+}
+
+future<> snapshot_ctl::run_snapshot_gate_operation(noncopyable_function<future<>()>&& f) {
+    return with_gate(_ops, [f = std::move(f), this] () mutable {
         return container().invoke_on(0, [f = std::move(f)] (snapshot_ctl& snap) mutable {
-            return with_lock(snap._lock.for_write(), std::move(f));
+            return f();
         });
     });
 }
 
-template <typename Func>
-std::result_of_t<Func()> snapshot_ctl::run_snapshot_list_operation(Func&& f) {
-    return with_gate(_ops, [f = std::move(f), this] () {
-        return container().invoke_on(0, [f = std::move(f)] (snapshot_ctl& snap) mutable {
-            return with_lock(snap._lock.for_read(), std::move(f));
-        });
-    });
-}
-
-future<> snapshot_ctl::take_snapshot(sstring tag, std::vector<sstring> keyspace_names, skip_flush sf) {
+future<> snapshot_ctl::take_snapshot(sstring tag, std::vector<sstring> keyspace_names, snapshot_options opts) {
     if (tag.empty()) {
         throw std::runtime_error("You must supply a snapshot name.");
     }
 
     if (keyspace_names.size() == 0) {
-        boost::copy(_db.local().get_keyspaces() | boost::adaptors::map_keys, std::back_inserter(keyspace_names));
+        std::ranges::copy(_db.local().get_keyspaces() | std::views::keys, std::back_inserter(keyspace_names));
     };
 
-    return run_snapshot_modify_operation([tag = std::move(tag), keyspace_names = std::move(keyspace_names), sf, this] {
-        return parallel_for_each(keyspace_names, [tag, this] (auto& ks_name) {
-            return check_snapshot_not_exist(ks_name, tag);
-        }).then([this, tag, keyspace_names, sf] {
-            return _db.invoke_on_all([tag = std::move(tag), keyspace_names, sf] (replica::database& db) {
-                return parallel_for_each(keyspace_names, [&db, tag = std::move(tag), sf] (auto& ks_name) {
-                    auto& ks = db.find_keyspace(ks_name);
-                    return parallel_for_each(ks.metadata()->cf_meta_data(), [&db, tag = std::move(tag), sf] (auto& pair) {
-                        auto& cf = db.find_column_family(pair.second);
-                        return cf.snapshot(db, tag, bool(sf));
-                    });
-                });
-            });
-        });
+    return run_snapshot_modify_operation([tag = std::move(tag), keyspace_names = std::move(keyspace_names), opts, this] () mutable {
+        return do_take_snapshot(std::move(tag), std::move(keyspace_names), opts);
     });
 }
 
-future<> snapshot_ctl::take_column_family_snapshot(sstring ks_name, std::vector<sstring> tables, sstring tag, skip_flush sf) {
+future<> snapshot_ctl::do_take_snapshot(sstring tag, std::vector<sstring> keyspace_names, snapshot_options opts) {
+    co_await coroutine::parallel_for_each(keyspace_names, [tag, this] (const auto& ks_name) {
+        return check_snapshot_not_exist(ks_name, tag);
+    });
+    co_await coroutine::parallel_for_each(keyspace_names, [this, tag = std::move(tag), opts] (const auto& ks_name) {
+        return replica::database::snapshot_keyspace_on_all_shards(_db, ks_name, tag, opts);
+    });
+}
+
+future<> snapshot_ctl::take_column_family_snapshot(sstring ks_name, std::vector<sstring> tables, sstring tag, snapshot_options opts) {
     if (ks_name.empty()) {
         throw std::runtime_error("You must supply a keyspace name");
     }
@@ -87,110 +154,339 @@ future<> snapshot_ctl::take_column_family_snapshot(sstring ks_name, std::vector<
         throw std::runtime_error("You must supply a snapshot name.");
     }
 
-    return run_snapshot_modify_operation([this, ks_name = std::move(ks_name), tables = std::move(tables), tag = std::move(tag), sf] {
-        return check_snapshot_not_exist(ks_name, tag, tables).then([this, ks_name, tables, tag, sf] {
-            return do_with(std::vector<sstring>(std::move(tables)),[this, ks_name, tag, sf](const std::vector<sstring>& tables) {
-                return do_for_each(tables, [ks_name, tag, sf, this] (const sstring& table_name) {
-                    if (table_name.find(".") != sstring::npos) {
-                        throw std::invalid_argument("Cannot take a snapshot of a secondary index by itself. Run snapshot on the table that owns the index.");
-                    }
-                    return _db.invoke_on_all([ks_name, table_name, tag, sf] (replica::database &db) {
-                        auto& cf = db.find_column_family(ks_name, table_name);
-                        return cf.snapshot(db, tag, bool(sf));
-                    });
-                });
-            });
-        });
+    return run_snapshot_modify_operation([this, ks_name = std::move(ks_name), tables = std::move(tables), tag = std::move(tag), opts] () mutable {
+        return do_take_column_family_snapshot(std::move(ks_name), std::move(tables), std::move(tag), opts);
     });
 }
 
-future<> snapshot_ctl::take_column_family_snapshot(sstring ks_name, sstring cf_name, sstring tag, skip_flush sf) {
-    return take_column_family_snapshot(ks_name, std::vector<sstring>{cf_name}, tag, sf);
+future<> snapshot_ctl::take_cluster_column_family_snapshot(std::vector<sstring> ks_names, std::vector<sstring> tables, sstring tag, snapshot_options opts) {
+    if (tag.empty()) {
+        throw std::invalid_argument("You must supply a snapshot name.");
+    }
+    if (ks_names.size() != 1 && !tables.empty()) {
+        throw std::invalid_argument("Cannot name tables when doing multiple keyspaces snapshot");
+    }
+    if (ks_names.empty()) {
+        std::ranges::copy(_db.local().get_keyspaces() | std::views::keys, std::back_inserter(ks_names));
+    }
+
+    return run_snapshot_modify_operation([this, ks_names = std::move(ks_names), tables = std::move(tables), tag = std::move(tag), opts] () mutable {
+        return do_take_cluster_column_family_snapshot(std::move(ks_names), std::move(tables), std::move(tag), opts);
+    });
+}
+
+future<> snapshot_ctl::do_take_cluster_column_family_snapshot(std::vector<sstring> ks_names, std::vector<sstring> tables, sstring tag, snapshot_options opts) {
+    if (tables.empty()) {
+        co_await coroutine::parallel_for_each(ks_names, [tag, this] (const auto& ks_name) {
+            return check_snapshot_not_exist(ks_name, tag);
+        });
+        co_await _sp.local().snapshot_keyspace(
+            ks_names | std::views::transform([&](auto& ks) { return std::make_pair(ks, sstring{}); }) 
+                | std::ranges::to<std::unordered_multimap>(),
+                tag, opts
+        );
+        co_return;
+    };
+
+    auto ks = ks_names[0];
+    co_await check_snapshot_not_exist(ks, tag, tables);
+
+    co_await _sp.local().snapshot_keyspace(
+        tables | std::views::transform([&](auto& cf) { return std::make_pair(ks, cf); }) 
+            | std::ranges::to<std::unordered_multimap>(),
+            tag, opts
+    );
+}
+
+sstring snapshot_ctl::resolve_table_name(const sstring& ks_name, const sstring& name) const {
+    try {
+        _db.local().find_uuid(ks_name, name);
+        return name;
+    } catch (const data_dictionary::no_such_column_family&) {
+        // The name may be a logical index name (e.g. "myindex").
+        // Only indexes with a backing view have a separate backing table
+        // that can be snapshotted. Custom indexes such as vector indexes
+        // do not, so keep rejecting them here rather than mapping them to
+        // a synthetic name.
+        auto schema = _db.local().find_indexed_table(ks_name, name);
+        if (schema) {
+            const auto& im = schema->all_indices().at(name);
+            if (db::schema_tables::view_should_exist(im)) {
+                return secondary_index::index_table_name(name);
+            }
+        }
+        throw;
+    }
+}
+
+future<> snapshot_ctl::do_take_column_family_snapshot(sstring ks_name, std::vector<sstring> tables, sstring tag, snapshot_options opts) {
+    for (auto& t : tables) {
+        t = resolve_table_name(ks_name, t);
+    }
+    co_await check_snapshot_not_exist(ks_name, tag, tables);
+    snap_log.debug("take_snapshot: tag={} keyspace={} tables={}: skip_flush={} created_at={} expires_at={}",
+            tag, ks_name, fmt::join(tables, ","),
+            opts.skip_flush, opts.created_at, opts.expires_at.value_or(gc_clock::time_point::min()));
+    co_await replica::database::snapshot_tables_on_all_shards(_db, ks_name, std::move(tables), std::move(tag), opts);
 }
 
 future<> snapshot_ctl::clear_snapshot(sstring tag, std::vector<sstring> keyspace_names, sstring cf_name) {
-    return run_snapshot_modify_operation([this, tag = std::move(tag), keyspace_names = std::move(keyspace_names), cf_name = std::move(cf_name)] {
-        return _db.local().clear_snapshot(tag, keyspace_names, cf_name);
+    snap_log.debug("clear_snapshot: tag={} keyspaces={} table={}", tag, fmt::join(keyspace_names, ","), cf_name);
+    co_await container().invoke_on(0, [&] (auto& sc) {
+        return sc.cancel_expiration(tag, keyspace_names, cf_name);
+    });
+    co_return co_await run_snapshot_modify_operation([this, tag = std::move(tag), keyspace_names = std::move(keyspace_names), cf_name = std::move(cf_name)] (this auto) -> future<> {
+        // clear_snapshot enumerates keyspace_names and uses cf_name as a
+        // filter in each. When cf_name needs resolution (e.g. logical index
+        // name -> backing table name), the result may differ per keyspace,
+        // so resolve and clear individually.
+        if (!cf_name.empty() && !keyspace_names.empty()) {
+            std::vector<std::pair<sstring, sstring>> resolved_targets;
+            resolved_targets.reserve(keyspace_names.size());
+
+            // Resolve every keyspace first so a later failure doesn't delete
+            // snapshots that were already matched in earlier keyspaces.
+            for (const auto& ks_name : keyspace_names) {
+                resolved_targets.emplace_back(ks_name, resolve_table_name(ks_name, cf_name));
+            }
+            for (auto& [ks_name, resolved_cf_name] : resolved_targets) {
+                co_await _db.local().clear_snapshot(tag, {ks_name}, std::move(resolved_cf_name));
+            }
+            co_return;
+        }
+        co_await _db.local().clear_snapshot(std::move(tag), std::move(keyspace_names), cf_name);
     });
 }
 
-future<std::unordered_map<sstring, std::vector<snapshot_ctl::snapshot_details>>>
+future<std::unordered_map<sstring, snapshot_ctl::db_snapshot_details>>
 snapshot_ctl::get_snapshot_details() {
-    using cf_snapshot_map = std::unordered_map<utils::UUID, replica::column_family::snapshot_details>;
-    using snapshot_map = std::unordered_map<sstring, cf_snapshot_map>;
+    using snapshot_map = std::unordered_map<sstring, db_snapshot_details>;
 
-    class snapshot_reducer {
-    private:
-        snapshot_map _result;
-    public:
-        future<> operator()(const snapshot_map& value) {
-            for (auto&& vp: value) {
-                if (auto [ignored, added] = _result.try_emplace(vp.first, std::move(vp.second)); added) {
+    co_return co_await run_snapshot_list_operation(coroutine::lambda([this] () -> future<snapshot_map> {
+        auto details = co_await _db.local().get_snapshot_details();
+
+        for (auto& [snapshot_name, snapshot_details] : details) {
+            for (auto& table : snapshot_details) {
+                auto schema = _db.local().as_data_dictionary().try_find_table(
+                        table.ks, table.cf);
+                if (!schema || !schema->schema()->is_view()) {
                     continue;
                 }
 
-                auto& rp = _result.at(vp.first);
-                for (auto&& cf: vp.second) {
-                    if (auto [ignored, added] = rp.try_emplace(cf.first, std::move(cf.second)); added) {
-                        continue;
-                    }
-                    auto& rcf = rp.at(cf.first);
-                    rcf.live = cf.second.live;
-                    rcf.total = cf.second.total;
+                auto helper = replica::make_schema_describe_helper(
+                        schema->schema(), _db.local().as_data_dictionary());
+                if (helper.type == schema_describe_helper::type::index) {
+                    table.cf = secondary_index::index_name_from_table_name(
+                            table.cf);
                 }
             }
-            return make_ready_future<>();
         }
-        snapshot_map get() && {
-            return std::move(_result);
-        }
-    };
 
-    return run_snapshot_list_operation([this] {
-        return _db.map_reduce(snapshot_reducer(), [] (replica::database& db) {
-            auto local_snapshots = make_lw_shared<snapshot_map>();
-            return parallel_for_each(db.get_column_families(), [local_snapshots] (auto& cf_pair) {
-                return cf_pair.second->get_snapshot_details().then([uuid = cf_pair.first, local_snapshots] (auto map) {
-                    for (auto&& snap_map: map) {
-                        auto [it, ignored] = local_snapshots->try_emplace(snap_map.first);
-                        it->second.emplace(uuid, snap_map.second);
-                    }
-                    return make_ready_future<>();
-                });
-            }).then([local_snapshots] {
-                return make_ready_future<snapshot_map>(std::move(*local_snapshots));
-            });
-        }).then([this] (snapshot_map&& map) {
-            std::unordered_map<sstring, std::vector<snapshot_ctl::snapshot_details>> result;
-            for (auto&& pair: map) {
-                std::vector<snapshot_ctl::snapshot_details> details;
-
-                for (auto&& snap_map: pair.second) {
-                    auto& cf = _db.local().find_column_family(snap_map.first);
-                    details.push_back({ snap_map.second.live, snap_map.second.total, cf.schema()->cf_name(), cf.schema()->ks_name() });
-                }
-                result.emplace(pair.first, std::move(details));
-            }
-
-            return make_ready_future<std::unordered_map<sstring, std::vector<snapshot_ctl::snapshot_details>>>(std::move(result));
-        });
-    });
+        co_return details;
+    }));
 }
 
 future<int64_t> snapshot_ctl::true_snapshots_size() {
-    return run_snapshot_list_operation([this] () mutable {
-        return do_with(int64_t(0), [this] (auto& total) {
-            return parallel_for_each(_db.local().get_column_families(), [&total] (auto& cf_pair) {
-                return cf_pair.second->get_snapshot_details().then([&total] (auto map) {
-                    for (auto&& snap_map: map) {
-                        total += snap_map.second.live;
-                    }
-                });
-            }).then([&total] {
-                return total;
-            });
-        });
-    });
+    co_return co_await run_snapshot_list_operation(coroutine::lambda([this] () -> future<int64_t> {
+        int64_t total = 0;
+        for (auto& [name, details] : co_await _db.local().get_snapshot_details()) {
+            total += std::accumulate(details.begin(), details.end(), int64_t(0), [] (int64_t sum, const auto& d) { return sum + d.details.live; });
+        }
+        co_return total;
+    }));
 }
 
+future<tasks::task_id> snapshot_ctl::start_backup(sstring endpoint, sstring bucket, sstring prefix, sstring keyspace, sstring table, sstring snapshot_name, bool move_files) {
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [&](auto& local) {
+            return local.start_backup(endpoint, bucket, prefix, keyspace, table, snapshot_name, move_files);
+        });
+    }
+
+    co_await coroutine::switch_to(_config.backup_sched_group);
+    snap_log.info("Backup sstables from {}({}) to {}", keyspace, snapshot_name, endpoint);
+    //
+    // The keyspace data directories and their snapshots are arranged as follows:
+    //
+    //  <data dir>
+    //  |- <keyspace name1>
+    //  |  |- <column family name1>
+    //  |     |- snapshots
+    //  |        |- <snapshot name1>
+    //  |          |- <snapshot file1>
+    //  |          |- <snapshot file2>
+    //  |          |- ...
+    //  |        |- <snapshot name2>
+    //  |        |- ...
+    //  |  |- <column family name2>
+    //  |  |- ...
+    //  |- <keyspace name2>
+    //  |- ...
+    //
+    // The backup only reads the on-disk snapshot files, so it must succeed even
+    // if the table or keyspace was dropped after the snapshot was created, or
+    // dropped and recreated under the same name, snapshots survive DROP.
+    // Locate the snapshot on disk instead of resolving it through the live
+    // table.
+    auto dir = co_await _db.local().find_snapshot_dir(keyspace, table, snapshot_name);
+    if (!dir) {
+        throw std::invalid_argument(format("snapshot {} not found for table {}.{}", snapshot_name, keyspace, table));
+    }
+
+    cancel_expiration(snapshot_name, {keyspace}, table);
+
+    auto state = make_lw_shared<snapshot::backup_state>(*this, _storage_manager.container(), std::move(endpoint), std::move(bucket), std::move(prefix), keyspace, std::move(*dir), move_files);
+    tasks::task_manager::task_builder task_builder{_task_manager_module, snapshot::backup_task_type};
+    task_builder.set_scope("node")
+                .set_keyspace(std::move(keyspace))
+                .set_progress_units("bytes")
+                .set_is_abortable(tasks::is_abortable::yes)
+                .set_is_internal(tasks::is_internal::no)
+                .set_is_user_task(tasks::is_user_task::yes)
+                .set_progress_fn([state] (const tasks::task_manager::task::impl&) {
+                    return state->get_progress().finally([state] {});
+                });
+    auto task = co_await std::move(task_builder).build([state] (tasks::task_manager::task::impl& self) {
+        return state->run(self.get_abort_source());
+    });
+    co_return task->id();
 }
+
+future<tasks::task_id> snapshot_ctl::start_global_backup(std::unordered_map<sstring, snapshot_dc_location> locations, std::vector<sstring> ks_names, std::vector<sstring> tables, sstring tag, bool move_files) {
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [&](auto& local) {
+            return local.start_global_backup(locations, ks_names, tables, tag, move_files);
+        });
+    }
+
+    if (tag.empty()) {
+        throw std::invalid_argument("You must supply a snapshot name.");
+    }
+    if (ks_names.size() != 1 && !tables.empty()) {
+        throw std::invalid_argument("Cannot name tables when doing multiple keyspaces snapshot backup");
+    }
+    if (ks_names.empty()) {
+        std::ranges::copy(_db.local().get_keyspaces() | std::views::keys, std::back_inserter(ks_names));
+    }
+
+    std::unordered_multimap<sstring, sstring> ks_tables;
+
+    if (tables.empty()) {
+        for (auto& ks_name : ks_names) {
+            auto& ks = _db.local().find_keyspace(ks_name);
+            for (auto& cf_name : ks.metadata()->cf_meta_data() | std::views::keys) {
+                ks_tables.emplace(ks_name, cf_name);
+            }
+        }
+    } else {
+        auto ks_name = ks_names[0];
+        for (auto& cf_name : tables) {
+            ks_tables.emplace(ks_name, cf_name);
+        }
+    }
+
+    co_await coroutine::switch_to(_config.backup_sched_group);
+    snap_log.info("Backup sstables from {}(cluster snapshot {}) to {}", ks_tables, tag, locations);
+
+    co_return co_await snapshot::start_global_backup(*this, static_pointer_cast<tasks::task_manager::module>(_task_manager_module), tag, std::move(ks_tables), std::move(locations), move_files);
+}
+
+future<>
+snapshot_ctl::backup_sstables(table_id table_id, std::string tag, std::string endpoint, std::string bucket, std::string prefix, dht::token first_token, dht::token last_token, utils::chunked_vector<sstables::sstable_id> sstable_ids, bool use_move) {
+    // Backups are created and run on shard 0
+    if (this_shard_id() != 0) {
+        co_return co_await container().invoke_on(0, [&](auto& local) {
+            return local.backup_sstables(table_id, tag, endpoint, bucket, prefix, first_token, last_token, sstable_ids, use_move);
+        });
+    }
+
+    co_await coroutine::switch_to(_config.backup_sched_group);
+    co_await snapshot::backup_sstables(*this, table_id, std::move(tag), std::move(endpoint), std::move(bucket), std::move(prefix), first_token, last_token, std::move(sstable_ids), use_move);
+}
+
+future<int64_t> snapshot_ctl::true_snapshots_size(sstring ks, sstring cf) {
+    co_return co_await run_snapshot_list_operation(coroutine::lambda([this, ks = std::move(ks), cf = std::move(cf)] () -> future<int64_t> {
+        int64_t total = 0;
+        for (auto& [name, details] : co_await _db.local().find_column_family(ks, cf).get_snapshot_details()) {
+            total += details.total;
+        }
+        co_return total;
+    }));
+}
+
+future<> snapshot_ctl::delete_expired_snapshots() {
+    auto delete_expired_snapshot = [this](expiration_info info) {
+        snap_log.info("Deleting expired snapshot {} of table {}.{}", info.tag, info.ks_name, info.table_name);
+        // Awaited indirectly using the `_ops` gate
+        (void)run_snapshot_modify_operation([this, info = std::move(info)]() mutable {
+            return _db.local().clear_snapshot(info.tag, {info.ks_name}, info.table_name).handle_exception([info = std::move(info)](std::exception_ptr ep) {
+                snap_log.warn("Failed to delete expired snapshot {} of table {}.{}: {}: Ignored", info.tag, info.ks_name, info.table_name, ep);
+            });
+        });
+    };
+    auto expiration_timer = timer([this] {
+        snap_log.debug("Expiration timer fired: queued={}", _expiration_queue.size());
+        _expiration_cond.signal();
+    });
+    while (!_ops.is_closed()) {
+        if (!_expiration_queue.empty()) {
+            auto now = gc_clock::now();
+            if (_expiration_queue.front().expires_at <= now) {
+                // FIXME: do not delete expired snapshots during backup
+                auto info = _expiration_queue.front();
+                std::ranges::pop_heap(_expiration_queue, std::greater{}, &expiration_info::expires_at);
+                _expiration_queue.resize(_expiration_queue.size() - 1);
+                delete_expired_snapshot(std::move(info));
+                continue;
+            } else {
+                auto wait_duration = _expiration_queue.front().expires_at - now;
+                snap_log.debug("Expiration waiting for {}: queued={}", wait_duration, _expiration_queue.size());
+                expiration_timer.rearm(timer<>::clock::now() + wait_duration);
+            }
+        } else {
+            snap_log.debug("Expiration waiting indefinitely: queue is empty");
+        }
+        co_await _expiration_cond.wait();
+    }
+}
+
+void snapshot_ctl::schedule_expiration(gc_clock::time_point when, sstring ks_name, sstring table_name, sstring tag) {
+    if (this_shard_id() != 0) {
+        on_internal_error(snap_log, "schedule_expiration must be called on shard 0");
+    }
+    if (!_ops.is_closed()) {
+        snap_log.info("Scheduling expiration of snapshot {} of table {}.{} at {}", tag, ks_name, table_name, when);
+        _expiration_queue.emplace_back(expiration_info{
+            .expires_at = when,
+            .ks_name = std::move(ks_name),
+            .table_name = std::move(table_name),
+            .tag = std::move(tag)
+        });
+        std::ranges::push_heap(_expiration_queue, std::greater{}, &expiration_info::expires_at);
+        _expiration_cond.signal();
+    }
+}
+
+void snapshot_ctl::cancel_expiration(sstring tag, std::vector<sstring> ks_names, sstring table_name) {
+    if (this_shard_id() != 0) {
+        on_internal_error(snap_log, "cancel_expiration must be called on shard 0");
+    }
+    snap_log.debug("Cancel expiration of snapshots with tag='{}' in keyspaces={} table={}", tag, fmt::join(ks_names, ","), table_name);
+    std::unordered_set<sstring> keyspaces;
+    std::ranges::move(ks_names, std::inserter(keyspaces, keyspaces.end()));
+    _expiration_queue.erase(std::remove_if(_expiration_queue.begin(), _expiration_queue.end(), [&] (const expiration_info& info) {
+        if (!tag.empty() && info.tag != tag) {
+            return false;
+        }
+        if (!keyspaces.empty() && !keyspaces.contains(info.ks_name)) {
+            return false;
+        }
+        if (!table_name.empty() && info.table_name != table_name) {
+            return false;
+        }
+        return true;
+    }), _expiration_queue.end());
+    std::ranges::make_heap(_expiration_queue, std::greater{}, &expiration_info::expires_at);
+}
+
+} // namespace db

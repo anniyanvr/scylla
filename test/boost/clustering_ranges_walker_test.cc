@@ -3,15 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
 #include <boost/test/unit_test.hpp>
-#include <seastar/testing/test_case.hh>
+#include "test/lib/scylla_test_case.hh"
 
 #include "test/lib/simple_schema.hh"
-#include "clustering_ranges_walker.hh"
+#include "keys/clustering_ranges_walker.hh"
 
 using namespace std::chrono_literals;
 
@@ -102,7 +102,7 @@ SEASTAR_TEST_CASE(test_basic_operation_on_various_data_sets) {
             query::clustering_range::make({keys[6], true}, {keys[6], true}),
         });
 
-        auto end_pos = position_in_partition::after_key(keys[6]);
+        auto end_pos = position_in_partition::after_key(*s.schema(), keys[6]);
 
         auto steps = std::vector<step>({
             {position_in_partition_view::for_static_row(),            true},
@@ -125,7 +125,7 @@ SEASTAR_TEST_CASE(test_basic_operation_on_various_data_sets) {
             query::clustering_range::make({keys[1], false}, {keys[2], true}),
         });
 
-        auto end_pos = position_in_partition::after_key(keys[2]);
+        auto end_pos = position_in_partition::after_key(*s.schema(), keys[2]);
 
         auto steps = std::vector<step>({
             {position_in_partition_view::for_static_row(),            true},
@@ -143,7 +143,7 @@ SEASTAR_TEST_CASE(test_basic_operation_on_various_data_sets) {
             query::clustering_range::make({keys[1], false}, {keys[2], true}),
         });
 
-        auto end_pos = position_in_partition::after_key(keys[2]);
+        auto end_pos = position_in_partition::after_key(*s.schema(), keys[2]);
 
         auto steps = std::vector<step>({
             {position_in_partition_view::for_static_row(),            false},
@@ -214,14 +214,14 @@ SEASTAR_TEST_CASE(test_range_overlap) {
 
     BOOST_REQUIRE(!walker.advance_to(
         position_in_partition::for_key(keys[0]),
-        position_in_partition::after_key(keys[0])));
+        position_in_partition::after_key(*s.schema(), keys[0])));
 
     ++lbcc;
     BOOST_REQUIRE(walker.lower_bound_change_counter() == lbcc);
     BOOST_REQUIRE(eq(walker.lower_bound(), position_in_partition::for_range_start(range1)));
 
     BOOST_REQUIRE(walker.advance_to(
-        position_in_partition::after_key(keys[0]),
+        position_in_partition::after_key(*s.schema(), keys[0]),
         position_in_partition::for_key(keys[1])));
 
     BOOST_REQUIRE(walker.lower_bound_change_counter() == lbcc);
@@ -240,7 +240,7 @@ SEASTAR_TEST_CASE(test_range_overlap) {
     BOOST_REQUIRE(eq(walker.lower_bound(), position_in_partition::for_range_start(range2)));
 
     BOOST_REQUIRE(walker.advance_to(
-        position_in_partition::after_key(keys[2]),
+        position_in_partition::after_key(*s.schema(), keys[2]),
         position_in_partition::for_key(keys[4])));
 
     BOOST_REQUIRE(walker.advance_to(

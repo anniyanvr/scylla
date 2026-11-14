@@ -3,47 +3,57 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <optional>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/coroutine/maybe_yield.hh>
-#include <boost/multiprecision/cpp_int.hpp>
 
+#include "cdc/log.hh"
+#include "exceptions/exceptions.hh"
 #include "gms/gossiper.hh"
 #include "gms/inet_address.hh"
 #include "inet_address_vectors.hh"
 #include "locator/abstract_replication_strategy.hh"
-#include "log.hh"
+#include "locator/tablet_metadata_guard.hh"
+#include "utils/log.hh"
 #include "gc_clock.hh"
 #include "replica/database.hh"
+#include "service/client_state.hh"
 #include "service_permit.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
 #include "service/storage_proxy.hh"
 #include "service/pager/paging_state.hh"
 #include "service/pager/query_pagers.hh"
 #include "gms/feature_service.hh"
-#include "sstables/types.hh"
-#include "mutation.hh"
-#include "types.hh"
+#include "mutation/mutation.hh"
+#include "types/types.hh"
 #include "types/map.hh"
+#include "utils/assert.hh"
 #include "utils/rjson.hh"
 #include "utils/big_decimal.hh"
-#include "utils/fb_utilities.hh"
 #include "cql3/selection/selection.hh"
 #include "cql3/values.hh"
 #include "cql3/query_options.hh"
 #include "cql3/column_identifier.hh"
 #include "alternator/executor.hh"
+#include "alternator/executor_util.hh"
 #include "alternator/controller.hh"
 #include "alternator/serialization.hh"
+#include "alternator/ttl_tag.hh"
 #include "dht/sharder.hh"
+#include "db/config.hh"
+#include "db/tags/utils.hh"
+#include "utils/labels.hh"
+#include "utils/error_injection.hh"
 
 #include "ttl.hh"
 
@@ -51,22 +61,18 @@ static logging::logger tlogger("alternator_ttl");
 
 namespace alternator {
 
-// We write the expiration-time attribute enabled on a table using a
-// tag TTL_TAG_KEY.
-// Currently, the *value* of this tag is simply the name of the attribute,
-// and the expiration scanner interprets it as an Alternator attribute name -
-// It can refer to a real column or if that doesn't exist, to a member of
-// the ":attrs" map column. Although this is designed for Alternator, it may
-// be good enough for CQL as well (there, the ":attrs" column won't exist).
-static const sstring TTL_TAG_KEY("system:ttl_attribute");
-
-future<executor::request_return_type> executor::update_time_to_live(client_state& client_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::update_time_to_live(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
     _stats.api_operations.update_time_to_live++;
-    if (!_proxy.data_dictionary().features().cluster_supports_alternator_ttl()) {
-        co_return api_error::unknown_operation("UpdateTimeToLive not yet supported. Experimental support is available if the 'alternator-ttl' experimental feature is enabled on all nodes.");
+    if (!_proxy.features().alternator_ttl) {
+        co_return api_error::unknown_operation("UpdateTimeToLive not yet supported. Upgrade all nodes to a version that supports it.");
     }
 
     schema_ptr schema = get_table(_proxy, request);
+    get_stats_from_schema(_proxy, *schema)->api_operations.update_time_to_live++;
+
+    maybe_audit(audit_info, audit::statement_category::DDL,
+                schema->ks_name(), schema->cf_name(), "UpdateTimeToLive", request);
+
     rjson::value* spec = rjson::find(request, "TimeToLiveSpecification");
     if (!spec || !spec->IsObject()) {
         co_return api_error::validation("UpdateTimeToLive missing mandatory TimeToLiveSpecification");
@@ -87,40 +93,43 @@ future<executor::request_return_type> executor::update_time_to_live(client_state
     if (v->GetStringLength() < 1 || v->GetStringLength() > 255) {
         co_return api_error::validation("The length of AttributeName must be between 1 and 255");
     }
-    sstring attribute_name(v->GetString(), v->GetStringLength());
+    sstring attribute_name = rjson::to_sstring(*v);
 
-    std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
-    if (enabled) {
-        if (tags_map.contains(TTL_TAG_KEY)) {
-            co_return api_error::validation("TTL is already enabled");
+    co_await verify_permission(_enforce_authorization, _warn_authorization, client_state, schema, auth::permission::ALTER, _stats);
+    co_await modify_tags(schema->ks_name(), schema->cf_name(), [&](std::map<sstring, sstring>& tags_map) {
+        if (enabled) {
+            if (tags_map.contains(TTL_TAG_KEY)) {
+                throw api_error::validation("TTL is already enabled");
+            }
+            tags_map[TTL_TAG_KEY] = attribute_name;
+        } else {
+            auto i = tags_map.find(TTL_TAG_KEY);
+            if (i == tags_map.end()) {
+                throw api_error::validation("TTL is already disabled");
+            } else if (i->second != attribute_name) {
+                throw api_error::validation(format(
+                    "Requested to disable TTL on attribute {}, but a different attribute {} is enabled.",
+                    attribute_name, i->second));
+            }
+            tags_map.erase(TTL_TAG_KEY);
         }
-        tags_map[TTL_TAG_KEY] = attribute_name;
-    } else {
-        auto i = tags_map.find(TTL_TAG_KEY);
-        if (i == tags_map.end()) {
-            co_return api_error::validation("TTL is already disabled");
-        } else if (i->second != attribute_name) {
-            co_return api_error::validation(format(
-                "Requested to disable TTL on attribute {}, but a different attribute {} is enabled.",
-                attribute_name, i->second));
-        }
-        tags_map.erase(TTL_TAG_KEY);
-    }
-    co_await update_tags(_mm, schema, std::move(tags_map));
+    });
+
     // Prepare the response, which contains a TimeToLiveSpecification
     // basically identical to the request's
     rjson::value response = rjson::empty_object();
     rjson::add(response, "TimeToLiveSpecification", std::move(*spec));
-    co_return make_jsonable(std::move(response));
+    co_return rjson::print(std::move(response));
 }
 
-future<executor::request_return_type> executor::describe_time_to_live(client_state& client_state, service_permit permit, rjson::value request) {
+future<executor::request_return_type> executor::describe_time_to_live(client_state& client_state, service_permit permit, rjson::value request, std::unique_ptr<audit::audit_info_alternator>& audit_info) {
     _stats.api_operations.describe_time_to_live++;
-    if (!_proxy.data_dictionary().features().cluster_supports_alternator_ttl()) {
-        co_return api_error::unknown_operation("DescribeTimeToLive not yet supported. Experimental support is available if the 'alternator_ttl' experimental feature is enabled on all nodes.");
-    }
     schema_ptr schema = get_table(_proxy, request);
-    std::map<sstring, sstring> tags_map = get_tags_of_table(schema);
+    
+    maybe_audit(audit_info, audit::statement_category::QUERY,
+                schema->ks_name(), schema->cf_name(), "DescribeTimeToLive", request);
+
+    std::map<sstring, sstring> tags_map = get_tags_of_table_or_throw(schema);
     rjson::value desc = rjson::empty_object();
     auto i = tags_map.find(TTL_TAG_KEY);
     if (i == tags_map.end()) {
@@ -131,47 +140,54 @@ future<executor::request_return_type> executor::describe_time_to_live(client_sta
     }
     rjson::value response = rjson::empty_object();
     rjson::add(response, "TimeToLiveDescription", std::move(desc));
-    co_return make_jsonable(std::move(response));
+    co_return rjson::print(std::move(response));
 }
 
-// expiration_service is a sharded service responsible for cleaning up expired
-// items in all tables with per-item expiration enabled. Currently, this means
-// Alternator tables with TTL configured via a UpdateTimeToLeave request.
+// expiration_service is a sharded service that cleans up expired items in all
+// tables with per-item expiration enabled. Currently, this includes Alternator
+// tables with TTL configured via UpdateTimeToLive and CQL tables using
+// per-row TTL.
 //
 // Here is a brief overview of how the expiration service works:
 //
-// An expiration thread on each shard periodically scans the items (i.e.,
-// rows) owned by this shard, looking for items whose chosen expiration-time
-// attribute indicates they are expired, and deletes those items.
-// The expiration-time "attribute" can be either an actual Scylla column
-// (must be numeric) or an Alternator "attribute" - i.e., an element in
-// the ATTRS_COLUMN_NAME map<utf8,bytes> column where the numeric expiration
-// time is encoded in DynamoDB's JSON encoding inside the bytes value.
-// To avoid scanning the same items RF times in RF replicas, only one node is
-// responsible for scanning a token range at a time. Normally, this is the
-// node owning this range as a "primary range" (the first node in the ring
-// with this range), but when this node is down, other nodes may take over
-// (FIXME: this is not implemented yet).
-// An expiration thread is reponsible for all tables which need expiration
-// scans. FIXME: explain how this is done with multiple tables - parallel,
-// staggered, or what?
-// The expiration thread scans item using CL=QUORUM to ensures that it reads
-// a consistent expiration-time attribute. This means that the items are read
-// locally and in addition QUORUM-1 additional nodes (one additional node
-// when RF=3) need to read the data and send digests.
-// FIXME: explain if we can read the exact attribute or the entire map.
-// When the expiration thread decides that an item has expired and wants
-// to delete it, it does it using a CL=QUORUM write. This allows this
-// deletion to be visible for consistent (quorum) reads. The deletion,
-// like user deletions, will also appear on the CDC log and therefore
-// Alternator Streams if enabled (FIXME: explain how we mark the
-// deletion different from user deletes. We don't do it yet.).
-expiration_service::expiration_service(data_dictionary::database db, service::storage_proxy& proxy)
+// On each shard, an expiration thread periodically scans items (rows) owned by
+// that shard, checks their configured expiration-time attribute, and deletes
+// expired items. The expiration thread on each shard runs in a lower priority
+// (the streaming scheduling group), and scans all tables that require
+// expiration scans.
+//
+// The expiration-time attribute can be either:
+// 1) a real Scylla column (must be numeric), or
+// 2) an Alternator attribute stored in ATTRS_COLUMN_NAME (map<utf8, bytes>),
+//    where the numeric expiration time is encoded using DynamoDB JSON inside
+//    the bytes value.
+//
+// Scans and deletes are done with CL=LOCAL_QUORUM:
+// - Scans use LOCAL_QUORUM so expiration decisions are based on a consistent
+//   value (for RF=3, this means the scanning thread reads the local replica
+//   plus asking one additional replica for a digest).
+// - Deletes use LOCAL_QUORUM so they are visible to LOCAL_QUORUM readers.
+//
+// TTL deletions are also written to CDC as system-originated expiration
+// deletions (not user-initiated deletes): In Alternator Streams, these events
+// include userIdentity (with Type=Service). In CQL CDC, the cdc$operation of
+// these expirations are different from regular deletes - service_row_delete
+// and service_partition_delete instead of the regular row_delete and
+// partition_delete.
+//
+// To avoid scanning each item RF times, exactly one node scans a token range
+// at a time. Normally this is the global primary owner (first replica in ring
+// order). If that node is down, the global secondary owner (second replica)
+// may temporarily take over.
+//
+// "Primary"/"secondary" ownership here is global (cluster-wide), not per DC,
+// so each item is scanned once per cluster. Resulting deletes are replicated
+// to other DCs by normal replication.
+expiration_service::expiration_service(data_dictionary::database db, service::storage_proxy& proxy, gms::gossiper& g)
         : _db(db)
         , _proxy(proxy)
+        , _gossiper(g)
 {
-    //FIXME: add metrics for the service
-    //setup_metrics();
 }
 
 // Convert the big_decimal used to represent expiration time to an integer.
@@ -236,11 +252,11 @@ static bool is_expired(const rjson::value& expiration_time, gc_clock::time_point
 }
 
 // expire_item() expires an item - i.e., deletes it as appropriate for
-// expiration - with CL=QUORUM and (FIXME!) in a way Alternator Streams
-// understands it is an expiration event - not a user-initiated deletion.
+// expiration - with CL=LOCAL_QUORUM, and in a way Alternator Streams
+// understands is an expiration event - not a user-initiated deletion.
 static future<> expire_item(service::storage_proxy& proxy,
                             const service::query_state& qs,
-                            const std::vector<bytes_opt>& row,
+                            const std::vector<managed_bytes_opt>& row,
                             schema_ptr schema,
                             api::timestamp_type ts) {
     // Prepare the row key to delete
@@ -259,7 +275,7 @@ static future<> expire_item(service::storage_proxy& proxy,
             // FIXME: log or increment a metric if this happens.
             return make_ready_future<>();
         }
-        exploded_pk.push_back(*row_c);
+        exploded_pk.push_back(to_bytes(*row_c));
     }
     auto pk = partition_key::from_exploded(exploded_pk);
     mutation m(schema, pk);
@@ -279,15 +295,25 @@ static future<> expire_item(service::storage_proxy& proxy,
                 // FIXME: log or increment a metric if this happens.
                 return make_ready_future<>();
             }
-            exploded_ck.push_back(*row_c);
+            exploded_ck.push_back(to_bytes(*row_c));
         }
         auto ck = clustering_key::from_exploded(exploded_ck);
         m.partition().clustered_row(*schema, ck).apply(tombstone(ts, gc_clock::now()));
     }
-    return proxy.mutate(std::vector<mutation>{std::move(m)},
+    utils::chunked_vector<mutation> mutations;
+    mutations.push_back(std::move(m));
+    return proxy.mutate(std::move(mutations),
         db::consistency_level::LOCAL_QUORUM,
         executor::default_timeout(), // FIXME - which timeout?
-        qs.get_trace_state(), qs.get_permit());
+        qs.get_trace_state(), qs.get_permit(),
+        db::allow_per_partition_rate_limit::no,
+        false,
+        cdc::per_request_options{
+            // tell Alternator Streams to report this deletion as a TTL
+            // expiration, not a user-initiated DeleteItem request.
+            .is_system_originated = true,
+        }
+    );
 }
 
 static size_t random_offset(size_t min, size_t max) {
@@ -305,18 +331,20 @@ static size_t random_offset(size_t min, size_t max) {
 // this range's primary node is down. For this we need to return not just
 // a list of this node's secondary ranges - but also the primary owner of
 // each of those ranges.
-static std::vector<std::pair<dht::token_range, gms::inet_address>> get_secondary_ranges(
-        const locator::effective_replication_map_ptr& erm,
-        gms::inet_address ep) {
+//
+// The function is to be used with vnodes only
+static future<std::vector<std::pair<dht::token_range, locator::host_id>>> get_secondary_ranges(
+        const locator::effective_replication_map* erm,
+        locator::host_id ep) {
     const auto& tm = *erm->get_token_metadata_ptr();
     const auto& sorted_tokens = tm.sorted_tokens();
-    std::vector<std::pair<dht::token_range, gms::inet_address>> ret;
-    if (sorted_tokens.empty()) {
-        on_internal_error(tlogger, "Token metadata is empty");
-    }
+    std::vector<std::pair<dht::token_range, locator::host_id>> ret;
+    throwing_assert(!sorted_tokens.empty());
     auto prev_tok = sorted_tokens.back();
     for (const auto& tok : sorted_tokens) {
-        inet_address_vector_replica_set eps = erm->get_natural_endpoints(tok);
+        co_await coroutine::maybe_yield();
+        // FIXME: pass is_vnode=true to get_natural_replicas since the token is in tm.sorted_tokens()
+        host_id_vector_replica_set eps = erm->get_natural_replicas(tok);
         if (eps.size() <= 1 || eps[1] != ep) {
             prev_tok = tok;
             continue;
@@ -343,7 +371,7 @@ static std::vector<std::pair<dht::token_range, gms::inet_address>> get_secondary
         }
         prev_tok = tok;
     }
-    return ret;
+    co_return ret;
 }
 
 
@@ -366,68 +394,86 @@ static std::vector<std::pair<dht::token_range, gms::inet_address>> get_secondary
 // 2. The primary replica for this token is currently marked down.
 // 3. In this node, this shard is responsible for this token.
 // We use the <secondary> case to handle the possibility that some of the
-// nodes in the system are down. A dead node will not be expiring expiring
+// nodes in the system are down. A dead node will not be expiring
 // the tokens owned by it, so we want the secondary owner to take over its
 // primary ranges.
 //
-// FIXME: need to decide how to choose primary ranges in multi-DC setup!
-// We could call get_primary_ranges_within_dc() below instead of get_primary_ranges().
+// Multi-DC design choice: We use get_primary_ranges() (global primary) rather
+// than get_primary_ranges_within_dc() (DC-local primary). This means each
+// token range is scanned by exactly one node in the entire cluster - not once
+// per DC. Deletions done with CL=LOCAL_QUORUM are replicated to all DCs by
+// the normal replication mechanism. A known limitation is that if an entire DC
+// goes down, some token ranges may not be scanned promptly: if both the global
+// primary and global secondary for a range are in the same down DC, expiration
+// of items in that range will be delayed until the DC comes back up.
+//
 // NOTICE: Iteration currently starts from a random token range in order to improve
 // the chances of covering all ranges during a scan when restarts occur.
 // A more deterministic way would be to regularly persist the scanning state,
 // but that incurs overhead that we want to avoid if not needed.
-enum primary_or_secondary_t {primary, secondary};
-template<primary_or_secondary_t primary_or_secondary>
-class token_ranges_owned_by_this_shard {
-    template<primary_or_secondary_t> class ranges_holder;
-    // ranges_holder<primary> holds just the primary ranges themselves
-    template<> class ranges_holder<primary> {
-        const dht::token_range_vector _token_ranges;
-     public:
-        ranges_holder(const locator::effective_replication_map_ptr& erm, gms::inet_address ep)
-            : _token_ranges(erm->get_primary_ranges(ep)) {}
-        std::size_t size() const { return _token_ranges.size(); }
-        const dht::token_range& operator[](std::size_t i) const {
-            return _token_ranges[i];
-        }
-        bool should_skip(std::size_t i) const {
-            return false;
-        }
-    };
-    // ranges_holder<secondary> holds the secondary token ranges plus each
-    // range's primary owner, needed to implement should_skip().
-    template<> class ranges_holder<secondary> {
-        std::vector<std::pair<dht::token_range, gms::inet_address>> _token_ranges;
-        gms::gossiper& _gossiper;
-     public:
-        ranges_holder(const locator::effective_replication_map_ptr& erm, gms::inet_address ep)
-            : _token_ranges(get_secondary_ranges(erm, ep))
-            , _gossiper(gms::get_local_gossiper()) {}
-        std::size_t size() const { return _token_ranges.size(); }
-        const dht::token_range& operator[](std::size_t i) const {
-            return _token_ranges[i].first;
-        }
-        // range i should be skipped if its primary owner is alive.
-        bool should_skip(std::size_t i) const {
-            return _gossiper.is_alive(_token_ranges[i].second);
-        }
-    };
+//
+// Note: this class is only used for the vnode path; the tablet path in
+// scan_table() is handled separately but follows the same multi-DC design
+// decisions described above.
 
+// ranges_holder_primary holds just the primary ranges themselves
+class ranges_holder_primary {
+    dht::token_range_vector _token_ranges;
+public:
+    explicit ranges_holder_primary(dht::token_range_vector token_ranges) : _token_ranges(std::move(token_ranges)) {}
+    static future<ranges_holder_primary> make(const locator::vnode_effective_replication_map* erm, locator::host_id ep) {
+        co_return ranges_holder_primary(co_await erm->get_primary_ranges(ep));
+    }
+    std::size_t size() const { return _token_ranges.size(); }
+    const dht::token_range& operator[](std::size_t i) const {
+        return _token_ranges[i];
+    }
+    bool should_skip(std::size_t i) const {
+        return false;
+    }
+};
+// ranges_holder<secondary> holds the secondary token ranges plus each
+// range's primary owner, needed to implement should_skip().
+class ranges_holder_secondary {
+    std::vector<std::pair<dht::token_range, locator::host_id>> _token_ranges;
+    const gms::gossiper& _gossiper;
+public:
+    explicit ranges_holder_secondary(std::vector<std::pair<dht::token_range, locator::host_id>> token_ranges, const gms::gossiper& g)
+        : _token_ranges(std::move(token_ranges))
+        , _gossiper(g) {}
+    static future<ranges_holder_secondary> make(const locator::vnode_effective_replication_map* erm, locator::host_id ep, const gms::gossiper& g) {
+        co_return ranges_holder_secondary(co_await get_secondary_ranges(erm, ep), g);
+    }
+    std::size_t size() const { return _token_ranges.size(); }
+    const dht::token_range& operator[](std::size_t i) const {
+        return _token_ranges[i].first;
+    }
+    // range i should be skipped if its primary owner is alive.
+    bool should_skip(std::size_t i) const {
+        return _gossiper.is_alive(_token_ranges[i].second);
+    }
+};
+
+// The token_ranges_owned_by_this_shard class is only used for vnodes, where the vnodes give a partition range for the entire node
+// and such range still needs to be divided between the shards.
+template<class primary_or_secondary_t>
+class token_ranges_owned_by_this_shard {
     schema_ptr _s;
+    locator::effective_replication_map_ptr _erm;
     // _token_ranges will contain a list of token ranges owned by this node.
     // We'll further need to split each such range to the pieces owned by
     // the current shard, using _intersecter.
-    const ranges_holder<primary_or_secondary> _token_ranges;
+    const primary_or_secondary_t _token_ranges;
     // NOTICE: _range_idx is used modulo _token_ranges size when accessing
     // the data to ensure that it doesn't go out of bounds
     size_t _range_idx;
     size_t _end_idx;
     std::optional<dht::selective_token_range_sharder> _intersecter;
 public:
-    token_ranges_owned_by_this_shard(replica::database& db, schema_ptr s)
+    token_ranges_owned_by_this_shard(schema_ptr s, primary_or_secondary_t token_ranges)
         :  _s(s)
-        , _token_ranges(db.find_keyspace(s->ks_name()).get_effective_replication_map(),
-                utils::fb_utilities::get_broadcast_address())
+        , _erm(s->table().get_effective_replication_map())
+        , _token_ranges(std::move(token_ranges))
         , _range_idx(random_offset(0, _token_ranges.size() - 1))
         , _end_idx(_range_idx + _token_ranges.size())
     {
@@ -462,7 +508,7 @@ public:
                     return std::nullopt;
                 }
             }
-            _intersecter.emplace(_s->get_sharder(), _token_ranges[_range_idx % _token_ranges.size()], this_shard_id());
+            _intersecter.emplace(_erm->get_sharder(*_s), _token_ranges[_range_idx % _token_ranges.size()], this_shard_id());
         }
     }
 
@@ -483,6 +529,7 @@ struct scan_ranges_context {
     bytes column_name;
     std::optional<std::string> member;
 
+    service::client_state internal_client_state;
     ::shared_ptr<cql3::selection::selection> selection;
     std::unique_ptr<service::query_state> query_state_ptr;
     std::unique_ptr<cql3::query_options> query_options;
@@ -492,6 +539,7 @@ struct scan_ranges_context {
         : s(s)
         , column_name(column_name)
         , member(member)
+        , internal_client_state(service::client_state::internal_tag())
     {
         // FIXME: don't read the entire items - read only parts of it.
         // We must read the key columns (to be able to delete) and also
@@ -499,22 +547,21 @@ struct scan_ranges_context {
         // member we may be forced to read the entire map - but it would
         // be good if we can read only the single item of the map - it
         // should be possible (and a must for issue #7751!).
-        lw_shared_ptr<service::pager::paging_state> paging_state = nullptr;
-        auto regular_columns = boost::copy_range<query::column_id_vector>(
-            s->regular_columns() | boost::adaptors::transformed([] (const column_definition& cdef) { return cdef.id; }));
+        lw_shared_ptr<const service::pager::paging_state> paging_state = nullptr;
+        auto regular_columns =
+            s->regular_columns() | std::views::transform(&column_definition::id)
+            | std::ranges::to<query::column_id_vector>();
         selection = cql3::selection::selection::wildcard(s);
         query::partition_slice::option_set opts = selection->get_query_options();
         opts.set<query::partition_slice::option::allow_short_read>();
+        // It is important that the scan bypass cache to avoid polluting it:
+        opts.set<query::partition_slice::option::bypass_cache>();
         std::vector<query::clustering_range> ck_bounds{query::clustering_range::make_open_ended_both_sides()};
         auto partition_slice = query::partition_slice(std::move(ck_bounds), {}, std::move(regular_columns), opts);
-        command = ::make_lw_shared<query::read_command>(s->id(), s->version(), partition_slice, proxy.get_max_result_size(partition_slice));
-        executor::client_state client_state{executor::client_state::internal_tag()};
+        command = ::make_lw_shared<query::read_command>(s->id(), s->version(), partition_slice, proxy.get_max_result_size(partition_slice), query::tombstone_limit(proxy.get_tombstone_limit()));
         tracing::trace_state_ptr trace_state;
         // NOTICE: empty_service_permit is used because the TTL service has fixed parallelism
-        query_state_ptr = std::make_unique<service::query_state>(client_state, trace_state, empty_service_permit());
-        // FIXME: What should we do on multi-DC? Will we run the expiration on the same ranges on all
-        // DCs or only once for each range? If the latter, we need to change the CLs in the
-        // scanner and deleter.
+        query_state_ptr = std::make_unique<service::query_state>(internal_client_state, trace_state, empty_service_permit());
         db::consistency_level cl = db::consistency_level::LOCAL_QUORUM;
         query_options = std::make_unique<cql3::query_options>(cl, std::vector<cql3::raw_value>{});
         query_options = std::make_unique<cql3::query_options>(std::move(query_options), std::move(paging_state));
@@ -524,16 +571,17 @@ struct scan_ranges_context {
 // Scan data in a list of token ranges in one table, looking for expired
 // items and deleting them.
 // Because of issue #9167, partition_ranges must have a single partition
-// for this code to work correctly.
+// range for this code to work correctly.
 static future<> scan_table_ranges(
         service::storage_proxy& proxy,
         const scan_ranges_context& scan_ctx,
         dht::partition_range_vector&& partition_ranges,
         abort_source& abort_source,
-        named_semaphore& page_sem)
+        named_semaphore& page_sem,
+        expiration_service::stats& expiration_stats)
 {
     const schema_ptr& s = scan_ctx.s;
-    assert (partition_ranges.size() == 1); // otherwise issue #9167 will cause incorrect results.
+    throwing_assert(partition_ranges.size() == 1); // otherwise issue #9167 will cause incorrect results.
     auto p = service::pager::query_pagers::pager(proxy, s, scan_ctx.selection, *scan_ctx.query_state_ptr,
             *scan_ctx.query_options, scan_ctx.command, std::move(partition_ranges), nullptr);
     while (!p->is_exhausted()) {
@@ -541,13 +589,34 @@ static future<> scan_table_ranges(
             co_return;
         }
         auto units = co_await get_units(page_sem, 1);
-        // We don't to limit page size in number of rows because there is a
-        // builtin limit of the page's size in bytes. Setting this limit to 1
-        // is useful for debugging the paging code with moderate-size data.
+        // We don't need to limit page size in number of rows because there is
+        // a builtin limit of the page's size in bytes. Setting this limit to
+        // 1 is useful for debugging the paging code with moderate-size data.
         uint32_t limit = std::numeric_limits<uint32_t>::max();
-        // FIXME: which timeout?
-        // FIXME: if read times out, need to retry it.
-        std::unique_ptr<cql3::result_set> rs = co_await p->fetch_page(limit, gc_clock::now(), executor::default_timeout());
+        // Read a page, and if that times out, try again after a small sleep.
+        // If we didn't catch the timeout exception, it would cause the scan
+        // be aborted and only be restarted at the next scanning period.
+        // If we retry too many times, give up and restart the scan later.
+        std::unique_ptr<cql3::result_set> rs;
+        for (int retries=0; ; retries++) {
+            try {
+                // FIXME: which timeout?
+                rs = co_await p->fetch_page(limit, gc_clock::now(), executor::default_timeout());
+                break;
+            } catch(exceptions::read_timeout_exception&) {
+                tlogger.warn("expiration scanner read timed out, will retry: {}",
+                    std::current_exception());
+            }
+            // If we didn't break out of this loop, add a minimal sleep
+            if (retries >= 10) {
+                // Don't get stuck forever asking the same page, maybe there's
+                // a bug or a real problem in several replicas. Give up on
+                // this scan and retry the scan from a random position later,
+                // in the next scan period.
+                throw runtime_exception("scanner thread failed after too many timeouts for the same page");
+            }
+            co_await sleep_abortable(std::chrono::seconds(1), abort_source);
+        }
         auto rows = rs->rows();
         auto meta = rs->get_metadata().get_names();
         std::optional<unsigned> expiration_column;
@@ -562,7 +631,7 @@ static future<> scan_table_ranges(
             continue;
         }
         for (const auto& row : rows) {
-            const bytes_opt& cell = row[*expiration_column];
+            const managed_bytes_opt& cell = row[*expiration_column];
             if (!cell) {
                 continue;
             }
@@ -579,9 +648,8 @@ static future<> scan_table_ranges(
                 // without iterating through it like we do here and compare
                 // the key?
                 for (const auto& entry : value_cast<map_type_impl::native_type>(v)) {
-                    std::string attr_name = value_cast<sstring>(entry.first);
-                    if (value_cast<sstring>(entry.first) == *scan_ctx.member) {
-                        bytes value = value_cast<bytes>(entry.second);
+                    if (value_cast<sstring>(entry.first) == std::string_view(*scan_ctx.member)) {
+                        const bytes& value = value_cast<bytes>(entry.second);
                         rjson::value json = deserialize_item(value);
                         expired = is_expired(json, now);
                         break;
@@ -589,17 +657,49 @@ static future<> scan_table_ranges(
                 }
             } else {
                 // For a real column to contain an expiration time, it
-                // must be a numeric type.
-                // FIXME: Currently we only support decimal_type (which is
-                // what Alternator uses), but other numeric types can be
-                // supported as well to make this feature more useful in CQL.
-                // Note that kind::decimal is also checked above.
-                big_decimal n = value_cast<big_decimal>(v);
-                expired = is_expired(n, now);
+                // must be a numeric type. We currently support decimal
+                // (used by Alternator TTL) as well as bigint, int and
+                // timestamp (used by CQL per-row TTL).
+                switch (meta[*expiration_column]->type->get_kind()) {
+                    case abstract_type::kind::decimal:
+                        // Used by Alternator TTL for key columns not stored
+                        // in the map. The value is in seconds, fractional
+                        // part is ignored.
+                        expired = is_expired(value_cast<big_decimal>(v), now);
+                        break;
+                    case abstract_type::kind::long_kind:
+                        // Used by CQL per-row TTL. The value is in seconds.
+                        expired = is_expired(gc_clock::time_point(std::chrono::seconds(value_cast<int64_t>(v))), now);
+                        break;
+                    case abstract_type::kind::int32:
+                        // Used by CQL per-row TTL. The value is in seconds.
+                        // Using int type is not recommended because it will
+                        // overflow in 2038, but we support it to allow users
+                        // to use existing int columns for expiration.
+                        expired = is_expired(gc_clock::time_point(std::chrono::seconds(value_cast<int32_t>(v))), now);
+                        break;
+                    case abstract_type::kind::timestamp:
+                        // Used by CQL per-row TTL. The value is in milliseconds
+                        // but we truncate it to gc_clock's precision (whole seconds).
+                        expired = is_expired(gc_clock::time_point(std::chrono::duration_cast<gc_clock::duration>(value_cast<db_clock::time_point>(v).time_since_epoch())), now);
+                        break;
+                    default:
+                        // Should never happen - we verified the column's type
+                        // before starting the scan.
+                        [[unlikely]]
+                        on_internal_error(tlogger, format("expiration scanner value of unsupported type {} in column {}", meta[*expiration_column]->type->cql3_type_name(), scan_ctx.column_name) );
+                }
             }
             if (expired) {
+                expiration_stats.items_deleted++;
                 // FIXME: maybe don't recalculate new_timestamp() all the time
                 // FIXME: if expire_item() throws on timeout, we need to retry it.
+                co_await utils::get_local_injector().inject("alternator_ttl_before_expire_item", [&s] (auto& handler) -> future<> {
+                    if (s->cf_name() != handler.get("cf_name")) {
+                        co_return;
+                    }
+                    co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::minutes{5});
+                });
                 auto ts = api::new_timestamp();
                 co_await expire_item(proxy, *scan_ctx.query_state_ptr, row, s, ts);
             }
@@ -609,16 +709,18 @@ static future<> scan_table_ranges(
     }
 }
 
-// scan_table() scans data in one table "owned" by this shard, looking for
+// scan_table() scans, in one table, data "owned" by this shard, looking for
 // expired items and deleting them.
 // We consider each node to "own" its primary token ranges, i.e., the tokens
 // that this node is their first replica in the ring. Inside the node, each
 // shard "owns" subranges of the node's token ranges - according to the node's
 // sharding algorithm.
-// When a node goes down, the token ranges owned by it will not be scanned
-// and items in those token ranges will not expire, so in the future (FIXME)
-// this function should additionally work on token ranges whose primary owner
-// is down and this node is the range's secondary owner.
+// When a node goes down, the token ranges owned by it will not be scanned by
+// it, but this function also has each node take over scanning the token
+// ranges whose primary owner is down and this node is the range's secondary
+// owner. This is implemented below, separately, for both the tablets case
+// and the vnodes case (the latter using the <secondary> case of
+// ranges_holder_primary/ranges_holder_secondary above).
 // If the TTL (expiration-time scanning) feature is not enabled for this
 // table, scan_table() returns false without doing anything. Remember that the
 // TTL feature may be enabled later so this function will need to be called
@@ -631,27 +733,26 @@ static future<> scan_table_ranges(
 static future<bool> scan_table(
     service::storage_proxy& proxy,
     data_dictionary::database db,
+    gms::gossiper& gossiper,
     schema_ptr s,
     abort_source& abort_source,
-    named_semaphore& page_sem)
+    named_semaphore& page_sem,
+    expiration_service::stats& expiration_stats)
 {
     // Check if an expiration-time attribute is enabled for this table.
     // If not, just return false immediately.
-    std::optional<std::string> attribute_name = find_tag(*s, TTL_TAG_KEY);
+    // FIXME: the setting of the TTL may change in the middle of a long scan!
+    std::optional<std::string> attribute_name = db::find_tag(*s, TTL_TAG_KEY);
     if (!attribute_name) {
         co_return false;
     }
     // attribute_name may be one of the schema's columns (in Alternator, this
-    // means it's a key column), or an element in Alternator's attrs map
-    // encoded in Alternator's JSON encoding.
-    // FIXME: To make this less Alternators-specific, we should encode in the
-    // single key's value three things:
-    // 1. The name of a column
-    // 2. Optionally if column is a map, a member in the map
-    // 3. The deserializer for the value: CQL or Alternator (JSON).
-    // The deserializer can be guessed: If the given column or map item is
-    // numeric, it can be used directly. If it is a "bytes" type, it needs to
-    // be deserialized using Alternator's deserializer.
+    // means a key column, in CQL it's a regular column), or an element in
+    // Alternator's attrs map encoded in Alternator's JSON encoding (which we
+    // decode). If attribute_name is a real column, in Alternator it will have
+    // the type decimal, counting seconds since the UNIX epoch, while in CQL
+    // it will one of the types bigint or int (counting seconds) or timestamp
+    // (counting milliseconds).
     bytes column_name = to_bytes(*attribute_name);
     const column_definition *cd = s->get_column_definition(column_name);
     std::optional<std::string> member;
@@ -670,43 +771,112 @@ static future<bool> scan_table(
     data_type column_type = cd->type;
     // Verify that the column has the right type: If "member" exists
     // the column must be a map, and if it doesn't, the column must
-    // (currently) be a decimal_type. If the column has the wrong type
-    // nothing can get expired in this table, and it's pointless to
-    // scan it.
+    // be decimal_type (Alternator), bigint, int or timestamp (CQL).
+    // If the column has the wrong type nothing can get expired in
+    // this table, and it's pointless to scan it.
     if ((member && column_type->get_kind() != abstract_type::kind::map) ||
-        (!member && column_type->get_kind() != abstract_type::kind::decimal)) {
+        (!member && column_type->get_kind() != abstract_type::kind::decimal &&
+         column_type->get_kind() != abstract_type::kind::long_kind &&
+         column_type->get_kind() != abstract_type::kind::int32 &&
+         column_type->get_kind() != abstract_type::kind::timestamp)) {
         tlogger.info("table {} TTL column has unsupported type, not scanning", s->cf_name());
         co_return false;
     }
+    expiration_stats.scan_table++;
     // FIXME: need to pace the scan, not do it all at once.
-    // FIXME: consider if we should ask the scan without caching?
-    // can we use cache but not fill it?
     scan_ranges_context scan_ctx{s, proxy, std::move(column_name), std::move(member)};
-    token_ranges_owned_by_this_shard<primary> my_ranges(db.real_database(), s);
-    while (std::optional<dht::partition_range> range = my_ranges.next_partition_range()) {
-        // Note that because of issue #9167 we need to run a separate
-        // query on each partition range, and can't pass several of
-        // them into one partition_range_vector.
-        dht::partition_range_vector partition_ranges;
-        partition_ranges.push_back(std::move(*range));
-        // FIXME: if scanning a single range fails, including network errors,
-        // we fail the entire scan (and rescan from the beginning). Need to
-        // reconsider this. Saving the scan position might be a good enough
-        // solution for this problem.
-        co_await scan_table_ranges(proxy, scan_ctx, std::move(partition_ranges), abort_source, page_sem);
-    }
-    // If each node only scans its own primary ranges, then when any node is
-    // down part of the token range will not get scanned. This can be viewed
-    // as acceptable (when the comes back online, it will resume its scan),
-    // but as noted in issue #9787, we can allow more prompt expiration
-    // by tasking another node to take over scanning of the dead node's primary
-    // ranges. What we do here is that this node will also check expiration
-    // on its *secondary* ranges - but only those whose primary owner is down.
-    token_ranges_owned_by_this_shard<secondary> my_secondary_ranges(db.real_database(), s);
-    while (std::optional<dht::partition_range> range = my_secondary_ranges.next_partition_range()) {
-        dht::partition_range_vector partition_ranges;
-        partition_ranges.push_back(std::move(*range));
-        co_await scan_table_ranges(proxy, scan_ctx, std::move(partition_ranges), abort_source, page_sem);
+
+    if (s->table().uses_tablets()) {
+        std::optional<dht::token> last_token;
+        do {
+            std::optional<locator::tablet_metadata_guard> tablet_guard;
+            std::optional<dht::partition_range> range;
+            {
+                auto erm = s->table().get_effective_replication_map();
+                auto my_host_id = erm->get_topology().my_host_id();
+                const auto& tablet_map = erm->get_token_metadata().tablets().get_tablet_map(s->id());
+                std::optional<locator::tablet_id> tablet = last_token ? tablet_map.get_tablet_id(dht::next_token(*last_token)) : tablet_map.first_tablet();
+
+                // The loop finds the tablet range to scan, one which we are the primary replica for,
+                // or if the primary replica is down, one which we are the secondary replica for.
+                do {
+                    auto tablet_token_range = tablet_map.get_token_range(*tablet);
+                    last_token = tablet_map.get_last_token(*tablet);
+                    auto tablet_primary_replica = tablet_map.get_primary_replica(*tablet, erm->get_topology());
+                    if (tablet_primary_replica.host == my_host_id && tablet_primary_replica.shard == this_shard_id()) {
+                        range = dht::to_partition_range(std::move(tablet_token_range));
+                    } else if (erm->get_replication_factor() > 1) {
+                        // If each node only scans its own primary ranges, then when any node is
+                        // down part of the token range will not get scanned. This can be viewed
+                        // as acceptable (when it comes back online, it will resume its scan),
+                        // but as noted in issue #9787, we can allow more prompt expiration
+                        // by tasking another node to take over scanning of the dead node's primary
+                        // ranges. What we do here is that this node will also check expiration
+                        // on its *secondary* ranges - but only those whose primary owner is down.
+                        auto tablet_secondary_replica = tablet_map.get_secondary_replica(*tablet, erm->get_topology()); // throws if no secondary replica
+                        if (tablet_secondary_replica.host == my_host_id && tablet_secondary_replica.shard == this_shard_id()) {
+                            if (!gossiper.is_alive(tablet_primary_replica.host)) {
+                                range = dht::to_partition_range(std::move(tablet_token_range));
+                            }
+                        }
+                    }
+                    if (range) {
+                        break;
+                    }
+                    tablet = tablet_map.next_tablet(*tablet);
+                } while (tablet);
+
+                if (range) {
+                    // Take the tablet guard to protect the tablet while we scan it.
+                    tablet_guard.emplace(s->table(), locator::global_tablet_id{s->id(), *tablet});
+                } else {
+                    // No range was found means all tablets have been iterated and we are done.
+                    break;
+                }
+            } // Drop the ERM before the scan so to unblock any tablet operations,
+              // which would otherwise be held up by us keeping the ERM.
+              // tablet_guard blocks only the selected tablet.
+
+            // Note that because of issue #9167 we need to run a separate query on each partition range, and can't pass
+            // several of them into one partition_range_vector that is passed to scan_table_ranges().
+            co_await scan_table_ranges(proxy, scan_ctx, {std::move(*range)}, abort_source, page_sem, expiration_stats);
+            tablet_guard.reset();
+        } while (*last_token < dht::last_token());
+    } else {  // VNodes
+        locator::static_effective_replication_map_ptr ermp =
+                db.real_database().find_keyspace(s->ks_name()).get_static_effective_replication_map();
+        auto* erm = ermp->maybe_as_vnode_effective_replication_map();
+        if (!erm) {
+            on_internal_error(tlogger, format("Keyspace {} is local", s->ks_name()));
+        }
+        auto my_host_id = erm->get_topology().my_host_id();
+        token_ranges_owned_by_this_shard my_ranges(s, co_await ranges_holder_primary::make(erm, my_host_id));
+        while (std::optional<dht::partition_range> range = my_ranges.next_partition_range()) {
+            // Note that because of issue #9167 we need to run a separate
+            // query on each partition range, and can't pass several of
+            // them into one partition_range_vector.
+            dht::partition_range_vector partition_ranges;
+            partition_ranges.push_back(std::move(*range));
+            // FIXME: if scanning a single range fails, including network errors,
+            // we fail the entire scan (and rescan from the beginning). Need to
+            // reconsider this. Saving the scan position might be a good enough
+            // solution for this problem.
+            co_await scan_table_ranges(proxy, scan_ctx, std::move(partition_ranges), abort_source, page_sem, expiration_stats);
+        }
+        // If each node only scans its own primary ranges, then when any node is
+        // down part of the token range will not get scanned. This can be viewed
+        // as acceptable (when it comes back online, it will resume its scan),
+        // but as noted in issue #9787, we can allow more prompt expiration
+        // by tasking another node to take over scanning of the dead node's primary
+        // ranges. What we do here is that this node will also check expiration
+        // on its *secondary* ranges - but only those whose primary owner is down.
+        token_ranges_owned_by_this_shard my_secondary_ranges(s, co_await ranges_holder_secondary::make(erm, my_host_id, gossiper));
+        while (std::optional<dht::partition_range> range = my_secondary_ranges.next_partition_range()) {
+            expiration_stats.secondary_ranges_scanned++;
+            dht::partition_range_vector partition_ranges;
+            partition_ranges.push_back(std::move(*range));
+            co_await scan_table_ranges(proxy, scan_ctx, std::move(partition_ranges), abort_source, page_sem, expiration_stats);
+        }
     }
     co_return true;
 }
@@ -719,6 +889,7 @@ future<> expiration_service::run() {
     // also need to notice when a new table is added, a table is
     // deleted or when ttl is enabled or disabled for a table!
     for (;;) {
+        auto start = lowres_clock::now();
         // _db.tables() may change under our feet during a
         // long-living loop, so we must keep our own copy of the list of
         // schemas.
@@ -732,7 +903,7 @@ future<> expiration_service::run() {
                 co_return;
             }
             try {
-                co_await scan_table(_proxy, _db, s, _abort_source, _page_sem);
+                co_await scan_table(_proxy, _db, _gossiper, s, _abort_source, _page_sem, _expiration_stats);
             } catch (...) {
                 // The scan of a table may fail in the middle for many
                 // reasons, including network failure and even the table
@@ -751,22 +922,33 @@ future<> expiration_service::run() {
                 }
             }
         }
-        // FIXME: replace this silly 1-second sleep by something smarter.
-        try {
-            co_await seastar::sleep_abortable(std::chrono::seconds(1), _abort_source);
-        } catch(seastar::sleep_aborted&) {}
+        _expiration_stats.scan_passes++;
+        // The TTL scanner runs above once over all tables, at full steam.
+        // After completing such a scan, we sleep until it's time start
+        // another scan. TODO: If the scan went too fast, we can slow it down
+        // in the next iteration by reducing the scanner's scheduling-group
+        // share (if using a separate scheduling group), or introduce
+        // finer-grain sleeps into the scanning code.
+        std::chrono::milliseconds scan_duration(std::chrono::duration_cast<std::chrono::milliseconds>(lowres_clock::now() - start));
+        std::chrono::milliseconds period(long(_db.get_config().alternator_ttl_period_in_seconds() * 1000));
+        if (scan_duration < period) {
+            try {
+                tlogger.info("sleeping {} seconds until next period", (period - scan_duration).count()/1000.0);
+                co_await seastar::sleep_abortable(period - scan_duration, _abort_source);
+            } catch(seastar::sleep_aborted&) {}
+        } else {
+                tlogger.warn("scan took {} seconds, longer than period - not sleeping", scan_duration.count()/1000.0);
+        }
     }
 }
 
 future<> expiration_service::start() {
     // Called by main() on each shard to start the expiration-service
     // thread. Just runs run() in the background and allows stop().
-    if (_db.features().cluster_supports_alternator_ttl()) {
-        if (!shutting_down()) {
-            _end = run().handle_exception([] (std::exception_ptr ep) {
-                tlogger.error("expiration_service failed: {}", ep);
-            });
-        }
+    if (!shutting_down()) {
+        _end = run().handle_exception([] (std::exception_ptr ep) {
+            tlogger.error("expiration_service failed: {}", ep);
+        });
     }
     return make_ready_future<>();
 }
@@ -782,5 +964,19 @@ future<> expiration_service::stop() {
     }
     return std::move(*_end);
 }
+
+expiration_service::stats::stats() {
+    _metrics.add_group("expiration", {
+        seastar::metrics::make_total_operations("scan_passes", scan_passes,
+            seastar::metrics::description("number of passes over the database"))(alternator_label).set_skip_when_empty(),
+        seastar::metrics::make_total_operations("scan_table", scan_table,
+            seastar::metrics::description("number of table scans (counting each scan of each table that enabled expiration)"))(alternator_label).set_skip_when_empty(),
+        seastar::metrics::make_total_operations("items_deleted", items_deleted,
+            seastar::metrics::description("number of items deleted after expiration"))(basic_level)(alternator_label).set_skip_when_empty(),
+        seastar::metrics::make_total_operations("secondary_ranges_scanned", secondary_ranges_scanned,
+            seastar::metrics::description("number of token ranges scanned by this node while their primary owner was down"))(alternator_label).set_skip_when_empty(),
+    });
+}
+
 
 } // namespace alternator

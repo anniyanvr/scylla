@@ -1,0 +1,550 @@
+/*
+ * Copyright (C) 2026-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+#pragma once
+
+#include "types.hh"
+#include "schema/schema_fwd.hh"
+#include "utils/chunked_vector.hh"
+#include "write_buffer.hh"
+#include "utils/log_heap.hh"
+#include "segment_stats.hh"
+#include <seastar/core/format.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/util/noncopyable_function.hh>
+#include <seastar/coroutine/maybe_yield.hh>
+#include "mutation_writer/token_group_based_splitting_writer.hh"
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <ranges>
+#include <optional>
+#include <vector>
+#include <functional>
+#include <utility>
+
+namespace replica {
+class compaction_group;
+} // namespace replica
+
+namespace replica::logstor {
+
+extern seastar::logger logstor_logger;
+
+class primary_index;
+struct segment_descriptor;
+class segment_set;
+struct separator_buffer;
+class segment_ref;
+class logstor_group;
+
+// What the separator owes the index for one record it rewrote: the entry that pointed at the record
+// in the segment it came from has to point at the copy the separator wrote. There is one of these
+// per record, which is why it is a struct rather than a closure - a closure carrying a key does not
+// fit inside a noncopyable_function and would take a heap allocation of its own on every write.
+struct separator_index_update {
+    primary_index* index;
+    primary_index_key key;
+    record_location prev_location;
+
+    void operator()(record_location new_location, seastar::gate::holder) const;
+};
+
+using split_target_group = std::function<logstor_group&(log_segment_id, dht::token first_token, dht::token last_token)>;
+
+// The separator buffer pool is sized for one buffer per compaction group - the one the group writes
+// into - plus this reserve, which covers the second buffer a group holds while its flush is writing
+// the first one out. It therefore bounds how many groups can be flushing while every other group
+// still holds the buffer it writes into; beyond that a group waits for a buffer to come back, which
+// is the same back-pressure it already takes when its own flush is in flight.
+constexpr size_t separator_flush_reserve = 16;
+
+inline constexpr log_heap_options segment_descriptor_hist_options(4 * 1024, 3, 128 * 1024);
+
+struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options> {
+    // free_space = segment_size - record_bytes
+    // initially set to segment_size
+    // when writing records, decrease by the record frame sizes written
+    // when freeing a record, increase by that record's frame size
+    size_t free_space{0};
+    size_t record_count{0};
+    segment_set* owner{nullptr}; // non-owning, set when added to a segment_set
+    int ref_count{0};
+    // Position in segment_set::_segment_list, set to no_index when the segment has no owner.
+    static constexpr uint32_t no_index = std::numeric_limits<uint32_t>::max();
+    uint32_t index_in_set{no_index};
+    // The sequence of the latest use of the segment, which each valid chunk of the segment also
+    // has, except between get_segment() and the write of the first chunk. reset() keeps it.
+    segment_sequence seq{0};
+
+    void reset(size_t segment_size) noexcept {
+        free_space = segment_size;
+        record_count = 0;
+    }
+
+    // The frame sizes of the live records of the segment summed, their padding excluded.
+    size_t record_bytes(size_t segment_size) const noexcept {
+        return segment_size - free_space;
+    }
+
+    void on_write(size_t record_bytes, size_t cnt = 1) noexcept {
+        free_space -= record_bytes;
+        record_count += cnt;
+    }
+
+    void on_write(record_location loc) noexcept {
+        on_write(loc.size);
+    }
+
+    void on_free(size_t record_bytes, size_t cnt = 1) noexcept {
+        free_space += record_bytes;
+        record_count -= cnt;
+    }
+
+    void on_free(record_location loc) noexcept {
+        on_free(loc.size);
+    }
+};
+
+using segment_descriptor_hist = log_heap<segment_descriptor, segment_descriptor_hist_options>;
+
+// The segments of one compaction group, and the statistics of their live record bytes.
+class segment_set {
+public:
+    // `shard_stats` are the shard-wide statistics. All the sets of the shard add their changes to
+    // them. Thus, the shard can read its utilization from one field, and it does not have to walk
+    // over the groups. Use nullptr for a set that is not part of a shard, for example in a test.
+    explicit segment_set(size_t segment_size, segment_stats* shard_stats = nullptr) noexcept
+        : _segment_size(segment_size)
+        , _shard_stats(shard_stats) {
+        // The set calculates the live record bytes and the utilization of a segment from its free
+        // space and from the segment size. Thus, a set without a segment size cannot account for
+        // its segments.
+        if (_segment_size == 0) {
+            on_fatal_internal_error(logstor_logger, "segment_set created with a zero segment size");
+        }
+    }
+
+    // Descriptors point back at their set and are linked into its containers, so a set cannot
+    // be copied or moved without leaving all of them dangling.
+    segment_set(const segment_set&) = delete;
+    segment_set& operator=(const segment_set&) = delete;
+    segment_set(segment_set&&) = delete;
+    segment_set& operator=(segment_set&&) = delete;
+
+    ~segment_set() {
+        clear();
+    }
+
+    future<> merge(segment_set& other) {
+        while (!other.empty()) {
+            // Make room before unlinking, so that failing to grow leaves the segment in `other`.
+            // Reserving per segment rather than for all of them up front also covers `other`
+            // growing while this yields, which link() could not report, being noexcept.
+            reserve_one();
+            auto& desc = *other._segment_list.back();
+            other.unlink(desc);
+            link(desc);
+            co_await coroutine::maybe_yield();
+        }
+    }
+
+    // Throws if the set cannot grow, in which case nothing is modified.
+    void add_segment(segment_descriptor& desc) {
+        if (desc.owner) {
+            on_internal_error(logstor_logger, "add_segment called for segment that has an owner");
+        }
+        reserve_one();
+        link(desc);
+        ++desc.ref_count;
+    }
+
+    // Accounts a record that was freed from a segment of this set. `freed_bytes` is the space the
+    // record gave back, which the caller has already added to the free space of the descriptor.
+    void update_segment(segment_descriptor& desc, size_t freed_bytes) noexcept {
+        // Freeing more than the set holds means its live bytes have drifted from its segments, and
+        // the wrap that would follow turns them into a huge number rather than a small one, which
+        // the size a tablet reports for itself is then read from. Abort over carrying that.
+        if (freed_bytes > _stats.live_record_bytes) [[unlikely]] {
+            on_fatal_internal_error(logstor_logger, format("freeing {} bytes from a set holding {} live record bytes", freed_bytes, _stats.live_record_bytes));
+        }
+        _segments.adjust_up(desc);
+        const auto record_bytes = desc.record_bytes(_segment_size);
+        const auto old_bucket = utilization_bucket_of(record_bytes + freed_bytes, _segment_size);
+        const auto new_bucket = utilization_bucket_of(record_bytes, _segment_size);
+        _stats.free_from_segment(freed_bytes, record_bytes, old_bucket, new_bucket);
+        if (_shard_stats) {
+            _shard_stats->free_from_segment(freed_bytes, record_bytes, old_bucket, new_bucket);
+        }
+    }
+
+    void remove_segment(segment_descriptor& desc) noexcept {
+        unlink(desc);
+        --desc.ref_count;
+    }
+
+    // unlink all segments for shutdown.
+    // don't decrement ref_count because the segments are still owned
+    // by this group and we don't want to free them.
+    void clear() noexcept {
+        while (!empty()) {
+            unlink(*_segment_list.back());
+        }
+    }
+
+    size_t segment_count() const noexcept {
+        return _segment_list.size();
+    }
+
+    // Bytes of the live records held by the segments of this set, which is the data the group owns
+    // rather than the space it takes: the rest of the space those segments hold is dead records,
+    // which compaction has yet to reclaim. Maintained as segments are linked, unlinked and freed
+    // from, so reading it is O(1) and exact.
+    uint64_t live_record_bytes() const noexcept {
+        return _stats.live_record_bytes;
+    }
+
+    bool empty() const noexcept {
+        return _segment_list.empty();
+    }
+
+    // The segments ordered approximately by free space, by histogram bucket, the most free first,
+    // which is the order compaction takes them in.
+    const segment_descriptor_hist& by_free_space() const noexcept {
+        return _segments;
+    }
+
+    // The segment at `index`, in [0, segment_count()), in no particular order. add_segment()
+    // appends a segment at the end, and remove_segment() moves the last segment into the position
+    // of the removed one. So, while no segment is removed, the positions below a segment_count()
+    // read before a walk do not change, and the walk can yield between calls.
+    const segment_descriptor& segment_at(size_t index) const noexcept {
+        return *_segment_list[index];
+    }
+
+    const segment_stats& stats() const noexcept {
+        return _stats;
+    }
+
+    // Calculates the statistics again from the segments. A test compares the result with the
+    // maintained statistics. All the paths that change the set must keep the two equal.
+    segment_stats recompute_stats_for_test() const noexcept {
+        segment_stats stats;
+        for (const auto* desc : _segment_list) {
+            const auto record_bytes = desc->record_bytes(_segment_size);
+            stats.add_segment(record_bytes, utilization_bucket_of(record_bytes, _segment_size));
+        }
+        return stats;
+    }
+
+private:
+    // The segments ordered by free space.
+    segment_descriptor_hist _segments;
+    // The same segments, in no particular order, so that a walk over them can yield safely.
+    utils::chunked_vector<segment_descriptor*> _segment_list;
+    // The size of a segment. The set uses it to calculate the live record bytes of a segment from
+    // its free space, and the utilization of a segment from its live record bytes.
+    size_t _segment_size;
+    // The statistics of this set, and the shard-wide statistics that get the same changes.
+    segment_stats _stats;
+    segment_stats* _shard_stats;
+
+    // Makes room for one more segment, so that the following link() cannot fail. Only useful when
+    // nothing can be added to the set in between, since the room is not reserved for a caller.
+    void reserve_one() {
+        static constexpr size_t min_reservation = 16;
+        static constexpr size_t chunk_capacity = decltype(_segment_list)::max_chunk_capacity();
+        const size_t capacity = _segment_list.capacity();
+        if (_segment_list.size() < capacity) {
+            return;
+        }
+        // While the list is under one chunk, grow geometrically: reserving a single element
+        // reallocates the partially filled last chunk and migrates it, which would make appending
+        // segments quadratic. Once the capacity is a whole number of chunks there is nothing to
+        // migrate, so add exactly one chunk. Clamping to chunk_capacity keeps the capacity chunk
+        // aligned, which is what makes the following reservations migration free.
+        _segment_list.reserve(capacity < chunk_capacity
+                ? std::min(std::max(capacity * 2, min_reservation), chunk_capacity)
+                : capacity + chunk_capacity);
+    }
+
+    // The caller must have made room for the segment, see reserve_one() and merge().
+    // Linking must not fail, or the segment would be left owned by a set that doesn't hold it.
+    void link(segment_descriptor& desc) noexcept {
+        _segment_list.push_back(&desc);
+        desc.owner = this;
+        desc.index_in_set = _segment_list.size() - 1;
+        _segments.push(desc);
+        const auto record_bytes = desc.record_bytes(_segment_size);
+        const auto bucket = utilization_bucket_of(record_bytes, _segment_size);
+        _stats.add_segment(record_bytes, bucket);
+        if (_shard_stats) {
+            _shard_stats->add_segment(record_bytes, bucket);
+        }
+    }
+
+    // Validates the invariants of every removal path, and aborts rather than throwing, both
+    // because it cannot leave the set half-updated and because it runs from the destructor.
+    void unlink(segment_descriptor& desc) noexcept {
+        if (desc.owner != this) {
+            on_fatal_internal_error(logstor_logger, "unlinking a segment from a set that is not its owner");
+        }
+        if (desc.index_in_set >= _segment_list.size() || _segment_list[desc.index_in_set] != &desc) {
+            on_fatal_internal_error(logstor_logger, "segment is not at its recorded position in its set");
+        }
+        const size_t record_bytes = desc.record_bytes(_segment_size);
+        if (record_bytes > _stats.live_record_bytes) [[unlikely]] {
+            on_fatal_internal_error(logstor_logger, format("unlinking a segment holding {} bytes from a set holding {} live record bytes", record_bytes, _stats.live_record_bytes));
+        }
+        _segments.erase(desc);
+        const auto bucket = utilization_bucket_of(record_bytes, _segment_size);
+        _stats.remove_segment(record_bytes, bucket);
+        if (_shard_stats) {
+            _shard_stats->remove_segment(record_bytes, bucket);
+        }
+        // Keep the list compact by moving the last segment into the freed slot.
+        auto* last = _segment_list.back();
+        _segment_list[desc.index_in_set] = last;
+        last->index_in_set = desc.index_in_set;
+        _segment_list.pop_back();
+        desc.owner = nullptr;
+        desc.index_in_set = segment_descriptor::no_index;
+    }
+};
+
+class segment_ref {
+    struct state {
+        log_segment_id id;
+        std::function<void()> on_last_release;
+        std::function<void()> on_failure;
+        bool flush_failure{false};
+        ~state() {
+            if (!flush_failure) {
+                if (on_last_release) on_last_release();
+            } else {
+                if (on_failure) on_failure();
+            }
+        }
+    };
+    lw_shared_ptr<state> _state;
+public:
+    segment_ref() = default;
+
+    // Copyable: copying increments the shared ref count
+    segment_ref(const segment_ref&) = default;
+    segment_ref& operator=(const segment_ref&) = default;
+    segment_ref(segment_ref&&) noexcept = default;
+    segment_ref& operator=(segment_ref&&) noexcept = default;
+
+    log_segment_id id() const noexcept { return _state->id; }
+    bool empty() const noexcept { return !_state; }
+
+    void set_flush_failure() noexcept { if (_state) _state->flush_failure = true; }
+
+private:
+    friend class segment_manager_impl;
+    explicit segment_ref(log_segment_id id, std::function<void()> on_last_release, std::function<void()> on_failure)
+        : _state(make_lw_shared<state>(id, std::move(on_last_release), std::move(on_failure)))
+    {}
+};
+
+struct separator_buffer {
+    owned_write_buffer buf;
+    utils::chunked_vector<future<>> pending_updates;
+    utils::chunked_vector<segment_ref> held_segments;
+    std::optional<segment_sequence> min_seq_num;
+
+    separator_buffer() = default;
+
+    separator_buffer(const separator_buffer&) = delete;
+    separator_buffer& operator=(const separator_buffer&) = delete;
+
+    separator_buffer(separator_buffer&&) noexcept = default;
+    separator_buffer& operator=(separator_buffer&&) noexcept = default;
+
+    ~separator_buffer();
+
+    template <log_record_writer_concept Writer>
+    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, Writer writer, separator_index_update after_written) {
+        // The separator buffer holds a reference to the source segment until its updates are durable.
+        if (held_segments.empty() || held_segments.back().id() != seg_ref.id()) {
+            held_segments.push_back(std::move(seg_ref));
+        }
+
+        if (segment_seq_num && (!min_seq_num || *segment_seq_num < *min_seq_num)) {
+            min_seq_num = *segment_seq_num;
+        }
+
+        pending_updates.push_back(
+            buf->write(std::move(writer)).then_unpack(std::move(after_written))
+        );
+    }
+
+    bool allocated() const noexcept {
+        return bool(buf);
+    }
+
+    template <log_record_writer_concept Writer>
+    bool can_fit(const Writer& writer) const noexcept {
+        return buf && buf->can_fit(writer);
+    }
+
+    bool can_fit(size_t write_size) const noexcept {
+        return buf && buf->can_fit(write_size);
+    }
+
+    bool empty() const noexcept {
+        return !buf || !buf->has_data();
+    }
+
+    size_t serialized_size() const noexcept {
+        return buf ? buf->serialized_size() : 0;
+    }
+
+    future<> close() {
+        return buf ? buf->close() : make_ready_future<>();
+    }
+
+    // Gives the write buffer back to the pool and drops what belonged to it, which releases the
+    // source segments it was holding. The buffer is expected to have been flushed, or aborted,
+    // before this.
+    future<> release();
+
+    future<> abort(std::exception_ptr);
+};
+
+class compaction_reenabler {
+    std::function<void()> _release;
+public:
+    compaction_reenabler() = default;
+    explicit compaction_reenabler(std::function<void()> release)
+        : _release(std::move(release)) {}
+    ~compaction_reenabler() { if (_release) _release(); }
+
+    compaction_reenabler(compaction_reenabler&&) = default;
+    compaction_reenabler& operator=(compaction_reenabler&&) = default;
+    compaction_reenabler(const compaction_reenabler&) = delete;
+    compaction_reenabler& operator=(const compaction_reenabler&) = delete;
+};
+
+class compaction_manager {
+public:
+    virtual ~compaction_manager() = default;
+
+    virtual future<> flush_separator_buffer(separator_buffer&, logstor_group&) = 0;
+
+    virtual future<owned_write_buffer> allocate_separator_buffer() = 0;
+
+    virtual void add(logstor_group&) = 0;
+    virtual future<> remove(logstor_group&) = 0;
+
+    virtual void submit(logstor_group&) = 0;
+    virtual void on_automatic_compaction_enabled() noexcept = 0;
+
+    virtual future<> submit_split_compaction(logstor_group& src, mutation_writer::classify_by_token_group, split_target_group) = 0;
+
+    virtual future<> stop_ongoing_compactions(logstor_group&) = 0;
+
+    virtual future<compaction_reenabler> disable_compaction(logstor_group&) = 0;
+    virtual compaction_reenabler disable_compaction_no_wait(logstor_group&) = 0;
+};
+
+// A compaction group in logstor.
+//
+// The group owns a `segment_set` of segments whose records all belong to it, and therefore to a
+// single table and token range. Compaction rewrites the live records of a batch of those segments
+// into new segments of the same group.
+//
+// The group is also the target of a write: the separator hands it the records of the shared active
+// segment that belong to it, and buffers them in its separator buffer, which is flushed into a new
+// segment in the group.
+class logstor_group {
+    segment_set _logstor_segments;
+    separator_buffer _active_buffer;
+    separator_buffer _flushing_buffer;
+    uint64_t _separator_generation{1};
+    shared_future<> _separator_flush{make_ready_future<>()};
+    // Whether the separator may write to this group. The group must be registered with the compaction
+    // manager in order for it to be enabled.
+    bool _separator_enabled{false};
+
+    void switch_active_separator_buffer();
+
+    future<> allocate_active_separator_buffer();
+
+protected:
+    // `shard_stats` are the shard-wide segment statistics. The set of this group adds its segments
+    // to them, see segment_set.
+    explicit logstor_group(size_t segment_size, segment_stats* shard_stats) noexcept
+        : _logstor_segments(segment_size, shard_stats) {
+    }
+
+    virtual compaction_manager& logstor_compaction_manager() noexcept = 0;
+
+public:
+    virtual ~logstor_group() = default;
+
+    virtual table_id table_id() const noexcept = 0;
+
+    // Returns true when automatic compaction of the table is off, for example after nodetool
+    // disableautocompaction. A compaction that is asked for explicitly still runs.
+    virtual bool automatic_compaction_disabled() const noexcept {
+        return false;
+    }
+
+    virtual primary_index& logstor_index() noexcept = 0;
+    virtual const primary_index& logstor_index() const noexcept = 0;
+
+    segment_set& logstor_segments() noexcept {
+        return _logstor_segments;
+    }
+    const segment_set& logstor_segments() const noexcept {
+        return _logstor_segments;
+    }
+
+    void add_logstor_segment(segment_descriptor& desc) {
+        _logstor_segments.add_segment(desc);
+    }
+
+    void clear_segments() {
+        _logstor_segments.clear();
+    }
+
+    template <log_record_writer_concept Writer>
+    future<> write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+
+    future<> flush_separator(std::optional<segment_sequence> seq_num = std::nullopt);
+
+    // Lets the separator write to this group. Called by the compaction manager when the group is
+    // registered with it, which is what makes the group's buffers flushable.
+    void enable_separator_writes() noexcept {
+        _separator_enabled = true;
+    }
+
+    // Stops taking separator writes and gives up what the separator has already buffered for this
+    // group, handing its buffers back to the pool. What is dropped here was never written out, so the
+    // source segments the buffers hold are marked as failed rather than released: the index still
+    // points at those records there. A group is expected to have been flushed before it is closed, so
+    // anything this finds costs the segments it is holding, and it says so.
+    future<> close_separator();
+
+    bool empty() const noexcept {
+        return _logstor_segments.empty()
+            && _active_buffer.empty() && _flushing_buffer.empty()
+            && _separator_flush.available();
+    }
+
+    bool separator_has_data() const noexcept {
+        return !_active_buffer.empty() || !_flushing_buffer.empty();
+    }
+
+    size_t separator_held_segment_count() const noexcept {
+        return _active_buffer.held_segments.size() + _flushing_buffer.held_segments.size();
+    }
+};
+
+} // namespace replica::logstor

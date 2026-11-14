@@ -3,36 +3,45 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
+#include "utils/assert.hh"
 #include <boost/test/unit_test.hpp>
-#include <seastar/testing/test_case.hh>
+#include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
-#include "test/boost/sstable_test.hh"
 #include <seastar/core/thread.hh>
 #include "sstables/sstables.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/sstable_utils.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include "test/lib/simple_schema.hh"
 #include "partition_slice_builder.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/random_schema.hh"
 
 using namespace sstables;
 using namespace std::chrono_literals;
 
-static
-mutation_source make_sstable_mutation_source(sstables::test_env& env, schema_ptr s, sstring dir, std::vector<mutation> mutations,
-        sstable_writer_config cfg, sstables::sstable::version_types version, gc_clock::time_point query_time = gc_clock::now()) {
-    return as_mutation_source(make_sstable(env, s, dir, std::move(mutations), cfg, version, query_time));
+static db_clock::time_point to_db_clock(gc_clock::time_point tp) {
+    return db_clock::from_time_t(gc_clock::to_time_t(tp));
 }
 
-static void consume_all(flat_mutation_reader& rd) {
-    while (auto mfopt = rd().get0()) {}
+static
+mutation_source make_sstable_mutation_source(sstables::test_env& env, schema_ptr s, sstring dir, utils::chunked_vector<mutation> mutations,
+        sstable_writer_config cfg, sstables::sstable::version_types version, gc_clock::time_point query_time = gc_clock::now()) {
+    auto sst = env.make_sstable(s, dir, env.new_generation(), version, sstable_format_types::big, default_sstable_buffer_size, to_db_clock(query_time));
+    auto mt = make_memtable(s, mutations).get();
+    auto mr = mt->make_mutation_reader(s, env.make_reader_permit());
+    sst->write_components(std::move(mr), mutations.size(), s, cfg, mt->get_encoding_stats()).get();
+    sst->load(s->get_sharder()).get();
+    return sst->as_mutation_source();
+}
+
+static void consume_all(mutation_reader& rd) {
+    while (auto mfopt = rd().get()) {}
 }
 
 // It is assumed that src won't change.
@@ -46,7 +55,7 @@ static
 void test_cache_population_with_range_tombstone_adjacent_to_population_range(populate_fn_ex populate) {
     simple_schema s;
     tests::reader_concurrency_semaphore_wrapper semaphore;
-    auto cache_mt = make_lw_shared<memtable>(s.schema());
+    auto cache_mt = make_lw_shared<replica::memtable>(s.schema());
 
     auto pkey = s.make_pkey();
 
@@ -59,7 +68,7 @@ void test_cache_population_with_range_tombstone_adjacent_to_population_range(pop
     cache_mt->apply(m1);
 
     cache_tracker tracker;
-    auto ms = populate(s.schema(), std::vector<mutation>({m1}), gc_clock::now());
+    auto ms = populate(s.schema(), utils::chunked_vector<mutation>({m1}), gc_clock::now());
     row_cache cache(s.schema(), snapshot_source_from_snapshot(std::move(ms)), tracker);
 
     auto pr = dht::partition_range::make_singular(pkey);
@@ -90,7 +99,7 @@ static future<> test_sstable_conforms_to_mutation_source(sstable_version_types v
         cfg.promoted_index_block_size = index_block_size;
 
         std::vector<tmpdir> dirs;
-        auto populate = [&env, &dirs, &cfg, version] (schema_ptr s, const std::vector<mutation>& partitions,
+        auto populate = [&env, &dirs, &cfg, version] (schema_ptr s, const utils::chunked_vector<mutation>& partitions,
                                                       gc_clock::time_point query_time) -> mutation_source {
             dirs.emplace_back();
             return make_sstable_mutation_source(env, s, dirs.back().path().string(), partitions, cfg, version, query_time);
@@ -133,8 +142,32 @@ SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_md_large) {
     return test_sstable_conforms_to_mutation_source(writable_sstable_versions[1], block_sizes[2]);
 }
 
-// This assert makes sure we don't miss writable vertions
-static_assert(writable_sstable_versions.size() == 2);
+SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_ms_tiny) {
+    return test_sstable_conforms_to_mutation_source(sstable_version_types::ms, block_sizes[0]);
+}
+
+SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_ms_medium) {
+    return test_sstable_conforms_to_mutation_source(sstable_version_types::ms, block_sizes[1]);
+}
+
+SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_ms_large) {
+    return test_sstable_conforms_to_mutation_source(sstable_version_types::ms, block_sizes[2]);
+}
+
+SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_mt_tiny) {
+    return test_sstable_conforms_to_mutation_source(sstable_version_types::mt, block_sizes[0]);
+}
+
+SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_mt_medium) {
+    return test_sstable_conforms_to_mutation_source(sstable_version_types::mt, block_sizes[1]);
+}
+
+SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_mt_large) {
+    return test_sstable_conforms_to_mutation_source(sstable_version_types::mt, block_sizes[2]);
+}
+
+// This SCYLLA_ASSERT makes sure we don't miss writable vertions
+static_assert(writable_sstable_versions.size() == 5);
 
 // `keys` may contain repetitions.
 // The generated position ranges are non-empty. The start of each range in the vector is greater than the end of the previous range.
@@ -159,7 +192,7 @@ static std::vector<position_range> random_ranges(const std::vector<clustering_ke
                 positions.emplace_back(position_in_partition::clustering_row_tag_t{}, std::move(ckp));
                 break;
             default:
-                positions.emplace_back(position_in_partition::after_clustering_row_tag_t{}, std::move(ckp));
+                positions.emplace_back(position_in_partition_view::after_all_prefixed(std::move(ckp)));
                 break;
         }
     }
@@ -198,11 +231,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_reversing_reader_random_schema) {
 
     auto muts = tests::generate_random_mutations(random_schema).get();
 
-    // FIXME: workaround for #9352. The index pages for reversed source would sometimes be different
-    // from the forward source, causing one source to hit the bug from #9352 but not the other.
-    muts.erase(std::remove_if(muts.begin(), muts.end(), [] (auto& m) { return m.decorated_key().token() == dht::token::from_int64(0); }), muts.end());
-
-    std::vector<mutation> reversed_muts;
+    utils::chunked_vector<mutation> reversed_muts;
     for (auto& m : muts) {
         reversed_muts.push_back(reverse(m));
     }
@@ -219,7 +248,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_reversing_reader_random_schema) {
 
     std::vector<query::clustering_range> ranges;
     for (auto& r: fwd_ranges) {
-        assert(position_in_partition::less_compare(*query_schema)(r.start(), r.end()));
+        SCYLLA_ASSERT(position_in_partition::less_compare(*query_schema)(r.start(), r.end()));
         auto cr_opt = position_range_to_clustering_range(r, *query_schema);
         if (!cr_opt) {
             continue;
@@ -231,13 +260,16 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_reversing_reader_random_schema) {
         .with_ranges(ranges)
         .build();
 
-    auto rev_slice = native_reverse_slice_to_legacy_reverse_slice(*query_schema, slice);
-    rev_slice.options.set(query::partition_slice::option::reversed);
+    // Clustering ranges of the slice are already reversed in relation to the reversed
+    // query schema. No need to reverse it. Just toggle the reverse option.
+    auto rev_slice = partition_slice_builder(*query_schema, slice)
+            .with_option<query::partition_slice::option::reversed>()
+            .build();
+    auto rev_full_slice = partition_slice_builder(*query_schema, query_schema->full_slice())
+            .with_option<query::partition_slice::option::reversed>()
+            .build();
 
-    auto rev_full_slice = native_reverse_slice_to_legacy_reverse_slice(*query_schema, query_schema->full_slice());
-    rev_full_slice.options.set(query::partition_slice::option::reversed);
-
-    sstables::test_env::do_with([&, version = writable_sstable_versions[1]] (sstables::test_env& env) {
+    sstables::test_env::do_with_async([&, version = writable_sstable_versions[1]] (sstables::test_env& env) {
 
         std::vector<tmpdir> dirs;
         sstable_writer_config cfg = env.manager().configure_writer();
@@ -259,26 +291,26 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_reversing_reader_random_schema) {
                 auto prange = dht::partition_range::make_singular(m.decorated_key());
 
                 {
-                    auto r1 = source.make_reader(query_schema, semaphore.make_permit(), prange,
-                            slice, default_priority_class(), nullptr,
+                    auto r1 = source.make_mutation_reader(query_schema, semaphore.make_permit(), prange,
+                            slice, nullptr,
                             streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
-                    auto close_r1 = deferred_action([&r1] { r1.close().get(); });
+                    auto close_r1 = deferred_action([&r1] noexcept { r1.close().get(); });
 
-                    auto r2 = rev_source.make_reader(query_schema, semaphore.make_permit(), prange,
-                            rev_slice, default_priority_class(), nullptr,
+                    auto r2 = rev_source.make_mutation_reader(query_schema, semaphore.make_permit(), prange,
+                            rev_slice, nullptr,
                             streamed_mutation::forwarding::no, mutation_reader::forwarding::no);
                     close_r1.cancel();
 
-                    compare_readers(*query_schema, std::move(r1), std::move(r2));
+                    compare_readers(*query_schema, std::move(r1), std::move(r2), true);
                 }
 
-                auto r1 = source.make_reader(query_schema, semaphore.make_permit(), prange,
-                        query_schema->full_slice(), default_priority_class(), nullptr,
+                auto r1 = source.make_mutation_reader(query_schema, semaphore.make_permit(), prange,
+                        query_schema->full_slice(), nullptr,
                         streamed_mutation::forwarding::yes, mutation_reader::forwarding::no);
-                auto close_r1 = deferred_action([&r1] { r1.close().get(); });
+                auto close_r1 = deferred_action([&r1] noexcept { r1.close().get(); });
 
-                auto r2 = rev_source.make_reader(query_schema, semaphore.make_permit(), prange,
-                        rev_full_slice, default_priority_class(), nullptr,
+                auto r2 = rev_source.make_mutation_reader(query_schema, semaphore.make_permit(), prange,
+                        rev_full_slice, nullptr,
                         streamed_mutation::forwarding::yes, mutation_reader::forwarding::no);
                 close_r1.cancel();
 

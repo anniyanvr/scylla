@@ -3,16 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "types.hh"
+#include <span>
+#include "types/types.hh"
 #include <seastar/core/future.hh>
-#include "lang/wasm_engine.hh"
+#include "db/functions/function_name.hh"
+#include "rust/wasmtime_bindings.hh"
+#include "lang/wasm_instance_cache.hh"
+#include "lang/wasm_alien_thread_runner.hh"
 
 namespace wasm {
+
+class instance_cache;
 
 struct exception : public std::exception {
     std::string _msg;
@@ -23,36 +29,23 @@ public:
     }
 };
 
-#ifdef SCYLLA_ENABLE_WASMTIME
+struct instance_corrupting_exception : public exception {
+    explicit instance_corrupting_exception(std::string_view msg) : exception(msg) {}
+};
 
 struct context {
-    wasm::engine* engine_ptr;
-    std::optional<wasmtime::Module> module;
+    wasmtime::Engine& engine_ptr;
+    std::optional<rust::Box<wasmtime::Module>> module;
     std::string function_name;
+    instance_cache& cache;
+    uint64_t yield_fuel;
+    uint64_t total_fuel;
 
-    context(wasm::engine* engine_ptr, std::string name);
+    context(wasmtime::Engine& engine_ptr, std::string name, instance_cache& cache, uint64_t yield_fuel, uint64_t total_fuel);
 };
 
-void compile(context& ctx, const std::vector<sstring>& arg_names, std::string script);
+seastar::future<> precompile(alien_thread_runner& alien_runner, context& ctx, const std::vector<sstring>& arg_names, std::string script);
 
-seastar::future<bytes_opt> run_script(context& ctx, const std::vector<data_type>& arg_types, const std::vector<bytes_opt>& params, data_type return_type, bool allow_null_input);
-
-#else
-
-struct context {
-    context(wasm::engine*, std::string) {
-        throw wasm::exception("WASM support was not enabled during compilation!");
-    }
-};
-
-inline void compile(context&, const std::vector<sstring>&, std::string) {
-    throw wasm::exception("WASM support was not enabled during compilation!");
-}
-
-inline seastar::future<bytes_opt> run_script(context&, const std::vector<data_type>&, const std::vector<bytes_opt>&, data_type, bool) {
-    throw wasm::exception("WASM support was not enabled during compilation!");
-}
-
-#endif
+seastar::future<bytes_opt> run_script(const db::functions::function_name& name, context& ctx, const std::vector<data_type>& arg_types, std::span<const bytes_opt> params, data_type return_type, bool allow_null_input);
 
 }

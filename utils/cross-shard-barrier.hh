@@ -3,11 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <atomic>
 #include <vector>
 #include <optional>
@@ -17,6 +18,13 @@
 using namespace seastar;
 
 namespace utils {
+
+class barrier_aborted_exception : public std::exception {
+public:
+    virtual const char* what() const noexcept override {
+        return "barrier aborted";
+    }
+};
 
 // Shards-coordination mechanism that allows shards to wait each other at
 // certain points. The barrier should be copied to each shard, then when
@@ -58,11 +66,12 @@ namespace utils {
 class cross_shard_barrier {
     struct barrier {
         std::atomic<int> counter;
+        std::atomic<bool> alive;
         std::vector<std::optional<promise<>>> wakeup;
 
-        barrier() : counter(smp::count) {
-            wakeup.reserve(smp::count);
-            for (unsigned i = 0; i < smp::count; i++) {
+        barrier() : counter(this_smp_shard_count()), alive(true) {
+            wakeup.reserve(this_smp_shard_count());
+            for (unsigned i = 0; i < this_smp_shard_count(); i++) {
                 wakeup.emplace_back();
             }
         }
@@ -91,21 +100,48 @@ public:
         // barrier, because it will likely be copied between sharded
         // users on sharded::start. The best check in this situation
         // is to make sure the local promise is not set up.
-        assert(!_b->wakeup[this_shard_id()].has_value());
+        SCYLLA_ASSERT(!_b->wakeup[this_shard_id()].has_value());
         auto i = _b->counter.fetch_add(-1);
         return i == 1 ? complete() : wait();
     }
 
+    /**
+     * Wakes up all arrivals with the barrier_aborted_exception() and
+     * returns this exception itself. Once called the barrier becomes
+     * unusable, any subsequent arrive_and_wait()s can (and actually
+     * will) hang forever.
+     */
+    void abort() noexcept {
+        // We can get here from shards that had already visited the
+        // arrive_and_wait() and got the exceptional future. In this
+        // case the counter would be set to this_smp_shard_count() and none of the
+        // fetch_add(-1)s below will make it call complete()
+        _b->alive.store(false);
+        auto i = _b->counter.fetch_add(-1);
+        if (i == 1) {
+            (void)complete().handle_exception([] (std::exception_ptr ignored) {});
+        }
+    }
+
 private:
     future<> complete() {
-        _b->counter.fetch_add(smp::count);
-        return smp::invoke_on_all([this, sid = this_shard_id()] {
+        _b->counter.fetch_add(this_smp_shard_count());
+        bool alive = _b->alive.load(std::memory_order_relaxed);
+        return smp::invoke_on_all([b = _b, sid = this_shard_id(), alive] {
             if (this_shard_id() != sid) {
-                std::optional<promise<>>& w = _b->wakeup[this_shard_id()];
-                assert(w.has_value());
-                w->set_value();
-                w.reset();
+                std::optional<promise<>>& w = b->wakeup[this_shard_id()];
+                if (alive) {
+                    SCYLLA_ASSERT(w.has_value());
+                    w->set_value();
+                    w.reset();
+                } else if (w.has_value()) {
+                    w->set_exception(barrier_aborted_exception());
+                    w.reset();
+                }
             }
+
+            return alive ? make_ready_future<>()
+                         : make_exception_future<>(barrier_aborted_exception());
         });
     }
 

@@ -3,27 +3,26 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "cdc_partitioner.hh"
 #include "dht/token.hh"
-#include "schema.hh"
+#include "schema/schema.hh"
 #include "sstables/key.hh"
-#include "utils/class_registrator.hh"
 #include "cdc/generation.hh"
-#include "keys.hh"
-
-static const sstring cdc_partitioner_name = "com.scylladb.dht.CDCPartitioner";
+#include "keys/keys.hh"
 
 namespace cdc {
 
+const sstring cdc_partitioner::classname = "com.scylladb.dht.CDCPartitioner";
+
 const sstring cdc_partitioner::name() const {
-    return cdc_partitioner_name;
+    return classname;
 }
 
 static dht::token to_token(int64_t value) {
-    return dht::token(dht::token::kind::key, value);
+    return dht::token(value);
 }
 
 static dht::token to_token(bytes_view key) {
@@ -47,8 +46,9 @@ cdc_partitioner::get_token(const schema& s, partition_key_view key) const {
     return to_token(exploded_key[0]);
 }
 
-using registry = class_registrator<dht::i_partitioner, cdc_partitioner>;
-static registry registrator(cdc_partitioner_name);
-static registry registrator_short_name("CDCPartitioner");
+void register_cdc_partitioner() {
+    dht::register_partitioner(cdc_partitioner::classname, [] { return std::make_unique<cdc_partitioner>(); });
+    dht::register_partitioner("CDCPartitioner", [] { return std::make_unique<cdc_partitioner>(); });
+}
 
 }

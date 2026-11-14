@@ -1,0 +1,222 @@
+# Copyright 2025-present ScyllaDB
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+
+###############################################################################
+# Tests to check if invalid ANN queries are handled correctly.
+# These tests ensure that queries that do not meet the requirements for ANN
+# indexing throw the appropriate exceptions.
+###############################################################################
+
+import pytest
+import re
+from .util import new_test_table, new_function, is_scylla
+from cassandra.protocol import InvalidRequest, SyntaxException
+
+ANN_REQUIRES_INDEX_MESSAGE = "ANN ordering by vector requires the column to be indexed"
+UNKNOWN_SCORING_FUNCTION_MESSAGE = "An ORDER BY expression must name at least one search, through ANN() or BM25()"
+# ANN()'s arguments are checked by ordinary function resolution, which runs before the vector
+# search claims the ORDER BY clause, so argument-count and argument-type diagnostics come from
+# the function layer and name the resolved function.
+ANN_ARGUMENT_COUNT_MESSAGE = "Invalid number of arguments for function system.ann"
+SCYLLA_ANN_REQUIRES_INDEXED_FILTERING_MESSAGE = "ANN ordering by vector does not support filtering"
+CASSANDRA_ANN_REQUIRES_INDEXED_FILTERING_MESSAGE = "ANN ordering by vector requires all restricted column(s) to be indexed"
+
+
+@pytest.fixture(scope="module")
+def indexed_vector_table(cql, test_keyspace, scylla_only):
+    """A table with a vector_index on the vector column `v`, for the function-style
+    ANN() syntax tests below. The syntax is a ScyllaDB extension."""
+    schema = 'p int primary key, c int, v vector<float, 3>'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(v) USING 'vector_index'")
+        yield table
+
+
+def test_ann_query_without_index(cql, test_keyspace):
+    schema = 'p int primary key, v vector<float, 3>'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match=re.escape(ANN_REQUIRES_INDEX_MESSAGE)):
+            cql.execute(f"SELECT * FROM {table} ORDER BY v ANN OF [0.1, 0.2, 0.3] LIMIT 5")
+
+def test_ann_query_with_null_vector(cql, test_keyspace):
+    schema = 'p int primary key, c int, v vector<float, 3>'
+    custom_index = 'vector_index' if is_scylla(cql) else 'sai'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(v) USING '{custom_index}'")
+
+        with pytest.raises(InvalidRequest, match="Unsupported null value for column v"):
+            cql.execute(f"SELECT * FROM {table} ORDER BY v ANN OF null LIMIT 5")
+
+###############################################################################
+# The function-style syntax ORDER BY ANN(column, query_vector) is a ScyllaDB
+# extension, equivalent to ORDER BY column ANN OF query_vector. The tests below
+# cover the ways it can be used incorrectly.
+###############################################################################
+
+def test_ann_function_without_index(cql, test_keyspace, scylla_only):
+    schema = 'p int primary key, v vector<float, 3>'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        with pytest.raises(InvalidRequest, match=re.escape(ANN_REQUIRES_INDEX_MESSAGE)):
+            cql.execute(f"SELECT * FROM {table} ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+
+def test_ann_function_in_where_clause(cql, indexed_vector_table):
+    # ANN is a reserved keyword, so a relation cannot even name it. The exact parser
+    # message is not asserted on purpose - the useful diagnostic is covered by
+    # test_quoted_ann_function_in_where_clause below.
+    with pytest.raises(SyntaxException):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} WHERE ANN(v, [0.1, 0.2, 0.3]) > 0 LIMIT 5")
+
+def test_quoted_ann_function_in_where_clause(cql, indexed_vector_table):
+    # A quoted function name bypasses the keyword restriction and reaches the semantic
+    # checks. With an ANN ordering the query is a vector search, which is what claims the
+    # restriction - and rejects it, because threshold filtering is not implemented.
+    with pytest.raises(InvalidRequest, match="Filtering by ANN similarity in the WHERE clause is not supported"):
+        cql.execute(f'SELECT * FROM {indexed_vector_table} WHERE "ann"(v, [0.1, 0.2, 0.3]) > 0 '
+                    f'ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5')
+
+def test_quoted_ann_function_in_where_clause_without_ordering(cql, indexed_vector_table):
+    # Without an ORDER BY nothing claims the restriction. It must not be silently dropped:
+    # scoring restrictions never reach the filtering machinery. Threshold filtering is rejected
+    # whatever the ORDER BY, so the message does not suggest adding one.
+    with pytest.raises(InvalidRequest, match="Filtering by ANN similarity in the WHERE clause is not supported"):
+        cql.execute(f'SELECT * FROM {indexed_vector_table} WHERE "ann"(v, [0.1, 0.2, 0.3]) > 0 LIMIT 5')
+
+# ANN() selected reports the score the rows are ranked by, so it needs an ANN ordering to agree
+# with, on the query vector and the column both.
+def test_ann_function_in_select_clause_without_ordering(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest,
+            match=re.escape("ANN() in SELECT must match an ANN search in ORDER BY, with the same column and query vector; ORDER BY has no ANN search")):
+        cql.execute(f"SELECT p, ANN(v, [0.1, 0.2, 0.3]) FROM {indexed_vector_table} WHERE p = 1")
+
+def test_ann_function_in_select_with_different_query_vector(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest,
+            match=re.escape("ANN() in SELECT must match an ANN search in ORDER BY, with the same column and query vector; the query vector differs")):
+        cql.execute(f"SELECT p, ANN(v, [0.4, 0.5, 0.6]) FROM {indexed_vector_table} "
+                    f"ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+
+def test_two_ann_calls_on_one_order_by_column_must_agree(cql, test_keyspace, indexed_vector_table):
+    """Two calls on one column in an ORDER BY expression are one search, so they must use the same
+    query vector."""
+    body = "(a tuple<float, int>, b tuple<float, int>) CALLED ON NULL INPUT RETURNS float LANGUAGE lua AS 'return 0'"
+    with new_function(cql, test_keyspace, body) as fuse:
+        with pytest.raises(InvalidRequest, match=re.escape(
+                "ANN() in ORDER BY must use the same query vector as the other ANN calls on the same column")):
+            cql.prepare(f"SELECT p FROM {indexed_vector_table} "
+                        f"ORDER BY {test_keyspace}.{fuse}(ANN(v, [0.1, 0.2, 0.3]), ANN(v, [0.4, 0.5, 0.6])) LIMIT 5")
+
+def test_ann_function_in_select_on_different_column(cql, test_keyspace, scylla_only):
+    schema = 'p int primary key, v vector<float, 3>, w vector<float, 3>'
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(v) USING 'vector_index'")
+        with pytest.raises(InvalidRequest,
+                match=re.escape("ANN() in SELECT must match an ANN search in ORDER BY, with the same column and query vector; ORDER BY has no ANN search on column w")):
+            cql.execute(f"SELECT p, ANN(w, [0.1, 0.2, 0.3]) FROM {table} "
+                        f"ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+
+# Aggregation is rejected whether or not the score is selected. Worth pinning for the selected
+# case, because it is what keeps the two users of the temporary slot space apart: the score arrives
+# in a slot allocated during prepare, and an aggregate's running state would want one of its own.
+def test_ann_query_with_aggregation_rejected(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match="cannot be run with aggregation"):
+        cql.execute(f"SELECT count(*) FROM {indexed_vector_table} "
+                    f"ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+    with pytest.raises(InvalidRequest, match="cannot be run with aggregation"):
+        cql.execute(f"SELECT max(ANN(v, [0.1, 0.2, 0.3])) FROM {indexed_vector_table} "
+                    f"ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+
+# GROUP BY is aggregation too, and is rejected whether or not the score is selected.
+def test_ann_query_with_group_by_rejected(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match="cannot be run with aggregation"):
+        cql.execute(f"SELECT p FROM {indexed_vector_table} GROUP BY p "
+                    f"ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+    with pytest.raises(InvalidRequest, match="cannot be run with aggregation"):
+        cql.execute(f"SELECT ANN(v, [0.1, 0.2, 0.3]) FROM {indexed_vector_table} GROUP BY p "
+                    f"ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+
+# DISTINCT asks for one row per partition, but an external search reads the base table one primary
+# key at a time, so nothing collapses a partition on the way back. Nothing rejects it either -
+# DISTINCT is checked against the selection's columns, and a selected score has none - so these
+# prepare rather than execute, to stop at the check they pin.
+@pytest.mark.parametrize("selection", ["p", "p, ANN(v, [0.1, 0.2, 0.3])"], ids=["key", "key_and_score"])
+@pytest.mark.xfail(reason="DISTINCT is accepted and answered with duplicate partition keys")
+def test_ann_query_with_distinct_rejected(cql, test_keyspace, scylla_only, selection):
+    schema = "p int, c int, v vector<float, 3>, PRIMARY KEY (p, c)"
+    with new_test_table(cql, test_keyspace, schema) as table:
+        cql.execute(f"CREATE CUSTOM INDEX ON {table}(v) USING 'vector_index'")
+        with pytest.raises(InvalidRequest):
+            cql.prepare(f"SELECT DISTINCT {selection} FROM {table} ORDER BY ANN(v, [0.1, 0.2, 0.3]) LIMIT 5")
+
+def test_ann_function_with_too_few_arguments(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match=re.escape(ANN_ARGUMENT_COUNT_MESSAGE)):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY ANN(v) LIMIT 5")
+
+def test_ann_function_with_too_many_arguments(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match=re.escape(ANN_ARGUMENT_COUNT_MESSAGE)):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY ANN(v, [0.1, 0.2, 0.3], 7) LIMIT 5")
+
+def test_ann_function_on_undefined_column(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match="Unrecognized name bad_col"):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY ANN(bad_col, [0.1, 0.2, 0.3]) LIMIT 5")
+
+def test_ann_function_with_wrong_query_vector_dimension(cql, indexed_vector_table):
+    # The query vector's dimension is inferred from the ordered column, so a mismatch is a
+    # function argument-type error.
+    with pytest.raises(InvalidRequest, match="All arguments must have the same vector dimensions"):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY ANN(v, [0.1, 0.2]) LIMIT 5")
+
+def test_ann_function_with_non_column_first_argument(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match=re.escape("First argument to ANN() must be a column reference")):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} "
+                    f"ORDER BY ANN([0.4, 0.5, 0.6], [0.1, 0.2, 0.3]) LIMIT 5")
+
+def test_ann_function_with_column_query_vector(cql, indexed_vector_table):
+    # The query vector must be a value, not another row's vector.
+    with pytest.raises(InvalidRequest, match=re.escape("Second argument to ANN() must not be a column reference")):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY ANN(v, v) LIMIT 5")
+
+def test_ann_function_on_non_vector_column(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match=re.escape("requires a float vector argument, but found c of type int")):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY ANN(c, [0.1, 0.2, 0.3]) LIMIT 5")
+
+def test_ann_function_with_null_vector(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match="Unsupported null value for column v"):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY ANN(v, null) LIMIT 5")
+
+def test_ann_function_in_select_with_null_bind_marker(cql, indexed_vector_table):
+    # A null query vector is rejected before the two occurrences are compared, so the SELECT one
+    # does not report a disagreement with the ordering.
+    stmt = cql.prepare(f"SELECT p, ANN(v, ?) FROM {indexed_vector_table} ORDER BY ANN(v, ?) LIMIT 5")
+    with pytest.raises(InvalidRequest, match="Unsupported null value"):
+        cql.execute(stmt, [None, None])
+
+# With a bind marker the two occurrences are only compared at execution, where the message used to
+# say "ANN()" whatever the query was written with.
+def test_ann_score_in_select_with_different_bound_query_vector(cql, indexed_vector_table):
+    stmt = cql.prepare(f"SELECT p, ANN_SCORE(v, ?) FROM {indexed_vector_table} ORDER BY ANN(v, ?) LIMIT 5")
+    with pytest.raises(InvalidRequest,
+            match=re.escape("ANN_SCORE() in SELECT must match an ANN search in ORDER BY, with the same column and query vector; the query vector differs")):
+        cql.execute(stmt, [[0.4, 0.5, 0.6], [0.1, 0.2, 0.3]])
+
+def test_unknown_scoring_function_in_order_by(cql, indexed_vector_table):
+    with pytest.raises(InvalidRequest, match=re.escape(UNKNOWN_SCORING_FUNCTION_MESSAGE)):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} ORDER BY now() LIMIT 5")
+
+def test_keyspace_qualified_ann_in_order_by_rejected(cql, test_keyspace, indexed_vector_table):
+    # Only the native, unqualified ann() is the vector ordering function. A keyspace-qualified
+    # name refers to a user-defined function, which no external search handler claims - here
+    # there is no such function at all, so resolution fails first.
+    with pytest.raises(InvalidRequest, match="Unknown function .* called"):
+        cql.execute(f"SELECT * FROM {indexed_vector_table} "
+                    f"ORDER BY {test_keyspace}.ann(v, [0.1, 0.2, 0.3]) LIMIT 5")
+
+def test_user_defined_ann_is_not_shadowed_by_native_ann(cql, test_keyspace, indexed_vector_table):
+    # Same as above, but with a UDF actually named ann() in the keyspace: it must not be silently
+    # executed as native ANN. The UDF is resolved as any other function would be - it is not an
+    # external function, so no external search handler claims it - and its int arguments do not
+    # accept a vector.
+    body = "(a int, b int) CALLED ON NULL INPUT RETURNS float LANGUAGE lua AS 'return 0.0'"
+    with new_function(cql, test_keyspace, body, name="ann", args="int, int"):
+        with pytest.raises(InvalidRequest, match="cannot be passed as argument 0 of function"):
+            cql.execute(f"SELECT * FROM {indexed_vector_table} "
+                        f"ORDER BY {test_keyspace}.ann(v, [0.1, 0.2, 0.3]) LIMIT 5")

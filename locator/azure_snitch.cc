@@ -1,8 +1,5 @@
 /*
- */
-
-/*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 /*
@@ -15,25 +12,32 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/http/response_parser.hh>
+#include <seastar/http/reply.hh>
 #include <seastar/net/api.hh>
 #include <seastar/net/dns.hh>
+#include <seastar/util/closeable.hh>
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <fmt/format.h>
+
 
 namespace locator {
 
 const std::string azure_snitch::REGION_NAME_QUERY_PATH = fmt::format(AZURE_QUERY_PATH_TEMPLATE, "location");
 const std::string azure_snitch::ZONE_NAME_QUERY_PATH = fmt::format(AZURE_QUERY_PATH_TEMPLATE, "zone");
 
-azure_snitch::azure_snitch(const sstring& fname, unsigned io_cpuid) : production_snitch_base(fname) {
-    if (this_shard_id() == io_cpuid) {
-        io_cpu_id() = io_cpuid;
+azure_snitch::azure_snitch(const snitch_config& cfg) : production_snitch_base(cfg) {
+    if (this_shard_id() == cfg.io_cpu_id) {
+        io_cpu_id() = cfg.io_cpu_id;
     }
 }
 
 future<> azure_snitch::load_config() {
+    if (this_shard_id() != io_cpu_id()) {
+        co_return;
+    }
+
     sstring region = co_await azure_api_call(REGION_NAME_QUERY_PATH);
     sstring azure_zone = co_await azure_api_call(ZONE_NAME_QUERY_PATH);
 
@@ -43,15 +47,12 @@ future<> azure_snitch::load_config() {
 
     logger().info("AzureSnitch using region: {}, zone: {}.", azure_region, azure_zone);
 
-    _my_rack = azure_zone;
-    _my_dc = azure_region;
+    // Zoneless regions return empty zone
+    sstring my_rack = (azure_zone != "" ? azure_zone : azure_region);
+    sstring my_dc = azure_region;
 
-    co_return co_await _my_distributed->invoke_on_all([this] (snitch_ptr& local_s) {
-        // Distribute the new values on all CPUs but the current one
-        if (this_shard_id() != io_cpu_id()) {
-            local_s->set_my_dc(_my_dc);
-            local_s->set_my_rack(_my_rack);
-        }
+    co_return co_await container().invoke_on_all([my_dc, my_rack] (snitch_ptr& local_s) {
+        local_s->set_my_dc_and_rack(my_dc, my_rack);
     });
 }
 
@@ -64,13 +65,40 @@ future<> azure_snitch::start() {
 }
 
 future<sstring> azure_snitch::azure_api_call(sstring path) {
+    return do_with(int(0), [this, path] (int& i) {
+        return repeat_until_value([this, path, &i]() -> future<std::optional<sstring>> {
+            ++i;
+            return azure_api_call_once(path).then([] (auto res) {
+                return make_ready_future<std::optional<sstring>>(std::move(res));
+            }).handle_exception([this, &i] (auto ep) {
+                try {
+                    std::rethrow_exception(ep);
+                } catch (const std::system_error &e) {
+                    if (i >= AZURE_API_CALL_RETRIES - 1) {
+                        logger().error("Azure API call failed: {}. Maximum number of retries exceeded", e.what());
+                        throw e;
+                    } else {
+                        logger().error("Azure API call failed: {}. Will retry in {} seconds", e.what(), std::chrono::duration_cast<std::chrono::seconds>(_azure_api_retry.sleep_time()).count());
+                    }
+                }
+                return _azure_api_retry.retry().then([] {
+                    return make_ready_future<std::optional<sstring>>(std::nullopt);
+                });
+            });
+        });
+    });
+}
+
+future<sstring> azure_snitch::azure_api_call_once(sstring path) {
     return seastar::async([path = std::move(path)] () -> sstring {
         using namespace boost::algorithm;
 
-        net::inet_address a = seastar::net::dns::resolve_name(AZURE_SERVER_ADDR, net::inet_address::family::INET).get0();
-        connected_socket sd(connect(socket_address(a, 80)).get0());
+        net::inet_address a = seastar::net::dns::resolve_name(AZURE_SERVER_ADDR, net::inet_address::family::INET).get();
+        connected_socket sd(connect(socket_address(a, 80)).get());
         input_stream<char> in(sd.input());
         output_stream<char> out(sd.output());
+        auto close_in = deferred_close(in);
+        auto close_out = deferred_close(out);
         sstring request(seastar::format("GET {} HTTP/1.1\r\nHost: {}\r\nMetadata: True\r\n\r\n", path, AZURE_SERVER_ADDR));
 
         out.write(request).get();
@@ -86,6 +114,10 @@ future<sstring> azure_snitch::azure_api_call(sstring path) {
 
         // Read HTTP response header first
         auto rsp = parser.get_parsed_response();
+        if (rsp->_status != http::reply::status_type::ok) {
+            throw std::runtime_error(format("Error: HTTP response status {}", rsp->_status));
+        }
+
         auto it = rsp->_headers.find("Content-Length");
         if (it == rsp->_headers.end()) {
             throw std::runtime_error("Error: HTTP response does not contain: Content-Length\n");
@@ -94,15 +126,9 @@ future<sstring> azure_snitch::azure_api_call(sstring path) {
         auto content_len = std::stoi(it->second);
 
         // Read HTTP response body
-        temporary_buffer<char> buf = in.read_exactly(content_len).get0();
+        temporary_buffer<char> buf = in.read_exactly(content_len).get();
 
-        sstring res(buf.get(), buf.size());
-
-        // Close streams
-        out.close().get();
-        in.close().get();
-
-        return res;
+        return sstring(buf.get(), buf.size());
     });
 }
 
@@ -117,17 +143,5 @@ future<sstring> azure_snitch::read_property_file() {
         return dc_suffix;
     });
 }
-
-using registry_2_params = class_registrator<i_endpoint_snitch, azure_snitch, const sstring&, const unsigned&>;
-static registry_2_params registrator2("org.apache.cassandra.locator.AzureSnitch");
-static registry_2_params registrator2_short_name("AzureSnitch");
-
-using registry_1_param = class_registrator<i_endpoint_snitch, azure_snitch, const sstring&>;
-static registry_1_param registrator1("org.apache.cassandra.locator.AzureSnitch");
-static registry_1_param registrator1_short_name("AzureSnitch");
-
-using registry_default = class_registrator<i_endpoint_snitch, azure_snitch>;
-static registry_default registrator_default("org.apache.cassandra.locator.AzureSnitch");
-static registry_default registrator_default_short_name("AzureSnitch");
 
 } // namespace locator

@@ -3,14 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "user_function.hh"
-#include "log.hh"
-#include "cql_serialization_format.hh"
+#include "cql3/description.hh"
+#include "cql3/util.hh"
+#include "utils/log.hh"
+#include "lang/wasm.hh"
+#include "utils/managed_string.hh"
 
 #include <seastar/core/thread.hh>
+
+#include <ranges>
 
 namespace cql3 {
 namespace functions {
@@ -31,7 +36,7 @@ bool user_function::is_aggregate() const { return false; }
 
 bool user_function::requires_thread() const { return true; }
 
-bytes_opt user_function::execute(cql_serialization_format sf, const std::vector<bytes_opt>& parameters) {
+managed_bytes_opt user_function::execute(std::span<const managed_bytes_opt> parameters) {
     const auto& types = arg_types();
     if (parameters.size() != types.size()) {
         throw std::logic_error("Wrong number of parameters");
@@ -40,27 +45,86 @@ bytes_opt user_function::execute(cql_serialization_format sf, const std::vector<
     if (!seastar::thread::running_in_thread()) {
         on_internal_error(log, "User function cannot be executed in this context");
     }
-    return seastar::visit(_ctx,
+    for (auto& param : parameters) {
+        if (!param && !_called_on_null_input) {
+            return std::nullopt;
+        }
+    }
+    return to_managed_bytes_opt(seastar::visit(_ctx,
         [&] (lua_context& ctx) -> bytes_opt {
             std::vector<data_value> values;
             values.reserve(parameters.size());
             for (int i = 0, n = types.size(); i != n; ++i) {
                 const data_type& type = types[i];
-                const bytes_opt& bytes = parameters[i];
-                if (!bytes && !_called_on_null_input) {
-                    return std::nullopt;
-                }
-                values.push_back(bytes ? type->deserialize(*bytes) : data_value::make_null(type));
+                const managed_bytes_opt& bytes = parameters[i];
+                values.push_back(bytes ? type->deserialize(managed_bytes_view(*bytes)) : data_value::make_null(type));
             }
-            return lua::run_script(lua::bitcode_view{ctx.bitcode}, values, return_type(), ctx.cfg).get0();
+            return lua::run_script(lua::bitcode_view{ctx.bitcode}, values, return_type(), ctx.cfg).get();
         },
-        [&] (wasm::context& ctx) {
+        [&] (wasm::context& ctx) -> bytes_opt {
+            // FIXME: change wasm::run_script to accept fragmented buffers
+            auto linear_parameters = parameters
+                    | std::views::transform([] (const managed_bytes_opt& parameter) { return to_bytes_opt(parameter); })
+                    | std::ranges::to<std::vector>();
             try {
-                return wasm::run_script(ctx, arg_types(), parameters, return_type(), _called_on_null_input).get0();
+                return wasm::run_script(name(), ctx, arg_types(), linear_parameters, return_type(), _called_on_null_input).get();
             } catch (const wasm::exception& e) {
                 throw exceptions::invalid_request_exception(format("UDF error: {}", e.what()));
             }
-        });
+        }));
+}
+
+sstring signature_type_name(const data_type& type) {
+    return type->is_collection() ? type->cql3_type_name() : type->cql3_type_name_without_frozen();
+}
+
+// Returns the function's body as a CQL string literal. A dollar-quoted
+// literal, $$...$$, is easier to read because quotes in the body aren't
+// escaped. But it has no escapes at all, so it can't hold a body containing
+// "$$", or ending with "$" (the closing "$$" would start one character
+// early). Such a body is single-quoted instead.
+static sstring body_literal(std::string_view body) {
+    if (body.contains("$$") || body.ends_with('$')) {
+        return cql3::util::single_quote(body);
+    }
+    return fmt::format("$${}$$", body);
+}
+
+description user_function::describe(with_create_statement with_stmt) const {
+    auto maybe_create_statement = std::invoke([&] -> std::optional<managed_string> {
+        if (!with_stmt) {
+            return std::nullopt;
+        }
+
+        fragmented_ostringstream stream;
+
+        auto arg_type_range = _arg_types | std::views::transform(signature_type_name);
+        auto arg_range = std::views::zip(_arg_names, arg_type_range)
+                | std::views::transform([] (std::tuple<std::string_view, std::string_view> arg) {
+                    const auto [name, type] = arg;
+                    return seastar::format("{} {}", cql3::util::maybe_quote(name), type);
+                });
+
+        fmt::format_to(stream.to_iter(), "CREATE FUNCTION {}.{}({})\n"
+                "{} ON NULL INPUT\n"
+                "RETURNS {}\n"
+                "LANGUAGE {}\n"
+                "AS {};",
+                cql3::util::maybe_quote(name().keyspace), cql3::util::maybe_quote(name().name), fmt::join(arg_range, ", "),
+                _called_on_null_input ? "CALLED" : "RETURNS NULL",
+                signature_type_name(_return_type),
+                _language,
+                body_literal(_body));
+
+        return std::move(stream).to_managed_string();
+    });
+
+    return description {
+        .keyspace = name().keyspace,
+        .type = "function",
+        .name = name().name,
+        .create_statement = std::move(maybe_create_statement)
+    };
 }
 
 }

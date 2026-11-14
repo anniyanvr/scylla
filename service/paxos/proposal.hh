@@ -1,18 +1,15 @@
 /*
- *
- *
- */
-/*
  * Copyright (C) 2019-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #pragma once
-#include "utils/UUID_gen.hh"
-#include "frozen_mutation.hh"
+
+#include "mutation/frozen_mutation.hh"
+#include <fmt/core.h>
 
 namespace service {
 
@@ -49,8 +46,10 @@ inline bool operator>(const proposal& lhs, const proposal& rhs) {
     return lhs.ballot.timestamp() > rhs.ballot.timestamp();
 }
 
-// Used for logging and debugging.
-std::ostream& operator<<(std::ostream& os, const proposal& proposal);
-
 } // end of namespace "paxos"
 } // end of namespace "service"
+
+// Used for logging and debugging.
+template <> struct fmt::formatter<service::paxos::proposal> : fmt::formatter<string_view> {
+    auto format(const service::paxos::proposal&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

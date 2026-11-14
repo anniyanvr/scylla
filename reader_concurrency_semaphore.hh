@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 /*
@@ -8,16 +8,126 @@
 
 #pragma once
 
+#include <deque>
+#include <functional>
 #include <boost/intrusive/list.hpp>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/queue.hh>
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/metrics_registration.hh>
+#include <seastar/util/log.hh>
 #include "reader_permit.hh"
-#include "flat_mutation_reader_v2.hh"
+#include "utils/updateable_value.hh"
+#include "dht/i_partitioner_fwd.hh"
 
 namespace bi = boost::intrusive;
 
 using namespace seastar;
+
+class mutation_reader;
+using mutation_reader_opt = optimized_optional<mutation_reader>;
+
+extern logger rcslog;
+
+class reader_concurrency_semaphore;
+
+// A shared pool of memory that can be used by multiple reader_concurrency_semaphores.
+// When a semaphore exhausts its dedicated memory, it can borrow from this pool.
+// A pool with total_memory=0 is inert: available_memory() returns 0, so no
+// borrowing occurs.
+//
+// Semaphores that have waiters blocked on memory can register themselves via
+// request_wakeup().  When memory is returned to the pool, a single registered
+// semaphore is woken up (FIFO order) so it can re-evaluate admission.  If it
+// still has blocked waiters, it re-registers at the back, giving round-robin
+// fairness across all waiting semaphores.
+//
+// The wakeup is handed off strictly in registration order: the next semaphore
+// is only offered the memory once the current head has had its turn and
+// actually borrowed some of it (via maybe_wake_next_waiter()).  A head whose
+// waiter is too big to fund declines without borrowing, leaving the memory
+// parked for its next turn rather than letting a smaller waiter in another
+// semaphore skim it.  This keeps a single large return from waking only one of
+// several waiters it could satisfy, while still preventing cross-semaphore
+// starvation.
+class reader_concurrency_semaphore_shared_pool {
+    ssize_t _available_memory;
+    ssize_t _total_memory;
+    seastar::metrics::metric_groups _metrics;
+    std::deque<std::reference_wrapper<reader_concurrency_semaphore>> _notify_list;
+public:
+    explicit reader_concurrency_semaphore_shared_pool(ssize_t memory) noexcept
+        : _available_memory(memory)
+        , _total_memory(memory) {}
+
+    /// Return a per-shard empty pool (total_memory=0) for semaphores that
+    /// do not participate in any shared pool.
+    static reader_concurrency_semaphore_shared_pool& empty_pool() noexcept {
+        static thread_local reader_concurrency_semaphore_shared_pool instance{0};
+        return instance;
+    }
+
+    // Take memory from the pool. The caller must not borrow more than
+    // available_memory(); overdrawing is a bug, so it is logged and clamped
+    // rather than silently producing negative availability.
+    void borrow(ssize_t amount) noexcept {
+        _available_memory -= amount;
+        if (_available_memory < 0)  [[unlikely]] {
+            static thread_local logger::rate_limit rate_limit(std::chrono::seconds(30));
+            rcslog.log(log_level::warn, rate_limit,
+                    "shared reader concurrency semaphore pool over-borrowed memory: available={}, total={}, borrowed={}; clamping available memory to 0",
+                    _available_memory, _total_memory, amount);
+            _available_memory = 0;
+        }
+    }
+
+    // Return previously borrowed memory to the pool and wake a waiting
+    // semaphore if any. Repaying more than was borrowed is a bug, so it is
+    // logged and clamped to total_memory rather than inflating the pool.
+    void repay(ssize_t amount) noexcept;
+
+    // Register a semaphore to be woken up the next time memory is returned
+    // to the pool.  Duplicate registrations are suppressed.
+    void request_wakeup(reader_concurrency_semaphore& sem) noexcept;
+
+    // Remove a semaphore from the notify list.  Must be called before
+    // the semaphore is destroyed to avoid dangling references.
+    void unregister_wakeup(reader_concurrency_semaphore& sem) noexcept;
+
+    // Wake the next registered semaphore if the pool still has memory to lend.
+    // Called by a semaphore that just borrowed pool memory while admitting
+    // waiters, to hand the remaining memory off to the next waiter in line.
+    void maybe_wake_next_waiter() noexcept;
+
+    ssize_t available_memory() const noexcept {
+        if (_available_memory < 0) {
+            return 0;
+        }
+        return _available_memory;
+    }
+
+    ssize_t total_memory() const noexcept {
+        return _total_memory;
+    }
+
+    void register_metrics(const seastar::sstring& name);
+
+    // Resize the pool, applying the change to the available memory too. If the
+    // pool shrinks below the amount currently borrowed, _available_memory goes
+    // negative; available_memory() clamps that to 0 on read, and the borrowed
+    // memory is reconciled as borrowers repay. Callers must serialize resizes
+    // (the group does so via adjust()) so the accounting stays consistent.
+    void set_total_memory(ssize_t memory) noexcept {
+        const auto diff = memory - _total_memory;
+        _total_memory = memory;
+        _available_memory += diff;
+    }
+
+private:
+    // Pop the semaphore at the front of the notify list and wake its execution
+    // loop so it re-evaluates admission.  Caller must ensure the list isn't empty.
+    void wake_front_waiter() noexcept;
+};
 
 /// Specific semaphore for controlling reader concurrency
 ///
@@ -37,8 +147,23 @@ using namespace seastar;
 /// number of waiting readers becomes equal or greater than
 /// `max_queue_length` (upon calling `obtain_permit()`) an exception of
 /// type `std::runtime_error` is thrown. Optionally, some additional
-/// code can be executed just before throwing (`prethrow_action` 
+/// code can be executed just before throwing (`prethrow_action`
 /// constructor parameter).
+///
+/// The semaphore has 3 layers of defense against consuming more memory
+/// than desired:
+/// 1) After memory consumption is larger than the configured memory limit,
+///    no more reads are admitted
+/// 2) After memory consumption is larger than `_serialize_limit_multiplier`
+///    times the configured memory limit, reads are serialized: only one of them
+///    is allowed to make progress, the rest is made to wait before they can
+///    consume more memory. Enforced via `request_memory()`.
+/// 4) After memory consumption is larger than `_kill_limit_multiplier`
+///    times the configured memory limit, reads are killed, by `consume()`
+///    throwing `std::bad_alloc`.
+///
+/// This makes `_kill_limit_multiplier` times the memory limit the effective
+/// upper bound of the memory consumed by reads.
 ///
 /// The semaphore also acts as an execution stage for reads. This
 /// functionality is exposed via \ref with_permit() and \ref
@@ -48,6 +173,8 @@ public:
     using resources = reader_resources;
 
     friend class reader_permit;
+    friend struct reader_concurrency_semaphore_tester;
+    friend class reader_concurrency_semaphore_shared_pool;
 
     enum class evict_reason {
         permit, // evicted due to permit shortage
@@ -69,19 +196,46 @@ public:
         // Total number of failed reads executed through this semaphore.
         uint64_t total_failed_reads = 0;
         // Total number of reads rejected because the admission queue reached its max capacity
+        // or rejected due to a high probability of not getting finalized on time.
         uint64_t total_reads_shed_due_to_overload = 0;
+        // Total number of reads killed due to the memory consumption reaching the kill limit.
+        uint64_t total_reads_killed_due_to_kill_limit = 0;
         // Total number of reads admitted, via all admission paths.
         uint64_t reads_admitted = 0;
         // Total number of reads enqueued to wait for admission.
-        uint64_t reads_enqueued = 0;
+        uint64_t reads_enqueued_for_admission = 0;
+        // Total number of reads enqueued to wait for memory.
+        uint64_t reads_enqueued_for_memory = 0;
+        // Total number of reads admitted immediately, without queueing
+        uint64_t reads_admitted_immediately = 0;
+        // Total number of reads enqueued because ready_list wasn't empty
+        uint64_t reads_queued_because_ready_list = 0;
+        // Total number of reads enqueued because there are permits who need CPU to make progress
+        uint64_t reads_queued_because_need_cpu_permits = 0;
+        // Total number of reads enqueued because there weren't enough memory resources
+        uint64_t reads_queued_because_memory_resources = 0;
+        // Total number of reads enqueued because there weren't enough count resources
+        uint64_t reads_queued_because_count_resources = 0;
+        // Total number of reads enqueued to be maybe admitted after evicting some inactive reads
+        uint64_t reads_queued_with_eviction = 0;
         // Total number of permits created so far.
         uint64_t total_permits = 0;
         // Current number of permits.
         uint64_t current_permits = 0;
-        // Current number of used permits.
-        uint64_t used_permits = 0;
-        // Current number of blocked permits.
-        uint64_t blocked_permits = 0;
+        // Current number permits needing CPU to make progress.
+        uint64_t need_cpu_permits = 0;
+        // Current number of permits awaiting I/O or an operation running on a remote shard.
+        uint64_t awaits_permits = 0;
+        // Current number of reads reading from the disk.
+        uint64_t disk_reads = 0;
+        // The number of sstables read currently.
+        uint64_t sstables_read = 0;
+        // Permits waiting on something: admission, memory or execution
+        uint64_t waiters = 0;
+        // Current amount of memory borrowed from the shared pool.
+        ssize_t reads_memory_borrowed_from_shared_pool = 0;
+
+        friend auto operator<=>(const stats&, const stats&) = default;
     };
 
     using permit_list_type = bi::list<
@@ -89,151 +243,203 @@ public:
             bi::base_hook<bi::list_base_hook<bi::link_mode<bi::auto_unlink>>>,
             bi::constant_time_size<false>>;
 
-    class inactive_read_handle;
-
     using read_func = noncopyable_function<future<>(reader_permit)>;
 
 private:
-    struct entry {
-        promise<> pr;
-        reader_permit permit;
-        read_func func;
-        entry(promise<>&& pr, reader_permit permit, read_func func)
-            : pr(std::move(pr)), permit(std::move(permit)), func(std::move(func)) {}
-    };
-
-    class expiry_handler {
-        reader_concurrency_semaphore& _semaphore;
-    public:
-        explicit expiry_handler(reader_concurrency_semaphore& semaphore)
-            : _semaphore(semaphore) {}
-        void operator()(entry& e) noexcept;
-    };
-
-    struct inactive_read : public bi::list_base_hook<bi::link_mode<bi::auto_unlink>> {
-        flat_mutation_reader_v2 reader;
-        eviction_notify_handler notify_handler;
-        timer<lowres_clock> ttl_timer;
-        inactive_read_handle* handle = nullptr;
-
-        explicit inactive_read(flat_mutation_reader_v2 reader_) noexcept
-            : reader(std::move(reader_))
-        { }
-        ~inactive_read();
-        void detach() noexcept;
-    };
-
-    using inactive_reads_type = bi::list<inactive_read, bi::constant_time_size<false>>;
+    struct inactive_read;
 
 public:
     class inactive_read_handle {
-        reader_concurrency_semaphore* _sem = nullptr;
-        inactive_read* _irp = nullptr;
+        reader_permit_opt _permit;
 
         friend class reader_concurrency_semaphore;
 
     private:
         void abandon() noexcept;
 
-        explicit inactive_read_handle(reader_concurrency_semaphore& sem, inactive_read& ir) noexcept
-            : _sem(&sem), _irp(&ir) {
-            _irp->handle = this;
-        }
+        explicit inactive_read_handle(reader_permit permit) noexcept;
     public:
         inactive_read_handle() = default;
-        inactive_read_handle(inactive_read_handle&& o) noexcept
-            : _sem(std::exchange(o._sem, nullptr))
-            , _irp(std::exchange(o._irp, nullptr)) {
-            if (_irp) {
-                _irp->handle = this;
-            }
-        }
-        inactive_read_handle& operator=(inactive_read_handle&& o) noexcept {
-            if (this == &o) {
-                return *this;
-            }
-            abandon();
-            _sem = std::exchange(o._sem, nullptr);
-            _irp = std::exchange(o._irp, nullptr);
-            if (_irp) {
-                _irp->handle = this;
-            }
-            return *this;
-        }
+        inactive_read_handle(inactive_read_handle&& o) noexcept;
+        inactive_read_handle& operator=(inactive_read_handle&& o) noexcept;
         ~inactive_read_handle() {
             abandon();
         }
         explicit operator bool() const noexcept {
-            return bool(_irp);
+            return bool(_permit);
         }
     };
 
 private:
-    const resources _initial_resources;
+    resources _initial_resources;
     resources _resources;
+    reader_concurrency_semaphore_shared_pool& _shared_pool;
+    bool _on_shared_pool_notify_list = false;
+    utils::observer<int> _count_observer;
 
-    expiring_fifo<entry, expiry_handler, db::timeout_clock> _wait_list;
-    queue<entry> _ready_list;
+    struct wait_queue {
+        // Stores entries for permits waiting to be admitted.
+        permit_list_type _admission_queue;
+        // Stores entries for serialized permits waiting to obtain memory.
+        permit_list_type _memory_queue;
+    public:
+        bool empty() const {
+            return _admission_queue.empty() && _memory_queue.empty();
+        }
+        void push_to_admission_queue(reader_permit::impl& p);
+        void push_to_memory_queue(reader_permit::impl& p);
+        reader_permit::impl& front();
+        const reader_permit::impl& front() const;
+    };
+
+    wait_queue _wait_list;
+    permit_list_type _ready_list;
+    condition_variable _ready_list_cv;
+    permit_list_type _inactive_reads;
+    // Stores permits that are not in any of the above list.
+    permit_list_type _permit_list;
 
     sstring _name;
     size_t _max_queue_length = std::numeric_limits<size_t>::max();
-    inactive_reads_type _inactive_reads;
+    size_t _unreduced_memory = 0;
+    utils::updateable_value<uint32_t> _serialize_limit_multiplier;
+    utils::updateable_value<uint32_t> _kill_limit_multiplier;
+    utils::updateable_value<uint32_t> _cpu_concurrency;
+    utils::updateable_value<float> _preemptive_abort_factor;
+
     stats _stats;
-    permit_list_type _permit_list;
+    std::optional<seastar::metrics::metric_groups> _metrics;
     bool _stopped = false;
-    gate _close_readers_gate;
-    gate _permit_gate;
+    bool _evicting = false;
+    named_gate _close_readers_gate;
+    named_gate _permit_gate;
     std::optional<future<>> _execution_loop_future;
+    reader_permit::impl* _blessed_permit = nullptr;
 
 private:
-    [[nodiscard]] flat_mutation_reader_v2 detach_inactive_reader(inactive_read&, evict_reason reason) noexcept;
-    void evict(inactive_read&, evict_reason reason) noexcept;
+    void do_detach_inactive_reader(reader_permit::impl&, evict_reason reason) noexcept;
+    [[nodiscard]] mutation_reader detach_inactive_reader(reader_permit::impl&, evict_reason reason) noexcept;
+    void evict(reader_permit::impl&, evict_reason reason) noexcept;
 
-    bool has_available_units(const resources& r) const;
+    enum class reason { all_ok = 0, ready_list, need_cpu_permits, memory_resources, count_resources };
+    reason has_available_units(const resources& r) const;
 
-    bool all_used_permits_are_stalled() const;
+    bool cpu_concurrency_limit_reached() const;
 
     [[nodiscard]] std::exception_ptr check_queue_size(std::string_view queue_name);
 
     // Add the permit to the wait queue and return the future which resolves when
     // the permit is admitted (popped from the queue).
-    future<> enqueue_waiter(reader_permit permit, read_func func);
+    enum class wait_on { admission, memory };
+    future<> enqueue_waiter(reader_permit::impl& permit, wait_on wait);
     void evict_readers_in_background();
-    future<> do_wait_admission(reader_permit permit, read_func func = {});
+    future<> do_wait_admission(reader_permit::impl& permit);
+
+    // Check whether permit can be admitted or not.
+    // The wait list is not taken into consideration, this is the caller's
+    // responsibility.
+    // A return value of can_admit::maybe means admission might be possible if
+    // some of the inactive readers are evicted.
+    enum class can_admit { no, maybe, yes };
+    struct admit_result { can_admit decision; reason why; };
+    admit_result can_admit_read(const reader_permit::impl& permit) const noexcept;
+
+    bool should_evict_inactive_read() const noexcept;
+
     void maybe_admit_waiters() noexcept;
+
+    void maybe_wake_execution_loop() noexcept;
+
+    // Request more memory for the permit.
+    // Request is instantly granted while memory consumption of all reads is
+    // below _kill_limit_multiplier.
+    // After memory consumption goes above the above limit, only one reader
+    // (permit) is allowed to make progress, this method will block for all other
+    // one, until:
+    // * The blessed read finishes and a new blessed permit is chosen.
+    // * Memory consumption falls below the limit.
+    future<> request_memory(reader_permit::impl& permit, size_t memory);
+
+    void dequeue_permit(reader_permit::impl&);
 
     void on_permit_created(reader_permit::impl&);
     void on_permit_destroyed(reader_permit::impl&) noexcept;
 
-    void on_permit_used() noexcept;
-    void on_permit_unused() noexcept;
+    void on_permit_preemptive_aborted() noexcept;
 
-    void on_permit_blocked() noexcept;
-    void on_permit_unblocked() noexcept;
+    void on_permit_need_cpu() noexcept;
+    void on_permit_not_need_cpu() noexcept;
+
+    void on_permit_awaits() noexcept;
+    void on_permit_not_awaits() noexcept;
 
     std::runtime_error stopped_exception();
 
     // closes reader in the background.
-    void close_reader(flat_mutation_reader_v2 reader);
+    void close_reader(mutation_reader reader);
 
     future<> execution_loop() noexcept;
 
+    uint64_t get_serialize_limit() const;
+    uint64_t get_kill_limit() const;
+
+    // Memory consumption counted against the anti-OOM (serialize/kill) limits.
+    // It excludes the memory the shared pool could still fund (this semaphore's
+    // current borrow plus the still-free pool), so while the pool can lend
+    // memory the effective serialize/kill limits are raised by that amount.
+    // Throttling thus engages only on consumption the semaphore must cover from
+    // its own dedicated memory. May be negative when the pool can fully fund the
+    // current consumption.
+    ssize_t oom_protection_consumed_memory() const noexcept;
+
+    // Throws std::bad_alloc if memory consumed is oom_kill_limit_multiply_threshold more than the memory limit.
+    void consume(reader_permit::impl& permit, resources r);
+    void signal(const resources& r) noexcept;
+
+    resources repay_shared_pool(const resources& r) noexcept;
+
+    future<> with_ready_permit(reader_permit::impl& permit);
+
 public:
     struct no_limits { };
+    using register_metrics = bool_class<class register_metrics_clas>;
 
     /// Create a semaphore with the specified limits
     ///
     /// The semaphore's name has to be unique!
-    reader_concurrency_semaphore(int count,
+    reader_concurrency_semaphore(
+            utils::updateable_value<int> count,
             ssize_t memory,
             sstring name,
-            size_t max_queue_length);
+            size_t max_queue_length,
+            utils::updateable_value<uint32_t> serialize_limit_multiplier,
+            utils::updateable_value<uint32_t> kill_limit_multiplier,
+            utils::updateable_value<uint32_t> cpu_concurrency,
+            utils::updateable_value<float> preemptive_abort_factor,
+            register_metrics metrics,
+            reader_concurrency_semaphore_shared_pool& shared_pool);
+
+    reader_concurrency_semaphore(
+            int count,
+            ssize_t memory,
+            sstring name,
+            size_t max_queue_length,
+            utils::updateable_value<uint32_t> serialize_limit_multiplier,
+            utils::updateable_value<uint32_t> kill_limit_multiplier,
+            utils::updateable_value<uint32_t> cpu_concurrency,
+            utils::updateable_value<float> preemptive_abort_factor,
+            register_metrics metrics,
+            reader_concurrency_semaphore_shared_pool& shared_pool)
+        : reader_concurrency_semaphore(utils::updateable_value(count), memory, std::move(name), max_queue_length,
+                std::move(serialize_limit_multiplier), std::move(kill_limit_multiplier), std::move(cpu_concurrency),
+                std::move(preemptive_abort_factor), metrics, shared_pool)
+    { }
 
     /// Create a semaphore with practically unlimited count and memory.
     ///
     /// And conversely, no queue limit either.
     /// The semaphore's name has to be unique!
-    explicit reader_concurrency_semaphore(no_limits, sstring name);
+    explicit reader_concurrency_semaphore(no_limits, sstring name, register_metrics metrics);
 
     /// A helper constructor *only for tests* that supplies default arguments.
     /// The other constructors have default values removed so 'production-code'
@@ -242,11 +448,18 @@ public:
     reader_concurrency_semaphore(for_tests, sstring name,
             int count = std::numeric_limits<int>::max(),
             ssize_t memory = std::numeric_limits<ssize_t>::max(),
-            size_t max_queue_length = std::numeric_limits<size_t>::max())
-        : reader_concurrency_semaphore(count, memory, std::move(name), max_queue_length)
+            size_t max_queue_length = std::numeric_limits<size_t>::max(),
+            utils::updateable_value<uint32_t> serialize_limit_multipler = utils::updateable_value(std::numeric_limits<uint32_t>::max()),
+            utils::updateable_value<uint32_t> kill_limit_multipler = utils::updateable_value(std::numeric_limits<uint32_t>::max()),
+            utils::updateable_value<uint32_t> cpu_concurrency = utils::updateable_value<uint32_t>(1),
+            utils::updateable_value<float> preemptive_abort_factor = utils::updateable_value<float>(0.0f),
+            register_metrics metrics = register_metrics::no,
+            reader_concurrency_semaphore_shared_pool& shared_pool = reader_concurrency_semaphore_shared_pool::empty_pool())
+        : reader_concurrency_semaphore(utils::updateable_value(count), memory, std::move(name), max_queue_length, std::move(serialize_limit_multipler),
+                std::move(kill_limit_multipler), std::move(cpu_concurrency), std::move(preemptive_abort_factor), metrics, shared_pool)
     {}
 
-    virtual ~reader_concurrency_semaphore();
+    ~reader_concurrency_semaphore();
 
     reader_concurrency_semaphore(const reader_concurrency_semaphore&) = delete;
     reader_concurrency_semaphore& operator=(const reader_concurrency_semaphore&) = delete;
@@ -271,7 +484,7 @@ public:
     ///
     /// The semaphore takes ownership of the passed in reader for the duration
     /// of its inactivity and it may evict it to free up resources if necessary.
-    inactive_read_handle register_inactive_read(flat_mutation_reader_v2 ir) noexcept;
+    inactive_read_handle register_inactive_read(mutation_reader ir, const dht::partition_range* range = nullptr) noexcept;
 
     /// Set the inactive read eviction notification handler and optionally eviction ttl.
     ///
@@ -291,7 +504,7 @@ public:
     ///
     /// If the read was not evicted, the inactive read object, passed in to the
     /// register call, will be returned. Otherwise a nullptr is returned.
-    flat_mutation_reader_v2_opt unregister_inactive_read(inactive_read_handle irh);
+    mutation_reader_opt unregister_inactive_read(inactive_read_handle irh);
 
     /// Try to evict an inactive read.
     ///
@@ -301,16 +514,14 @@ public:
 
     /// Clear all inactive reads.
     void clear_inactive_reads();
-private:
-    // The following two functions are extension points for
-    // future inheriting classes that needs to run some stop
-    // logic just before or just after the current stop logic.
-    virtual future<> stop_ext_pre() {
-        return make_ready_future<>();
-    }
-    virtual future<> stop_ext_post() {
-        return make_ready_future<>();
-    }
+
+    /// Evict all inactive reads the belong to the table designated by the id.
+    /// If a range is provided, only inactive reads whose range overlaps with the
+    /// range are evicted.
+    /// The range of the inactive read is provided in register_inactive_read().
+    /// If the range for an inactive read was not provided, all reads for the
+    /// table are evicted.
+    future<> evict_inactive_reads_for_table(table_id id, const dht::partition_range* range = nullptr) noexcept;
 public:
     /// Stop the reader_concurrency_semaphore and clear all inactive reads.
     ///
@@ -337,8 +548,8 @@ public:
     ///
     /// Some permits cannot be associated with any table, so passing nullptr as
     /// the schema parameter is allowed.
-    future<reader_permit> obtain_permit(const schema* const schema, const char* const op_name, size_t memory, db::timeout_clock::time_point timeout);
-    future<reader_permit> obtain_permit(const schema* const schema, sstring&& op_name, size_t memory, db::timeout_clock::time_point timeout);
+    future<reader_permit> obtain_permit(schema_ptr schema, const char* const op_name, size_t memory, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
+    future<reader_permit> obtain_permit(schema_ptr schema, sstring&& op_name, size_t memory, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
 
     /// Make a tracking only permit
     ///
@@ -353,8 +564,8 @@ public:
     ///
     /// Some permits cannot be associated with any table, so passing nullptr as
     /// the schema parameter is allowed.
-    reader_permit make_tracking_only_permit(const schema* const schema, const char* const op_name, db::timeout_clock::time_point timeout);
-    reader_permit make_tracking_only_permit(const schema* const schema, sstring&& op_name, db::timeout_clock::time_point timeout);
+    reader_permit make_tracking_only_permit(schema_ptr schema, const char* const op_name, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
+    reader_permit make_tracking_only_permit(schema_ptr schema, sstring&& op_name, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
 
     /// Run the function through the semaphore's execution stage with an admitted permit
     ///
@@ -375,7 +586,8 @@ public:
     ///
     /// Some permits cannot be associated with any table, so passing nullptr as
     /// the schema parameter is allowed.
-    future<> with_permit(const schema* const schema, const char* const op_name, size_t memory, db::timeout_clock::time_point timeout, read_func func);
+    future<> with_permit(schema_ptr schema, const char* const op_name, size_t memory, db::timeout_clock::time_point timeout,
+            tracing::trace_state_ptr trace_ptr, reader_permit_opt& permit_holder, read_func func);
 
     /// Run the function through the semaphore's execution stage with a pre-admitted permit
     ///
@@ -385,6 +597,16 @@ public:
     /// \ref obtain_permit(), then \ref with_ready_permit() is less
     /// optimal then just using \ref with_permit().
     future<> with_ready_permit(reader_permit permit, read_func func);
+
+    /// Set the total resources of the semaphore to \p r.
+    ///
+    /// After this call, \ref initial_resources() will reflect the new value.
+    /// Available resources will be adjusted by the delta.
+    void set_resources(resources r, size_t unreduced_memory = 0);
+
+    size_t unreduced_memory() const noexcept {
+        return _unreduced_memory;
+    }
 
     const resources initial_resources() const {
         return _initial_resources;
@@ -398,14 +620,8 @@ public:
         return _resources;
     }
 
-    void consume(resources r) {
-        _resources -= r;
-    }
-
-    void signal(const resources& r) noexcept;
-
-    size_t waiters() const {
-        return _wait_list.size();
+    const resources consumed_resources() const {
+        return _initial_resources - _resources;
     }
 
     void broken(std::exception_ptr ex = {});
@@ -419,4 +635,13 @@ public:
     void set_max_queue_length(size_t size) {
         _max_queue_length = size;
     }
+
+    uint64_t active_reads() const noexcept {
+        return _stats.current_permits - _stats.inactive_reads - _stats.waiters;
+    }
+
+    void foreach_permit(noncopyable_function<void(const reader_permit::impl&)> func) const;
+    void foreach_permit(noncopyable_function<void(const reader_permit&)> func) const;
+
+    uintptr_t get_blessed_permit() const noexcept { return reinterpret_cast<uintptr_t>(_blessed_permit); }
 };

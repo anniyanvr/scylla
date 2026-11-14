@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -56,16 +56,11 @@ public:
 
     const cache_key_type& key() const { return _key; }
 
-    bool operator==(const authorized_prepared_statements_cache_key& other) const {
-        return _key == other._key;
-    }
-
-    bool operator!=(const authorized_prepared_statements_cache_key& other) const {
-        return !(*this == other);
-    }
+    bool operator==(const authorized_prepared_statements_cache_key&) const = default;
 
     static size_t hash(const auth::authenticated_user& user, const cql3::prepared_cache_key_type::cache_key_type& prep_cache_key) {
-        return utils::hash_combine(std::hash<auth::authenticated_user>()(user), utils::tuple_hash()(prep_cache_key));
+        return utils::hash_combine(std::hash<auth::authenticated_user>()(user),
+                                   std::hash<cql3::prepared_cache_key_type::cache_key_type>()(prep_cache_key));
     }
 };
 
@@ -81,6 +76,7 @@ class authorized_prepared_statements_cache {
 public:
     struct stats {
         uint64_t authorized_prepared_statements_cache_evictions = 0;
+        uint64_t authorized_prepared_statements_privileged_entries_evictions_on_size = 0;
         uint64_t authorized_prepared_statements_unprivileged_entries_evictions_on_size = 0;
     };
 
@@ -95,6 +91,10 @@ public:
         static void inc_blocks() noexcept {}
         static void inc_evictions() noexcept {
             ++shard_stats().authorized_prepared_statements_cache_evictions;
+        }
+
+        static void inc_privileged_on_cache_size_eviction() noexcept {
+            ++shard_stats().authorized_prepared_statements_privileged_entries_evictions_on_size;
         }
 
         static void inc_unprivileged_on_cache_size_eviction() noexcept {
@@ -128,17 +128,17 @@ private:
 
 public:
     // Choose the memory budget such that would allow us ~4K entries when a shard gets 1GB of RAM
-    authorized_prepared_statements_cache(std::chrono::milliseconds entry_expiration, std::chrono::milliseconds entry_refresh, size_t cache_size, logging::logger& logger)
-        : _cache(cache_size, entry_expiration, entry_refresh, logger, [this] (const key_type& k) {
+    authorized_prepared_statements_cache(utils::loading_cache_config c, logging::logger& logger)
+        : _cache(std::move(c), logger, [this] (const key_type& k) {
             _cache.remove(k);
             return make_ready_future<value_type>();
         })
     {}
 
     future<> insert(auth::authenticated_user user, cql3::prepared_cache_key_type prep_cache_key, value_type v) noexcept {
-        return _cache.get_ptr(key_type(std::move(user), std::move(prep_cache_key)), [v = std::move(v)] (const cache_key_type&) mutable {
+        return _cache.insert(key_type(std::move(user), std::move(prep_cache_key)), [v = std::move(v)] (const cache_key_type&) mutable {
             return make_ready_future<value_type>(std::move(v));
-        }).discard_result();
+        });
     }
 
     value_ptr find(const auth::authenticated_user& user, const cql3::prepared_cache_key_type& prep_cache_key) {
@@ -157,6 +157,14 @@ public:
         return _cache.memory_footprint();
     }
 
+    bool update_config(utils::loading_cache_config c) {
+        return _cache.update_config(std::move(c));
+    }
+
+    void reset() {
+        _cache.reset();
+    }
+
     future<> stop() {
         return _cache.stop();
     }
@@ -172,7 +180,12 @@ struct hash<cql3::authorized_prepared_statements_cache_key> final {
     }
 };
 
-inline std::ostream& operator<<(std::ostream& out, const cql3::authorized_prepared_statements_cache_key& k) {
-    return out << "{ " << k.key().first << ", " << k.key().second << " }";
 }
-}
+
+template <>
+struct fmt::formatter<cql3::authorized_prepared_statements_cache_key> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const cql3::authorized_prepared_statements_cache_key& k, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{{{}, {}}}", k.key().first, k.key().second);
+    }
+};

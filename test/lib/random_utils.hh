@@ -2,20 +2,22 @@
  * Copyright (C) 2018-present ScyllaDB
  */
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <algorithm>
 #include <random>
-
-#include <boost/range/algorithm/generate.hpp>
+#include <ranges>
 #include <iostream>
 
+#include <seastar/testing/random.hh>
 #include <seastar/testing/test_runner.hh>
 
 #include "bytes.hh"
+#include "utils/assert.hh"
+#include "utils/preempt.hh"
 
 namespace tests::random {
 
@@ -98,6 +100,13 @@ Real get_real(Real max, RandomEngine& engine) {
     return get_real<Real>(Real{0}, max, engine);
 }
 
+/// Returns true with probability p.
+/// p = 1.0 means 100%.
+inline
+bool with_probability(double p) {
+    return get_real<double>(1, gen()) < p;
+}
+
 template <typename Real, typename RandomEngine>
 Real get_real(RandomEngine& engine) {
     return get_real<Real>(Real{0}, std::numeric_limits<Real>::max(), engine);
@@ -128,10 +137,15 @@ inline bool get_bool() {
     return get_bool(gen());
 }
 
-inline bytes get_bytes(size_t n) {
+template <typename RandomEngine>
+inline bytes get_bytes(size_t n, RandomEngine& engine) {
     bytes b(bytes::initialized_later(), n);
-    boost::generate(b, [] { return get_int<bytes::value_type>(); });
+    std::ranges::generate(b, [&engine] { return get_int<bytes::value_type>(engine); });
     return b;
+}
+
+inline bytes get_bytes(size_t n) {
+    return get_bytes(n, gen());
 }
 
 inline bytes get_bytes() {
@@ -141,7 +155,7 @@ inline bytes get_bytes() {
 template <typename RandomEngine>
 inline sstring get_sstring(size_t n, RandomEngine& engine) {
     sstring str = uninitialized_string(n);
-    boost::generate(str, [&engine] { return get_int<sstring::value_type>('a', 'z', engine); });
+    std::ranges::generate(str, [&engine] { return get_int<sstring::value_type>('a', 'z', engine); });
     return str;
 }
 
@@ -156,7 +170,7 @@ inline sstring get_sstring() {
 // Picks a random subset of size `m` from the given vector.
 template <typename T>
 std::vector<T> random_subset(std::vector<T> v, unsigned m, std::mt19937& engine) {
-    assert(m <= v.size());
+    SCYLLA_ASSERT(m <= v.size());
     std::shuffle(v.begin(), v.end(), engine);
     return {v.begin(), v.begin() + m};
 }
@@ -164,11 +178,18 @@ std::vector<T> random_subset(std::vector<T> v, unsigned m, std::mt19937& engine)
 // Picks a random subset of size `m` from the set {0, ..., `n` - 1}.
 template<typename T>
 std::vector<T> random_subset(unsigned n, unsigned m, std::mt19937& engine) {
-    assert(m <= n);
+    SCYLLA_ASSERT(m <= n);
 
     std::vector<T> the_set(n);
     std::iota(the_set.begin(), the_set.end(), T{});
     return random_subset(std::move(the_set), m, engine);
+}
+
+inline
+preemption_check random_preempt() {
+    return [] () noexcept {
+        return get_bool();
+    };
 }
 
 }

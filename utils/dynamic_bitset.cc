@@ -3,20 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <seastar/core/bitops.hh>
 #include <seastar/core/align.hh>
-#include <boost/range/adaptor/reversed.hpp>
-#include <boost/range/irange.hpp>
+#include <ranges>
 
 #include "utils/dynamic_bitset.hh"
 #include "seastarx.hh"
 
 namespace utils {
 
-void dynamic_bitset::set(size_t n) {
+void dynamic_bitset::set(size_t n) noexcept {
     for (auto& level : _bits) {
         auto idx = n / bits_per_int;
         auto old = level[idx];
@@ -28,7 +27,7 @@ void dynamic_bitset::set(size_t n) {
     }
 }
 
-void dynamic_bitset::clear(size_t n) {
+void dynamic_bitset::clear(size_t n) noexcept {
     for (auto& level : _bits) {
         auto idx = n / bits_per_int;
         auto old = level[idx];
@@ -40,10 +39,10 @@ void dynamic_bitset::clear(size_t n) {
     }
 }
 
-size_t dynamic_bitset::find_first_set() const
+size_t dynamic_bitset::find_first_set() const noexcept
 {
     size_t pos = 0;
-    for (auto& vv : _bits | boost::adaptors::reversed) {
+    for (auto& vv : _bits | std::views::reverse) {
         auto v = vv[pos];
         pos *= bits_per_int;
         if (v) {
@@ -55,7 +54,7 @@ size_t dynamic_bitset::find_first_set() const
     return pos;
 }
 
-size_t dynamic_bitset::find_next_set(size_t n) const
+size_t dynamic_bitset::find_next_set(size_t n) const noexcept
 {
     ++n;
 
@@ -91,10 +90,10 @@ size_t dynamic_bitset::find_next_set(size_t n) const
     return n;
 }
 
-size_t dynamic_bitset::find_last_set() const
+size_t dynamic_bitset::find_last_set() const noexcept
 {
     size_t pos = 0;
-    for (auto& vv : _bits | boost::adaptors::reversed) {
+    for (auto& vv : _bits | std::views::reverse) {
         auto v = vv[pos];
         pos *= bits_per_int;
         if (v) {

@@ -1,19 +1,16 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #pragma once
 
-#include "bytes.hh"
-#include "bloom_calculations.hh"
+#include <memory>
+#include "bytes_fwd.hh"
 
 namespace utils {
 
@@ -41,9 +38,9 @@ struct i_filter {
     virtual ~i_filter() {}
 
     virtual void add(const bytes_view& key) = 0;
+    virtual void add(const hashed_key& key) = 0;
     virtual bool is_present(const bytes_view& key) = 0;
     virtual bool is_present(hashed_key) = 0;
-    virtual void clear() = 0;
     virtual void close() = 0;
 
     virtual size_t memory_size() = 0;
@@ -56,5 +53,10 @@ struct i_filter {
      *         filter.
      */
     static filter_ptr get_filter(int64_t num_elements, double max_false_pos_prob, filter_format format);
+
+    /**
+     * @return the size of the smallest filter (in bytes), according to the conditions described at get_filter()
+     */
+    static size_t get_filter_size(int64_t num_elements, double max_false_pos_prob);
 };
 }

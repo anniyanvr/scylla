@@ -5,15 +5,15 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 import os
 import sys
 import argparse
-from scylla_util import *
+from scylla_util import is_nonroot, is_container, etcdir, sysconfig_parser
 
 if __name__ == '__main__':
-    if not is_nonroot() and os.getuid() > 0:
+    if not is_nonroot() and not is_container() and os.getuid() > 0:
         print('Requires root permission.')
         sys.exit(1)
     parser = argparse.ArgumentParser(description='Modify Scylla running mode.')

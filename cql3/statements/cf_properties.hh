@@ -1,18 +1,16 @@
 /*
- */
-
-/*
  * Copyright 2016-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/statements/cf_prop_defs.hh"
 #include "cql3/column_identifier.hh"
+#include "data_dictionary/data_dictionary.hh"
 
 namespace cql3 {
 
@@ -21,7 +19,8 @@ namespace statements {
 /**
  * Class for common statement properties.
  */
-class cf_properties final {
+class cf_properties {
+protected:
     const ::shared_ptr<cf_prop_defs> _properties = ::make_shared<cf_prop_defs>();
     bool _use_compact_storage = false;
     std::vector<std::pair<::shared_ptr<column_identifier>, bool>> _defined_ordering; // Insertion ordering is important

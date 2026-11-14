@@ -4,10 +4,10 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
-set -e
+set -eo pipefail
 
 if [ -z "$BASH_VERSION" ]; then
     echo "Unsupported shell, please run this script on bash."
@@ -22,13 +22,14 @@ Options:
   --root /path/to/root     alternative install root (default /)
   --prefix /prefix         directory prefix (default /usr)
   --python3 /opt/python3   path of the python3 interpreter relative to install root (default /opt/scylladb/python3/bin/python3)
-  --housekeeping           enable housekeeping service
-  --nonroot                install Scylla without required root priviledge
+  --nonroot                install Scylla without required root privilege
   --sysconfdir /etc/sysconfig   specify sysconfig directory name
   --packaging               use install.sh for packaging
   --upgrade                 upgrade existing scylla installation (don't overwrite config files)
   --supervisor             enable supervisor to manage scylla processes
   --supervisor-log-to-stdout logging to stdout on supervisor
+  --without-systemd         skip installing systemd units
+  --p11-trust-paths         specify trust path for p11-kit
   --help                   this helpful message
 EOF
     exit 1
@@ -62,12 +63,14 @@ EOF
 # isn't changed by it.
 
 root=/
-housekeeping=false
 nonroot=false
 packaging=false
 upgrade=false
 supervisor=false
 supervisor_log_to_stdout=false
+without_systemd=false
+skip_systemd_check=false
+p11_trust_paths=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -78,10 +81,6 @@ while [ $# -gt 0 ]; do
         "--prefix")
             prefix="$2"
             shift 2
-            ;;
-        "--housekeeping")
-            housekeeping=true
-            shift 1
             ;;
         "--python3")
             python3="$2"
@@ -97,6 +96,7 @@ while [ $# -gt 0 ]; do
             ;;
         "--packaging")
             packaging=true
+            skip_systemd_check=true
             shift 1
             ;;
         "--upgrade")
@@ -105,11 +105,21 @@ while [ $# -gt 0 ]; do
             ;;
         "--supervisor")
             supervisor=true
+            skip_systemd_check=true
             shift 1
             ;;
         "--supervisor-log-to-stdout")
             supervisor_log_to_stdout=true
             shift 1
+            ;;
+        "--without-systemd")
+            without_systemd=true
+            skip_systemd_check=true
+            shift 1
+            ;;
+        "--p11-trust-paths")
+            p11_trust_paths="$2"
+            shift 2
             ;;
         "--help")
             shift 1
@@ -139,11 +149,21 @@ adjust_bin() {
 #!/bin/bash -e
 [[ -z "\$LD_PRELOAD" ]] || { echo "\$0: not compatible with LD_PRELOAD" >&2; exit 110; }
 export GNUTLS_SYSTEM_PRIORITY_FILE="\${GNUTLS_SYSTEM_PRIORITY_FILE-$prefix/libreloc/gnutls.config}"
+# hide AES+PMULL, keep SHA (0x58; 0x18 if no SHA512; none if no SHA1/2): nettle's aarch64 AES-GCM is ~4x faster (SCYLLADB-5387)
+if [[ \$HOSTTYPE == aarch64 ]] && grep -qw sha1 /proc/cpuinfo && grep -qw sha2 /proc/cpuinfo; then
+    if grep -qw sha512 /proc/cpuinfo; then
+        export GNUTLS_CPUID_OVERRIDE=0x58
+    else
+        export GNUTLS_CPUID_OVERRIDE=0x18
+    fi
+fi
 export LD_LIBRARY_PATH="$prefix/libreloc"
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:+$UBSAN_OPTIONS:}suppressions=$prefix/libexec/ubsan-suppressions.supp"
+export LSAN_OPTIONS="${LSAN_OPTIONS:+$LSAN_OPTIONS:}suppressions=$prefix/libexec/lsan-suppressions.supp"
+${p11_trust_paths:+export SCYLLA_P11_TRUST_PATHS="$p11_trust_paths"}
 exec -a "\$0" "$prefix/libexec/$bin" "\$@"
 EOF
-    chmod +x "$root/$prefix/bin/$bin"
+    chmod 755 "$root/$prefix/bin/$bin"
 }
 
 relocate_python3() {
@@ -156,15 +176,14 @@ relocate_python3() {
     local pythonpath="$(dirname "$pythoncmd")"
 
     if [ ! -x "$script" ]; then
-        cp "$script" "$install"
+        install -m755 "$script" "$install"
         return
     fi
-    mkdir -p "$relocateddir"
-    cp "$script" "$relocateddir"
+    install -d -m755 "$relocateddir"
+    install -m755 "$script" "$relocateddir"
     cat > "$install"<<EOF
 #!/usr/bin/env bash
 [[ -z "\$LD_PRELOAD" ]] || { echo "\$0: not compatible with LD_PRELOAD" >&2; exit 110; }
-export LC_ALL=en_US.UTF-8
 x="\$(readlink -f "\$0")"
 b="\$(basename "\$x")"
 d="\$(dirname "\$x")"
@@ -178,7 +197,7 @@ if [ -f "\${DEBIAN_SSL_CERT_FILE}" ]; then
 fi
 PYTHONPATH="\${d}:\${d}/libexec:\$PYTHONPATH" PATH="\${d}/../bin:\${d}/$pythonpath:\${PATH}" SSL_CERT_FILE="\${c}" exec -a "\$0" "\${d}/libexec/\${b}" "\$@"
 EOF
-    chmod +x "$install"
+    chmod 755 "$install"
 }
 
 install() {
@@ -205,14 +224,23 @@ installconfig() {
 }
 
 check_usermode_support() {
-    user=$(systemctl --help|grep -e '--user')
-    [ -n "$user" ]
+    systemctl --help | grep -q -e '--user'
 }
 
 . /etc/os-release
 
+is_redhat_variant() {
+    local is_redhat=0
+    for i in $ID $ID_LIKE; do
+        case "$i" in
+          rhel|fedora|centos) is_redhat=1;;
+        esac
+    done
+    [ $is_redhat -eq 1 ]
+}
+
 is_debian_variant() {
-    [ "$ID_LIKE" = "debian" -o "$ID" = "debian" ]
+    [ "$ID_LIKE" = "debian" ] || [ "$ID" = "debian" ]
 }
 
 is_alpine() {
@@ -240,7 +268,7 @@ supervisor_conf() {
     fi
 }
 
-if ! $packaging && [ ! -d /run/systemd/system/ ] && ! $supervisor; then
+if ! $skip_systemd_check && [ ! -d /run/systemd/system/ ]; then
     echo "systemd is not detected, unsupported distribution."
     exit 1
 fi
@@ -248,7 +276,29 @@ fi
 # change directory to the package's root directory
 cd "$(dirname "$0")"
 
-product="$(cat ./SCYLLA-PRODUCT-FILE)"
+if [ -z "$p11_trust_paths" ]; then
+    # our package builder is cross-distro, so we cannot detect distro by os-release
+    if $packaging; then
+        echo "Please specify --p11-trust-paths."
+        echo "The path can be get by following command:"
+        echo "  pkg-config --variable p11_trust_paths p11-kit-1"
+        echo
+        print_usage
+    else
+        # for offline installer users we provide default p11-trust-paths
+        if is_redhat_variant; then
+            p11_trust_paths=/etc/pki/ca-trust/source:/usr/share/pki/ca-trust-source
+        elif is_debian_variant; then
+            p11_trust_paths=/etc/ssl/certs/ca-certificates.crt
+        else
+            echo "Please specify --p11-trust-paths."
+            echo "The path can be get by following command:"
+            echo "  pkg-config --variable p11_trust_paths p11-kit-1"
+            echo
+            print_usage
+        fi
+    fi
+fi
 
 if [ -z "$prefix" ]; then
     if $nonroot; then
@@ -284,7 +334,6 @@ if ! $nonroot; then
     rsystemd=$(realpath -m "$rusr/lib/systemd/system")
     rdoc="$rprefix/share/doc"
     rdata=$(realpath -m "$root/var/lib/scylla")
-    rhkdata=$(realpath -m "$root/var/lib/scylla-housekeeping")
 else
     retc="$rprefix/etc"
     rsysconfdir="$rprefix/$sysconfdir"
@@ -296,14 +345,19 @@ fi
 # scylla-conf
 install -d -m755 "$retc"/scylla
 install -d -m755 "$retc"/scylla.d
-grep -v api_ui_dir conf/scylla.yaml | grep -v api_doc_dir > /tmp/scylla.yaml
-echo "api_ui_dir: /opt/scylladb/swagger-ui/dist/" >> /tmp/scylla.yaml
-echo "api_doc_dir: /opt/scylladb/api/api-doc/" >> /tmp/scylla.yaml
-installconfig 644 /tmp/scylla.yaml "$retc"/scylla
-rm -f /tmp/scylla.yaml
+
+scylla_yaml_dir=$(mktemp -d)
+scylla_yaml=$scylla_yaml_dir/scylla.yaml
+grep -v api_ui_dir conf/scylla.yaml | grep -v api_doc_dir > $scylla_yaml
+echo "api_ui_dir: $prefix/swagger-ui/dist/" >> $scylla_yaml
+echo "api_doc_dir: $prefix/api/api-doc/" >> $scylla_yaml
+installconfig 644 $scylla_yaml "$retc"/scylla
+rm -rf $scylla_yaml_dir
+
 installconfig 644 conf/cassandra-rackdc.properties "$retc"/scylla
-if $housekeeping; then
-    installconfig 644 conf/housekeeping.cfg "$retc"/scylla.d
+# scylla-perf-collector
+if ! $nonroot; then
+    install -d -m755 "$root"/var/log/scylla-perf
 fi
 # scylla-kernel-conf
 if ! $nonroot; then
@@ -312,65 +366,83 @@ if ! $nonroot; then
         installconfig 644 "$file" "$rusr"/lib/sysctl.d
     done
 fi
-# scylla-node-exporter
-install -d -m755 "$rsysconfdir" "$rsystemd"
-install -d -m755 "$rprefix"/node_exporter
-install -d -m755 "$rprefix"/node_exporter/licenses
-install -m755 node_exporter/node_exporter "$rprefix"/node_exporter
-install -m644 node_exporter/LICENSE "$rprefix"/node_exporter/licenses
-install -m644 node_exporter/NOTICE "$rprefix"/node_exporter/licenses
-install -m644 dist/common/systemd/scylla-node-exporter.service -Dt "$rsystemd"
-installconfig 644 dist/common/sysconfig/scylla-node-exporter "$rsysconfdir"
-if ! $nonroot; then
-    install -d -m755 "$retc"/systemd/system/scylla-node-exporter.service.d
-    install -m644 dist/common/systemd/scylla-node-exporter.service.d/dependencies.conf -Dt "$retc"/systemd/system/scylla-node-exporter.service.d
-    if [ "$sysconfdir" != "/etc/sysconfig" ]; then
-        cat << EOS > "$retc"/systemd/system/scylla-node-exporter.service.d/sysconfdir.conf
+install -d -m755 -d "$rprefix"/kernel_conf
+install -m755 dist/common/kernel_conf/scylla_tune_sched -Dt "$rprefix"/kernel_conf
+install -m755 dist/common/kernel_conf/post_install.sh "$rprefix"/kernel_conf
+if ! $without_systemd; then
+    install -m644 dist/common/systemd/scylla-tune-sched.service -Dt "$rsystemd"
+    if ! $nonroot && [ "$prefix" != "/opt/scylladb" ]; then
+        install -d -m755 "$retc"/systemd/system/scylla-tune-sched.service.d
+        cat << EOS > "$retc"/systemd/system/scylla-tune-sched.service.d/execpath.conf
 [Service]
-EnvironmentFile=
-EnvironmentFile=$sysconfdir/scylla-node-exporter
-EOS
-    fi
-else
-    install -d -m755 "$rsystemd"/scylla-node-exporter.service.d
-    cat << EOS > "$rsystemd"/scylla-node-exporter.service.d/nonroot.conf
-[Service]
-EnvironmentFile=
-EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-node-exporter")
 ExecStart=
-ExecStart=$rprefix/node_exporter/node_exporter $SCYLLA_NODE_EXPORTER_ARGS
-User=
-Group=
+ExecStart=$prefix/kernel_conf/scylla_tune_sched
 EOS
-
+        chmod 644 "$retc"/systemd/system/scylla-tune-sched.service.d/execpath.conf
+    fi
 fi
+relocate_python3 "$rprefix"/kernel_conf dist/common/kernel_conf/scylla_tune_sched
 
 # scylla-server
 install -m755 -d "$rprefix"
 install -m755 -d "$retc/scylla.d"
-installconfig 644 dist/common/sysconfig/scylla-housekeeping "$rsysconfdir"
 installconfig 644 dist/common/sysconfig/scylla-server "$rsysconfdir"
 for file in dist/common/scylla.d/*.conf; do
     installconfig 644 "$file" "$retc"/scylla.d
 done
 
-install -d -m755 "$retc"/scylla "$rprefix/bin" "$rprefix/libexec" "$rprefix/libreloc" "$rprefix/scripts" "$rprefix/bin"
-install -m644 dist/common/systemd/scylla-fstrim.service -Dt "$rsystemd"
-install -m644 dist/common/systemd/scylla-housekeeping-daily.service -Dt "$rsystemd"
-install -m644 dist/common/systemd/scylla-housekeeping-restart.service -Dt "$rsystemd"
-install -m644 dist/common/systemd/scylla-server.service -Dt "$rsystemd"
-install -m644 dist/common/systemd/*.slice -Dt "$rsystemd"
-install -m644 dist/common/systemd/*.timer -Dt "$rsystemd"
+install -d -m755 "$retc"/scylla "$rprefix/bin" "$rprefix/libexec" "$rprefix/libreloc" "$rprefix/libreloc/fipscheck" "$rprefix/libreloc/pkcs11" "$rprefix/scripts" "$rprefix/bin"
+if ! $without_systemd; then
+    install -m644 dist/common/systemd/scylla-fstrim.service -Dt "$rsystemd"
+    install -m644 dist/common/systemd/scylla-server.service -Dt "$rsystemd"
+    install -m644 dist/common/perf-collector/scylla-perf-collector.service -Dt "$rsystemd"
+    install -m644 dist/common/systemd/*.slice -Dt "$rsystemd"
+    install -m644 dist/common/systemd/*.timer -Dt "$rsystemd"
+fi
 install -m755 seastar/scripts/seastar-cpu-map.sh -Dt "$rprefix"/scripts
 install -m755 seastar/dpdk/usertools/dpdk-devbind.py -Dt "$rprefix"/scripts
-install -m755 libreloc/* -Dt "$rprefix/libreloc"
+find libreloc/ -maxdepth 1 -type f | while read -r i; do
+    install -m755 "$i" -Dt "$rprefix/libreloc"
+done
+for i in $(find libreloc/fipscheck/ -maxdepth 1 -type f); do
+    install -m755 "$i" -Dt "$rprefix/libreloc/fipscheck"
+done
+for i in $(find libreloc/pkcs11/ -maxdepth 1 -type f); do
+    install -m755 "$i" -Dt "$rprefix/libreloc/pkcs11"
+done
+
+LIBGNUTLS_SO=$(basename libreloc/libgnutls.so.*)
+LIBGNUTLS_HMAC=$(cat libreloc/.libgnutls.so.*.hmac)
+LIBNETTLE_SO=$(basename libreloc/libnettle.so.*)
+LIBNETTLE_HMAC=$(cat libreloc/.libnettle.so.*.hmac)
+LIBHOGWEED_SO=$(basename libreloc/libhogweed.so.*)
+LIBHOGWEED_HMAC=$(cat libreloc/.libhogweed.so.*.hmac)
+LIBGMP_SO=$(basename libreloc/libgmp.so.*)
+LIBGMP_HMAC=$(cat libreloc/.libgmp.so.*.hmac)
+cat << EOS > "$rprefix"/libreloc/.$LIBGNUTLS_SO.hmac
+[global]
+format-version = 1
+[$LIBGNUTLS_SO]
+path = "$prefix"/libreloc/$LIBGNUTLS_SO
+hmac = $LIBGNUTLS_HMAC
+[$LIBNETTLE_SO]
+path = "$prefix"/libreloc/$LIBNETTLE_SO
+hmac = $LIBNETTLE_HMAC
+[$LIBHOGWEED_SO]
+path = "$prefix"/libreloc/$LIBHOGWEED_SO
+hmac = $LIBHOGWEED_HMAC
+[$LIBGMP_SO]
+path = "$prefix"/libreloc/$LIBGMP_SO
+hmac = $LIBGMP_HMAC
+EOS
 # some files in libexec are symlinks, which "install" dereferences
 # use cp -P for the symlinks instead.
 install -m755 libexec/* -Dt "$rprefix/libexec"
 for bin in libexec/*; do
-	adjust_bin "${bin#libexec/}"
+    adjust_bin "${bin#libexec/}"
 done
 install -m644 ubsan-suppressions.supp -Dt "$rprefix/libexec"
+install -m644 lsan-suppressions.supp -Dt "$rprefix/libexec"
 
 install -d -m755 "$rdoc"/scylla
 install -m644 README.md -Dt "$rdoc"/scylla/
@@ -385,27 +457,31 @@ install -m755 -d "$rdata"/hints
 install -m755 -d "$rdata"/view_hints
 install -m755 -d "$rdata"/coredump
 install -m755 -d "$rprefix"/swagger-ui
-cp -r swagger-ui/dist "$rprefix"/swagger-ui
+cp -pr swagger-ui/dist "$rprefix"/swagger-ui
 install -d -m755 -d "$rprefix"/api
-cp -r api/api-doc "$rprefix"/api
+cp -pr api/api-doc "$rprefix"/api
 install -d -m755 -d "$rprefix"/scyllatop
-cp -r tools/scyllatop/* "$rprefix"/scyllatop
+cp -pr tools/scyllatop/* "$rprefix"/scyllatop
+install -d -m755 -d "$rprefix"/lib-python/tablets
+cp -pr scripts/tablets/*.py "$rprefix"/lib-python/tablets
 install -d -m755 -d "$rprefix"/scripts
-cp -r dist/common/scripts/* "$rprefix"/scripts
+cp -pr dist/common/scripts/* "$rprefix"/scripts
 ln -srf "$rprefix/scyllatop/scyllatop.py" "$rprefix/bin/scyllatop"
+ln -srf "$rprefix/lib-python/scylla-tablets.py" "$rprefix/bin/scylla-tablets"
 if $supervisor; then
     install -d -m755 "$rprefix"/supervisor
     install -m755 dist/common/supervisor/* -Dt "$rprefix"/supervisor
 fi
 
+# scylla tools
+install -d -m755 "$retc"/bash_completion.d
+install -m644 dist/common/nodetool-completion "$retc"/bash_completion.d
+install -m755 bin/nodetool "$rprefix/bin"
+
 SBINFILES=$(cd dist/common/scripts/; ls scylla_*setup node_health_check scylla_kernel_check)
 SBINFILES+=" $(cd seastar/scripts; ls seastar-cpu-map.sh)"
 
-cat << EOS > "$rprefix"/scripts/scylla_product.py
-PRODUCT="$product"
-EOS
-
-if ! $nonroot; then
+if ! $nonroot && ! $without_systemd; then
     install -d -m755 "$retc"/systemd/system/scylla-server.service.d
     install -m644 dist/common/systemd/scylla-server.service.d/dependencies.conf -Dt "$retc"/systemd/system/scylla-server.service.d
     if [ "$sysconfdir" != "/etc/sysconfig" ]; then
@@ -415,24 +491,61 @@ EnvironmentFile=
 EnvironmentFile=$sysconfdir/scylla-server
 EnvironmentFile=/etc/scylla.d/*.conf
 EOS
-    for i in daily restart; do
-        install -d -m755 "$retc"/systemd/system/scylla-housekeeping-$i.service.d
-        cat << EOS > "$retc"/systemd/system/scylla-housekeeping-$i.service.d/sysconfdir.conf
+        chmod 644 "$retc"/systemd/system/scylla-server.service.d/sysconfdir.conf
+    fi
+elif ! $without_systemd; then
+    install -d -m755 "$rsystemd"/scylla-server.service.d
+    if [ -d /var/log/journal ]; then
+        cat << EOS > "$rsystemd"/scylla-server.service.d/nonroot.conf
 [Service]
 EnvironmentFile=
-EnvironmentFile=$sysconfdir/scylla-housekeeping
+EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-server")
+EnvironmentFile=$retc/scylla.d/*.conf
+ExecStartPre=
+ExecStart=
+ExecStart=$rprefix/bin/scylla \$SCYLLA_ARGS \$SEASTAR_IO \$DEV_MODE \$CPUSET
+ExecStopPost=
+User=
+AmbientCapabilities=
 EOS
-    done
+        chmod 644 "$rsystemd"/scylla-server.service.d/nonroot.conf
+    else
+        cat << EOS > "$rsystemd"/scylla-server.service.d/nonroot.conf
+[Service]
+EnvironmentFile=
+EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-server")
+EnvironmentFile=$retc/scylla.d/*.conf
+ExecStartPre=
+ExecStartPre=$rprefix/scripts/scylla_logrotate
+ExecStart=
+ExecStart=$rprefix/bin/scylla \$SCYLLA_ARGS \$SEASTAR_IO \$DEV_MODE \$CPUSET
+ExecStopPost=
+User=
+AmbientCapabilities=
+StandardOutput=
+StandardOutput=file:$rprefix/scylla-server.log
+StandardError=
+StandardError=inherit
+EOS
+        chmod 644 "$rsystemd"/scylla-server.service.d/nonroot.conf
+    fi
+fi
+
+
+if ! $nonroot; then
+    if [ "$sysconfdir" != "/etc/sysconfig" ]; then
         cat << EOS > "$rprefix"/scripts/scylla_sysconfdir.py
 SYSCONFDIR="$sysconfdir"
 EOS
+        chmod 644 "$rprefix"/scripts/scylla_sysconfdir.py
     fi
     install -m755 -d "$rusr/bin"
-    install -m755 -d "$rhkdata"
     ln -srf "$rprefix/bin/scylla" "$rusr/bin/scylla"
     ln -srf "$rprefix/bin/iotune" "$rusr/bin/iotune"
     ln -srf "$rprefix/bin/scyllatop" "$rusr/bin/scyllatop"
-    install -d "$rusr"/sbin
+    ln -srf "$rprefix/bin/scylla-tablets" "$rusr/bin/scylla-tablets"
+    ln -srf "$rprefix/bin/nodetool" "$rusr/bin/nodetool"
+    install -d -m755 "$rusr"/sbin
     for i in $SBINFILES; do
         ln -srf "$rprefix/scripts/$i" "$rusr/sbin/$i"
     done
@@ -452,46 +565,17 @@ EOS
     done
 else
     install -m755 -d "$rdata"/saved_caches
-    install -d -m755 "$rsystemd"/scylla-server.service.d
-    if [ -d /var/log/journal ]; then
-        cat << EOS > "$rsystemd"/scylla-server.service.d/nonroot.conf
-[Service]
-EnvironmentFile=
-EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-server")
-EnvironmentFile=$retc/scylla.d/*.conf
-ExecStartPre=
-ExecStart=
-ExecStart=$rprefix/bin/scylla \$SCYLLA_ARGS \$SEASTAR_IO \$DEV_MODE \$CPUSET
-ExecStopPost=
-User=
-EOS
-    else
-        cat << EOS > "$rsystemd"/scylla-server.service.d/nonroot.conf
-[Service]
-EnvironmentFile=
-EnvironmentFile=$(realpath -m "$rsysconfdir/scylla-server")
-EnvironmentFile=$retc/scylla.d/*.conf
-ExecStartPre=
-ExecStartPre=$rprefix/scripts/scylla_logrotate
-ExecStart=
-ExecStart=$rprefix/bin/scylla \$SCYLLA_ARGS \$SEASTAR_IO \$DEV_MODE \$CPUSET
-ExecStopPost=
-User=
-StandardOutput=
-StandardOutput=file:$rprefix/scylla-server.log
-StandardError=
-StandardError=inherit
-EOS
-        cat << EOS > "$rprefix"/scripts/scylla_sysconfdir.py
+    cat << EOS > "$rprefix"/scripts/scylla_sysconfdir.py
 SYSCONFDIR="$sysconfdir"
 EOS
-    fi
-
-    install -d "$rprefix"/sbin
+    chmod 644 "$rprefix"/scripts/scylla_sysconfdir.py
+    install -d -m755 "$rprefix"/sbin
     for i in $SBINFILES; do
         ln -srf "$rprefix/scripts/$i" "$rprefix/sbin/$i"
     done
 fi
+
+
 
 install -m755 scylla-gdb.py -Dt "$rprefix"/scripts/
 
@@ -499,24 +583,32 @@ PYSCRIPTS=$(find dist/common/scripts/ -maxdepth 1 -type f -exec grep -Pls '\A#!/
 for i in $PYSCRIPTS; do
     relocate_python3 "$rprefix"/scripts "$i"
 done
-for i in seastar/scripts/perftune.py seastar/scripts/seastar-addr2line; do
+for i in seastar/scripts/{perftune.py,addr2line.py,seastar-addr2line}; do
     relocate_python3 "$rprefix"/scripts "$i"
 done
 relocate_python3 "$rprefix"/scyllatop tools/scyllatop/scyllatop.py
+relocate_python3 "$rprefix"/lib-python scripts/tablets/scylla-tablets.py
 relocate_python3 "$rprefix"/scripts fix_system_distributed_tables.py
 
 if $supervisor; then
     install -d -m755 `supervisor_dir $retc`
-    for service in scylla-server scylla-jmx scylla-node-exporter; do
+    for service in scylla-server scylla-jmx; do
+        if [ "$service" = "scylla-server" ]; then
+            program="scylla"
+        else
+            program=$service
+        fi
         cat << EOS > `supervisor_conf $retc $service`
-[program:$service]
+[program:$program]
 directory=$rprefix
 command=/bin/bash -c './supervisor/$service.sh'
 EOS
+        chmod 644 `supervisor_conf $retc $service`
         if [ "$service" != "scylla-server" ]; then
             cat << EOS >> `supervisor_conf $retc $service`
 user=scylla
 EOS
+            chmod 644 `supervisor_conf $retc $service`
         fi
         if $supervisor_log_to_stdout; then
             cat << EOS >> `supervisor_conf $retc $service`
@@ -525,6 +617,7 @@ stdout_logfile_maxbytes=0
 stderr_logfile=/dev/stderr
 stderr_logfile_maxbytes=0
 EOS
+            chmod 644 `supervisor_conf $retc $service`
         fi
     done
 fi
@@ -538,8 +631,10 @@ if $nonroot; then
     fi
     # nonroot install is also 'offline install'
     touch $rprefix/SCYLLA-OFFLINE-FILE
+    chmod 644 $rprefix/SCYLLA-OFFLINE-FILE
     touch $rprefix/SCYLLA-NONROOT-FILE
-    if ! $supervisor && ! $packaging && check_usermode_support; then
+    chmod 644 $rprefix/SCYLLA-NONROOT-FILE
+    if ! $skip_systemd_check && check_usermode_support; then
         systemctl --user daemon-reload
     fi
     echo "Scylla non-root install completed."
@@ -549,6 +644,7 @@ elif ! $packaging; then
     fi
     # run install.sh without --packaging is 'offline install'
     touch $rprefix/SCYLLA-OFFLINE-FILE
+    chmod 644 $rprefix/SCYLLA-OFFLINE-FILE
     nousr=
     nogrp=
     getent passwd scylla || nousr=1
@@ -563,7 +659,6 @@ elif ! $packaging; then
         usermod -g scylla scylla
     fi
     chown -R scylla:scylla $rdata
-    chown -R scylla:scylla $rhkdata
 
     for file in dist/common/sysctl.d/*.conf; do
         bn=$(basename "$file")
@@ -572,6 +667,7 @@ elif ! $packaging; then
     done
     if ! $supervisor; then
         $rprefix/scripts/scylla_post_install.sh
+        $rprefix/kernel_conf/post_install.sh
     fi
     echo "Scylla offline install completed."
 fi

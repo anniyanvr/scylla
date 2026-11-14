@@ -3,12 +3,8 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
-
-#include <boost/range/adaptor/transformed.hpp>
-#include <boost/range/algorithm/copy.hpp>
-#include <boost/range/algorithm_ext/push_back.hpp>
 
 #include "partition_slice_builder.hh"
 
@@ -44,16 +40,16 @@ partition_slice_builder::build() {
     if (_static_columns) {
         static_columns = std::move(*_static_columns);
     } else {
-        boost::range::push_back(static_columns,
-            _schema.static_columns() | boost::adaptors::transformed(std::mem_fn(&column_definition::id)));
+        static_columns =
+            _schema.static_columns() | std::views::transform(std::mem_fn(&column_definition::id)) | std::ranges::to<query::column_id_vector>();
     }
 
     query::column_id_vector regular_columns;
     if (_regular_columns) {
         regular_columns = std::move(*_regular_columns);
     } else {
-        boost::range::push_back(regular_columns,
-            _schema.regular_columns() | boost::adaptors::transformed(std::mem_fn(&column_definition::id)));
+        regular_columns = 
+            _schema.regular_columns() | std::views::transform(std::mem_fn(&column_definition::id)) | std::ranges::to<query::column_id_vector>();
     }
 
     return {
@@ -62,7 +58,6 @@ partition_slice_builder::build() {
         std::move(regular_columns),
         std::move(_options),
         std::move(_specific_ranges),
-        cql_serialization_format::internal(),
         _partition_row_limit,
     };
 }
@@ -101,6 +96,12 @@ partition_slice_builder::mutate_specific_ranges(std::function<void(query::specif
     if (_specific_ranges) {
         func(*_specific_ranges);
     }
+    return *this;
+}
+
+partition_slice_builder&
+partition_slice_builder::set_specific_ranges(query::specific_ranges ranges) {
+    _specific_ranges = std::make_unique<query::specific_ranges>(std::move(ranges));
     return *this;
 }
 

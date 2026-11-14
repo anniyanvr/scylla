@@ -3,17 +3,19 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <seastar/testing/test_case.hh>
+#include "test/lib/scylla_test_case.hh"
+#include <fmt/ranges.h>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/random_utils.hh"
+#include "test/lib/test_utils.hh"
 
-#include "compound.hh"
-#include "compound_compat.hh"
+#include "keys/compound.hh"
+#include "keys/compound_compat.hh"
 #include "test/boost/range_assert.hh"
-#include "schema_builder.hh"
+#include "schema/schema_builder.hh"
 #include "dht/murmur3_partitioner.hh"
 
 static std::vector<managed_bytes> to_bytes_vec(std::vector<sstring> values) {
@@ -182,11 +184,11 @@ SEASTAR_THREAD_TEST_CASE(test_conversion_to_legacy_form) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_conversion_to_legacy_form_same_token_singular) {
-    auto s = schema_builder("ks", "cf")
+    auto s = schema_builder(this_smp_shard_count(), "ks", "cf")
                 .with_column("c", int32_type, column_kind::partition_key)
                 .with_column("v", int32_type)
                 .build();
-    auto s1 = schema_builder("ks", "cf")
+    auto s1 = schema_builder(this_smp_shard_count(), "ks", "cf")
                   .with_column("c", byte_type, column_kind::partition_key)
                   .with_column("v", int32_type)
                   .build();
@@ -203,12 +205,12 @@ SEASTAR_THREAD_TEST_CASE(test_conversion_to_legacy_form_same_token_singular) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_conversion_to_legacy_form_same_token_two_components) {
-    auto s = schema_builder("ks", "cf")
+    auto s = schema_builder(this_smp_shard_count(), "ks", "cf")
                 .with_column("c1", int32_type, column_kind::partition_key)
                 .with_column("c2", int32_type, column_kind::partition_key)
                 .with_column("v", int32_type)
                 .build();
-    auto s1 = schema_builder("ks", "cf")
+    auto s1 = schema_builder(this_smp_shard_count(), "ks", "cf")
                   .with_column("c", byte_type, column_kind::partition_key)
                   .with_column("v", int32_type)
                   .build();
@@ -297,7 +299,7 @@ SEASTAR_THREAD_TEST_CASE(test_enconding_of_singular_composite) {
 SEASTAR_THREAD_TEST_CASE(test_enconding_of_static_composite) {
     using components = std::vector<composite::component>;
 
-    auto s = schema_builder("ks", "cf")
+    auto s = schema_builder(this_smp_shard_count(), "ks", "cf")
         .with_column("pk", bytes_type, column_kind::partition_key)
         .with_column("ck", bytes_type, column_kind::clustering_key)
         .with_column("v", bytes_type, column_kind::regular_column)
@@ -324,9 +326,9 @@ SEASTAR_THREAD_TEST_CASE(test_composite_from_exploded) {
 
 SEASTAR_THREAD_TEST_CASE(test_composite_view_explode) {
     auto to_owning_vector = [] (std::vector<bytes_view> bvs) {
-        return boost::copy_range<std::vector<bytes>>(bvs | boost::adaptors::transformed([] (auto bv) {
+        return bvs | std::views::transform([] (auto bv) {
             return bytes(bv.begin(), bv.end());
-        }));
+        }) | std::ranges::to<std::vector<bytes>>();
     };
     {
         BOOST_REQUIRE_EQUAL(to_owning_vector(composite_view(composite(bytes({'\x00', '\x03', 'e', 'l', '1', '\x00'}))).explode()),

@@ -1,86 +1,109 @@
+# Global variables
 # You can set these variables from the command line.
-POETRY        := $(HOME)/.poetry/bin/poetry
-SPHINXBUILD   := $(POETRY) run sphinx-build
-SPHINXOPTS    :=
+UV            := uv
+SPHINXOPTS    := -j auto
+SPHINXBUILD   := $(UV) run sphinx-build
 PAPER         :=
 BUILDDIR      := _build
 SOURCEDIR     := .
+PREVIEW_HOST  := 127.0.0.1
+FLAG          := manual
+CONF_PATH     := ./
 
-# Internal variables.
+# Internal variables
+ifeq ($(FLAG), enterprise)
+    CONF_PATH = ./_enterprise
+endif
+
 PAPEROPT_a4     := -D latex_paper_size=a4
 PAPEROPT_letter := -D latex_paper_size=letter
-ALLSPHINXOPTS   := -d $(BUILDDIR)/doctrees $(PAPEROPT_$(PAPER)) $(SPHINXOPTS) $(SOURCEDIR)
+ALLSPHINXOPTS   := -d $(BUILDDIR)/doctrees $(PAPEROPT_$(PAPER)) $(SPHINXOPTS) $(SOURCEDIR) -c $(CONF_PATH)
 TESTSPHINXOPTS  := $(ALLSPHINXOPTS) -W --keep-going
-
-# the i18n builder cannot share the environment and doctrees with the others
-I18NSPHINXOPTS  := $(PAPEROPT_$(PAPER)) $(SPHINXOPTS) $(SOURCEDIR)
+PROD_OPTS       := -D html_theme_options.collapse_navigation='false' -D html_theme_options.navigation_depth=3 -c $(CONF_PATH)
 
 .PHONY: all
 all: dirhtml
 
+# Setup commands
+.PHONY: setupenv
+setupenv:
+	pip install -q uv
+
+.PHONY: setup
+setup:
+	$(UV) sync
+
+.PHONY: update
+update:
+	$(UV) sync --upgrade
+
+# Clean commands
 .PHONY: pristine
 pristine: clean
 	git clean -dfX
 
-.PHONY: setup
-setup:
-	./_utils/setup.sh
-
 .PHONY: clean
 clean:
 	rm -rf $(BUILDDIR)/*
+	rm -rf _data/*
 
-.PHONY: preview
-preview: setup
-	$(POETRY) run sphinx-autobuild -b dirhtml $(ALLSPHINXOPTS) $(BUILDDIR)/dirhtml --port 5500
-
+# Generate output commands
 .PHONY: dirhtml
 dirhtml: setup
-	$(SPHINXBUILD) -b dirhtml $(ALLSPHINXOPTS) $(BUILDDIR)/dirhtml
+	FLAG=$(FLAG) $(SPHINXBUILD) -b dirhtml $(ALLSPHINXOPTS) $(BUILDDIR)/dirhtml
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/dirhtml."
 
 .PHONY: singlehtml
 singlehtml: setup
-	$(SPHINXBUILD) -b singlehtml $(ALLSPHINXOPTS) $(BUILDDIR)/singlehtml
+	FLAG=$(FLAG) $(SPHINXBUILD) -b singlehtml $(ALLSPHINXOPTS) $(BUILDDIR)/singlehtml
 	@echo
 	@echo "Build finished. The HTML page is in $(BUILDDIR)/singlehtml."
 
 .PHONY: epub
-epub: 	setup
-	$(SPHINXBUILD) -b epub $(ALLSPHINXOPTS) $(BUILDDIR)/epub
+epub: setup
+	FLAG=$(FLAG) $(SPHINXBUILD) -b epub $(ALLSPHINXOPTS) $(BUILDDIR)/epub
 	@echo
 	@echo "Build finished. The epub file is in $(BUILDDIR)/epub."
 
 .PHONY: epub3
-epub3:	setup
-	$(SPHINXBUILD) -b epub3 $(ALLSPHINXOPTS) $(BUILDDIR)/epub3
+epub3: setup
+	FLAG=$(FLAG) $(SPHINXBUILD) -b epub3 $(ALLSPHINXOPTS) $(BUILDDIR)/epub3
 	@echo
 	@echo "Build finished. The epub3 file is in $(BUILDDIR)/epub3."
 
-.PHONY: dummy
-dummy: 	setup
-	$(SPHINXBUILD) -b dummy $(ALLSPHINXOPTS) $(BUILDDIR)/dummy
-	@echo
-	@echo "Build finished. Dummy builder generates no files."
-
-.PHONY: linkcheck
-linkcheck: setup
-	$(SPHINXBUILD) -b linkcheck $(SOURCEDIR) $(BUILDDIR)/linkcheck
-
 .PHONY: multiversion
 multiversion: setup
-	@mkdir -p $(HOME)/.cache/pypoetry/virtualenvs
-	$(POETRY) run sphinx-multiversion $(SOURCEDIR) $(BUILDDIR)/dirhtml
+	FLAG=$(FLAG) $(UV) run sphinx-multiversion $(SOURCEDIR) $(BUILDDIR)/dirhtml $(PROD_OPTS)
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/dirhtml."
+
+.PHONY: redirects
+redirects: setup
+	FLAG=$(FLAG) $(UV) run redirects-cli fromfile --yaml-file ./_utils/redirects.yaml --output-dir $(BUILDDIR)/dirhtml
+	@echo
+	@echo "Build finished. The HTML pages are in $(BUILDDIR)/dirhtml."
+
+.PHONY: check-redirects
+check-redirects: setup
+	FLAG=$(FLAG) $(UV) run scylla-check-redirects --yaml _utils/redirects.yaml --conf $(CONF_PATH)
+
+# Preview commands
+.PHONY: preview
+preview: setup
+	FLAG=$(FLAG) $(UV) run sphinx-autobuild -b dirhtml $(ALLSPHINXOPTS) $(BUILDDIR)/dirhtml --host $(PREVIEW_HOST) --port 5500 --ignore *.csv --ignore *.json --ignore *.yaml
 
 .PHONY: multiversionpreview
 multiversionpreview: multiversion
-	$(POETRY) run python3 -m http.server 5500 --directory $(BUILDDIR)/dirhtml 
+	FLAG=$(FLAG) $(UV) run python -m http.server 5500 --directory $(BUILDDIR)/dirhtml
 
+# Test commands
 .PHONY: test
 test: setup
-	$(SPHINXBUILD) -b dirhtml $(TESTSPHINXOPTS) $(BUILDDIR)/dirhtml
+	FLAG=$(FLAG) $(SPHINXBUILD) -b dirhtml $(TESTSPHINXOPTS) $(BUILDDIR)/dirhtml
 	@echo
 	@echo "Build finished. The HTML pages are in $(BUILDDIR)/dirhtml."
+
+.PHONY: linkcheck
+linkcheck: setup
+	FLAG=$(FLAG) $(SPHINXBUILD) -b linkcheck $(SOURCEDIR) $(BUILDDIR)/linkcheck

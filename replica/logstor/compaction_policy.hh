@@ -1,0 +1,256 @@
+/*
+ * Copyright (C) 2026-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+#pragma once
+
+#include "utils/largest_k.hh"
+#include <algorithm>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <optional>
+#include <vector>
+
+namespace replica::logstor {
+
+struct segment_descriptor;
+class segment_set;
+
+// The number of compaction jobs that may run concurrently on a shard, counted in output buffers:
+// a normal compaction takes one, a split compaction takes two. It sizes the compaction buffer pool,
+// which is what enforces it, and the segment pool's compaction reserve, which is what keeps an
+// output segment available for every concurrent flush.
+constexpr size_t max_compaction_parallelism = 8;
+
+// The buffers a split compaction takes, and therefore the slots automatic compaction leaves free so
+// that a tablet split is never queued behind it.
+constexpr size_t split_compaction_buffers = 2;
+
+// The largest number of automatic compactions that can be in flight at once. The dynamic limit is
+// derived per disk by make_compaction_limits(); this is the bound the semaphore is sized for.
+constexpr size_t max_auto_compaction_parallelism = std::min<size_t>(4, max_compaction_parallelism - split_compaction_buffers);
+
+// The smallest batch worth compacting. A batch reclaims only when its mean utilization is below
+// `1 - 1/n_in`, so a smaller batch could not reclaim anything from a disk that is even moderately
+// packed. It also sets the minimum of the space floor.
+constexpr size_t min_segments_per_compaction = 8;
+
+// The largest batch. A job frees its inputs only when it ends, so a larger batch holds more of the
+// space floor for longer.
+constexpr size_t max_segments_per_compaction = 32;
+static_assert(max_segments_per_compaction >= min_segments_per_compaction);
+
+// The fraction of the best reclamation efficiency that a longer batch must keep to be selected
+// instead. On its own the efficiency score picks short batches, which is per-job overhead for no
+// write-amplification benefit; extending within this tolerance trades about 1% of efficiency for
+// half as many jobs.
+constexpr double compaction_batch_extension_tolerance = 0.8;
+
+// The fraction of the efficiency of the best batch that a batch must keep to start while another
+// compaction job runs. The first job always starts, so the gate cannot stop compaction. The gate
+// limits the write amplification of parallel jobs when the groups of a shard hold different amounts
+// of dead records, see compaction_driver::refuse_marginal(). When the groups are similar, it
+// refuses nothing.
+//
+// The bar is relative, because an absolute bar of one segment reclaimed per segment copied refuses
+// every batch on a disk that is more than half full.
+constexpr double compaction_marginal_admission_ratio = 0.75;
+
+// Returns the space floor, the free level at which the space pressure is 1, see
+// compaction_space_pressure(). The jobs in flight can hold this many segments. The write path can
+// also use these segments, and only the compaction reserve of the segment pool keeps segments for
+// compaction. The space floor is `fraction` of the disk, logstor_compaction_space_floor, with a
+// minimum of two batches for a small disk. The option is a fraction and not a number of segments,
+// because on a large disk the space floor is the room that the write path has for a burst until
+// compaction reclaims again. A larger `fraction` is limited to max_space_floor_fraction.
+uint64_t compaction_space_floor(uint64_t segment_count, double fraction) noexcept;
+
+// The largest space floor, as a fraction of the disk. With the default anchor at twice the space
+// floor, it leaves at least half of the disk for data.
+constexpr double max_space_floor_fraction = 0.25;
+
+// The limits of what automatic compaction can take at the same time, derived from the space floor.
+// The defaults are the smallest limits that make_compaction_limits() returns, so that limits that
+// are not computed yet still let compaction run.
+struct compaction_limits {
+    // The number of automatic compaction jobs that can run at the same time.
+    size_t auto_parallelism = 1;
+    // The largest number of input segments that one job can take.
+    size_t batch_cap = min_segments_per_compaction;
+};
+
+// A job allocates its output segments while it runs and frees its inputs only when it ends, so each
+// job in flight can hold up to `batch_cap` segments. Both limits come from the space floor, so that
+// `auto_parallelism * batch_cap <= space_floor`. Otherwise the jobs can use all of the space floor
+// and then wait for a segment that only one of them can free. The batch cap is at most
+// max_segments_per_compaction.
+//
+// When the space floor is less than one batch the relation cannot hold, and the limits are one job
+// of `min_segments_per_compaction` segments, the smallest batch that can reclaim.
+compaction_limits make_compaction_limits(uint64_t space_floor) noexcept;
+
+// The utilization threshold as a function of the free level, in available segments: a
+// piecewise-linear curve through three points.
+//
+//     available <= space floor          -> 1         any batch with a net gain
+//     space floor < available < anchor  -> 1 .. u    space pressure increases the threshold
+//     available == anchor               -> u         the configured threshold
+//     anchor < available < ceiling      -> u .. m    more free space decreases it
+//     available >= ceiling              -> m         the minimum threshold
+//
+// The slope above the anchor sets the policy. With `m = u` the threshold is constant, and the free
+// level changes with the data on the disk. With the ceiling one segment above the anchor, the free
+// level stays near the anchor.
+//
+// The part below the anchor lets a disk that is too full for `u` run. When the disk holds so much
+// live data that too few segments are under `u`, compaction cannot free enough segments and the
+// free level falls. Then the threshold increases, and compaction takes fuller segments.
+//
+// The minimum threshold `m` makes sure that a segment with a few long-lived records is compacted at
+// any free level. This limits the space that such segments hold, at a write amplification of about
+// `m / (1 - m)`.
+struct utilization_threshold_curve {
+    uint64_t space_floor;
+    uint64_t anchor;
+    // The free level above the anchor where the threshold reaches `min_threshold`.
+    uint64_t ceiling;
+    // The configured threshold, logstor_compaction_utilization_threshold, in [0, 1]. At 1, any
+    // segment from which compaction can reclaim space is a candidate.
+    double threshold;
+    // The threshold at the ceiling and above, logstor_compaction_min_utilization_threshold, in
+    // [0, threshold].
+    double min_threshold;
+
+    bool operator==(const utilization_threshold_curve&) const noexcept = default;
+};
+
+// Returns the curve for a disk of `segment_count` segments and the space floor `space_floor`, from
+// the configuration. `anchor_fraction` and `ceiling_fraction` are fractions of the disk. An anchor
+// of 0 is twice the space floor, and a ceiling of 0 is one segment above the anchor. Whatever the
+// configuration is, the function keeps the anchor above the space floor and at most half of the
+// disk, the ceiling above the anchor, the threshold in [0, 1], and the minimum threshold in [0,
+// threshold].
+utilization_threshold_curve make_utilization_threshold_curve(uint64_t segment_count, uint64_t space_floor,
+        double threshold, double anchor_fraction, double ceiling_fraction, double min_threshold) noexcept;
+
+// Returns the space pressure, the shortage of segments of the write path, in [0, 1]: 0 at the
+// anchor or above, 1 at the space floor or below, and linear between them.
+double compaction_space_pressure(uint64_t available_segments, const utilization_threshold_curve&) noexcept;
+
+// Returns the fewest candidate segments that a group must have before a job selects a batch from
+// them: min_segments_per_compaction when there is no space pressure, and less as the pressure
+// increases, down to 1 at the space floor. The batch can be shorter than this minimum, because
+// select_compaction_batch() keeps only the most efficient prefix of the candidates. Under a
+// threshold the candidates of a group arrive one at a time, so without a minimum most jobs would
+// take one or two segments, and each job has fixed costs. The decrease is gradual, because a disk
+// that is too full for the threshold stays in the pressure band, and a step would make jobs of one
+// segment normal there.
+size_t effective_min_batch(double pressure) noexcept;
+
+// Returns the utilization threshold at this free level.
+double effective_utilization_threshold(uint64_t available_segments, const utilization_threshold_curve&) noexcept;
+
+// The cost of one candidate compaction batch: `n_in` segments are read and rewritten into `n_out`
+// segments, copying `live_bytes` of live data.
+struct compaction_candidate_score {
+    size_t n_in;
+    size_t n_out;
+    uint64_t live_bytes;
+
+    size_t reclaimed() const noexcept {
+        return n_in > n_out ? n_in - n_out : 0;
+    }
+
+    // Segments reclaimed per segment-worth of data copied, which is exactly the reciprocal of the
+    // batch's marginal write amplification. Comparisons cancel the segment_size factor, so it is
+    // needed only where the absolute value is wanted, i.e. for logging.
+    double efficiency(uint64_t segment_size) const noexcept {
+        return live_bytes == 0
+                ? std::numeric_limits<double>::infinity()
+                : double(reclaimed()) * double(segment_size) / double(live_bytes);
+    }
+
+    // Whether this batch's efficiency is at least `fraction` of `other`'s.
+    bool efficiency_at_least(const compaction_candidate_score& other, double fraction) const noexcept {
+        if (live_bytes == 0) {
+            return true;
+        }
+        if (other.live_bytes == 0) {
+            return false;
+        }
+        return double(reclaimed()) * double(other.live_bytes)
+                >= fraction * double(other.reclaimed()) * double(live_bytes);
+    }
+
+    bool operator==(const compaction_candidate_score& other) const noexcept = default;
+
+    // Orders batches by reclamation efficiency, so that the score is the reciprocal of the write
+    // amplification the batch would incur, and ties by how much the batch reclaims.
+    bool operator<(const compaction_candidate_score& other) const noexcept;
+};
+
+// The batch select_compaction_batch() chose: the segments to compact, least utilized first, and the
+// score of the batch as a whole - which is also the score its group is ranked by, so that the batch
+// that wins the ranking is the one that would run.
+struct compaction_batch {
+    std::vector<const segment_descriptor*> segments;
+    compaction_candidate_score score;
+};
+
+// What bounds the batch select_compaction_batch() picks.
+struct compaction_batch_limits {
+    // The largest number of input segments that one job can take.
+    size_t batch_cap;
+    // The fewest candidate segments that a group must have for a batch, unless the batch is dead
+    // segments only. A job has fixed costs: a scan, a barrier on the reads in flight, and an output
+    // segment that is sealed part full. The minimum counts the candidates, and the batch that
+    // select_compaction_batch() selects from them can be shorter, see effective_min_batch().
+    size_t min_batch;
+    // Only a segment whose utilization is at most this is a candidate, see
+    // effective_utilization_threshold(). 1 makes every segment a candidate.
+    double utilization_threshold;
+    // The fraction of the best efficiency that a longer batch must keep, see
+    // compaction_batch_extension_tolerance.
+    double extension_tolerance = compaction_batch_extension_tolerance;
+};
+
+// Picks the segments one compaction job should read, out of the ones a group owns.
+//
+// The free-space histogram of the set gives the segments in ascending utilization, which is close
+// to the best order in which to compact them, so the function only decides where to stop. The
+// candidates are the segments under the utilization threshold at the start of the histogram, at
+// most `batch_cap` of them, and select_compaction_prefix() selects a prefix of the candidates.
+//
+// With fewer candidates than `min_batch`, the batch is the dead candidates. In the bucket of the
+// histogram that the threshold cuts, the scan skips at most `batch_cap` segments over the
+// threshold, so that its cost does not grow with the group.
+//
+// Returns nothing when there is no such batch or no prefix reclaims a segment. This answer holds
+// for the whole group and not only for this batch, because a longer prefix would only add fuller
+// segments, except for a candidate behind the skipped segments.
+std::optional<compaction_batch> select_compaction_batch(const segment_set& segments,
+        uint64_t segment_size, const compaction_batch_limits& limits);
+
+// Gives the score of a compaction candidate, which top_compaction_candidates ranks it by.
+struct compaction_score_of {
+    template <typename Candidate>
+    requires std::same_as<decltype(Candidate::score), compaction_candidate_score>
+    const compaction_candidate_score& operator()(const Candidate& candidate) const noexcept {
+        return candidate.score;
+    }
+};
+
+// Keeps the best `capacity` compaction candidates by compaction_candidate_score. `Candidate` is any
+// type that has a `score` member of type compaction_candidate_score. take_sorted() returns the
+// candidates in worst-to-best order, so that a caller that takes them from the back gets the best
+// one first.
+template <typename Candidate>
+using top_compaction_candidates = utils::largest_k<Candidate, std::less<>, compaction_score_of>;
+
+} // namespace replica::logstor

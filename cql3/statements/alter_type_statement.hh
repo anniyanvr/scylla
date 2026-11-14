@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -17,11 +14,7 @@
 #include "cql3/cql3_type.hh"
 #include "cql3/ut_name.hh"
 #include "data_dictionary/data_dictionary.hh"
-#include "schema.hh"
-
-namespace service {
-class migration_manager;
-}
+#include "schema/schema.hh"
 
 namespace cql3 {
 
@@ -39,25 +32,17 @@ public:
 
     virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
-    virtual void validate(query_processor& qp, const service::client_state& state) const override;
-
     virtual const sstring& keyspace() const override;
 
 
-    future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
 
     class add_or_alter;
     class renames;
 protected:
     virtual user_type make_updated_type(data_dictionary::database db, user_type to_update) const = 0;
 private:
-    struct base_visitor {
-        virtual future<> operator()(view_ptr view) = 0;
-        virtual future<> operator()(user_type type) = 0;
-        virtual future<> operator()(schema_ptr cfm, bool from_thrift, std::vector<view_ptr>&& view_updates, std::optional<api::timestamp_type> ts_opt) = 0;
-    };
-
-    future<std::vector<mutation>> prepare_announcement_mutations(data_dictionary::database db, service::migration_manager& mm, api::timestamp_type) const;
+    future<utils::chunked_vector<mutation>> prepare_announcement_mutations(service::storage_proxy& sp, api::timestamp_type) const;
 };
 
 class alter_type_statement::add_or_alter : public alter_type_statement {
@@ -69,7 +54,7 @@ public:
                  const shared_ptr<column_identifier> field_name,
                  const shared_ptr<cql3_type::raw> field_type);
     virtual user_type make_updated_type(data_dictionary::database db, user_type to_update) const override;
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
 private:
     user_type do_add(data_dictionary::database db, user_type to_update) const;
     user_type do_alter(data_dictionary::database db, user_type to_update) const;
@@ -86,7 +71,7 @@ public:
     void add_rename(shared_ptr<column_identifier> previous_name, shared_ptr<column_identifier> new_name);
 
     virtual user_type make_updated_type(data_dictionary::database db, user_type to_update) const override;
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
 };
 
 }

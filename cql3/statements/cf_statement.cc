@@ -1,19 +1,16 @@
 /*
- */
-
-/*
  * Copyright 2014-present-2015 ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "raw/cf_statement.hh"
 #include "service/client_state.hh"
-#include "cql3/column_specification.hh"
 
 namespace cql3 {
 
@@ -29,8 +26,8 @@ cf_statement::cf_statement(std::optional<cf_name> cf_name)
 void cf_statement::prepare_keyspace(const service::client_state& state)
 {
     if (!_cf_name->has_keyspace()) {
-        // XXX: We explicitely only want to call state.getKeyspace() in this case, as we don't want to throw
-        // if not logged in any keyspace but a keyspace is explicitely set on the statement. So don't move
+        // XXX: We explicitly only want to call state.getKeyspace() in this case, as we don't want to throw
+        // if not logged in any keyspace but a keyspace is explicitly set on the statement. So don't move
         // the call outside the 'if' or replace the method by 'prepareKeyspace(state.getKeyspace())'
         _cf_name->set_keyspace(state.get_keyspace(), true);
     }
@@ -43,15 +40,21 @@ void cf_statement::prepare_keyspace(std::string_view keyspace)
     }
 }
 
+bool cf_statement::has_keyspace() const {
+    throwing_assert(_cf_name.has_value());
+    return _cf_name->has_keyspace();
+}
+
 const sstring& cf_statement::keyspace() const
 {
-    assert(_cf_name->has_keyspace()); // "The statement hasn't be prepared correctly";
+    throwing_assert(_cf_name->has_keyspace()); // "The statement hasn't be prepared correctly";
     return _cf_name->get_keyspace();
 }
 
 const sstring& cf_statement::column_family() const
 {
-    return _cf_name->get_column_family();
+    thread_local static sstring empty = "";
+    return bool(_cf_name) ? _cf_name->get_column_family() : empty;
 }
 
 }

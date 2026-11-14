@@ -3,31 +3,37 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+
+#pragma once
 
 #include "sstables/sstable_set.hh"
 #include "streaming/stream_reason.hh"
+#include "service/topology_guard.hh"
+#include <optional>
 
 namespace replica {
 class database;
 }
 
 namespace db {
-class system_distributed_keyspace;
 namespace view {
-class view_update_generator;
+class view_builder;
+class view_building_worker;
 }
 }
 
 namespace streaming {
 
-std::function<future<>(flat_mutation_reader)> make_streaming_consumer(sstring origin,
+mutation_reader_consumer make_streaming_consumer(sstring origin,
     sharded<replica::database>& db,
-    sharded<db::system_distributed_keyspace>& sys_dist_ks,
-    sharded<db::view::view_update_generator>& vug,
+    db::view::view_builder& vb,
+    sharded<db::view::view_building_worker>& vbw,
     uint64_t estimated_partitions,
     stream_reason reason,
-    sstables::offstrategy offstrategy);
+    sstables::offstrategy offstrategy,
+    service::frozen_topology_guard,
+    std::function<void (sstables::shared_sstable sst)> on_sstable_written = {});
 
 }

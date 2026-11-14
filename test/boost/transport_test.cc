@@ -3,15 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <seastar/testing/thread_test_case.hh>
+#include "test/lib/scylla_test_case.hh"
+
+#include <fmt/ranges.h>
+#include <fmt/std.h>
 
 #include "transport/request.hh"
 #include "transport/response.hh"
-
+#include "cql3/column_identifier.hh"
+#include "utils/memory_data_sink.hh"
 #include "test/lib/random_utils.hh"
+#include "test/lib/test_utils.hh"
 
 namespace cql3 {
 
@@ -45,15 +50,15 @@ SEASTAR_THREAD_TEST_CASE(test_response_request_reader) {
     res.write_value(bytes_opt(value));
 
     // Name and value list
-    auto names_and_values = boost::copy_range<std::vector<std::pair<sstring, bytes_opt>>>(
-        boost::irange<int16_t>(0, tests::random::get_int<int16_t>(16) + 16)
-        | boost::adaptors::transformed([] (int) {
+    auto names_and_values =
+        std::views::iota(0, tests::random::get_int<int>(16) + 16)
+        | std::views::transform([] (int) {
             return std::pair(
                 tests::random::get_sstring(),
                 !tests::random::get_int(4) ? bytes_opt() : bytes_opt(tests::random::get_bytes(tests::random::get_int<int16_t>(1024)))
             );
         })
-    );
+        | std::ranges::to<std::vector<std::pair<sstring, bytes_opt>>>();
     res.write_short(names_and_values.size());
     for (auto& [ name, value ] : names_and_values) {
         res.write_string(name);
@@ -61,21 +66,21 @@ SEASTAR_THREAD_TEST_CASE(test_response_request_reader) {
     }
 
     // String list
-    auto string_list = boost::copy_range<std::vector<sstring>>(
-        boost::irange<int16_t>(0, tests::random::get_int<int16_t>(16) + 16)
-        | boost::adaptors::transformed([] (int) {
+    auto string_list =
+        std::views::iota(0, tests::random::get_int<int>(16) + 16)
+        | std::views::transform([] (int) {
             return tests::random::get_sstring();
         })
-    );
+        | std::ranges::to<std::vector<sstring>>();
     res.write_string_list(string_list);
 
     // String map
-    auto string_map = boost::copy_range<std::map<sstring, sstring>>(
-        boost::irange<int16_t>(0, tests::random::get_int<int16_t>(16) + 16)
-        | boost::adaptors::transformed([] (int) {
+    auto string_map =
+        std::views::iota(0, tests::random::get_int<int>(16) + 16)
+        | std::views::transform([] (int) {
             return std::pair(tests::random::get_sstring(), tests::random::get_sstring());
         })
-    );
+        | std::ranges::to<std::map>();
     res.write_string_map(string_map);
     auto string_unordered_map = std::unordered_map<sstring, sstring>(string_map.begin(), string_map.end());
 
@@ -88,67 +93,134 @@ SEASTAR_THREAD_TEST_CASE(test_response_request_reader) {
     res.serialize({sc::change_type::CREATED, sc::target_type::FUNCTION, "foo", "bar", "zed"}, version);
     res.serialize({sc::change_type::CREATED, sc::target_type::AGGREGATE, "foo", "bar", "zed"}, version);
 
-    auto msg = res.make_message(version, cql_transport::cql_compression::none).release();
-    auto total_length = msg.len();
-    auto fbufs = fragmented_temporary_buffer(msg.release(), total_length);
+    memory_data_sink_buffers buffers;
+    {
+        output_stream<char> out(data_sink(std::make_unique<memory_data_sink>(buffers)));
+        res.write_message(out, version, cql_transport::cql_compression::none, deleter()).get();
+    }
+    auto total_length = buffers.size();
+    auto fbufs = fragmented_temporary_buffer(buffers.buffers() | std::views::as_rvalue | std::ranges::to<std::vector>(), total_length);
 
     bytes_ostream linearization_buffer;
     auto req = cql_transport::request_reader(fbufs.get_istream(), linearization_buffer);
-    BOOST_CHECK_EQUAL(unsigned(uint8_t(req.read_byte())), version | 0x80);
-    BOOST_CHECK_EQUAL(unsigned(req.read_byte()), 0); // flags
-    BOOST_CHECK_EQUAL(req.read_short(), stream_id);
-    BOOST_CHECK_EQUAL(unsigned(req.read_byte()), unsigned(opcode));
-    BOOST_CHECK_EQUAL(req.read_int() + 9, total_length);
+    BOOST_CHECK_EQUAL(unsigned(uint8_t(req.read_byte().value())), version | 0x80);
+    BOOST_CHECK_EQUAL(unsigned(req.read_byte().value()), 0); // flags
+    BOOST_CHECK_EQUAL(req.read_short().value(), stream_id);
+    BOOST_CHECK_EQUAL(unsigned(req.read_byte().value()), unsigned(opcode));
+    BOOST_CHECK_EQUAL(req.read_int().value() + 9, total_length);
 
-    BOOST_CHECK(req.read_value_view(version).is_null());
-    BOOST_CHECK(req.read_value_view(version).is_unset_value());
-    BOOST_CHECK_EQUAL(to_bytes(req.read_value_view(version)), value);
+    auto v1 = req.read_value_view(version).value();
+    BOOST_CHECK(!v1.unset && v1.value.is_null());
+    auto v2 = req.read_value_view(version).value();
+    BOOST_CHECK(v2.unset);
+    BOOST_CHECK_EQUAL(to_bytes(req.read_value_view(version).value().value), value);
 
-    std::vector<sstring_view> names;
+    std::vector<std::string_view> names;
     std::vector<cql3::raw_value_view> values;
-    req.read_name_and_value_list(version, names, values);
-    BOOST_CHECK_EQUAL(names, names_and_values | boost::adaptors::transformed([] (auto& name_and_value) {
-        return sstring_view(name_and_value.first);
-    }));
-    BOOST_CHECK_EQUAL(values, names_and_values | boost::adaptors::transformed([] (auto& name_and_value) {
+    cql3::unset_bind_variable_vector unset;
+    BOOST_CHECK(req.read_name_and_value_list(version, names, values, unset));
+    BOOST_CHECK(std::none_of(unset.begin(), unset.end(), std::identity()));
+    BOOST_CHECK(std::ranges::equal(names, names_and_values | std::views::transform([] (auto& name_and_value) {
+        return std::string_view(name_and_value.first);
+    })));
+    BOOST_CHECK(std::ranges::equal(values, names_and_values | std::views::transform([] (auto& name_and_value) {
         if (!name_and_value.second) {
             return cql3::raw_value_view::make_null();
         }
         return cql3::raw_value_view::make_value(fragmented_temporary_buffer::view(*name_and_value.second));
-    }));
+    })));
 
     auto received_string_list = std::vector<sstring>();
-    req.read_string_list(received_string_list);
+    BOOST_CHECK(req.read_string_list(received_string_list));
     BOOST_CHECK_EQUAL(received_string_list, string_list);
 
-    auto received_string_map = req.read_string_map();
+    auto received_string_map = req.read_string_map().value();
     BOOST_CHECK_EQUAL(received_string_map, string_unordered_map);
 
-    BOOST_CHECK_EQUAL(req.read_string(), "CREATED");
-    BOOST_CHECK_EQUAL(req.read_string(), "KEYSPACE");
-    BOOST_CHECK_EQUAL(req.read_string(), "foo");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "CREATED");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "KEYSPACE");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "foo");
 
-    BOOST_CHECK_EQUAL(req.read_string(), "CREATED");
-    BOOST_CHECK_EQUAL(req.read_string(), "TABLE");
-    BOOST_CHECK_EQUAL(req.read_string(), "foo");
-    BOOST_CHECK_EQUAL(req.read_string(), "bar");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "CREATED");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "TABLE");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "foo");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "bar");
 
-    BOOST_CHECK_EQUAL(req.read_string(), "CREATED");
-    BOOST_CHECK_EQUAL(req.read_string(), "TYPE");
-    BOOST_CHECK_EQUAL(req.read_string(), "foo");
-    BOOST_CHECK_EQUAL(req.read_string(), "bar");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "CREATED");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "TYPE");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "foo");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "bar");
 
-    BOOST_CHECK_EQUAL(req.read_string(), "CREATED");
-    BOOST_CHECK_EQUAL(req.read_string(), "FUNCTION");
-    BOOST_CHECK_EQUAL(req.read_string(), "foo");
-    BOOST_CHECK_EQUAL(req.read_string(), "bar");
-    BOOST_CHECK_EQUAL(req.read_short(), 1);
-    BOOST_CHECK_EQUAL(req.read_string(), "zed");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "CREATED");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "FUNCTION");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "foo");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "bar");
+    BOOST_CHECK_EQUAL(req.read_short().value(), 1);
+    BOOST_CHECK_EQUAL(req.read_string().value(), "zed");
 
-    BOOST_CHECK_EQUAL(req.read_string(), "CREATED");
-    BOOST_CHECK_EQUAL(req.read_string(), "AGGREGATE");
-    BOOST_CHECK_EQUAL(req.read_string(), "foo");
-    BOOST_CHECK_EQUAL(req.read_string(), "bar");
-    BOOST_CHECK_EQUAL(req.read_short(), 1);
-    BOOST_CHECK_EQUAL(req.read_string(), "zed");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "CREATED");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "AGGREGATE");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "foo");
+    BOOST_CHECK_EQUAL(req.read_string().value(), "bar");
+    BOOST_CHECK_EQUAL(req.read_short().value(), 1);
+    BOOST_CHECK_EQUAL(req.read_string().value(), "zed");
+}
+
+SEASTAR_THREAD_TEST_CASE(test_response_metadata_changed_for_empty_request_metadata_id) {
+    auto col = make_lw_shared<cql3::column_specification>(
+            "ks", "cf", ::make_shared<cql3::column_identifier>("v", true), utf8_type);
+    cql3::metadata m({col});
+    auto calculated_metadata_id = m.calculate_metadata_id();
+    auto expected_metadata_id = calculated_metadata_id.to_bytes_view();
+
+    // Create a different (zero-filled) metadata_id for request to trigger METADATA_CHANGED
+    bytes dummy_request_bytes(bytes::initialized_later(), 16);
+    std::fill(dummy_request_bytes.begin(), dummy_request_bytes.end(), int8_t(0));
+    auto res = cql_transport::response(0, cql_transport::cql_binary_opcode::RESULT, tracing::trace_state_ptr());
+    res.write(m, cql_transport::cql_metadata_id_wrapper(
+            cql3::cql_metadata_id_type(bytes_view(dummy_request_bytes)),
+            cql3::cql_metadata_id_type(bytes_view(expected_metadata_id))), true);
+
+    memory_data_sink_buffers buffers;
+    {
+        output_stream<char> out(data_sink(std::make_unique<memory_data_sink>(buffers)));
+        res.write_message(out, 4, cql_transport::cql_compression::none, deleter()).get();
+    }
+    auto total_length = buffers.size();
+    auto fbufs = fragmented_temporary_buffer(buffers.buffers() | std::views::as_rvalue | std::ranges::to<std::vector>(), total_length);
+
+    bytes_ostream linearization_buffer;
+    auto req = cql_transport::request_reader(fbufs.get_istream(), linearization_buffer);
+    BOOST_REQUIRE(req.read_byte());
+    BOOST_REQUIRE(req.read_byte());
+    BOOST_REQUIRE(req.read_short());
+    BOOST_REQUIRE(req.read_byte());
+    BOOST_REQUIRE(req.read_int());
+
+    auto flags = req.read_int().value();
+    BOOST_CHECK(flags & cql3::metadata::flag_enum_set::mask_for<cql3::metadata::flag::METADATA_CHANGED>());
+    BOOST_CHECK(!(flags & cql3::metadata::flag_enum_set::mask_for<cql3::metadata::flag::NO_METADATA>()));
+    BOOST_CHECK_EQUAL(req.read_int().value(), 1);
+    BOOST_CHECK_EQUAL(req.read_short_bytes().value(), expected_metadata_id);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_response_write_inetaddr) {
+    auto res = cql_transport::response(0, cql_transport::cql_binary_opcode::ERROR, tracing::trace_state_ptr());
+    res.write_inetaddr(net::inet_address("127.0.0.1"));
+    res.write_short(0x0002);
+    res.write_inetaddr(net::inet_address("::1"));
+    res.write_short(0xf001);
+
+    auto body = std::move(res).extract_body();
+    const auto expected = std::vector<uint8_t>{
+        0x04, 0x7f, 0x00, 0x00, 0x01,
+        0x00, 0x02,
+        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0xf0, 0x01,
+    };
+    auto actual = body.linearize();
+    BOOST_REQUIRE_EQUAL(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        BOOST_CHECK_EQUAL(unsigned(uint8_t(actual[i])), unsigned(expected[i]));
+    }
 }

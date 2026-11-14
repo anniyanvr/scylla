@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -26,9 +26,13 @@
  * or calling Size() on a non-array value.
  */
 
+#include <iostream>
+#include <map>
 #include <string>
-#include <stdexcept>
+#include <string_view>
+#include <type_traits>
 #include "utils/base64.hh"
+#include "utils/chunked_vector.hh"
 
 #include <seastar/core/future.hh>
 
@@ -54,14 +58,20 @@ public:
 // 2. assert() crashes a program
 // Fortunately, the default policy can be overridden, and so rapidjson errors will
 // throw an rjson::error exception instead.
-#define RAPIDJSON_ASSERT(x) do { if (!(x)) throw rjson::error(std::string("JSON error: condition not met: ") + #x); } while (0)
+#define RAPIDJSON_ASSERT(x) do { if (!(x)) throw rjson::error(fmt::format("JSON assert failed on condition '{}', at: {}", #x, current_backtrace_tasklocal())); } while (0)
+// This macro is used for functions which are called for every json char making it
+// quite costly if not inlined, by default rapidjson only enables it if NDEBUG
+// is defined which isn't the case for us.
+#define RAPIDJSON_FORCEINLINE __attribute__((always_inline))
 
 #include <rapidjson/document.h>
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
-#include <rapidjson/error/en.h>
 #include <rapidjson/allocators.h>
+#include <rapidjson/ostreamwrapper.h>
 #include <seastar/core/sstring.hh>
+#include "utils/UUID.hh"
+
 #include "seastarx.hh"
 
 namespace rjson {
@@ -151,15 +161,60 @@ std::string print(const rjson::value& value, size_t max_nested_level = default_m
 // pushing fully to stream. I.e. it is valid to do `return print(rjson::value("... something..."), os);`
 seastar::future<> print(const rjson::value& value, seastar::output_stream<char>&, size_t max_nested_level = default_max_nested_level);
 
-// Returns a string_view to the string held in a JSON value (which is
-// assumed to hold a string, i.e., v.IsString() == true). This is a view
-// to the existing data - no copying is done.
-inline std::string_view to_string_view(const rjson::value& v) {
-    return std::string_view(v.GetString(), v.GetStringLength());
-}
+// A variant of print() which prints a JSON object (it assumes the given
+// rjson::value is an object) but adds to it at the end an additional array.
+// That extra array is given a separate chunked_vector, to avoid putting it
+// inside the rjson::value because RapidJSON does contiguous allocations
+// for arrays, which we want to avoid for potentially long arrays (#23535).
+// We only have a streaming version of this function, as it is only used for
+// large arrays, and we want to yield while printing the JSON.
+// If we can ever fix RapidJSON to avoid contiguous allocations for arrays,
+// we can remove this function.
+future<> print_with_extra_array(const rjson::value& value,
+    std::string_view array_name,
+    const utils::chunked_vector<rjson::value>& array,
+    seastar::output_stream<char>& os,
+    size_t max_nested_level = default_max_nested_level);
 
 // Copies given JSON value - involves allocation
 rjson::value copy(const rjson::value& value);
+
+// copyable_value can be used when seamless copying of value is needed
+class copyable_value : public value {
+public:
+    copyable_value() noexcept : value() {
+    }
+    copyable_value(const copyable_value& v) : value(copy(v)) {
+    }
+    copyable_value(copyable_value&& v) noexcept : value(std::move(v)) {
+    }
+    copyable_value(value&& v) noexcept : value(std::move(v)) {
+    }
+    copyable_value& operator=(const copyable_value& v) {
+        if (this != &v) {
+            *this = copy(v);
+        }
+        return *this;
+    }
+    copyable_value& operator=(copyable_value&& v) noexcept {
+        value::operator=(value(std::move(v)));
+        return *this;
+    }
+};
+
+// Returns a human-readable name for the given rjson type.
+inline std::string_view type_name(rjson::type t) {
+    switch (t) {
+    case rapidjson::kNullType: return "kNullType";
+    case rapidjson::kFalseType: return "kFalseType";
+    case rapidjson::kTrueType: return "kTrueType";
+    case rapidjson::kObjectType: return "kObjectType";
+    case rapidjson::kArrayType: return "kArrayType";
+    case rapidjson::kStringType: return "kStringType";
+    case rapidjson::kNumberType: return "kNumberType";
+    }
+    throw std::runtime_error("unknown rjson type provided");
+}
 
 // Parses a JSON value from given string or raw character array.
 // The string/char array liveness does not need to be persisted,
@@ -190,6 +245,35 @@ rjson::value parse_yieldable(chunked_content&&, size_t max_nested_level = defaul
 rjson::value from_string(const char* str, size_t size);
 rjson::value from_string(std::string_view view);
 
+// Returns a string_view to the string held in a JSON value.
+// Throws if the value does not hold a string.
+// This is a view to the existing data - no copying is done.
+inline std::string_view to_string_view(const rjson::value& v) {
+    if (!v.IsString()) {
+        throw std::runtime_error(fmt::format("rjson::to_string_view expects a string value, got: {}", type_name(v.GetType())));
+    }
+    return std::string_view(v.GetString(), v.GetStringLength());
+}
+
+// Those functions must be called on json string object.
+// They make a copy of underlying data so it's safe to destroy
+// rjson::value afterwards.
+//
+// Rapidjson's GetString method alone is not good enough
+// for string conversion because it needs to scan the string
+// unnecessarily and GetStringLength could be used to avoid that.
+inline sstring to_sstring(const rjson::value& str) {
+    if (!str.IsString()) {
+        throw std::runtime_error(fmt::format("rjson::to_sstring expects a string value, got: {}", type_name(str.GetType())));
+    }
+    return sstring(str.GetString(), str.GetStringLength());
+}
+inline std::string to_string(const rjson::value& str) {
+    if (!str.IsString()) {
+        throw std::runtime_error(fmt::format("rjson::to_string expects a string value, got: {}", type_name(str.GetType())));
+    }
+    return std::string(str.GetString(), str.GetStringLength());
+}
 // Returns a pointer to JSON member if it exists, nullptr otherwise
 rjson::value* find(rjson::value& value, std::string_view name);
 const rjson::value* find(const rjson::value& value, std::string_view name);
@@ -331,11 +415,74 @@ rjson::value from_string_map(const std::map<sstring, sstring>& map);
 sstring quote_json_string(const sstring& value);
 
 inline bytes base64_decode(const value& v) {
-  return ::base64_decode(std::string_view(v.GetString(), v.GetStringLength()));
+    return ::base64_decode(to_string_view(v));
 }
+
+// A writer which allows writing json into an std::ostream in a streaming manner.
+//
+// It is a wrapper around rapidjson::Writer, with a more convenient API.
+class streaming_writer {
+    using stream = rapidjson::BasicOStreamWrapper<std::ostream>;
+    using writer = rapidjson::Writer<stream, rjson::encoding, rjson::encoding, rjson::allocator>;
+
+    stream _stream;
+    writer _writer;
+
+public:
+    streaming_writer(std::ostream& os = std::cout) : _stream(os), _writer(_stream)
+    { }
+
+    writer& rjson_writer() { return _writer; }
+
+    // following the rapidjson method names here
+    bool Null() { return _writer.Null(); }
+    bool Bool(bool b) { return _writer.Bool(b); }
+    bool Int(int i) { return _writer.Int(i); }
+    bool Uint(unsigned i) { return _writer.Uint(i); }
+    bool Int64(int64_t i) { return _writer.Int64(i); }
+    bool Uint64(uint64_t i) { return _writer.Uint64(i); }
+    bool Double(double d) { return _writer.Double(d); }
+    bool RawNumber(std::string_view str) { return _writer.RawNumber(str.data(), str.size(), false); }
+    bool RawValue(std::string_view json, type root_type) { return _writer.RawValue(json.data(), json.size(), root_type); }
+    bool String(std::string_view str) { return _writer.String(str.data(), str.size(), false); }
+    bool StartObject() { return _writer.StartObject(); }
+    bool Key(std::string_view str) { return _writer.Key(str.data(), str.size(), false); }
+    bool EndObject(rapidjson::SizeType memberCount = 0) { return _writer.EndObject(memberCount); }
+    bool StartArray() { return _writer.StartArray(); }
+    bool EndArray(rapidjson::SizeType elementCount = 0) { return _writer.EndArray(elementCount); }
+
+    template<typename U>
+    bool Write(U v) {
+        using T = std::remove_cvref_t<U>;
+        if constexpr (std::same_as<T, bool>) {
+            return Bool(v);
+        } else if constexpr (std::same_as<T, int>) {
+            return Int(v);
+        } else if constexpr (std::same_as<T, unsigned>) {
+            return Uint(v);
+        } else if constexpr (std::same_as<T, int64_t>) {
+            return Int64(v);
+        } else if constexpr (std::same_as<T, uint64_t>) {
+            return Uint64(v);
+        } else if constexpr (std::same_as<T, double>) {
+            return Double(v);
+        } else if constexpr (std::convertible_to<T, std::string_view>) {
+            return String(v);
+        }
+    }
+};
+
+inline bool is_leaf(const rjson::value& value) {
+    return !value.IsObject() && !value.IsArray();
+}
+
+future<> destroy_gently(rjson::value&& value);
 
 } // end namespace rjson
 
-namespace std {
-std::ostream& operator<<(std::ostream& os, const rjson::value& v);
-}
+template <> struct fmt::formatter<rjson::value> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const rjson::value& v, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", rjson::print(v));
+    }
+};

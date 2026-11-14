@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,16 +11,18 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 
-#include "protocol_server.hh"
+#include "transport/protocol_server.hh"
 
 namespace service {
 class storage_proxy;
+class storage_service;
 class migration_manager;
 class memory_limiter;
 }
 
 namespace db {
 class system_distributed_keyspace;
+class system_keyspace;
 class config;
 }
 
@@ -33,6 +35,24 @@ namespace gms {
 class gossiper;
 
 }
+
+namespace auth {
+class service;
+}
+
+namespace qos {
+class service_level_controller;
+}
+
+namespace vector_search {
+class vector_store_client;
+}
+
+namespace sstables {
+class dictionary_service;
+}
+
+class updateable_timeout_config;
 
 namespace alternator {
 
@@ -49,10 +69,16 @@ class server;
 class controller : public protocol_server {
     sharded<gms::gossiper>& _gossiper;
     sharded<service::storage_proxy>& _proxy;
+    sharded<sstables::dictionary_service>& _dicts;
     sharded<service::migration_manager>& _mm;
     sharded<db::system_distributed_keyspace>& _sys_dist_ks;
+    sharded<db::system_keyspace>& _sys_ks;
     sharded<cdc::generation_service>& _cdc_gen_svc;
     sharded<service::memory_limiter>& _memory_limiter;
+    sharded<auth::service>& _auth_service;
+    sharded<qos::service_level_controller>& _sl_controller;
+    sharded<vector_search::vector_store_client>& _vsc;
+    sharded<updateable_timeout_config>& _timeout_config;
     const db::config& _config;
 
     std::vector<socket_address> _listen_addresses;
@@ -64,11 +90,18 @@ public:
     controller(
         sharded<gms::gossiper>& gossiper,
         sharded<service::storage_proxy>& proxy,
+        sharded<sstables::dictionary_service>& dicts,
         sharded<service::migration_manager>& mm,
         sharded<db::system_distributed_keyspace>& sys_dist_ks,
+        sharded<db::system_keyspace>& sys_ks,
         sharded<cdc::generation_service>& cdc_gen_svc,
         sharded<service::memory_limiter>& memory_limiter,
-        const db::config& config);
+        sharded<auth::service>& auth_service,
+        sharded<qos::service_level_controller>& sl_controller,
+        sharded<vector_search::vector_store_client>& vsc,
+        sharded<updateable_timeout_config>& timeout_config,
+        const db::config& config,
+        seastar::scheduling_group sg);
 
     virtual sstring name() const override;
     virtual sstring protocol() const override;
@@ -77,6 +110,10 @@ public:
     virtual future<> start_server() override;
     virtual future<> stop_server() override;
     virtual future<> request_stop_server() override;
+    // This virtual function is called (on each shard separately) when the
+    // virtual table "system.clients" is read. It is expected to generate a
+    // list of clients connected to this server (on this shard).
+    virtual future<utils::chunked_vector<foreign_ptr<std::unique_ptr<client_data>>>> get_client_data() override;
 };
 
 }

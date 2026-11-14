@@ -1,48 +1,209 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.27)
 
 project(scylla)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  message(STATUS "Setting build type to 'Release' as none was specified.")
-  set(CMAKE_BUILD_TYPE "Release" CACHE
-      STRING "Choose the type of build." FORCE)
-  # Set the possible values of build type for cmake-gui
-  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
-    "Debug" "Release" "Dev" "Sanitize")
-endif()
+# Disable CMake's automatic -fcolor-diagnostics injection (CMake 3.24+ adds
+# it for Clang+Ninja). configure.py does not add any color diagnostics flags,
+# so we clear the internal CMake variable to prevent injection.
+set(CMAKE_CXX_COMPILE_OPTIONS_COLOR_DIAGNOSTICS "")
+set(CMAKE_C_COMPILE_OPTIONS_COLOR_DIAGNOSTICS "")
 
-if(CMAKE_BUILD_TYPE)
-    string(TOLOWER "${CMAKE_BUILD_TYPE}" BUILD_TYPE)
-else()
-    set(BUILD_TYPE "release")
-endif()
+list(APPEND CMAKE_MODULE_PATH
+  ${CMAKE_CURRENT_SOURCE_DIR}/cmake
+  ${CMAKE_CURRENT_SOURCE_DIR}/seastar/cmake)
 
-function(default_target_arch arch)
-    set(x86_instruction_sets i386 i686 x86_64)
-    if(CMAKE_SYSTEM_PROCESSOR IN_LIST x86_instruction_sets)
-        set(${arch} "westmere" PARENT_SCOPE)
-    elseif(CMAKE_SYSTEM_PROCESSOR EQUAL "aarch64")
-        set(${arch} "armv8-a+crc+crypto" PARENT_SCOPE)
-    else()
-        set(${arch} "" PARENT_SCOPE)
+# Set the possible values of build type for cmake-gui
+set(scylla_build_types
+    "Debug" "RelWithDebInfo" "Dev" "Sanitize" "Coverage")
+if(DEFINED CMAKE_BUILD_TYPE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+     ${scylla_build_types})
+    if(NOT CMAKE_BUILD_TYPE)
+        set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE
+            STRING "Choose the type of build." FORCE)
+        message(WARNING "CMAKE_BUILD_TYPE not specified, Using 'RelWithDebInfo'")
+    elseif(NOT CMAKE_BUILD_TYPE IN_LIST scylla_build_types)
+        message(FATAL_ERROR "Unknown CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}. "
+            "Following types are supported: ${scylla_build_types}")
     endif()
-endfunction()
-default_target_arch(target_arch)
-if(target_arch)
-    set(target_arch_flag "-march=${target_arch}")
+endif(DEFINED CMAKE_BUILD_TYPE)
+
+option(Scylla_ENABLE_LTO "Turn on link-time optimization for the 'release' mode." ON)
+
+include(mode.common)
+get_property(is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(is_multi_config)
+    foreach(config ${CMAKE_CONFIGURATION_TYPES})
+        include(mode.${config})
+        list(APPEND scylla_build_modes ${scylla_build_mode_${config}})
+    endforeach()
+    add_custom_target(mode_list
+        COMMAND ${CMAKE_COMMAND} -E echo "$<JOIN:${scylla_build_modes}, >"
+        COMMENT "List configured modes"
+        BYPRODUCTS mode-list.phony.stamp
+        COMMAND_EXPAND_LISTS)
+else()
+    include(mode.${CMAKE_BUILD_TYPE})
+    add_custom_target(mode_list
+        ${CMAKE_COMMAND} -E echo "${scylla_build_mode}"
+        COMMENT "List configured modes")
 endif()
 
-set(cxx_coro_flag)
-if (CMAKE_CXX_COMPILER_ID MATCHES GNU)
-    set(cxx_coro_flag -fcoroutines)
-endif()
+include(limit_jobs)
 
 # Configure Seastar compile options to align with Scylla
-set(Seastar_CXX_FLAGS ${cxx_coro_flag} ${target_arch_flag} CACHE INTERNAL "" FORCE)
-set(Seastar_CXX_DIALECT gnu++20 CACHE INTERNAL "" FORCE)
+set(CMAKE_CXX_STANDARD "26" CACHE INTERNAL "")
+set(CMAKE_CXX_EXTENSIONS ON CACHE INTERNAL "")
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF CACHE INTERNAL "")
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
-add_subdirectory(seastar)
+# Global defines matching configure.py
+# Since gcc 13, libgcc doesn't need the exception workaround
+add_compile_definitions(SEASTAR_NO_EXCEPTION_HACK)
+# Hacks needed to expose internal APIs for xxhash dependencies
+add_compile_definitions(XXH_PRIVATE_API)
+
+# Build the bundled fmt submodule rather than relying on whatever version
+# happens to be installed on the host (matching configure.py). This must come
+# before Seastar is configured below: for the in-tree Seastar build, CMake
+# redirects Seastar's find_package(fmt) to this subdirectory's fmt::fmt target.
+# Build fmt shared in Debug/Dev and static otherwise, matching Seastar's own
+# linkage so fmt symbols don't end up in both libseastar and a static libfmt.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "Dev")
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+else()
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+endif()
+set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+set(FMT_TEST OFF CACHE BOOL "" FORCE)
+set(FMT_DOC OFF CACHE BOOL "" FORCE)
+set(FMT_FUZZ OFF CACHE BOOL "" FORCE)
+# We don't consume fmt's C++20 module; building it drags in module dependency
+# scanning, which Scylla otherwise disables.
+set(FMT_MODULE OFF CACHE BOOL "" FORCE)
+add_subdirectory(fmt)
+
+# Same story for c-ares: build the bundled submodule rather than the host's,
+# and do it before Seastar is configured, so that cmake/Findc-ares.cmake can
+# hand Seastar's find_package(c-ares) the target defined here. Static and
+# position-independent, matching configure_c_ares(): c-ares is linked into
+# libseastar, so there is no libcares.so to find at runtime.
+set(CARES_STATIC ON CACHE BOOL "" FORCE)
+set(CARES_SHARED OFF CACHE BOOL "" FORCE)
+set(CARES_STATIC_PIC ON CACHE BOOL "" FORCE)
+set(CARES_INSTALL OFF CACHE BOOL "" FORCE)
+set(CARES_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CARES_BUILD_CONTAINER_TESTS OFF CACHE BOOL "" FORCE)
+set(CARES_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+# c-ares 1.34.6 declares cmake_minimum_required(VERSION 3.5.0...3.10.0), which
+# CMake 4 rejects outright.
+set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
+# mode.common.cmake puts -Werror in this directory's COMPILE_OPTIONS, and
+# add_subdirectory() inherits them. Scylla's warning policy is for Scylla's own
+# code, not for a vendored library we do not maintain, so turn -Werror back off
+# for c-ares. That also matches configure_c_ares(), which passes only
+# lib_cflags to its sub-build; Scylla's warning flags are not part of those.
+#
+# -Wc11-extensions on top of that, for quiet rather than for correctness:
+# c-ares compiles as gnu90, and under -Wpedantic every call to a glibc string
+# function whose header defines it in terms of _Generic (strchr(), memchr(),
+# ...) warns. That is 15 warnings with nothing behind them.
+get_directory_property(scylla_compile_options COMPILE_OPTIONS)
+add_compile_options(-Wno-error -Wno-c11-extensions)
+add_subdirectory(c-ares)
+set_directory_properties(PROPERTIES COMPILE_OPTIONS "${scylla_compile_options}")
+unset(scylla_compile_options)
+unset(CMAKE_POLICY_VERSION_MINIMUM)
+
+# SEASTAR_TESTING_MAIN is added later (after add_subdirectory(seastar) and
+# add_subdirectory(abseil)) to avoid leaking into the seastar subdirectory.
+# If SEASTAR_TESTING_MAIN is defined globally before seastar, it causes a
+# duplicate 'main' symbol in seastar_testing.
+
+if(is_multi_config)
+    find_package(Seastar)
+    # this is atypical compared to standard ExternalProject usage:
+    # - Seastar's build system should already be configured at this point.
+    # - We maintain separate project variants for each configuration type.
+    #
+    # Benefits of this approach:
+    # - Allows the parent project to consume the compile options exposed by
+    #   .pc file. as the compile options vary from one config to another.
+    # - Allows application of config-specific settings
+    # - Enables building Seastar within the parent project's build system
+    # - Facilitates linking of artifacts with the external project target,
+    #   establishing proper dependencies between them
+    include(ExternalProject)
+
+    # should be consistent with configure_seastar() in configure.py
+    set(seastar_build_dir "${CMAKE_BINARY_DIR}/$<CONFIG>/seastar")
+    ExternalProject_Add(Seastar
+        SOURCE_DIR "${PROJECT_SOURCE_DIR}/seastar"
+        CONFIGURE_COMMAND ""
+        BUILD_COMMAND ${CMAKE_COMMAND} --build "${seastar_build_dir}"
+          --target seastar
+          --target seastar_testing
+          --target seastar_perf_testing
+          --target app_iotune
+        BUILD_ALWAYS ON
+        BUILD_BYPRODUCTS
+          ${seastar_build_dir}/libseastar.$<IF:$<CONFIG:Debug,Dev>,so,a>
+          ${seastar_build_dir}/libseastar_testing.$<IF:$<CONFIG:Debug,Dev>,so,a>
+          ${seastar_build_dir}/libseastar_perf_testing.$<IF:$<CONFIG:Debug,Dev>,so,a>
+          ${seastar_build_dir}/apps/iotune/iotune
+          ${seastar_build_dir}/gen/include/seastar/http/chunk_parsers.hh
+          ${seastar_build_dir}/gen/include/seastar/http/request_parser.hh
+          ${seastar_build_dir}/gen/include/seastar/http/response_parser.hh
+        INSTALL_COMMAND "")
+    add_dependencies(Seastar::seastar Seastar)
+    add_dependencies(Seastar::seastar_testing Seastar)
+else()
+    set(Seastar_TESTING ON CACHE BOOL "" FORCE)
+    set(Seastar_API_LEVEL 9 CACHE STRING "" FORCE)
+    set(Seastar_DEPRECATED_OSTREAM_FORMATTERS OFF CACHE BOOL "" FORCE)
+    set(Seastar_APPS ON CACHE BOOL "" FORCE)
+    set(Seastar_EXCLUDE_APPS_FROM_ALL ON CACHE BOOL "" FORCE)
+    set(Seastar_EXCLUDE_TESTS_FROM_ALL ON CACHE BOOL "" FORCE)
+    set(Seastar_IO_URING ON CACHE BOOL "" FORCE)
+    set(Seastar_SCHEDULING_GROUPS_COUNT 26 CACHE STRING "" FORCE)
+    set(Seastar_UNUSED_RESULT_ERROR ON CACHE BOOL "" FORCE)
+    set(Seastar_OPENSSL OFF CACHE BOOL "" FORCE)
+    set(Seastar_LTTNG OFF CACHE BOOL "" FORCE)
+    # Match configure.py's build_seastar_shared_libs: Debug and Dev
+    # build Seastar as a shared library, others build it static.
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "Dev")
+        set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+    else()
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    endif()
+    add_subdirectory(seastar)
+endif()
+
+set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
+
+if(Scylla_ENABLE_LTO)
+    list(APPEND absl_cxx_flags $<$<CONFIG:RelWithDebInfo>:${CMAKE_CXX_COMPILE_OPTIONS_IPO};-ffat-lto-objects>)
+endif()
+
+find_package(Sanitizers QUIET)
+# Match configure.py:2192 — abseil gets sanitizer flags with -fno-sanitize=vptr
+# to exclude vptr checks which are incompatible with abseil's usage.
+list(APPEND absl_cxx_flags
+    $<$<CONFIG:Debug,Sanitize>:$<TARGET_PROPERTY:Sanitizers::address,INTERFACE_COMPILE_OPTIONS>;$<TARGET_PROPERTY:Sanitizers::undefined_behavior,INTERFACE_COMPILE_OPTIONS>;-fno-sanitize=vptr>)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    list(APPEND ABSL_GCC_FLAGS ${absl_cxx_flags})
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    list(APPEND absl_cxx_flags "-Wno-deprecated-builtins")
+    list(APPEND ABSL_LLVM_FLAGS ${absl_cxx_flags})
+endif()
+set(ABSL_DEFAULT_LINKOPTS
+    $<$<CONFIG:Debug,Sanitize>:$<TARGET_PROPERTY:Sanitizers::address,INTERFACE_LINK_LIBRARIES>;$<TARGET_PROPERTY:Sanitizers::undefined_behavior,INTERFACE_LINK_LIBRARIES>>)
 add_subdirectory(abseil)
+add_library(absl-headers INTERFACE)
+target_include_directories(absl-headers SYSTEM INTERFACE
+    "${PROJECT_SOURCE_DIR}/abseil")
+add_library(absl::headers ALIAS absl-headers)
+
 # Exclude absl::strerror from the default "all" target since it's not
 # used in Scylla build and, moreover, makes use of deprecated glibc APIs,
 # such as sys_nerr, which are not exposed from "stdio.h" since glibc 2.32,
@@ -53,745 +214,304 @@ add_subdirectory(abseil)
 # unfortunately.
 set_target_properties(absl_strerror PROPERTIES EXCLUDE_FROM_ALL TRUE)
 
+# Now that seastar and abseil subdirectories are fully processed, add
+# SEASTAR_TESTING_MAIN globally. This matches configure.py's global define
+# without leaking into seastar (which would cause duplicate main symbols).
+add_compile_definitions(SEASTAR_TESTING_MAIN)
+
 # System libraries dependencies
-find_package(Boost COMPONENTS filesystem program_options system thread regex REQUIRED)
-find_package(Lua REQUIRED)
-find_package(ZLIB REQUIRED)
-find_package(ICU COMPONENTS uc REQUIRED)
+find_package(Boost REQUIRED
+    COMPONENTS filesystem program_options system thread regex unit_test_framework)
+# When using shared Boost libraries, define BOOST_ALL_DYN_LINK (matching configure.py)
+if(NOT Boost_USE_STATIC_LIBS)
+    add_compile_definitions(BOOST_ALL_DYN_LINK)
+endif()
 
-set(scylla_build_dir "${CMAKE_BINARY_DIR}/build/${BUILD_TYPE}")
-set(scylla_gen_build_dir "${scylla_build_dir}/gen")
-file(MAKE_DIRECTORY "${scylla_build_dir}" "${scylla_gen_build_dir}")
-
-# Place libraries, executables and archives in ${buildroot}/build/${mode}/
-foreach(mode RUNTIME LIBRARY ARCHIVE)
-    set(CMAKE_${mode}_OUTPUT_DIRECTORY "${scylla_build_dir}")
-endforeach()
-
-# Generate C++ source files from thrift definitions
-function(scylla_generate_thrift)
-    set(one_value_args TARGET VAR IN_FILE OUT_DIR SERVICE)
-    cmake_parse_arguments(args "" "${one_value_args}" "" ${ARGN})
-
-    get_filename_component(in_file_name ${args_IN_FILE} NAME_WE)
-
-    set(aux_out_file_name ${args_OUT_DIR}/${in_file_name})
-    set(outputs
-        ${aux_out_file_name}_types.cpp
-        ${aux_out_file_name}_types.h
-        ${aux_out_file_name}_constants.cpp
-        ${aux_out_file_name}_constants.h
-        ${args_OUT_DIR}/${args_SERVICE}.cpp
-        ${args_OUT_DIR}/${args_SERVICE}.h)
-
-    add_custom_command(
-        DEPENDS
-            ${args_IN_FILE}
-            thrift
-        OUTPUT ${outputs}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${args_OUT_DIR}
-        COMMAND thrift -gen cpp:cob_style,no_skeleton -out "${args_OUT_DIR}" "${args_IN_FILE}")
-
-    add_custom_target(${args_TARGET}
-        DEPENDS ${outputs})
-
-    set(${args_VAR} ${outputs} PARENT_SCOPE)
-endfunction()
-
-scylla_generate_thrift(
-    TARGET scylla_thrift_gen_cassandra
-    VAR scylla_thrift_gen_cassandra_files
-    IN_FILE "${CMAKE_SOURCE_DIR}/interface/cassandra.thrift"
-    OUT_DIR ${scylla_gen_build_dir}
-    SERVICE Cassandra)
-
-# Parse antlr3 grammar files and generate C++ sources
-function(scylla_generate_antlr3)
-    set(one_value_args TARGET VAR IN_FILE OUT_DIR)
-    cmake_parse_arguments(args "" "${one_value_args}" "" ${ARGN})
-
-    get_filename_component(in_file_pure_name ${args_IN_FILE} NAME)
-    get_filename_component(stem ${in_file_pure_name} NAME_WE)
-
-    set(outputs
-        "${args_OUT_DIR}/${stem}Lexer.hpp"
-        "${args_OUT_DIR}/${stem}Lexer.cpp"
-        "${args_OUT_DIR}/${stem}Parser.hpp"
-        "${args_OUT_DIR}/${stem}Parser.cpp")
-
-    add_custom_command(
-        DEPENDS
-            ${args_IN_FILE}
-        OUTPUT ${outputs}
-        # Remove #ifdef'ed code from the grammar source code
-        COMMAND sed -e "/^#if 0/,/^#endif/d" "${args_IN_FILE}" > "${args_OUT_DIR}/${in_file_pure_name}"
-        COMMAND antlr3 "${args_OUT_DIR}/${in_file_pure_name}"
-        # We replace many local `ExceptionBaseType* ex` variables with a single function-scope one.
-        # Because we add such a variable to every function, and because `ExceptionBaseType` is not a global
-        # name, we also add a global typedef to avoid compilation errors.
-        COMMAND sed -i -e "/^.*On :.*$/d" "${args_OUT_DIR}/${stem}Lexer.hpp"
-        COMMAND sed -i -e "/^.*On :.*$/d" "${args_OUT_DIR}/${stem}Lexer.cpp"
-        COMMAND sed -i -e "/^.*On :.*$/d" "${args_OUT_DIR}/${stem}Parser.hpp"
-        COMMAND sed -i
-            -e "s/^\\( *\\)\\(ImplTraits::CommonTokenType\\* [a-zA-Z0-9_]* = NULL;\\)$/\\1const \\2/"
-            -e "/^.*On :.*$/d"
-            -e "1i using ExceptionBaseType = int;"
-            -e "s/^{/{ ExceptionBaseType\\* ex = nullptr;/; s/ExceptionBaseType\\* ex = new/ex = new/; s/exceptions::syntax_exception e/exceptions::syntax_exception\\& e/"
-            "${args_OUT_DIR}/${stem}Parser.cpp"
-        VERBATIM)
-
-    add_custom_target(${args_TARGET}
-        DEPENDS ${outputs})
-
-    set(${args_VAR} ${outputs} PARENT_SCOPE)
-endfunction()
-
-set(antlr3_grammar_files
-    cql3/Cql.g
-    alternator/expressions.g)
-
-set(antlr3_gen_files)
-
-foreach(f ${antlr3_grammar_files})
-    get_filename_component(grammar_file_name "${f}" NAME_WE)
-    get_filename_component(f_dir "${f}" DIRECTORY)
-    scylla_generate_antlr3(
-        TARGET scylla_antlr3_gen_${grammar_file_name}
-        VAR scylla_antlr3_gen_${grammar_file_name}_files
-        IN_FILE "${CMAKE_SOURCE_DIR}/${f}"
-        OUT_DIR ${scylla_gen_build_dir}/${f_dir})
-    list(APPEND antlr3_gen_files "${scylla_antlr3_gen_${grammar_file_name}_files}")
-endforeach()
-
-# Generate C++ sources from ragel grammar files
-seastar_generate_ragel(
-    TARGET scylla_ragel_gen_protocol_parser
-    VAR scylla_ragel_gen_protocol_parser_file
-    IN_FILE "${CMAKE_SOURCE_DIR}/redis/protocol_parser.rl"
-    OUT_FILE ${scylla_gen_build_dir}/redis/protocol_parser.hh)
-
-# Generate C++ sources from Swagger definitions
-set(swagger_files
-    api/api-doc/cache_service.json
-    api/api-doc/collectd.json
-    api/api-doc/column_family.json
-    api/api-doc/commitlog.json
-    api/api-doc/compaction_manager.json
-    api/api-doc/config.json
-    api/api-doc/endpoint_snitch_info.json
-    api/api-doc/error_injection.json
-    api/api-doc/failure_detector.json
-    api/api-doc/gossiper.json
-    api/api-doc/hinted_handoff.json
-    api/api-doc/lsa.json
-    api/api-doc/messaging_service.json
-    api/api-doc/storage_proxy.json
-    api/api-doc/storage_service.json
-    api/api-doc/stream_manager.json
-    api/api-doc/system.json
-    api/api-doc/utils.json)
-
-set(swagger_gen_files)
-
-foreach(f ${swagger_files})
-    get_filename_component(fname "${f}" NAME_WE)
-    get_filename_component(dir "${f}" DIRECTORY)
-    seastar_generate_swagger(
-        TARGET scylla_swagger_gen_${fname}
-        VAR scylla_swagger_gen_${fname}_files
-        IN_FILE "${CMAKE_SOURCE_DIR}/${f}"
-        OUT_DIR "${scylla_gen_build_dir}/${dir}")
-    list(APPEND swagger_gen_files "${scylla_swagger_gen_${fname}_files}")
-endforeach()
-
-# Create C++ bindings for IDL serializers
-function(scylla_generate_idl_serializer)
-    set(one_value_args TARGET VAR IN_FILE OUT_FILE)
-    cmake_parse_arguments(args "" "${one_value_args}" "" ${ARGN})
-    get_filename_component(out_dir ${args_OUT_FILE} DIRECTORY)
-    set(idl_compiler "${CMAKE_SOURCE_DIR}/idl-compiler.py")
-
-    find_package(Python3 COMPONENTS Interpreter)
-
-    add_custom_command(
-        DEPENDS
-            ${args_IN_FILE}
-            ${idl_compiler}
-        OUTPUT ${args_OUT_FILE}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${out_dir}
-        COMMAND Python3::Interpreter ${idl_compiler} --ns ser -f ${args_IN_FILE} -o ${args_OUT_FILE})
-
-    add_custom_target(${args_TARGET}
-        DEPENDS ${args_OUT_FILE})
-
-    set(${args_VAR} ${args_OUT_FILE} PARENT_SCOPE)
-endfunction()
-
-set(idl_serializers
-    idl/cache_temperature.idl.hh
-    idl/commitlog.idl.hh
-    idl/consistency_level.idl.hh
-    idl/frozen_mutation.idl.hh
-    idl/frozen_schema.idl.hh
-    idl/gossip_digest.idl.hh
-    idl/hinted_handoff.idl.hh
-    idl/idl_test.idl.hh
-    idl/keys.idl.hh
-    idl/messaging_service.idl.hh
-    idl/mutation.idl.hh
-    idl/paging_state.idl.hh
-    idl/partition_checksum.idl.hh
-    idl/paxos.idl.hh
-    idl/query.idl.hh
-    idl/raft.idl.hh
-    idl/range.idl.hh
-    idl/read_command.idl.hh
-    idl/reconcilable_result.idl.hh
-    idl/replay_position.idl.hh
-    idl/result.idl.hh
-    idl/ring_position.idl.hh
-    idl/streaming.idl.hh
-    idl/token.idl.hh
-    idl/tracing.idl.hh
-    idl/truncation_record.idl.hh
-    idl/uuid.idl.hh
-    idl/view.idl.hh)
-
-set(idl_gen_files)
-
-foreach(f ${idl_serializers})
-    get_filename_component(idl_name "${f}" NAME)
-    get_filename_component(idl_target "${idl_name}" NAME_WE)
-    get_filename_component(idl_dir "${f}" DIRECTORY)
-    string(REPLACE ".idl.hh" ".dist.hh" idl_out_hdr_name "${idl_name}")
-    scylla_generate_idl_serializer(
-        TARGET scylla_idl_gen_${idl_target}
-        VAR scylla_idl_gen_${idl_target}_files
-        IN_FILE "${CMAKE_SOURCE_DIR}/${f}"
-        OUT_FILE ${scylla_gen_build_dir}/${idl_dir}/${idl_out_hdr_name})
-    list(APPEND idl_gen_files "${scylla_idl_gen_${idl_target}_files}")
-endforeach()
-
-set(scylla_sources
-    absl-flat_hash_map.cc
-    alternator/auth.cc
-    alternator/conditions.cc
-    alternator/controller.cc
-    alternator/executor.cc
-    alternator/expressions.cc
-    alternator/serialization.cc
-    alternator/server.cc
-    alternator/stats.cc
-    alternator/streams.cc
-    api/api.cc
-    api/cache_service.cc
-    api/collectd.cc
-    api/column_family.cc
-    api/commitlog.cc
-    api/compaction_manager.cc
-    api/config.cc
-    api/endpoint_snitch.cc
-    api/error_injection.cc
-    api/failure_detector.cc
-    api/gossiper.cc
-    api/hinted_handoff.cc
-    api/lsa.cc
-    api/messaging_service.cc
-    api/storage_proxy.cc
-    api/storage_service.cc
-    api/stream_manager.cc
-    api/system.cc
-    atomic_cell.cc
-    auth/allow_all_authenticator.cc
-    auth/allow_all_authorizer.cc
-    auth/authenticated_user.cc
-    auth/authentication_options.cc
-    auth/authenticator.cc
-    auth/common.cc
-    auth/default_authorizer.cc
-    auth/password_authenticator.cc
-    auth/passwords.cc
-    auth/permission.cc
-    auth/permissions_cache.cc
-    auth/resource.cc
-    auth/role_or_anonymous.cc
-    auth/roles-metadata.cc
-    auth/sasl_challenge.cc
-    auth/service.cc
-    auth/standard_role_manager.cc
-    auth/transitional.cc
-    bytes.cc
-    caching_options.cc
-    canonical_mutation.cc
-    cdc/cdc_partitioner.cc
-    cdc/generation.cc
-    cdc/log.cc
-    cdc/metadata.cc
-    cdc/split.cc
-    clocks-impl.cc
-    collection_mutation.cc
-    compaction/compaction.cc
-    compaction/compaction_manager.cc
-    compaction/compaction_strategy.cc
-    compaction/leveled_compaction_strategy.cc
-    compaction/size_tiered_compaction_strategy.cc
-    compaction/time_window_compaction_strategy.cc
-    compress.cc
-    connection_notifier.cc
-    converting_mutation_partition_applier.cc
-    counters.cc
-    cql3/abstract_marker.cc
-    cql3/attributes.cc
-    cql3/cf_name.cc
-    cql3/column_condition.cc
-    cql3/column_identifier.cc
-    cql3/column_specification.cc
-    cql3/constants.cc
-    cql3/cql3_type.cc
-    cql3/expr/expression.cc
-    cql3/expr/prepare_expr.cc
-    cql3/functions/aggregate_fcts.cc
-    cql3/functions/castas_fcts.cc
-    cql3/functions/error_injection_fcts.cc
-    cql3/functions/functions.cc
-    cql3/functions/user_function.cc
-    cql3/index_name.cc
-    cql3/keyspace_element_name.cc
-    cql3/lists.cc
-    cql3/maps.cc
-    cql3/operation.cc
-    cql3/prepare_context.cc
-    cql3/query_options.cc
-    cql3/query_processor.cc
-    cql3/relation.cc
-    cql3/restrictions/statement_restrictions.cc
-    cql3/result_set.cc
-    cql3/role_name.cc
-    cql3/selection/abstract_function_selector.cc
-    cql3/selection/selectable.cc
-    cql3/selection/selection.cc
-    cql3/selection/selector.cc
-    cql3/selection/selector_factories.cc
-    cql3/selection/simple_selector.cc
-    cql3/sets.cc
-    cql3/single_column_relation.cc
-    cql3/statements/alter_keyspace_statement.cc
-    cql3/statements/alter_service_level_statement.cc
-    cql3/statements/alter_table_statement.cc
-    cql3/statements/alter_type_statement.cc
-    cql3/statements/alter_view_statement.cc
-    cql3/statements/attach_service_level_statement.cc
-    cql3/statements/authentication_statement.cc
-    cql3/statements/authorization_statement.cc
-    cql3/statements/batch_statement.cc
-    cql3/statements/cas_request.cc
-    cql3/statements/cf_prop_defs.cc
-    cql3/statements/cf_statement.cc
-    cql3/statements/create_aggregate_statement.cc
-    cql3/statements/create_function_statement.cc
-    cql3/statements/create_index_statement.cc
-    cql3/statements/create_keyspace_statement.cc
-    cql3/statements/create_service_level_statement.cc
-    cql3/statements/create_table_statement.cc
-    cql3/statements/create_type_statement.cc
-    cql3/statements/create_view_statement.cc
-    cql3/statements/delete_statement.cc
-    cql3/statements/detach_service_level_statement.cc
-    cql3/statements/drop_aggregate_statement.cc
-    cql3/statements/drop_function_statement.cc
-    cql3/statements/drop_index_statement.cc
-    cql3/statements/drop_keyspace_statement.cc
-    cql3/statements/drop_service_level_statement.cc
-    cql3/statements/drop_table_statement.cc
-    cql3/statements/drop_type_statement.cc
-    cql3/statements/drop_view_statement.cc
-    cql3/statements/function_statement.cc
-    cql3/statements/grant_statement.cc
-    cql3/statements/index_prop_defs.cc
-    cql3/statements/index_target.cc
-    cql3/statements/ks_prop_defs.cc
-    cql3/statements/list_permissions_statement.cc
-    cql3/statements/list_service_level_attachments_statement.cc
-    cql3/statements/list_service_level_statement.cc
-    cql3/statements/list_users_statement.cc
-    cql3/statements/modification_statement.cc
-    cql3/statements/permission_altering_statement.cc
-    cql3/statements/property_definitions.cc
-    cql3/statements/raw/parsed_statement.cc
-    cql3/statements/revoke_statement.cc
-    cql3/statements/role-management-statements.cc
-    cql3/statements/schema_altering_statement.cc
-    cql3/statements/select_statement.cc
-    cql3/statements/service_level_statement.cc
-    cql3/statements/sl_prop_defs.cc
-    cql3/statements/truncate_statement.cc
-    cql3/statements/update_statement.cc
-    cql3/statements/use_statement.cc
-    cql3/token_relation.cc
-    cql3/type_json.cc
-    cql3/untyped_result_set.cc
-    cql3/update_parameters.cc
-    cql3/user_types.cc
-    cql3/util.cc
-    cql3/ut_name.cc
-    cql3/values.cc
-    data_dictionary/data_dictionary.cc
-    db/batchlog_manager.cc
-    db/commitlog/commitlog.cc
-    db/commitlog/commitlog_entry.cc
-    db/commitlog/commitlog_replayer.cc
-    db/config.cc
-    db/consistency_level.cc
-    db/cql_type_parser.cc
-    db/data_listeners.cc
-    db/extensions.cc
-    db/heat_load_balance.cc
-    db/hints/host_filter.cc
-    db/hints/manager.cc
-    db/hints/resource_manager.cc
-    db/hints/sync_point.cc
-    db/large_data_handler.cc
-    db/legacy_schema_migrator.cc
-    db/marshal/type_parser.cc
-    db/schema_tables.cc
-    db/size_estimates_virtual_reader.cc
-    db/snapshot-ctl.cc
-    db/sstables-format-selector.cc
-    db/system_distributed_keyspace.cc
-    db/system_keyspace.cc
-    db/view/row_locking.cc
-    db/view/view.cc
-    db/view/view_update_generator.cc
-    db/virtual_table.cc
-    dht/boot_strapper.cc
-    dht/i_partitioner.cc
-    dht/murmur3_partitioner.cc
-    dht/range_streamer.cc
-    dht/token.cc
-    distributed_loader.cc
-    duration.cc
-    exceptions/exceptions.cc
-    flat_mutation_reader.cc
-    frozen_mutation.cc
-    frozen_schema.cc
-    generic_server.cc
-    gms/application_state.cc
-    gms/endpoint_state.cc
-    gms/failure_detector.cc
-    gms/feature_service.cc
-    gms/gossip_digest_ack2.cc
-    gms/gossip_digest_ack.cc
-    gms/gossip_digest_syn.cc
-    gms/gossiper.cc
-    gms/inet_address.cc
-    gms/versioned_value.cc
-    gms/version_generator.cc
-    hashers.cc
-    index/secondary_index.cc
-    index/secondary_index_manager.cc
-    init.cc
-    keys.cc
-    lister.cc
-    locator/abstract_replication_strategy.cc
-    locator/azure_snitch.cc
-    locator/ec2_multi_region_snitch.cc
-    locator/ec2_snitch.cc
-    locator/everywhere_replication_strategy.cc
-    locator/gce_snitch.cc
-    locator/gossiping_property_file_snitch.cc
-    locator/local_strategy.cc
-    locator/network_topology_strategy.cc
-    locator/production_snitch_base.cc
-    locator/rack_inferring_snitch.cc
-    locator/simple_snitch.cc
-    locator/simple_strategy.cc
-    locator/snitch_base.cc
-    locator/token_metadata.cc
-    lang/lua.cc
-    main.cc
-    memtable.cc
-    message/messaging_service.cc
-    multishard_mutation_query.cc
-    mutation.cc
-    mutation_fragment.cc
-    mutation_partition.cc
-    mutation_partition_serializer.cc
-    mutation_partition_view.cc
-    mutation_query.cc
-    mutation_reader.cc
-    mutation_writer/feed_writers.cc
-    mutation_writer/multishard_writer.cc
-    mutation_writer/partition_based_splitting_writer.cc
-    mutation_writer/shard_based_splitting_writer.cc
-    mutation_writer/timestamp_based_splitting_writer.cc
-    partition_slice_builder.cc
-    partition_version.cc
-    querier.cc
-    query.cc
-    query-result-set.cc
-    raft/fsm.cc
-    raft/log.cc
-    raft/raft.cc
-    raft/server.cc
-    raft/tracker.cc
-    range_tombstone.cc
-    range_tombstone_list.cc
-    tombstone_gc_options.cc
-    tombstone_gc.cc
-    reader_concurrency_semaphore.cc
-    redis/abstract_command.cc
-    redis/command_factory.cc
-    redis/commands.cc
-    redis/keyspace_utils.cc
-    redis/lolwut.cc
-    redis/mutation_utils.cc
-    redis/options.cc
-    redis/query_processor.cc
-    redis/query_utils.cc
-    redis/server.cc
-    redis/service.cc
-    redis/stats.cc
-    release.cc
-    repair/repair.cc
-    repair/row_level.cc
-    replica/database.cc
-    replica/table.cc
-    row_cache.cc
-    schema.cc
-    schema_mutations.cc
-    schema_registry.cc
-    serializer.cc
-    service/client_state.cc
-    service/migration_manager.cc
-    service/misc_services.cc
-    service/pager/paging_state.cc
-    service/pager/query_pagers.cc
-    service/paxos/paxos_state.cc
-    service/paxos/prepare_response.cc
-    service/paxos/prepare_summary.cc
-    service/paxos/proposal.cc
-    service/priority_manager.cc
-    service/qos/qos_common.cc
-    service/qos/service_level_controller.cc
-    service/qos/standard_service_level_distributed_data_accessor.cc
-    service/raft/raft_gossip_failure_detector.cc
-    service/raft/raft_group_registry.cc
-    service/raft/raft_rpc.cc
-    service/raft/raft_sys_table_storage.cc
-    service/raft/group0_state_machine.cc
-    service/storage_proxy.cc
-    service/storage_service.cc
-    sstables/compress.cc
-    sstables/integrity_checked_file_impl.cc
-    sstables/kl/reader.cc
-    sstables/metadata_collector.cc
-    sstables/m_format_read_helpers.cc
-    sstables/mx/reader.cc
-    sstables/mx/writer.cc
-    sstables/prepended_input_stream.cc
-    sstables/random_access_reader.cc
-    sstables/sstable_directory.cc
-    sstables/sstable_mutation_reader.cc
-    sstables/sstables.cc
-    sstables/sstable_set.cc
-    sstables/sstables_manager.cc
-    sstables/sstable_version.cc
-    sstables/writer.cc
-    streaming/consumer.cc
-    streaming/progress_info.cc
-    streaming/session_info.cc
-    streaming/stream_coordinator.cc
-    streaming/stream_manager.cc
-    streaming/stream_plan.cc
-    streaming/stream_reason.cc
-    streaming/stream_receive_task.cc
-    streaming/stream_request.cc
-    streaming/stream_result_future.cc
-    streaming/stream_session.cc
-    streaming/stream_session_state.cc
-    streaming/stream_summary.cc
-    streaming/stream_task.cc
-    streaming/stream_transfer_task.cc
-    table_helper.cc
-    thrift/controller.cc
-    thrift/handler.cc
-    thrift/server.cc
-    thrift/thrift_validation.cc
-    timeout_config.cc
-    tools/scylla-sstable-index.cc
-    tools/scylla-types.cc
-    tracing/traced_file.cc
-    tracing/trace_keyspace_helper.cc
-    tracing/trace_state.cc
-    tracing/tracing_backend_registry.cc
-    tracing/tracing.cc
-    transport/controller.cc
-    transport/cql_protocol_extension.cc
-    transport/event.cc
-    transport/event_notifier.cc
-    transport/messages/result_message.cc
-    transport/server.cc
-    types.cc
-    unimplemented.cc
-    utils/arch/powerpc/crc32-vpmsum/crc32_wrapper.cc
-    utils/array-search.cc
-    utils/ascii.cc
-    utils/base64.cc
-    utils/big_decimal.cc
-    utils/bloom_calculations.cc
-    utils/bloom_filter.cc
-    utils/buffer_input_stream.cc
-    utils/build_id.cc
-    utils/config_file.cc
-    utils/directories.cc
-    utils/disk-error-handler.cc
-    utils/dynamic_bitset.cc
-    utils/error_injection.cc
-    utils/exceptions.cc
-    utils/file_lock.cc
-    utils/generation-number.cc
-    utils/gz/crc_combine.cc
-    utils/gz/gen_crc_combine_table.cc
-    utils/human_readable.cc
-    utils/i_filter.cc
-    utils/large_bitset.cc
-    utils/like_matcher.cc
-    utils/limiting_data_source.cc
-    utils/logalloc.cc
-    utils/managed_bytes.cc
-    utils/multiprecision_int.cc
-    utils/murmur_hash.cc
-    utils/rate_limiter.cc
-    utils/rjson.cc
-    utils/runtime.cc
-    utils/updateable_value.cc
-    utils/utf8.cc
-    utils/uuid.cc
-    utils/UUID_gen.cc
-    validation.cc
-    vint-serialization.cc
-    zstd.cc)
-
-set(scylla_gen_sources
-    "${scylla_thrift_gen_cassandra_files}"
-    "${scylla_ragel_gen_protocol_parser_file}"
-    "${swagger_gen_files}"
-    "${idl_gen_files}"
-    "${antlr3_gen_files}")
-
-add_executable(scylla
-    ${scylla_sources}
-    ${scylla_gen_sources})
-
-target_link_libraries(scylla PRIVATE
-    seastar
-    # Boost dependencies
+# CMake's Boost package config adds per-component defines like
+# BOOST_UNIT_TEST_FRAMEWORK_DYN_LINK, BOOST_REGEX_DYN_LINK, etc. on the
+# imported targets. configure.py only uses BOOST_ALL_DYN_LINK (which covers
+# all components), so strip the per-component defines to align the two build
+# systems.
+foreach(_boost_target
+    Boost::unit_test_framework
+    Boost::regex
     Boost::filesystem
     Boost::program_options
     Boost::system
-    Boost::thread
-    Boost::regex
-    Boost::headers
-    # Abseil libs
-    absl::hashtablez_sampler
-    absl::raw_hash_set
-    absl::synchronization
-    absl::graphcycles_internal
-    absl::stacktrace
-    absl::symbolize
-    absl::debugging_internal
-    absl::demangle_internal
-    absl::time
-    absl::time_zone
-    absl::int128
-    absl::city
+    Boost::thread)
+  if(TARGET ${_boost_target})
+    # Completely remove all INTERFACE_COMPILE_DEFINITIONS from the Boost target.
+    # This prevents per-component *_DYN_LINK and *_NO_LIB defines from
+    # propagating. BOOST_ALL_DYN_LINK (set globally) covers all components.
+    set_property(TARGET ${_boost_target} PROPERTY INTERFACE_COMPILE_DEFINITIONS)
+  endif()
+endforeach()
+target_link_libraries(Boost::regex
+  INTERFACE
+    ICU::i18n
+    ICU::uc)
+find_package(Lua REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(ICU COMPONENTS uc i18n REQUIRED)
+# Resolves to the bundled submodule added via add_subdirectory(fmt) above
+# (CMake redirects find_package to it), not the host's fmt.
+find_package(fmt REQUIRED)
+find_package(libdeflate REQUIRED)
+find_package(libxcrypt REQUIRED)
+find_package(p11-kit REQUIRED)
+find_package(Snappy REQUIRED)
+find_package(RapidJSON REQUIRED)
+find_package(xxHash REQUIRED)
+find_package(yaml-cpp REQUIRED)
+find_package(zstd REQUIRED)
+find_package(lz4 REQUIRED)
+
+set(scylla_gen_build_dir "${CMAKE_BINARY_DIR}/gen")
+file(MAKE_DIRECTORY "${scylla_gen_build_dir}")
+
+include(add_version_library)
+generate_scylla_version()
+
+option(Scylla_USE_PRECOMPILED_HEADER "Use precompiled header for Scylla" ON)
+add_library(scylla-precompiled-header STATIC exported_templates.cc)
+target_link_libraries(scylla-precompiled-header PRIVATE
+    absl::headers
+    absl::btree
     absl::hash
-    absl::malloc_internal
-    absl::spinlock_wait
-    absl::base
-    absl::dynamic_annotations
-    absl::raw_logging_internal
-    absl::exponential_biased
-    absl::throw_delegate
-    # System libs
-    ZLIB::ZLIB
-    ICU::uc
+    absl::raw_hash_set
+    Seastar::seastar
+    Snappy::snappy
     systemd
-    zstd
-    snappy
-    ${LUA_LIBRARIES}
-    thrift
-    crypt)
+    ZLIB::ZLIB
+    lz4::lz4_static
+    zstd::zstd_static)
+if (Scylla_USE_PRECOMPILED_HEADER)
+  set(Scylla_USE_PRECOMPILED_HEADER_USE ON)
+  find_program(DISTCC_EXEC NAMES distcc OPTIONAL)
+  if (DISTCC_EXEC)
+    if(DEFINED ENV{DISTCC_HOSTS})
+      set(Scylla_USE_PRECOMPILED_HEADER_USE OFF)
+      message(STATUS "Disabling precompiled header usage because distcc exists and DISTCC_HOSTS is set, assuming you're using distributed compilation.")
+    else()
+      file(REAL_PATH "~/.distcc/hosts" DIST_CC_HOSTS_PATH EXPAND_TILDE)
+      if (EXISTS ${DIST_CC_HOSTS_PATH})
+        set(Scylla_USE_PRECOMPILED_HEADER_USE OFF)
+        message(STATUS "Disabling precompiled header usage because distcc and ~/.distcc/hosts exists, assuming you're using distributed compilation.")
+      endif()
+    endif()
+  endif()
+  if (Scylla_USE_PRECOMPILED_HEADER_USE)
+    message(STATUS "Using precompiled header for Scylla - remember to add `sloppiness = pch_defines,time_macros` to ccache.conf, if you're using ccache.")
+    target_precompile_headers(scylla-precompiled-header PRIVATE "stdafx.hh")
+    target_compile_definitions(scylla-precompiled-header PRIVATE SCYLLA_USE_PRECOMPILED_HEADER)
+    # Match configure.py: -fpch-validate-input-files-content tells the compiler
+    # to check content of stdafx.hh if timestamps don't match (important for
+    # ccache/git workflows where timestamps may not be preserved).
+    # scylla-precompiled-header needs the flag on its own: the content hashes
+    # are recorded when the PCH is written, and add_compile_options() below only
+    # applies to targets created after it.
+    target_compile_options(scylla-precompiled-header PRIVATE -fpch-validate-input-files-content)
+    add_compile_options(-fpch-validate-input-files-content)
+  endif()
+else()
+  set(Scylla_USE_PRECOMPILED_HEADER_USE OFF)
+endif()
+
+add_library(scylla-main STATIC)
+if (Scylla_USE_PRECOMPILED_HEADER_USE)
+  target_precompile_headers(scylla-main REUSE_FROM scylla-precompiled-header)
+endif()
+
+target_sources(scylla-main
+  PRIVATE
+    absl-flat_hash_map.cc
+    bytes.cc
+    client_data.cc
+    clocks-impl.cc
+    sstable_dict_autotrainer.cc
+    exceptions/exceptions.cc
+    debug.cc
+    init.cc
+    keys/keys.cc
+    mutation_query.cc
+    node_ops/task_manager_module.cc
+    partition_slice_builder.cc
+    query/query.cc
+    query_ranges_to_vnodes.cc
+    query/query-result-set.cc
+    tombstone_gc_options.cc
+    tombstone_gc.cc
+    reader_concurrency_semaphore.cc
+    reader_concurrency_semaphore_group.cc
+    serializer.cc
+    service/direct_failure_detector/failure_detector.cc
+    sstables_loader.cc
+    sstables_loader_helpers.cc
+    table_helper.cc
+    tasks/task_handler.cc
+    tasks/task_manager.cc
+    timeout_config.cc
+    unimplemented.cc
+    validation.cc
+    vint-serialization.cc)
+target_link_libraries(scylla-main
+  PRIVATE
+    db
+    absl::headers
+    absl::btree
+    absl::hash
+    absl::raw_hash_set
+    Seastar::seastar
+    Snappy::snappy
+    systemd
+    ZLIB::ZLIB
+    lz4::lz4_static
+    zstd::zstd_static
+    scylla-precompiled-header
+)
+
+option(Scylla_CHECK_HEADERS
+  "Add check-headers target for checking the self-containness of headers")
+if(Scylla_CHECK_HEADERS)
+    add_custom_target(check-headers)
+    # compatibility target used by CI, which builds "check-headers" only for
+    # the "Dev" mode.
+    # our CI currently builds "dev-headers" using ninja without specify a build
+    # mode. where "dev" is actually a prefix encoded in the target name for the
+    # underlying "headers" target. while we don't have this convention in CMake
+    # targets. in contrast, the "check-headers" which is built for all
+    # configurations defined by "CMAKE_DEFAULT_CONFIGS". however, we only need
+    # to build "check-headers" for the "Dev" configuration. Therefore, before
+    # updating the CI to use build "check-headers:Dev", let's add a new target
+    # that specifically builds "check-headers" only for Dev configuration. The
+    # new target will do nothing for other configurations.
+    add_custom_target(dev-headers
+        COMMAND ${CMAKE_COMMAND}
+          "$<IF:$<CONFIG:Dev>,--build;${CMAKE_BINARY_DIR};--config;$<CONFIG>;--target;check-headers,-E;echo;skipping;dev-headers;in;$<CONFIG>>"
+        COMMAND_EXPAND_LISTS)
+endif()
+
+include(check_headers)
+check_headers(check-headers scylla-main
+  GLOB ${CMAKE_CURRENT_SOURCE_DIR}/*.hh)
+
+option(Scylla_DIST
+  "Build dist targets"
+  ON)
+
+add_custom_target(compiler-training)
+
+add_subdirectory(api)
+add_subdirectory(alternator)
+add_subdirectory(audit)
+add_subdirectory(db)
+add_subdirectory(auth)
+add_subdirectory(cdc)
+add_subdirectory(compaction)
+add_subdirectory(cql3)
+add_subdirectory(data_dictionary)
+add_subdirectory(dht)
+add_subdirectory(ent)
+add_subdirectory(gms)
+add_subdirectory(idl)
+add_subdirectory(index)
+add_subdirectory(lang)
+add_subdirectory(locator)
+add_subdirectory(message)
+add_subdirectory(mutation)
+add_subdirectory(mutation_writer)
+add_subdirectory(readers)
+add_subdirectory(replica)
+add_subdirectory(raft)
+add_subdirectory(repair)
+add_subdirectory(rust)
+add_subdirectory(schema)
+add_subdirectory(service)
+add_subdirectory(sstables)
+add_subdirectory(streaming)
+add_subdirectory(test)
+add_subdirectory(tools)
+add_subdirectory(tracing)
+add_subdirectory(transport)
+add_subdirectory(types)
+add_subdirectory(utils)
+add_subdirectory(vector_search)
+add_version_library(scylla_version
+    release.cc)
+
+add_executable(scylla
+  main.cc)
+set(scylla_libs
+    audit
+    scylla-main
+    api
+    auth
+    alternator
+    db
+    cdc
+    compaction
+    cql3
+    data_dictionary
+    dht
+    encryption
+    gms
+    idl
+    index
+    lang
+    ldap
+    locator
+    message
+    mutation
+    mutation_writer
+    raft
+    readers
+    repair
+    replica
+    schema
+    scylla_version
+    service
+    sstables
+    streaming
+    test-perf
+    tools
+    tracing
+    transport
+    types
+    utils
+    vector_search)
+target_link_libraries(scylla PRIVATE
+    ${scylla_libs})
+
+if(Scylla_ENABLE_LTO)
+  include(enable_lto)
+  foreach(target scylla ${scylla_libs})
+    enable_lto(${target})
+  endforeach()
+endif()
 
 target_link_libraries(scylla PRIVATE
-    -Wl,--build-id=sha1 # Force SHA1 build-id generation
-    # TODO: Use lld linker if it's available, otherwise gold, else bfd
-    -fuse-ld=lld)
-# TODO: patch dynamic linker to match configure.py behavior
-
-target_compile_options(scylla PRIVATE
-    -std=gnu++20
-    ${cxx_coro_flag}
-    ${target_arch_flag})
-# Hacks needed to expose internal APIs for xxhash dependencies
-target_compile_definitions(scylla PRIVATE XXH_PRIVATE_API HAVE_LZ4_COMPRESS_DEFAULT)
+    p11-kit::p11-kit
+    Seastar::seastar
+    absl::headers
+    yaml-cpp::yaml-cpp
+    Boost::program_options)
 
 target_include_directories(scylla PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
-    libdeflate
-    abseil
     "${scylla_gen_build_dir}")
 
-###
-### Create crc_combine_table helper executable.
-### Use it to generate crc_combine_table.cc to be used in scylla at build time.
-###
-add_executable(crc_combine_table utils/gz/gen_crc_combine_table.cc)
-target_link_libraries(crc_combine_table PRIVATE seastar)
-target_include_directories(crc_combine_table PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_compile_options(crc_combine_table PRIVATE
-    -std=gnu++20
-    ${cxx_coro_flag}
-    ${target_arch_flag})
-add_dependencies(scylla crc_combine_table)
+add_custom_target(maybe-scylla
+  DEPENDS $<$<CONFIG:Dev>:$<TARGET_FILE:scylla>>)
+add_dependencies(compiler-training
+  maybe-scylla)
 
-# Generate an additional source file at build time that is needed for Scylla compilation
-add_custom_command(OUTPUT "${scylla_gen_build_dir}/utils/gz/crc_combine_table.cc"
-    COMMAND $<TARGET_FILE:crc_combine_table> > "${scylla_gen_build_dir}/utils/gz/crc_combine_table.cc"
-    DEPENDS crc_combine_table)
-target_sources(scylla PRIVATE "${scylla_gen_build_dir}/utils/gz/crc_combine_table.cc")
-
-###
-### Generate version file and supply appropriate compile definitions for release.cc
-###
-execute_process(COMMAND ${CMAKE_SOURCE_DIR}/SCYLLA-VERSION-GEN --output-dir "${CMAKE_BINARY_DIR}/gen" RESULT_VARIABLE scylla_version_gen_res)
-if(scylla_version_gen_res)
-    message(SEND_ERROR "Version file generation failed. Return code: ${scylla_version_gen_res}")
+if(Scylla_DIST)
+  add_subdirectory(dist)
 endif()
 
-file(READ "${CMAKE_BINARY_DIR}/gen/SCYLLA-VERSION-FILE" scylla_version)
-string(STRIP "${scylla_version}" scylla_version)
+if(Scylla_BUILD_INSTRUMENTED)
+  add_subdirectory(pgo)
+endif()
 
-file(READ "${CMAKE_BINARY_DIR}/gen/SCYLLA-RELEASE-FILE" scylla_release)
-string(STRIP "${scylla_release}" scylla_release)
-
-get_property(release_cdefs SOURCE "${CMAKE_SOURCE_DIR}/release.cc" PROPERTY COMPILE_DEFINITIONS)
-list(APPEND release_cdefs "SCYLLA_VERSION=\"${scylla_version}\"" "SCYLLA_RELEASE=\"${scylla_release}\"")
-set_source_files_properties("${CMAKE_SOURCE_DIR}/release.cc" PROPERTIES COMPILE_DEFINITIONS "${release_cdefs}")
-
-###
-### Custom command for building libdeflate. Link the library to scylla.
-###
-set(libdeflate_lib "${scylla_build_dir}/libdeflate/libdeflate.a")
-add_custom_command(OUTPUT "${libdeflate_lib}"
-    COMMAND make -C "${CMAKE_SOURCE_DIR}/libdeflate"
-        BUILD_DIR=../build/${BUILD_TYPE}/libdeflate/
-        CC=${CMAKE_C_COMPILER}
-        "CFLAGS=${target_arch_flag}"
-        ../build/${BUILD_TYPE}/libdeflate//libdeflate.a) # Two backslashes are important!
-# Hack to force generating custom command to produce libdeflate.a
-add_custom_target(libdeflate DEPENDS "${libdeflate_lib}")
-target_link_libraries(scylla PRIVATE "${libdeflate_lib}")
-
-# TODO: create cmake/ directory and move utilities (generate functions etc) there
-# TODO: Build tests if BUILD_TESTING=on (using CTest module)
+add_executable(patchelf
+  tools/patchelf.cc)

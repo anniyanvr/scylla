@@ -3,8 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+
+#include "raft/raft.hh"
+
+#include "idl/uuid.idl.hh"
 
 namespace raft {
 
@@ -17,20 +21,29 @@ struct tagged_id {
 
 template<typename Tag>
 struct tagged_uint64 {
-    uint64_t get_value();
+    uint64_t value();
 };
 
 } // namespace internal
 
 struct server_address {
     raft::server_id id;
-    bool can_vote;
     bytes info;
 };
 
+struct config_member {
+    raft::server_address addr;
+    raft::is_voter can_vote;
+};
+
 struct configuration {
-    std::unordered_set<raft::server_address> current;
-    std::unordered_set<raft::server_address> previous;
+    std::unordered_set<raft::config_member, raft::config_member_hash, std::equal_to<void>> current;
+    std::unordered_set<raft::config_member, raft::config_member_hash, std::equal_to<void>> previous;
+};
+
+struct time_bounds {
+    raft::lease_clock::time_point earliest;
+    raft::lease_clock::time_point latest;
 };
 
 struct log_entry {
@@ -39,6 +52,7 @@ struct log_entry {
     raft::term_t term;
     raft::index_t idx;
     std::variant<bytes_ostream, raft::configuration, raft::log_entry::dummy> data;
+    std::optional<raft::time_bounds> lease_time [[version 2026.3]];
 };
 
 }

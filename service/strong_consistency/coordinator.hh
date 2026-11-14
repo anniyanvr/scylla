@@ -1,0 +1,151 @@
+/*
+ * Copyright (C) 2025-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#pragma once
+
+#include "locator/tablets.hh"
+#include "mutation/mutation.hh"
+#include "query/query-result.hh"
+#include "utils/histogram.hh"
+#include <seastar/core/metrics.hh>
+#include <seastar/core/scheduling_specific.hh>
+#include <seastar/util/noncopyable_function.hh>
+
+namespace gms {
+
+class gossiper;
+
+}
+
+namespace service::strong_consistency {
+
+class groups_manager;
+
+// Classifies a strongly consistent read based on the CQL consistency level.
+//
+// linearizable: the read is forwarded to the raft leader, where read_barrier()
+//   is performed locally. This way we read the most up-to-date applied data.
+//   Currently mapped from CL=QUORUM (the default).
+//
+// non_linearizable: the read is performed on the local replica without
+//   a read_barrier. Because of this, the read may return slightly stale data,
+//   so reads from different nodes may not be linearizable. Currently mapped from CL=ONE.
+enum class read_type {
+    linearizable,
+    non_linearizable,
+};
+
+struct need_redirect {
+    locator::tablet_replica target;
+    locator::host_id_or_exception_callback on_forwarding_finished;
+};
+template <typename T = std::monostate>
+using value_or_redirect = std::variant<T, need_redirect>;
+
+struct stats {
+    utils::timed_rate_moving_average_summary_and_histogram write;
+    uint64_t foreground_writes = 0;
+    uint64_t write_errors_timeout = 0;
+    uint64_t write_errors_status_unknown = 0;
+    uint64_t write_errors_unavailable = 0;
+    uint64_t write_errors_table_dropped = 0;
+    uint64_t write_errors_other = 0;
+    uint64_t write_retries_wait_for_leader = 0;
+    uint64_t write_retries_stale_leader = 0;
+    uint64_t write_retries_not_a_leader = 0;
+    uint64_t write_retries_dropped_entry = 0;
+    uint64_t write_node_bounces = 0;
+    uint64_t write_shard_bounces = 0;
+
+    utils::timed_rate_moving_average_summary_and_histogram linearizable_read;
+    utils::timed_rate_moving_average_summary_and_histogram non_linearizable_read;
+    uint64_t foreground_reads = 0;
+    uint64_t read_errors_timeout = 0;
+    uint64_t read_errors_unavailable = 0;
+    uint64_t read_errors_table_dropped = 0;
+    uint64_t read_errors_other = 0;
+    uint64_t read_retries_wait_for_leader = 0;
+    uint64_t read_retries_stale_leader = 0;
+    uint64_t read_node_bounces = 0;
+    uint64_t read_shard_bounces = 0;
+
+    seastar::metrics::metric_groups _metrics;
+
+    void register_stats();
+};
+
+class coordinator : public peering_sharded_service<coordinator> {
+public:
+    using timeout_clock = typename db::timeout_clock;
+
+private:
+    groups_manager& _groups_manager;
+    replica::database& _db;
+    gms::gossiper& _gossiper;
+    scheduling_group_key _stats_key;
+
+    class replica_selector;
+    struct operation_ctx;
+    // `needs_leader` says whether the request has to be executed by the raft group's
+    // leader, which is true for writes and linearizable reads and false for a read that
+    // is served from local storage. It decides both where the request may run and, when
+    // it may not run here, which replica it is redirected to: a request needing the
+    // leader can go to any replica that could be the leader, a local read only to one
+    // that holds the tablet's data.
+    future<value_or_redirect<operation_ctx>> create_operation_ctx(const schema& schema,
+        const dht::token& token,
+        abort_source& as,
+        bool needs_leader,
+        const tracing::trace_state_ptr& trace_state);
+public:
+    coordinator(groups_manager& groups_manager, replica::database& db, gms::gossiper& gossiper,
+        scheduling_group_key stats_key);
+
+    stats& get_stats() { return scheduling_group_get_specific<stats>(_stats_key); }
+
+    // What a request that ran on this node hands back. `routing_info` is set when the
+    // request carried a tablet version block that doesn't match the tablet's current
+    // version: the driver's routing cache is stale, and this is what it should hold
+    // instead. `tablet_version_block` below is that block, when the driver sent one.
+    struct mutate_result {
+        std::optional<locator::tablet_routing_info_v2> routing_info;
+    };
+    using mutation_gen = noncopyable_function<mutation(api::timestamp_type)>;
+    future<value_or_redirect<mutate_result>> mutate(schema_ptr schema,
+        const dht::token& token,
+        mutation_gen&& mutation_gen,
+        tracing::trace_state_ptr trace_state,
+        timeout_clock::time_point timeout,
+        abort_source& as,
+        std::optional<locator::tablet_version_block> tablet_version_block);
+
+    struct query_result {
+        lw_shared_ptr<query::result> result;
+        std::optional<locator::tablet_routing_info_v2> routing_info;
+    };
+    using query_result_type = value_or_redirect<query_result>;
+    future<query_result_type> query(schema_ptr schema,
+        const query::read_command& cmd,
+        const dht::partition_range_vector& ranges,
+        read_type rtype,
+        tracing::trace_state_ptr trace_state,
+        timeout_clock::time_point timeout,
+        abort_source& as,
+        std::optional<locator::tablet_version_block> tablet_version_block);
+
+    // Sends an RPC to every host that holds a tablet replica of the given table, asking it to wait
+    // until the raft groups for those tablets are started and ready to serve queries.
+    // For the local node, waits directly without an RPC.
+    future<> wait_for_table_raft_groups_on_all_hosts(table_id table, lowres_clock::time_point timeout);
+
+    groups_manager& get_groups_manager() const noexcept {
+        return _groups_manager;
+    }
+};
+
+}

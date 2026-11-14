@@ -3,15 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
+#include <seastar/core/sharded.hh>
 
-#include "api.hh"
+namespace seastar::httpd {
+class routes;
+}
+
+namespace replica {
+class database;
+}
 
 namespace api {
 
-void set_cache_service(http_context& ctx, routes& r);
+struct http_context;
+void set_cache_service(http_context& ctx, seastar::sharded<replica::database>& db, seastar::httpd::routes& r);
+void unset_cache_service(http_context& ctx, seastar::httpd::routes& r);
 
 }

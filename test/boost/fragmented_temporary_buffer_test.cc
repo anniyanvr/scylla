@@ -3,22 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <seastar/core/thread.hh>
-#include <seastar/testing/thread_test_case.hh>
+#include <seastar/util/memory-data-source.hh>
+#include "test/lib/scylla_test_case.hh"
 
+#include "utils/assert.hh"
 #include "utils/fragmented_temporary_buffer.hh"
 
 #include "test/lib/random_utils.hh"
 
 struct {
-    [[noreturn]]
-    static void throw_out_of_range(size_t a, size_t b) {
-        throw size_t(a + b);
+    static utils::result_with_exception_ptr<void> out_of_range(size_t a, size_t b) {
+        return bo::failure(std::make_exception_ptr(size_t(a + b)));
     }
-} int_thrower;
+} int_creator;
 
 std::tuple<std::vector<fragmented_temporary_buffer>, uint64_t, uint16_t> get_buffers()
 {
@@ -207,10 +208,10 @@ SEASTAR_THREAD_TEST_CASE(test_empty_istream) {
 
     auto linearization_buffer = bytes_ostream();
     BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-    BOOST_CHECK_THROW(in.read<char>(), std::out_of_range);
-    BOOST_CHECK_THROW(in.read_view(1), std::out_of_range);
-    BOOST_CHECK_THROW(in.read_bytes_view(1, linearization_buffer), std::out_of_range);
-    BOOST_CHECK_EQUAL(in.read_bytes_view(0, linearization_buffer), bytes_view());
+    BOOST_CHECK_THROW(in.read<char>().value(), std::out_of_range);
+    BOOST_CHECK_THROW(in.read_view(1).value(), std::out_of_range);
+    BOOST_CHECK_THROW(in.read_bytes_view(1, linearization_buffer).value(), std::out_of_range);
+    BOOST_CHECK_EQUAL(in.read_bytes_view(0, linearization_buffer).value(), bytes_view());
     BOOST_CHECK(linearization_buffer.empty());
 }
 
@@ -222,18 +223,18 @@ SEASTAR_THREAD_TEST_CASE(test_read_pod) {
 
         auto in = ftb.get_istream();
         BOOST_CHECK_EQUAL(in.bytes_left(), sizeof(type1) + sizeof(type2));
-        BOOST_CHECK_EQUAL(in.read<type1>(), expected_value1);
+        BOOST_CHECK_EQUAL(in.read<type1>().value(), expected_value1);
         BOOST_CHECK_EQUAL(in.bytes_left(), sizeof(type2));
-        BOOST_CHECK_THROW(in.read<type1>(), std::out_of_range);
+        BOOST_CHECK_THROW(in.read<type1>().value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), sizeof(type2));
-        BOOST_CHECK_EQUAL(in.read<type2>(), expected_value2);
+        BOOST_CHECK_EQUAL(in.read<type2>().value(), expected_value2);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read<type2>(), std::out_of_range);
+        BOOST_CHECK_THROW(in.read<type2>().value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read<type1>(), std::out_of_range);
+        BOOST_CHECK_THROW(in.read<type1>().value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read<char>(), std::out_of_range);
-        BOOST_CHECK_EXCEPTION(in.read<char>(int_thrower), size_t, [] (size_t v) { return v == 1; });
+        BOOST_CHECK_THROW(in.read<char>().value(), std::out_of_range);
+        BOOST_CHECK_EXCEPTION(in.read<char>(int_creator).value(), size_t, [] (size_t v) { return v == 1; });
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
     };
 
@@ -245,28 +246,28 @@ SEASTAR_THREAD_TEST_CASE(test_read_pod) {
 
 SEASTAR_THREAD_TEST_CASE(test_read_to) {
     auto test = [&] (bytes_view expected_value1, bytes_view expected_value2, fragmented_temporary_buffer& ftb) {
-        assert(expected_value2.size() < expected_value1.size());
+        SCYLLA_ASSERT(expected_value2.size() < expected_value1.size());
 
         bytes actual_value;
 
         auto in = ftb.get_istream();
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value1.size() + expected_value2.size());
         actual_value = bytes(bytes::initialized_later(), expected_value1.size());
-        in.read_to(expected_value1.size(), actual_value.begin());
+        BOOST_CHECK(in.read_to(expected_value1.size(), actual_value.begin()).value());
         BOOST_CHECK_EQUAL(actual_value, expected_value1);
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value2.size());
-        BOOST_CHECK_THROW(in.read_to(expected_value1.size(), actual_value.begin()), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_to(expected_value1.size(), actual_value.begin()).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value2.size());
         actual_value = bytes(bytes::initialized_later(), expected_value2.size());
-        in.read_to(expected_value2.size(), actual_value.begin());
+        BOOST_CHECK(in.read_to(expected_value2.size(), actual_value.begin()).value());
         BOOST_CHECK_EQUAL(actual_value, expected_value2);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_to(expected_value2.size(), actual_value.begin()), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_to(expected_value2.size(), actual_value.begin()).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_to(expected_value1.size(), actual_value.begin()), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_to(expected_value1.size(), actual_value.begin()).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_to(1, actual_value.begin()), std::out_of_range);
-        BOOST_CHECK_EXCEPTION(in.read_to(1, actual_value.begin(), int_thrower), size_t, [] (size_t v) { return v == 1; });
+        BOOST_CHECK_THROW(in.read_to(1, actual_value.begin()).value(), std::out_of_range);
+        BOOST_CHECK_EXCEPTION(in.read_to(1, actual_value.begin(), int_creator).value(), size_t, [] (size_t v) { return v == 1; });
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
     };
 
@@ -281,22 +282,22 @@ SEASTAR_THREAD_TEST_CASE(test_read_to) {
 
 SEASTAR_THREAD_TEST_CASE(test_read_view) {
     auto test = [&] (bytes_view expected_value1, bytes_view expected_value2, fragmented_temporary_buffer& ftb) {
-        assert(expected_value2.size() < expected_value1.size());
+        SCYLLA_ASSERT(expected_value2.size() < expected_value1.size());
 
         auto in = ftb.get_istream();
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value1.size() + expected_value2.size());
-        BOOST_CHECK_EQUAL(linearized(in.read_view(expected_value1.size())), expected_value1);
+        BOOST_CHECK_EQUAL(linearized(in.read_view(expected_value1.size()).value()), expected_value1);
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value2.size());
-        BOOST_CHECK_THROW(in.read_view(expected_value1.size()), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_view(expected_value1.size()).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value2.size());
-        BOOST_CHECK_EQUAL(linearized(in.read_view(expected_value2.size())), expected_value2);
+        BOOST_CHECK_EQUAL(linearized(in.read_view(expected_value2.size()).value()), expected_value2);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_view(expected_value2.size()), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_view(expected_value2.size()).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_view(expected_value1.size()), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_view(expected_value1.size()).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_view(1), std::out_of_range);
-        BOOST_CHECK_EXCEPTION(in.read_view(1, int_thrower), size_t, [] (size_t v) { return v == 1; });
+        BOOST_CHECK_THROW(in.read_view(1).value(), std::out_of_range);
+        BOOST_CHECK_EXCEPTION(in.read_view(1, int_creator).value(), size_t, [] (size_t v) { return v == 1; });
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
     };
 
@@ -312,25 +313,25 @@ SEASTAR_THREAD_TEST_CASE(test_read_view) {
 SEASTAR_THREAD_TEST_CASE(test_read_bytes_view) {
     auto linearization_buffer = bytes_ostream();
     auto test = [&] (bytes_view expected_value1, bytes_view expected_value2, fragmented_temporary_buffer& ftb) {
-        assert(expected_value2.size() < expected_value1.size());
+        SCYLLA_ASSERT(expected_value2.size() < expected_value1.size());
 
         auto in = ftb.get_istream();
-        BOOST_CHECK_EQUAL(in.read_bytes_view(0, linearization_buffer), bytes_view());
+        BOOST_CHECK_EQUAL(in.read_bytes_view(0, linearization_buffer).value(), bytes_view());
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value1.size() + expected_value2.size());
-        BOOST_CHECK_EQUAL(in.read_bytes_view(expected_value1.size(), linearization_buffer), expected_value1);
+        BOOST_CHECK_EQUAL(in.read_bytes_view(expected_value1.size(), linearization_buffer).value(), expected_value1);
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value2.size());
-        BOOST_CHECK_THROW(in.read_bytes_view(expected_value1.size(), linearization_buffer), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_bytes_view(expected_value1.size(), linearization_buffer).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), expected_value2.size());
-        BOOST_CHECK_EQUAL(in.read_bytes_view(expected_value2.size(), linearization_buffer), expected_value2);
+        BOOST_CHECK_EQUAL(in.read_bytes_view(expected_value2.size(), linearization_buffer).value(), expected_value2);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_bytes_view(expected_value2.size(), linearization_buffer), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_bytes_view(expected_value2.size(), linearization_buffer).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_bytes_view(expected_value1.size(), linearization_buffer), std::out_of_range);
+        BOOST_CHECK_THROW(in.read_bytes_view(expected_value1.size(), linearization_buffer).value(), std::out_of_range);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read_bytes_view(1, linearization_buffer), std::out_of_range);
-        BOOST_CHECK_EXCEPTION(in.read_bytes_view(1, linearization_buffer, int_thrower), size_t, [] (size_t v) { return v == 1; });
+        BOOST_CHECK_THROW(in.read_bytes_view(1, linearization_buffer).value(), std::out_of_range);
+        BOOST_CHECK_EXCEPTION(in.read_bytes_view(1, linearization_buffer, int_creator).value(), size_t, [] (size_t v) { return v == 1; });
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_EQUAL(in.read_bytes_view(0, linearization_buffer), bytes_view());
+        BOOST_CHECK_EQUAL(in.read_bytes_view(0, linearization_buffer).value(), bytes_view());
     };
 
 
@@ -340,29 +341,6 @@ SEASTAR_THREAD_TEST_CASE(test_read_bytes_view) {
         auto value2_bv = bytes_view(reinterpret_cast<const bytes::value_type*>(&value2), sizeof(value2));
         test(value1_bv, value2_bv, frag_buffer);
     }
-}
-
-namespace {
-
-class memory_data_source final : public data_source_impl {
-private:
-    using vector_type = std::vector<temporary_buffer<char>>;
-    vector_type _buffers;
-    vector_type::iterator _position;
-public:
-    explicit memory_data_source(std::vector<temporary_buffer<char>> buffers)
-        : _buffers(std::move(buffers))
-        , _position(_buffers.begin())
-    { }
-
-    virtual future<temporary_buffer<char>> get() override {
-        if (_position == _buffers.end()) {
-            return make_ready_future<temporary_buffer<char>>();
-        }
-        return make_ready_future<temporary_buffer<char>>(std::move(*_position++));
-    }
-};
-
 }
 
 SEASTAR_THREAD_TEST_CASE(test_read_fragmented_buffer) {
@@ -412,20 +390,20 @@ SEASTAR_THREAD_TEST_CASE(test_read_fragmented_buffer) {
         auto size = expected_data.size();
         auto suffix_size = expected_suffix.size();
 
-        auto in = input_stream<char>(data_source(std::make_unique<memory_data_source>(std::move(buffers))));
+        auto in = seastar::util::as_input_stream(std::move(buffers));
 
-        auto prefix = in.read_exactly(prefix_size).get0();
+        auto prefix = in.read_exactly(prefix_size).get();
         BOOST_CHECK_EQUAL(prefix.size(), prefix_size);
         BOOST_CHECK_EQUAL(bytes_view(reinterpret_cast<const bytes::value_type*>(prefix.get()), prefix.size()),
                           expected_prefix);
 
         auto reader = fragmented_temporary_buffer::reader();
-        auto fbuf = reader.read_exactly(in, size).get0();
+        auto fbuf = reader.read_exactly(in, size).get();
         auto view = fragmented_temporary_buffer::view(fbuf);
         BOOST_CHECK_EQUAL(view.size_bytes(), size);
         BOOST_CHECK_EQUAL(linearized(view), expected_data);
 
-        auto suffix = in.read_exactly(suffix_size).get0();
+        auto suffix = in.read_exactly(suffix_size).get();
         BOOST_CHECK_EQUAL(suffix.size(), suffix_size);
         BOOST_CHECK_EQUAL(bytes_view(reinterpret_cast<const bytes::value_type*>(suffix.get()), suffix.size()),
                           expected_suffix);
@@ -443,7 +421,7 @@ SEASTAR_THREAD_TEST_CASE(test_skip) {
         BOOST_CHECK_EQUAL(in.bytes_left(), sizeof(type1) + sizeof(type2));
         in.skip(sizeof(type1));
         BOOST_CHECK_EQUAL(in.bytes_left(), sizeof(type2));
-        BOOST_CHECK_EQUAL(in.read<type2>(), expected_value2);
+        BOOST_CHECK_EQUAL(in.read<type2>().value(), expected_value2);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
         in.skip(sizeof(type2));
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
@@ -465,9 +443,9 @@ SEASTAR_THREAD_TEST_CASE(test_remove_suffix) {
         BOOST_CHECK_EQUAL(ftb.size_bytes(), sizeof(type1));
 
         auto in = ftb.get_istream();
-        BOOST_CHECK_EQUAL(in.read<type1>(), expected_value1);
+        BOOST_CHECK_EQUAL(in.read<type1>().value(), expected_value1);
         BOOST_CHECK_EQUAL(in.bytes_left(), 0);
-        BOOST_CHECK_THROW(in.read<char>(), std::out_of_range);
+        BOOST_CHECK_THROW(in.read<char>().value(), std::out_of_range);
 
         ftb.remove_suffix(sizeof(type1) - 1);
         BOOST_CHECK_EQUAL(ftb.size_bytes(), 1);
@@ -491,10 +469,9 @@ static void do_test_read_exactly_eof(size_t input_size) {
     if (input_size) {
         data.push_back(temporary_buffer<char>(input_size));
     }
-    auto ds = data_source(std::make_unique<memory_data_source>(std::move(data)));
-    auto is = input_stream<char>(std::move(ds));
+    auto is = seastar::util::as_input_stream(std::move(data));
     auto reader = fragmented_temporary_buffer::reader();
-    auto result = reader.read_exactly(is, input_size + 1).get0();
+    auto result = reader.read_exactly(is, input_size + 1).get();
     BOOST_CHECK_EQUAL(result.size_bytes(), size_t(0));
 }
 

@@ -3,20 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <array>
 #include <type_traits>
+#include <algorithm>
 
 #include "utils/allocation_strategy.hh"
 
 template<typename T, unsigned InternalSize = 0, typename SizeType = size_t>
+requires std::is_nothrow_move_constructible_v<T>
 class managed_vector {
-    static_assert(std::is_nothrow_move_constructible<T>::value,
-        "objects stored in managed_vector need to be nothrow move-constructible");
 public:
     using value_type = T;
     using size_type = SizeType;
@@ -28,14 +28,12 @@ private:
         T _data[0];
 
         external(external&& other) noexcept : _backref(other._backref) {
-            for (unsigned i = 0; i < _backref->size(); i++) {
-                new (_data + i) T(std::move(other._data[i]));
-                other._data[i].~T();
-            }
+            std::uninitialized_move(other._data, other._data + other._backref->_size, _data);
+            std::destroy(other._data, other._data + other._backref->_size);
             _backref->_data = _data;
         }
         size_t storage_size() const noexcept {
-            return sizeof(*this) + sizeof(T[_backref->_capacity]);
+            return sizeof(*this) + sizeof(T) * _backref->_capacity;
         }
     };
     union maybe_constructed {
@@ -164,6 +162,11 @@ public:
         while (_size) {
             pop_back();
         }
+    }
+    // If the user of `managed_vector` wants to fit within n bytes,
+    // the `managed_vector` must have at most `(n - metadata_size()) / sizeof(T)` elements.
+    constexpr static size_t metadata_size() {
+        return sizeof(external);
     }
     void reserve(size_type new_capacity) {
         if (new_capacity <= _capacity) {

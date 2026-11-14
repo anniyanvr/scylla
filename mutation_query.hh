@@ -3,17 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "query-request.hh"
-#include "query-result.hh"
-#include "frozen_mutation.hh"
+#include "query/query-request.hh"
+#include "query/query-result.hh"
+#include "mutation/frozen_mutation.hh"
 #include "db/timeout_clock.hh"
-#include "mutation.hh"
+#include "mutation/mutation.hh"
 #include "utils/chunked_vector.hh"
+#include "mutation/range_tombstone_assembler.hh"
 
 class reconcilable_result;
 class frozen_reconcilable_result;
@@ -59,10 +60,6 @@ struct partition {
 
     bool operator==(const partition& other) const {
         return row_count() == other.row_count() && _m.representation() == other._m.representation();
-    }
-
-    bool operator!=(const partition& other) const {
-        return !(*this == other);
     }
 };
 
@@ -110,7 +107,10 @@ public:
     }
 
     bool operator==(const reconcilable_result& other) const;
-    bool operator!=(const reconcilable_result& other) const;
+
+    // other must be disjoint with this
+    // does not merge or update memory trackers
+    void merge_disjoint(schema_ptr schema, const reconcilable_result& other);
 
     struct printer {
         const reconcilable_result& self;
@@ -121,10 +121,20 @@ public:
     printer pretty_printer(schema_ptr) const;
 };
 
+// Reverse reconcilable_result by reversing mutations for all partitions.
+future<foreign_ptr<lw_shared_ptr<reconcilable_result>>> reversed(foreign_ptr<lw_shared_ptr<reconcilable_result>> result);
+
+template <>
+struct fmt::formatter<reconcilable_result::printer> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const reconcilable_result::printer&, fmt::format_context& ctx) const
+        -> decltype(ctx.out());
+};
+
+
 class reconcilable_result_builder {
-    const schema& _schema;
+    schema_ptr _query_schema;
     const query::partition_slice& _slice;
-    bool _reversed;
 
     bool _return_static_content_on_partition_with_no_rows{};
     bool _static_row_is_alive{};
@@ -132,15 +142,21 @@ class reconcilable_result_builder {
     query::result_memory_accounter _memory_accounter;
     stop_iteration _stop;
     std::optional<streamed_mutation_freezer> _mutation_consumer;
+    range_tombstone_assembler _rt_assembler;
 
     uint64_t _live_rows{};
     // make this the last member so it is destroyed first. #7240
     utils::chunked_vector<partition> _result;
+    size_t _used_at_entry;
+
+private:
+    stop_iteration consume(range_tombstone&& rt);
+
 public:
-    // Expects table schema (non-reversed) and half-reversed (legacy) slice when building results for reverse query.
-    reconcilable_result_builder(const schema& s, const query::partition_slice& slice,
+    // Expects reversed schema and reversed slice when building results for reverse query.
+    reconcilable_result_builder(const schema& query_schema, const query::partition_slice& slice,
                                 query::result_memory_accounter&& accounter) noexcept
-        : _schema(s), _slice(slice), _reversed(_slice.options.contains(query::partition_slice::option::reversed))
+        : _query_schema(query_schema.shared_from_this()), _slice(slice)
         , _memory_accounter(std::move(accounter))
     { }
 
@@ -148,12 +164,12 @@ public:
     void consume(tombstone t);
     stop_iteration consume(static_row&& sr, tombstone, bool is_alive);
     stop_iteration consume(clustering_row&& cr, row_tombstone, bool is_alive);
-    stop_iteration consume(range_tombstone&& rt);
+    stop_iteration consume(range_tombstone_change&& rtc);
     stop_iteration consume_end_of_partition();
     reconcilable_result consume_end_of_stream();
 };
 
-query::result to_data_query_result(
+future<query::result> to_data_query_result(
         const reconcilable_result&,
         schema_ptr,
         const query::partition_slice&,

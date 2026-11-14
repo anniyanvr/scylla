@@ -3,23 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <boost/range/irange.hpp>
+#include "utils/assert.hh"
 
 #include <seastar/util/defer.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/thread.hh>
 
 #include "partition_slice_builder.hh"
-#include "schema_builder.hh"
-#include "memtable.hh"
-#include "row_cache.hh"
-#include "frozen_mutation.hh"
+#include "schema/schema_builder.hh"
+#include "replica/memtable.hh"
+#include "db/row_cache.hh"
+#include "mutation/frozen_mutation.hh"
 #include "test/lib/tmpdir.hh"
 #include "sstables/sstables.hh"
-#include "canonical_mutation.hh"
+#include "mutation/canonical_mutation.hh"
+#include "utils/chunked_string.hh"
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/test_services.hh"
 #include "test/lib/sstable_test_env.hh"
@@ -45,7 +46,7 @@ class size_calculator {
 public:
     static void print_cache_entry_size() {
         std::cout << prefix() << "sizeof(cache_entry) = " << sizeof(cache_entry) << "\n";
-        std::cout << prefix() << "sizeof(memtable_entry) = " << sizeof(memtable_entry) << "\n";
+        std::cout << prefix() << "sizeof(memtable_entry) = " << sizeof(replica::memtable_entry) << "\n";
         std::cout << prefix() << "sizeof(bptree::node) = " << sizeof(row_cache::partitions_type::outer_tree::node) << "\n";
         std::cout << prefix() << "sizeof(bptree::data) = " << sizeof(row_cache::partitions_type::outer_tree::data) << "\n";
 
@@ -95,7 +96,7 @@ public:
 thread_local int size_calculator::nest::level = 0;
 
 static schema_ptr cassandra_stress_schema() {
-    return schema_builder("ks", "cf")
+    return schema_builder(this_smp_shard_count(), "ks", "cf")
         .with_column("KEY", bytes_type, column_kind::partition_key)
         .with_column("C0", bytes_type)
         .with_column("C1", bytes_type)
@@ -108,10 +109,10 @@ static schema_ptr cassandra_stress_schema() {
 [[gnu::unused]]
 static mutation make_cs_mutation() {
     auto s = cassandra_stress_schema();
-    mutation m(s, partition_key::from_single_value(*s, bytes_type->from_string("4b343050393536353531")));
+    mutation m(s, partition_key::from_single_value(*s, to_bytes(bytes_type->from_string("4b343050393536353531"))));
     for (auto&& col : s->regular_columns()) {
         m.set_clustered_cell(clustering_key::make_empty(), col,
-            atomic_cell::make_live(*bytes_type, 1, bytes_type->from_string("8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a")));
+            atomic_cell::make_live(*bytes_type, 1, to_bytes(bytes_type->from_string("8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a"))));
     }
     return m;
 }
@@ -144,7 +145,7 @@ struct mutation_settings {
 };
 
 static schema_ptr make_schema(const mutation_settings& settings) {
-    auto builder = schema_builder("ks", "cf")
+    auto builder = schema_builder(this_smp_shard_count(), "ks", "cf")
         .with_column("pk", bytes_type, column_kind::partition_key)
         .with_column("ck", bytes_type, column_kind::clustering_key);
 
@@ -181,12 +182,12 @@ struct sizes {
 static sizes calculate_sizes(cache_tracker& tracker, const mutation_settings& settings) {
     sizes result;
     auto s = make_schema(settings);
-    auto mt = make_lw_shared<memtable>(s);
+    auto mt = make_lw_shared<replica::memtable>(s);
     row_cache cache(s, make_empty_snapshot_source(), tracker);
 
     auto cache_initial_occupancy = tracker.region().occupancy().used_space();
 
-    assert(mt->occupancy().used_space() == 0);
+    SCYLLA_ASSERT(mt->occupancy().used_space() == 0);
 
     std::vector<mutation> muts;
     for (size_t i = 0; i < settings.partition_count; ++i) {
@@ -204,16 +205,12 @@ static sizes calculate_sizes(cache_tracker& tracker, const mutation_settings& se
 
     tmpdir sstable_dir;
     sstables::test_env::do_with_async([&] (sstables::test_env& env) {
-        for (auto v  : sstables::all_sstable_versions) {
-            auto sst = env.make_sstable(s,
-                sstable_dir.path().string(),
-                1 /* generation */,
-                v,
-                sstables::sstable::format_types::big);
-            auto mt2 = make_lw_shared<memtable>(s);
+        for (auto v  : sstables::writable_sstable_versions) {
+            auto sst = env.make_sstable(s, v);
+            auto mt2 = make_lw_shared<replica::memtable>(s);
             mt2->apply(*mt, env.make_reader_permit()).get();
-            write_memtable_to_sstable_for_test(*mt2, sst).get();
-            sst->load().get();
+            write_memtable_to_sstable(*mt2, sst).get();
+            sst->open_data().get();
             result.sstable[v] = sst->data_size();
         }
     }).get();
@@ -235,7 +232,7 @@ int main(int argc, char** argv) {
         ("data-size", bpo::value<size_t>()->default_value(32), "cell data size");
 
     return app.run(argc, argv, [&] {
-        if (smp::count != 1) {
+        if (this_smp_shard_count() != 1) {
             throw std::runtime_error("This test has to be run with -c1");
         }
 
@@ -261,7 +258,7 @@ int main(int argc, char** argv) {
             std::cout << " - in memtable:  " << sizes.memtable << "\n";
             std::cout << " - in sstable:\n";
             for (auto v : sizes.sstable) {
-                std::cout << "   " << sstables::to_string(v.first) << ":   " << v.second << "\n";
+                std::cout << "   " << fmt::to_string(v.first) << ":   " << v.second << "\n";
             }
             std::cout << " - frozen:       " << sizes.frozen << "\n";
             std::cout << " - canonical:    " << sizes.canonical << "\n";
@@ -269,6 +266,12 @@ int main(int argc, char** argv) {
 
             std::cout << "\n";
             size_calculator::print_cache_entry_size();
+
+            auto cache_st = tracker.region().collect_stats();
+            std::cout << "LSA stats:" << "\n";
+            for (auto [ name, size ] : cache_st) {
+                std::cout << "  " << name << ": " << size << "\n";
+            }
         });
     });
 }

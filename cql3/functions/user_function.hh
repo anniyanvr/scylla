@@ -5,12 +5,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include "abstract_function.hh"
+#include "cql3/description.hh"
 #include "scalar_function.hh"
 #include "lang/lua.hh"
 #include "lang/wasm.hh"
@@ -25,7 +26,7 @@ public:
         sstring bitcode;
         // FIXME: We should not need a copy in each function. It is here
         // because user_function::execute is only passed the
-        // cql_serialization_format and the runtime arguments.  We could
+        // the runtime arguments.  We could
         // avoid it by having a runtime->execute(user_function) instead,
         // but that is a large refactoring. We could also store a
         // lua_runtime in a thread_local variable, but that is one extra
@@ -58,8 +59,18 @@ public:
     virtual bool is_native() const override;
     virtual bool is_aggregate() const override;
     virtual bool requires_thread() const override;
-    virtual bytes_opt execute(cql_serialization_format sf, const std::vector<bytes_opt>& parameters) override;
+    virtual managed_bytes_opt execute(std::span<const managed_bytes_opt> parameters) override;
+
+    description describe(with_create_statement) const;
 };
+
+// The name of the type of a user-defined function's argument or return value,
+// or of a user-defined aggregate's argument or state, as it is written in
+// CREATE FUNCTION or CREATE AGGREGATE. A user-defined type or a tuple there is
+// always frozen, but is written without frozen<> (which CREATE FUNCTION
+// refuses for a user-defined type). A collection, however, may be declared
+// frozen or not, so a frozen collection is written with frozen<>.
+sstring signature_type_name(const data_type& type);
 
 }
 }

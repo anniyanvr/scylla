@@ -1,9 +1,9 @@
 /*
- * Copyright (C) 2021 ScyllaDB
+ * Copyright (C) 2021-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,7 +11,8 @@
 #include <seastar/core/coroutine.hh>
 #include "sstables/consumer.hh"
 
-#if __cpp_impl_coroutine >= 201902L
+// Clang < 14 only supports the TS
+#if __has_include(<coroutine>) && (!defined(__clang__) || __clang_major__ >= 14)
 #  define COROUTINE_NS std
 #else
 #  define COROUTINE_NS std::experimental

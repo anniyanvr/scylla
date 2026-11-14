@@ -1,24 +1,22 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include <seastar/core/shared_ptr.hh>
-#include "exceptions/exceptions.hh"
+#include "cql3/cql3_type.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "update_parameters.hh"
 #include "cql3/column_identifier.hh"
 #include "cql3/expr/expression.hh"
+#include "cql3/expr/unset.hh"
 
 #include <optional>
 
@@ -52,10 +50,13 @@ protected:
     // may require none of more than one expression, but most need 1 so it simplify things a bit.
     std::optional<expr::expression> _e;
 
+    // A guard to check if the operation should be skipped due to unset operand.
+    expr::unset_bind_variable_guard _unset_guard;
 public:
-    operation(const column_definition& column_, std::optional<expr::expression> e)
+    operation(const column_definition& column_, std::optional<expr::expression> e, expr::unset_bind_variable_guard ubvg)
         : column{column_}
         , _e(std::move(e))
+        , _unset_guard(std::move(ubvg))
     { }
 
     virtual ~operation() {}
@@ -65,10 +66,30 @@ public:
     }
 
     /**
-    * @return whether the operation requires a read of the previous value to be executed
-    * (only lists setterByIdx, discard and discardByIdx requires that).
+    * @return whether the operation requires a read of the previous value to
+    * be executed. In traditional CQL only a few specific list operations
+    * perform read before the write, *non-atomically*:
+    *   - lists::setter_by_index (SET c[i] = v)
+    *   - lists::discarder (SET c = c - [v])
+    *   - lists::discarder_by_index (DELETE c[i])
+    *
+    * We're gradually adding ScyllaDB-only CQL extensions to allow additional
+    * expressions that need to read the old value of the row, e.g.,
+    * SET r = r + 1. The operations will set require_read() to true, but will
+    * also set requires_lwt() to true to require that this operation must be
+    * execute in an LWT update - and this will guarantee that so the read-
+    * modify-write operation is atomic.
     */
     virtual bool requires_read() const {
+        return false;
+    }
+
+    /**
+     * @return whether the operation is only valid in an LWT (conditional)
+     * update. For example, non-counter arithmetic (e.g. SET r = r + 1 on a
+     * regular column) requires LWT so that the read-modify-write is atomic.
+     */
+    virtual bool requires_lwt() const {
         return false;
     }
 
@@ -78,16 +99,16 @@ public:
      * @param meta the list of column specification where to collect the
      * bind variables of this term in.
      */
-    virtual void fill_prepare_context(prepare_context& ctx) {
-        if (_e.has_value()) {
-            expr::fill_prepare_context(*_e, ctx);
-        }
-    }
+    virtual void fill_prepare_context(prepare_context& ctx);
 
     /**
-     * Execute the operation.
+     * Execute the operation. Check should_skip_operation() first.
      */
     virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) = 0;
+
+    bool should_skip_operation(const query_options& qo) const {
+        return _unset_guard.is_unset(qo);
+    }
 
     /**
      * A parsed raw UPDATE operation.
@@ -115,7 +136,7 @@ public:
          * be a true column.
          * @return the prepared update operation.
          */
-        virtual ::shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const = 0;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const = 0;
 
         /**
          * @return whether this operation can be applied alongside the {@code
@@ -152,7 +173,7 @@ public:
          * @param receiver the "column" this operation applies to.
          * @return the prepared delete operation.
          */
-        virtual ::shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const = 0;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const = 0;
     };
 
     class set_value;
@@ -169,7 +190,7 @@ public:
             : _selector(std::move(selector)), _value(std::move(value)), _by_uuid(by_uuid) {
         }
 
-        virtual shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
 
         virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
@@ -185,7 +206,7 @@ public:
             : _field(std::move(field)), _value(std::move(value)) {
         }
 
-        virtual shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
 
         virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
@@ -202,7 +223,7 @@ public:
 
         virtual const column_identifier::raw& affected_column() const override;
 
-        virtual shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
     };
 
     class addition : public raw_update {
@@ -214,7 +235,7 @@ public:
                 : _value(std::move(value)) {
         }
 
-        virtual shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
 
         virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
@@ -228,7 +249,7 @@ public:
                 : _value(std::move(value)) {
         }
 
-        virtual shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
 
         virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
@@ -242,7 +263,7 @@ public:
                 : _value(std::move(value)) {
         }
 
-        virtual shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
 
         virtual bool is_compatible_with(const std::unique_ptr<raw_update>& other) const override;
     };
@@ -257,8 +278,22 @@ public:
                 : _id(std::move(id)), _element(std::move(element)) {
         }
         virtual const column_identifier::raw& affected_column() const override;
-        virtual shared_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
+        virtual std::unique_ptr<operation> prepare(data_dictionary::database db, const sstring& keyspace, const column_definition& receiver) const override;
     };
+};
+
+class operation_skip_if_unset : public operation {
+public:
+    operation_skip_if_unset(const column_definition& column, expr::expression e)
+            : operation(column, e, expr::unset_bind_variable_guard(e)) {
+    }
+};
+
+class operation_no_unset_support : public operation {
+public:
+    operation_no_unset_support(const column_definition& column, std::optional<expr::expression> e)
+            : operation(column, std::move(e), expr::unset_bind_variable_guard(std::nullopt)) {
+    }
 };
 
 }

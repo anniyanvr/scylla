@@ -1,0 +1,374 @@
+/*
+ * Copyright (C) 2025-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/shard_id.hh>
+#include <seastar/core/on_internal_error.hh>
+#include "state_machine.hh"
+#include "db/schema_tables.hh"
+#include "mutation/frozen_mutation.hh"
+#include "schema/schema_registry.hh"
+#include "serializer_impl.hh"
+#include "idl/strong_consistency/state_machine.dist.hh"
+#include "idl/strong_consistency/state_machine.dist.impl.hh"
+#include "replica/database.hh"
+#include "service/migration_manager.hh"
+#include "db/system_keyspace.hh"
+#include "utils/error_injection.hh"
+#include "schema/schema_registry.hh"
+#include "service/strong_consistency/raft_commitlog.hh"
+#include "service/strong_consistency/raft_resize_tracker.hh"
+#include "utils/latency.hh"
+
+using namespace std::chrono_literals;
+
+namespace service::strong_consistency {
+
+static logging::logger logger("sc_state_machine");
+
+mutation make_resize_marker_mutation(raft::group_id gid, shard_id shard, const resize_marker& marker) {
+    auto s = db::system_keyspace::raft_groups();
+    auto pk = partition_key::from_exploded(*s, {
+        short_type->decompose(int16_t(shard)),
+        timeuuid_type->decompose(gid.id),
+    });
+    mutation m(s, std::move(pk));
+    m.set_clustered_cell(clustering_key::make_empty(), to_bytes(fmt::to_string(marker.kind)), data_value(true),
+            marker.timestamp);
+    return m;
+}
+
+class state_machine : public raft_state_machine {
+    locator::global_tablet_id _tablet;
+    raft::group_id _group_id;
+    replica::database& _db;
+    service::migration_manager& _mm;
+    db::system_keyspace& _sys_ks;
+    raft_groups_storage& _persistence;
+    raft_resize_tracker& _resize_tracker;
+    lw_shared_ptr<state_machine_stats> _stats;
+
+    abort_source _as;
+
+public:
+    state_machine(locator::global_tablet_id tablet,
+        raft::group_id gid,
+        replica::database& db,
+        service::migration_manager& mm,
+        db::system_keyspace& sys_ks,
+        raft_groups_storage& persistence,
+        raft_resize_tracker& resize_tracker,
+        lw_shared_ptr<state_machine_stats> stats)
+        : _tablet(tablet)
+        , _group_id(gid)
+        , _db(db)
+        , _mm(mm)
+        , _sys_ks(sys_ks)
+        , _persistence(persistence)
+        , _resize_tracker(resize_tracker)
+        , _stats(std::move(stats))
+    {
+    }
+
+    // Report a batch as applied when it never will be, because its table or
+    // keyspace is gone. A record is released only once its last command applies,
+    // so without the report the record stays at the front of the queue for good.
+    // Releases are front-first, so the whole queue freezes behind it and every segment
+    // the group holds stays dirty. Safe: no memtable holds this batch's data.
+    void note_batch_discarded(const raft::log_entry_ptr_list& command) {
+        if (!command.empty()) {
+            _persistence.note_applied(command.back()->idx);
+        }
+    }
+
+    future<> apply(raft::log_entry_ptr_list command) override {
+        static thread_local logging::logger::rate_limit rate_limit(std::chrono::seconds(10));
+        try {
+            co_await utils::get_local_injector().inject("strong_consistency_state_machine_wait_before_apply", utils::wait_for_message(20min));
+            logger.trace("Tablet {}, raft group {}, applies {} entries, indexes {} to {}.",
+                _tablet, _group_id, command.size(), command.front()->idx, command.back()->idx);
+            // One store for the whole batch, so that commands written with the same
+            // schema version resolve their schema only once.
+            schema_store schemas(_db, _sys_ks, [this]() -> future<> {
+                ++_stats->schema_barrier_waits;
+                if (utils::get_local_injector().enter("disable_raft_drop_append_entries_for_specified_group")) {
+                    utils::get_local_injector().disable("raft_drop_incoming_append_entries_for_specified_group");
+                }
+                logger.debug("apply(): waiting for the group0 barrier for tablet {}, group_id={}", _tablet, _group_id);
+                co_await _mm.get_group0_barrier().trigger(false, &_as);
+            });
+            // Apply the commands sequentially to preserve linearizability.
+            // E.g., for writes A-B-C-D, a reader must observe
+            // them in that order and never see A-C or A-D skipping intermediate values.
+            for (size_t i = 0; i < command.size(); ++i) {
+                utils::latency_counter lc;
+                lc.start();
+                auto cmd = detail::deserialize_raft_command(command[i]);
+                if (const auto* marker = std::get_if<resize_marker>(&cmd.change)) {
+                    logger.log(log_level::trace, rate_limit, "apply(): applying the {} marker of group {}",
+                        marker->kind, _group_id);
+                    auto m = make_resize_marker_mutation(_group_id, this_shard_id(), *marker);
+                    // We pin the segment under system.raft_groups, which the marker's row goes to.
+                    co_await _db.apply_in_memory(m, m.schema()->table(),
+                            _persistence.pin_raft_groups_for_apply(command[i]->idx), db::no_timeout);
+                    _resize_tracker.mark_resize_phase(_group_id, *marker);
+                    _persistence.note_applied(command[i]->idx);
+                    continue;
+                }
+                if (const auto* tc = std::get_if<truncate_command>(&cmd.change)) {
+                    auto record = co_await raft_groups_storage::load_truncate_record(
+                            _sys_ks.query_processor(), _group_id, this_shard_id());
+                    // Nothing of this entry reaches a memtable, so no pin. The entry is
+                    // reported applied only below, once the record is durable, so its
+                    // segment outlives the record's sync and a crash replays the entry.
+                    co_await apply_truncate_command(_db, _tablet, _group_id, command[i]->idx, *tc, record);
+                    _persistence.note_applied(command[i]->idx);
+                    continue;
+                }
+                auto& mut = std::get<write_mutation>(cmd.change).mutation;
+                auto schema = co_await schemas.resolve_and_upgrade(mut);
+                // Taken after the schema resolution, which may yield on the
+                // group0 barrier.
+                auto commitlog_pin = _persistence.pin_target_table_for_apply(command[i]->idx);
+                if (utils::get_local_injector().enter("strong_consistency_state_machine_abort_before_apply_in_memory")) {
+                    throw std::runtime_error("strong_consistency_state_machine_abort_before_apply_in_memory");
+                }
+                // Concurrent apply_in_memory() calls can complete out of order under memory pressure
+                // (suspended at run_when_memory_available()), making mutations visible out of Raft log order.
+                // Therefore we must await each apply_in_memory() sequentially to preserve Raft log order.
+                // apply_in_memory() skips the write counters of database::apply(), so count here.
+                try {
+                    co_await _db.apply_in_memory(mut, std::move(schema), std::move(commitlog_pin), db::no_timeout, db::noop_large_data_guardrail::instance());
+                } catch (...) {
+                    ++_db.get_stats().total_writes_failed;
+                    throw;
+                }
+                ++_db.get_stats().total_writes;
+                _stats->apply_latency.add(lc.stop().latency());
+                _persistence.note_applied(command[i]->idx);
+            }
+        } catch (replica::no_such_column_family&) {
+            // If the table doesn't exist, it means it was already dropped.
+            // This cannot happen if the table wasn't created yet on the node
+            // because the state machine is created only after the table is created
+            // (see `schema_applier::commit_on_shard()` and `storage_service::commit_token_metadata_change()`).
+            // In this case, we should just ignore mutations without throwing an error.
+            logger.log(log_level::warn, rate_limit, "apply(): table {} was already dropped, ignoring mutations", _tablet.table);
+            note_batch_discarded(command);
+        } catch (replica::no_such_keyspace&) {
+            // Thrown when DROP KEYSPACE races with the raft applier fiber.
+            // The path: schema_store::resolve_and_upgrade() calls
+            // local_schema_registry().get_or_null(schema_version), which may
+            // trigger lazy unfreezing of a cached frozen_schema. Unfreezing
+            // re-parses column types via cql_type_parser::parse(), which
+            // consults db_user_types_storage::get(ks_name), which calls
+            // database::find_keyspace() — and that throws no_such_keyspace
+            // if the keyspace was concurrently dropped.
+            // Safe to ignore: the table's raft group is about to be destroyed
+            // by schedule_raft_group_deletion() anyway.
+            logger.log(log_level::warn, rate_limit, "apply(): keyspace for table {} was already dropped, ignoring mutations", _tablet.table);
+            note_batch_discarded(command);
+        } catch (const abort_requested_exception& ex) {
+            // The exception can be thrown by schema_store::resolve_and_upgrade.
+            // It means that the Raft group is being removed.
+            //
+            // No note_batch_discarded() here, unlike the two arms above. abort() is
+            // called only while the group is torn down, and the teardown gives up the
+            // whole queue (raft_commitlog::release_all(), or the destructor), so no
+            // record is left waiting for the batch.
+            //
+            // Technically, throwing an exception from a state machine
+            // may result in killing the corresponding Raft instance:
+            // cf. the description of raft::state_machine:
+            //
+            //  "Any of the functions may return an error, but it will kill the
+            //   raft instance that uses it. Depending on what state the failure
+            //   leaves the state is the raft instance will either have to be recreated
+            //   with the same state machine and rejoined the cluster with the same server_id
+            //   or it new raft instance will have to be created with empty state machine and
+            //   it will have to rejoin to the cluster with different server_id through
+            //   configuration change."
+            //
+            // Fortunately, in strong consistency, we use the default Raft server
+            // implementation, which handles abort_requested_exception thrown by
+            // raft::state_machine::apply -- it will simply end the applier fiber.
+            logger.debug("apply(): execution for tablet {}, group_id={} aborted due to: {}",
+                _tablet, _group_id, ex);
+            throw;
+        }
+         catch (...) {
+            // Nested, so that the Raft server can still tell what the error is.
+            std::throw_with_nested(std::runtime_error(::format(
+                "tablet {}, group id {}: error while applying mutations of entries {} to {}",
+                _tablet, _group_id, command.front()->idx, command.back()->idx)));
+        }
+    }
+
+    future<raft::snapshot_id> take_snapshot() override {
+        // Until snapshot transfer is fully implemented, return a fake ID
+        // and don't actually do anything. As long as we don't do snapshot
+        // transfers (attempting to do that throws an exception), we should
+        // be safe.
+        return make_ready_future<raft::snapshot_id>(raft::snapshot_id(utils::make_random_uuid()));
+    }
+
+    void drop_snapshot(raft::snapshot_id id) override {
+        // Taking a snapshot is a no-op, so dropping a snapshot is also a no-op.
+        (void) id;
+    }
+
+    future<> load_snapshot(raft::snapshot_id id) override {
+        return make_ready_future<>();
+    }
+
+    future<> abort() override {
+        logger.debug("abort(): Aborting state machine for group {}", _group_id);
+        _as.request_abort();
+        return make_ready_future<>();
+    }
+
+    // FIXME: once implemented, the transfer has to carry the group's metadata (resize markers) stored in system.raft_groups
+    future<> transfer_snapshot(raft::server_id from_id, raft::snapshot_descriptor snp) override {
+        throw std::runtime_error("transfer_snapshot() not implemented");
+    }
+};
+
+thread_local schema_store::column_mappings_cache schema_store::_column_mapping_cache(
+        std::numeric_limits<size_t>::max(), 1h, logger);
+
+future<schema_store::schema_entry> schema_store::get_schema(table_id table, table_schema_version schema_version) {
+    if (utils::get_local_injector().enter("sc_state_machine_return_empty_schema")) {
+        co_return schema_entry{nullptr, nullptr};
+    }
+
+    auto schema = local_schema_registry().get_or_null(schema_version);
+    if (schema) {
+        co_return schema_entry{std::move(schema), nullptr};
+    }
+
+    // `db.find_schema()` may throw `replica::no_such_column_family` if the table was already dropped.
+    schema = _db.find_schema(table);
+    // The column mapping may be already present in the cache from another call
+    auto cm_ptr = _column_mapping_cache.find(schema_version);
+    if (cm_ptr) {
+        co_return schema_entry{std::move(schema), std::move(cm_ptr)};
+    }
+
+    // We may not find the column mapping if the mutation schema is newer than the present schema.
+    // In this case, we should trigger the barrier to wait for the schema to be updated and then try again.
+    auto cm_opt = co_await db::schema_tables::get_column_mapping_if_exists(_sys_ks, table, schema_version);
+    if (!cm_opt) {
+        co_return schema_entry{nullptr, nullptr};
+    }
+
+    cm_ptr = co_await _column_mapping_cache.get_ptr(schema_version, [cm = std::move(*cm_opt)](auto schema_version) -> future<column_mapping> {
+        co_return std::move(cm);
+    });
+    co_return schema_entry{std::move(schema), std::move(cm_ptr)};
+}
+
+schema_store::schema_store(replica::database& db, db::system_keyspace& sys_ks, std::function<future<>()> barrier_trigger)
+    : _db(db)
+    , _sys_ks(sys_ks)
+    , _barrier_trigger(std::move(barrier_trigger))
+{
+}
+
+future<schema_ptr> schema_store::resolve_and_upgrade(frozen_mutation& m) {
+    const auto schema_version = m.schema_version();
+
+    auto it = _schema_mappings.find(schema_version);
+    if (it == _schema_mappings.end()) {
+        const auto table = m.column_family_id();
+        auto [schema, cm_ptr] = co_await get_schema(table, schema_version);
+        if (!schema) {
+            if (const auto trigger = std::exchange(_barrier_trigger, nullptr)) {
+                logger.debug("Table {} has no local schema version {}, running a group0 read barrier.",
+                    table, schema_version);
+                co_await trigger();
+                std::tie(schema, cm_ptr) = co_await get_schema(table, schema_version);
+                if (schema) {
+                    logger.debug("Table {} has schema version {} after the group0 read barrier.", table, schema_version);
+                }
+            }
+        }
+        if (!schema) {
+            // Old schema are TTLed after 10 days (see comment in `schema_applier::finalize_tables_and_views()`),
+            // so this error theoretically may be triggered if a node is stuck longer than this.
+            // But in practice we should do a snapshot much earlier, that's why `on_internal_error()` here.
+            // And if the table or keyspace was already dropped, `no_such_column_family`
+            // or `no_such_keyspace` will be thrown earlier.
+            on_internal_error(logger, fmt::format("couldn't find schema for table {} and mutation schema version {}",
+                    table, schema_version));
+        }
+        if (cm_ptr) {
+            logger.trace("Upgrading mutations of table {} from schema version {} to {}.",
+                table, schema_version, schema->version());
+        }
+        it = _schema_mappings.insert({schema_version, {std::move(schema), cm_ptr}}).first;
+    }
+
+    const auto& [schema, cm_ptr] = it->second;
+    if (cm_ptr) {
+        m = freeze(m.unfreeze_upgrading(schema, *cm_ptr));
+    }
+    co_return schema;
+}
+
+std::unique_ptr<raft_state_machine> make_state_machine(locator::global_tablet_id tablet,
+    raft::group_id gid,
+    replica::database& db,
+    service::migration_manager& mm,
+    db::system_keyspace& sys_ks,
+    raft_groups_storage& persistence,
+    raft_resize_tracker& resize_tracker,
+    lw_shared_ptr<state_machine_stats> stats)
+{
+    return std::make_unique<state_machine>(tablet, gid, db, mm, sys_ks, persistence, resize_tracker, std::move(stats));
+}
+
+future<> apply_truncate_command(replica::database& db, locator::global_tablet_id tablet, raft::group_id gid,
+        raft::index_t idx, const truncate_command& tc, truncate_record& record) {
+    if (record.last_truncate_request_id == tc.request_id) {
+        logger.debug("group {}: truncate of tablet {} by request {} was already applied, skipping",
+                gid, tablet, tc.request_id);
+        co_return;
+    }
+    logger.info("group {}: truncating tablet {} at {} by request {}",
+            gid, tablet, tc.truncated_at, tc.request_id);
+    co_await db.find_column_family(tablet.table).truncate_tablet_locally(db, tablet.tablet);
+    record = truncate_record{.truncated_at = tc.truncated_at, .last_truncate_request_id = tc.request_id, .truncate_index = idx,
+            .written_at = record.written_at};
+    // Durable before returning, so no entry after this one is applied until the record is.
+    // Otherwise a crash could leave an sstable of post-truncate writes without the record,
+    // and the replayed entry would delete it.
+    co_await utils::get_local_injector().inject("truncate_apply_before_record", utils::wait_for_message(5min));
+    co_await raft_groups_storage::store_truncate_record(db, gid, this_shard_id(), record);
+}
+
+namespace detail {
+
+raft_command deserialize_raft_command(const raft::log_entry_ptr& entry) {
+    const auto& cmd = std::get<raft::command>(entry->data);
+    auto is = ser::as_input_stream(cmd);
+    return ser::deserialize(is, std::type_identity<raft_command>());
+}
+
+} // namespace detail
+}; // namespace service::strong_consistency
+
+auto fmt::formatter<service::strong_consistency::resize_marker_kind>::format(service::strong_consistency::resize_marker_kind kind,
+        fmt::format_context& ctx) const -> decltype(ctx.out()) {
+    using enum service::strong_consistency::resize_marker_kind;
+    std::string_view name;
+    switch (kind) {
+    case start_resize: name = "start_resize"; break;
+    case end_resize: name = "end_resize"; break;
+    }
+    return fmt::formatter<string_view>::format(name, ctx);
+}

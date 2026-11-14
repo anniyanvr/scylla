@@ -9,7 +9,7 @@
 -- 
 -- Modified by ScyllaDB
 -- 
--- SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+-- SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
 
 -- setup
 CREATE KEYSPACE ks1 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}
@@ -388,4 +388,4 @@ INSERT INTO conditional_deletes_on_static_with_null_batch (a, b, s1, v) values (
 DELETE s1 FROM conditional_deletes_on_static_with_null_batch WHERE a = 7 IF s2 != 7
 APPLY BATCH;
 SELECT * FROM conditional_deletes_on_static_with_null_batch       WHERE a = 7;
-
+DROP KEYSPACE ks1;

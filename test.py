@@ -3,895 +3,761 @@
 #
 # Copyright (C) 2015-present ScyllaDB
 #
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+#
 
-#
-# SPDX-License-Identifier: AGPL-3.0-or-later
-#
-from abc import ABC, abstractmethod
+from __future__ import annotations
+
+import os
+import pathlib
+import subprocess
+import sys
+
+
+def _ensure_running_under_uv() -> None:
+    """Re-exec test.py under `uv run --locked`, so the whole process (not
+    just some packages spliced onto sys.path) runs inside a venv synced
+    from test/pyproject.toml / test/uv.lock, instead of test.py depending
+    on whatever happens to be frozen into the toolchain image.
+
+    `--locked` makes `uv run` fail loudly instead of silently re-resolving
+    if test/pyproject.toml and test/uv.lock have drifted apart. `uv run`
+    also re-syncs the venv in place before running if the lockfile changed
+    since the last run, so bumping a pin there takes effect immediately,
+    with no toolchain image rebuild required.
+
+    The venv lives under build/test-dependencies, keyed by the ABI of the
+    interpreter `uv` will actually run it with (per test/pyproject.toml's
+    requires-python, not necessarily the interpreter currently running this
+    function), so `rm -rf build` wipes it along with everything else, and
+    different checkouts (potentially on different Python versions) never
+    share (or clobber) each other's packages.
+
+    Set DISABLE_VENV=1 to skip all of this and run test.py directly under
+    whatever Python/environment invoked it -- e.g. to use a specific
+    interpreter, a manually-managed venv, or a debugger, or when `uv` isn't
+    available. Dependencies are then whatever's already importable; nothing
+    installs or syncs them. The re-exec sets DISABLE_VENV=1 itself, so the
+    same variable doubles as the guard that makes this run exactly once per
+    process tree rather than looping.
+    """
+    if os.environ.get("DISABLE_VENV"):
+        return
+
+    top_src_dir = pathlib.Path(__file__).resolve().parent
+    # The rest of test.py (and the test harness under test/) assumes it runs
+    # from the repo root -- e.g. path_to() in test/__init__.py builds
+    # "build/{mode}/..." relative to the cwd. Every current caller (ninja,
+    # dbuild) already invokes "./test.py" from the root, but chdir here too
+    # so a run started from elsewhere (or via a symlink) behaves the same
+    # way instead of failing later on a missing relative path.
+    os.chdir(top_src_dir)
+    os.environ["UV_PROJECT"] = str(top_src_dir / "test")
+    # Ask uv which interpreter it will use to satisfy test/pyproject.toml's
+    # requires-python, rather than assuming it matches the one running this
+    # function -- they can differ, e.g. the system's default "python3" is
+    # older than what the project requires and uv fetches/uses a newer one.
+    resolved_python = subprocess.check_output(["uv", "python", "find"], text=True).strip()
+    soabi = subprocess.check_output(
+        [resolved_python, "-c", "import sysconfig; print(sysconfig.get_config_var('SOABI'))"],
+        text=True).strip()
+    venv_dir = top_src_dir / "build" / "test-dependencies" / soabi
+
+    os.environ["DISABLE_VENV"] = "1"
+    os.environ["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
+    # Given a .py path, `uv run` runs it with the synced venv's own interpreter
+    # (__file__ is already absolute), so no explicit "python3" is needed.
+    os.execvp("uv", ["uv", "run", "--locked", "--quiet", __file__, *sys.argv[1:]])
+
+
+if __name__ == "__main__":
+    _ensure_running_under_uv()
+
 import argparse
 import asyncio
+import dataclasses
+import math
+import shlex
+import textwrap
+from bisect import insort
+from random import randint
+
+import pytest
+
 import colorama
-import difflib
-import filecmp
-import glob
-import io
 import itertools
 import logging
 import multiprocessing
 import os
-import pathlib
-import re
-import shlex
-import shutil
-import signal
-import subprocess
-import sys
+import resource
 import time
-import xml.etree.ElementTree as ET
-import yaml
+
+import humanfriendly
+import treelib
 
 from scripts import coverage
-
-output_is_a_tty = sys.stdout.isatty()
-
-all_modes = set(['debug', 'release', 'dev', 'sanitize', 'coverage'])
-debug_modes = set(['debug', 'sanitize'])
-
-
-def create_formatter(*decorators):
-    """Return a function which decorates its argument with the given
-    color/style if stdout is a tty, and leaves intact otherwise."""
-    def color(arg):
-        return "".join(decorators) + str(arg) + colorama.Style.RESET_ALL
-
-    def nocolor(arg):
-        return str(arg)
-    return color if output_is_a_tty else nocolor
-
-
-class palette:
-    """Color palette for formatting terminal output"""
-    ok = create_formatter(colorama.Fore.GREEN, colorama.Style.BRIGHT)
-    fail = create_formatter(colorama.Fore.RED, colorama.Style.BRIGHT)
-    new = create_formatter(colorama.Fore.BLUE)
-    skip = create_formatter(colorama.Style.DIM)
-    path = create_formatter(colorama.Style.BRIGHT)
-    diff_in = create_formatter(colorama.Fore.GREEN)
-    diff_out = create_formatter(colorama.Fore.RED)
-    diff_mark = create_formatter(colorama.Fore.MAGENTA)
-    warn = create_formatter(colorama.Fore.YELLOW)
-    crit = create_formatter(colorama.Fore.RED, colorama.Style.BRIGHT)
-
-
-class TestSuite(ABC):
-    """A test suite is a folder with tests of the same type.
-    E.g. it can be unit tests, boost tests, or CQL tests."""
-
-    # All existing test suites, one suite per path.
-    suites = dict()
-    _next_id = 0
-
-    def __init__(self, path, cfg):
-        self.path = path
-        self.name = os.path.basename(self.path)
-        self.cfg = cfg
-        self.tests = []
-
-        self.run_first_tests = set(cfg.get("run_first", []))
-        self.no_parallel_cases = set(cfg.get("no_parallel_cases", []))
-        disabled = self.cfg.get("disable", [])
-        non_debug = self.cfg.get("skip_in_debug_modes", [])
-        self.enabled_modes = dict()
-        self.disabled_tests = dict()
-        for mode in all_modes:
-            self.disabled_tests[mode] = \
-                set(self.cfg.get("skip_in_" + mode, []) + (non_debug if mode in debug_modes else []) + disabled)
-            for shortname in set(self.cfg.get("run_in_" + mode, [])):
-                self.enabled_modes[shortname] = self.enabled_modes.get(shortname, []) + [mode]
-
-    @property
-    def next_id(self):
-        TestSuite._next_id += 1
-        return TestSuite._next_id
-
-    @staticmethod
-    def test_count():
-        return TestSuite._next_id
-
-    @staticmethod
-    def load_cfg(path):
-        with open(os.path.join(path, "suite.yaml"), "r") as cfg_file:
-            cfg = yaml.safe_load(cfg_file.read())
-            if not isinstance(cfg, dict):
-                raise RuntimeError("Failed to load tests in {}: suite.yaml is empty".format(path))
-            return cfg
-
-    @staticmethod
-    def opt_create(path):
-        """Return a subclass of TestSuite with name cfg["type"].title + TestSuite.
-        Ensures there is only one suite instance per path."""
-        suite = TestSuite.suites.get(path)
-        if not suite:
-            cfg = TestSuite.load_cfg(path)
-            kind = cfg.get("type")
-            if kind is None:
-                raise RuntimeError("Failed to load tests in {}: suite.yaml has no suite type".format(path))
-            SpecificTestSuite = globals().get(kind.title() + "TestSuite")
-            if not SpecificTestSuite:
-                raise RuntimeError("Failed to load tests in {}: suite type '{}' not found".format(path, kind))
-            suite = SpecificTestSuite(path, cfg)
-            TestSuite.suites[path] = suite
-        return suite
-
-    @staticmethod
-    def tests():
-        return itertools.chain(*[suite.tests for suite in
-                                 TestSuite.suites.values()])
-
-    @property
-    @abstractmethod
-    def pattern(self):
-        pass
-
-    @abstractmethod
-    def add_test(self, name, args, mode, options):
-        pass
-
-    def junit_tests(self):
-        """Tests which participate in a consolidated junit report"""
-        return self.tests
-
-    def add_test_list(self, mode, options):
-        lst = [ os.path.splitext(os.path.basename(t))[0] for t in glob.glob(os.path.join(self.path, self.pattern)) ]
-        if lst:
-            # Some tests are long and are better to be started earlier,
-            # so pop them up while sorting the list
-            lst.sort(key=lambda x: (x not in self.run_first_tests, x))
-
-        for shortname in lst:
-            if shortname in self.disabled_tests[mode]:
-                continue
-            enabled_modes = self.enabled_modes.get(shortname, [])
-            if enabled_modes and mode not in enabled_modes:
-                continue
-
-            t = os.path.join(self.name, shortname)
-            patterns = options.name if options.name else [t]
-            if options.skip_pattern and options.skip_pattern in t:
-                continue
-
-            for p in patterns:
-                if p in t:
-                    for i in range(options.repeat):
-                        self.add_test(shortname, mode, options)
-
-
-class UnitTestSuite(TestSuite):
-    """TestSuite instantiation for non-boost unit tests"""
-
-    def __init__(self, path, cfg):
-        super().__init__(path, cfg)
-        # Map of custom test command line arguments, if configured
-        self.custom_args = cfg.get("custom_args", {})
-
-    def create_test(self, shortname, args, suite, mode, options):
-        test = UnitTest(self.next_id, shortname, args, suite, mode, options)
-        self.tests.append(test)
-
-    def add_test(self, shortname, mode, options):
-        """Create a UnitTest class with possibly custom command line
-        arguments and add it to the list of tests"""
-        # Skip tests which are not configured, and hence are not built
-        if os.path.join("test", self.name, shortname) not in options.tests:
-            return
-
-        # Default seastar arguments, if not provided in custom test options,
-        # are two cores and 2G of RAM
-        args = self.custom_args.get(shortname, ["-c2 -m2G"])
-        for a in args:
-            self.create_test(shortname, a, self, mode, options)
-
-    @property
-    def pattern(self):
-        return "*_test.cc"
-
-
-class BoostTestSuite(UnitTestSuite):
-    """TestSuite for boost unit tests"""
-
-    def __init__(self, path, cfg):
-        super().__init__(path, cfg)
-        self._cases_cache = { 'name': None, 'cases': [] }
-
-    def create_test(self, shortname, args, suite, mode, options):
-        if options.parallel_cases and (shortname not in self.no_parallel_cases):
-            if self._cases_cache['name'] != shortname:
-                cases = subprocess.run([ os.path.join("build", mode, "test", suite.name, shortname), '--list_content' ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        check=True, universal_newlines=True).stderr
-                case_list = [ case[:-1] for case in cases.splitlines() if case.endswith('*')]
-                self._cases_cache['name'] = shortname
-                self._cases_cache['cases'] = case_list
-
-            case_list = self._cases_cache['cases']
-            if len(case_list) == 1:
-                test = BoostTest(self.next_id, shortname, args, suite, None, mode, options)
-                self.tests.append(test)
-            else:
-                for case in case_list:
-                    test = BoostTest(self.next_id, shortname, args, suite, case, mode, options)
-                    self.tests.append(test)
-        else:
-            test = BoostTest(self.next_id, shortname, args, suite, None, mode, options)
-            self.tests.append(test)
-
-    def junit_tests(self):
-        """Boost tests produce an own XML output, so are not included in a junit report"""
-        return []
-
-
-class CqlTestSuite(TestSuite):
-    """TestSuite for CQL tests"""
-
-    def add_test(self, shortname, mode, options):
-        """Create a CqlTest class and add it to the list"""
-        test = CqlTest(self.next_id, shortname, self, mode, options)
-        self.tests.append(test)
-
-    @property
-    def pattern(self):
-        return "*_test.cql"
-
-class RunTestSuite(TestSuite):
-    """TestSuite for test directory with a 'run' script """
-
-    def add_test(self, shortname, mode, options):
-        test = RunTest(self.next_id, shortname, self, mode, options)
-        self.tests.append(test)
-
-    @property
-    def pattern(self):
-        return "run"
-
-
-class Test:
-    """Base class for CQL, Unit and Boost tests"""
-    def __init__(self, test_no, shortname, suite, mode, options):
-        self.id = test_no
-        # Name with test suite name
-        self.name = os.path.join(suite.name, shortname.split('.')[0])
-        # Name within the suite
-        self.shortname = shortname
-        self.mode = mode
-        self.suite = suite
-        # Unique file name, which is also readable by human, as filename prefix
-        self.uname = "{}.{}".format(self.shortname, self.id)
-        self.log_filename = os.path.join(options.tmpdir, self.mode, self.uname + ".log")
-        self.success = None
-
-    @abstractmethod
-    async def run(self, options):
-        pass
-
-    @abstractmethod
-    def print_summary(self):
-        pass
-
-    def get_junit_etree(self):
-        return None
-
-    def check_log(self, trim):
-        """Check and trim logs and xml output for tests which have it"""
-        if trim:
-            pathlib.Path(self.log_filename).unlink()
-        pass
-
-
-class UnitTest(Test):
-    standard_args = shlex.split("--overprovisioned --unsafe-bypass-fsync 1 --kernel-page-cache 1 --blocked-reactor-notify-ms 2000000 --collectd 0"
-                                " --max-networking-io-control-blocks=100")
-
-    def __init__(self, test_no, shortname, args, suite, mode, options):
-        super().__init__(test_no, shortname, suite, mode, options)
-        self.path = os.path.join("build", self.mode, "test", self.name)
-        self.args = shlex.split(args) + UnitTest.standard_args
-        if self.mode == "coverage":
-            self.env = coverage.env(self.path)
-        else:
-            self.env = dict()
-
-    def print_summary(self):
-        print("Output of {} {}:".format(self.path, " ".join(self.args)))
-        print(read_log(self.log_filename))
-
-    async def run(self, options):
-        self.success = await run_test(self, options, env=self.env)
-        logging.info("Test #%d %s", self.id, "succeeded" if self.success else "failed ")
-        return self
-
-
-class BoostTest(UnitTest):
-    """A unit test which can produce its own XML output"""
-
-    def __init__(self, test_no, shortname, args, suite, casename, mode, options):
-        boost_args = []
-        if casename:
-            shortname += '.' + casename
-            boost_args += ['--run_test=' + casename]
-        super().__init__(test_no, shortname, args, suite, mode, options)
-        self.xmlout = os.path.join(options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
-        boost_args += ['--report_level=no',
-                       '--logger=HRF,test_suite:XML,test_suite,' + self.xmlout]
-        boost_args += ['--catch_system_errors=no']  # causes undebuggable cores
-        boost_args += ['--color_output=false']
-        boost_args += ['--']
-        self.args = boost_args + self.args
-        self.casename = casename
-        self.__junit_etree = None
-
-    def get_junit_etree(self):
-        def adjust_suite_name(name):
-            # Normalize "path/to/file.cc" to "path.to.file" to conform to
-            # Jenkins expectations that the suite name is a class name. ".cc"
-            # doesn't add any infomation. Add the mode, otherwise failures
-            # in different modes are indistinguishable. The "test/" prefix adds
-            # no information, so remove it.
-            import re
-            name = re.sub(r'^test/', '', name)
-            name = re.sub(r'\.cc$', '', name)
-            name = re.sub(r'/', '.', name)
-            name = f'{name}.{self.mode}'
-            return name
-        if self.__junit_etree is None:
-            self.__junit_etree = ET.parse(self.xmlout)
-            root = self.__junit_etree.getroot()
-            suites = root.findall('.//TestSuite')
-            for suite in suites:
-                suite.attrib['name'] = adjust_suite_name(suite.attrib['name'])
-                skipped = suite.findall('./TestCase[@reason="disabled"]')
-                for e in skipped:
-                    suite.remove(e)
-            os.unlink(self.xmlout)
-        return self.__junit_etree
-
-    def check_log(self, trim):
-        self.get_junit_etree()
-        super().check_log(trim)
-
-
-class CqlTest(Test):
-    """Run the sequence of CQL commands stored in the file and check
-    output"""
-
-    def __init__(self, test_no, shortname, suite, mode, options):
-        super().__init__(test_no, shortname, suite, mode, options)
-        # Path to cql_repl driver, in the given build mode
-        self.path = os.path.join("build", self.mode, "test/tools/cql_repl")
-        self.cql = os.path.join(suite.path, self.shortname + ".cql")
-        self.result = os.path.join(suite.path, self.shortname + ".result")
-        self.tmpfile = os.path.join(options.tmpdir, self.mode, self.uname + ".reject")
-        self.reject = os.path.join(suite.path, self.shortname + ".reject")
-        self.args = shlex.split("-c1 -m2G --input={} --output={} --log={}".format(
-            self.cql, self.tmpfile, self.log_filename))
-        self.args += UnitTest.standard_args
-        self.is_executed_ok = False
-        self.is_new = False
-        self.is_equal_result = None
-        self.summary = "not run"
-        if self.mode == "coverage":
-            self.env = coverage.env(self.path, distinct_id=self.id)
-        else:
-            self.env = dict()
-
-    async def run(self, options):
-        self.is_executed_ok = await run_test(self, options, env=self.env)
-
-        self.success = False
-        self.summary = "failed"
-
-        def set_summary(summary):
-            self.summary = summary
-            logging.info("Test %d %s", self.id, summary)
-
-        if not os.path.isfile(self.tmpfile):
-            set_summary("failed: no output file")
-        elif not os.path.isfile(self.result):
-            set_summary("failed: no result file")
-            self.is_new = True
-        else:
-            self.is_equal_result = filecmp.cmp(self.result, self.tmpfile)
-            if self.is_equal_result is False:
-                set_summary("failed: test output does not match expected result")
-            elif self.is_executed_ok:
-                self.success = True
-                set_summary("succeeded")
-            else:
-                set_summary("failed: correct output but non-zero return status.\nCheck test log.")
-
-        if self.is_new or self.is_equal_result is False:
-            # Put a copy of the .reject file close to the .result file
-            # so that it's easy to analyze the diff or overwrite .result
-            # with .reject. Preserve the original .reject file: in
-            # multiple modes the copy .reject file may be overwritten.
-            shutil.copyfile(self.tmpfile, self.reject)
-        elif os.path.exists(self.tmpfile):
-            pathlib.Path(self.tmpfile).unlink()
-
-        return self
-
-    def print_summary(self):
-        print("Test {} ({}) {}".format(palette.path(self.name), self.mode,
-                                       self.summary))
-        if self.is_equal_result is False:
-            print_unidiff(self.result, self.reject)
-
-class RunTest(Test):
-    """Run tests in a directory started by a run script"""
-
-    def __init__(self, test_no, shortname, suite, mode, options):
-        super().__init__(test_no, shortname, suite, mode, options)
-        self.path = os.path.join(suite.path, shortname)
-        self.xmlout = os.path.join(options.tmpdir, self.mode, "xml", self.uname + ".xunit.xml")
-        self.args = ["--junit-xml={}".format(self.xmlout)]
-        self.scylla_path = os.path.join("build", self.mode, "scylla")
-
-        if self.mode == "coverage":
-            self.env = coverage.env(self.scylla_path, distinct_id=self.suite.name)
-        else:
-            self.env = dict()
-        self.env['SCYLLA'] = self.scylla_path
-
-    def print_summary(self):
-        print("Output of {} {}:".format(self.path, " ".join(self.args)))
-        print(read_log(self.log_filename))
-
-    async def run(self, options):
-        # This test can and should be killed gently, with SIGTERM, not with SIGKILL
-        self.success = await run_test(self, options, gentle_kill=True, env=self.env)
-        logging.info("Test #%d %s", self.id, "succeeded" if self.success else "failed ")
-        return self
-
-class TabularConsoleOutput:
-    """Print test progress to the console"""
-
-    def __init__(self, verbose, test_count):
-        self.verbose = verbose
-        self.test_count = test_count
-        self.print_newline = False
-        self.last_test_no = 0
-        self.last_line_len = 1
-
-    def print_start_blurb(self):
-        print("="*80)
-        print("{:10s} {:^8s} {:^7s} {:8s} {}".format("[N/TOTAL]", "SUITE", "MODE", "RESULT", "TEST"))
-        print("-"*78)
-
-    def print_end_blurb(self):
-        if self.print_newline:
-            print("")
-        print("-"*78)
-
-    def print_progress(self, test):
-        self.last_test_no += 1
-        msg = "{:10s} {:^8s} {:^7s} {:8s} {}".format(
-            "[{}/{}]".format(self.last_test_no, self.test_count),
-            test.suite.name, test.mode[:7],
-            palette.ok("[ PASS ]") if test.success else palette.fail("[ FAIL ]"),
-            test.uname
+from test import ALL_MODES, HOST_ID, TOP_SRC_DIR, path_to, DEBUG_MODES
+from test.pylib import coverage_utils
+from test.pylib.runner import drop_disabled_tests
+from test.pylib.util import LogPrefixAdapter, get_configured_modes, palette
+
+launch_time = time.monotonic()
+
+class ThreadsCalculator:
+    """
+    The ThreadsCalculator class calculates the number of jobs that can be run concurrently based on system
+    memory and CPU constraints. It allows resource reservation and configurable parameters for
+    flexible job scheduling in various modes, such as `debug`.
+    """
+
+    def __init__(self,
+                 modes: list[str],
+                 threads_multiplier: float = 1.0,
+                 min_system_memory_reserve: float = 5e9,
+                 max_system_memory_reserve: float = 8e9,
+                 system_memory_reserve_fraction = 16,
+                 max_test_memory: float = 5e9,
+                 test_memory_fraction: float = 8.0,
+                 debug_test_memory_multiplier: float = 1.5,
+                 debug_cpus_per_test_job=1.5,
+                 non_debug_cpus_per_test_job: float =1.0,
+                 non_debug_max_test_memory: float = 4e9
+                 ):
+        sys_mem = int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+        system_memory_reserve = int(min(
+            max(sys_mem / system_memory_reserve_fraction, min_system_memory_reserve),
+            max_system_memory_reserve,
+        ))
+        available_mem = max(0, sys_mem - system_memory_reserve)
+        is_debug = set(DEBUG_MODES) & set(modes)
+        test_mem = min(
+            sys_mem / test_memory_fraction,
+            max_test_memory if is_debug else non_debug_max_test_memory,
         )
-        if self.verbose is False:
-            if test.success:
-                print("\r" + " " * self.last_line_len, end="")
-                self.last_line_len = len(msg)
-                print("\r" + msg, end="")
-                self.print_newline = True
-            else:
-                if self.print_newline:
-                    print("")
-                print(msg)
-                self.print_newline = False
-        else:
-            if hasattr(test, 'time_end') and test.time_end > 0:
-                msg += " {:.2f}s".format(test.time_end - test.time_start)
-            print(msg)
+        if is_debug:
+            test_mem *= debug_test_memory_multiplier
+        self.cpus_per_test_job = (
+            debug_cpus_per_test_job if is_debug else non_debug_cpus_per_test_job
+        )
+        self.default_num_jobs_mem = max(1, int(available_mem // test_mem))
+        self.threadt_multiplier = threads_multiplier
+
+    def get_number_of_threads(self, nr_cpus: int) -> int:
+        default_num_jobs_cpu = max(1, math.ceil(nr_cpus / self.cpus_per_test_job))
+        return int(min(self.default_num_jobs_mem, default_num_jobs_cpu) * self.threadt_multiplier)
 
 
-async def run_test(test, options, gentle_kill=False, env=dict()):
-    """Run test program, return True if success else False"""
 
-    with open(test.log_filename, "wb") as log:
-
-        def report_error(error):
-            msg = "=== TEST.PY SUMMARY START ===\n"
-            msg += "{}\n".format(error)
-            msg += "=== TEST.PY SUMMARY END ===\n"
-            log.write(msg.encode(encoding="UTF-8"))
-        process = None
-        stdout = None
-        logging.info("Starting test #%d: %s %s", test.id, test.path, " ".join(test.args))
-        UBSAN_OPTIONS = [
-            "halt_on_error=1",
-            "abort_on_error=1",
-            f"suppressions={os.getcwd()}/ubsan-suppressions.supp",
-            os.getenv("UBSAN_OPTIONS"),
-        ]
-        ASAN_OPTIONS = [
-            "disable_coredump=0",
-            "abort_on_error=1",
-            "detect_stack_use_after_return=1",
-            os.getenv("ASAN_OPTIONS"),
-        ]
-        try:
-            log.write("=== TEST.PY STARTING TEST #{} ===\n".format(test.id).encode(encoding="UTF-8"))
-            log.write("export UBSAN_OPTIONS='{}'\n".format(":".join(filter(None, UBSAN_OPTIONS))).encode(encoding="UTF-8"))
-            log.write("export ASAN_OPTIONS='{}'\n".format(":".join(filter(None, ASAN_OPTIONS))).encode(encoding="UTF-8"))
-            log.write("{} {}\n".format(test.path, " ".join(test.args)).encode(encoding="UTF-8"))
-            log.write("=== TEST.PY TEST OUTPUT ===\n".format(test.id).encode(encoding="UTF-8"))
-            log.flush();
-            test.time_start = time.time()
-            test.time_end = 0
-
-            path = test.path
-            args = test.args
-            if options.cpus:
-                path = 'taskset'
-                args = [ '-c', options.cpus, test.path, *test.args ]
-            process = await asyncio.create_subprocess_exec(
-                path, *args,
-                stderr=log,
-                stdout=log,
-                env=dict(os.environ,
-                         UBSAN_OPTIONS=":".join(filter(None, UBSAN_OPTIONS)),
-                         ASAN_OPTIONS=":".join(filter(None, ASAN_OPTIONS)),
-                         # TMPDIR env variable is used by any seastar/scylla
-                         # test for directory to store test temporary data.
-                         TMPDIR=os.path.join(options.tmpdir, test.mode),
-                         **env,
-                         ),
-                preexec_fn=os.setsid,
-            )
-            stdout, _ = await asyncio.wait_for(process.communicate(), options.timeout)
-            test.time_end = time.time()
-            if process.returncode != 0:
-                report_error('Test exited with code {code}\n'.format(code=process.returncode))
-                return False
-            try:
-                test.check_log(not options.save_log_on_success)
-            except Exception as e:
-                print("")
-                print(test.name + ": " + palette.crit("failed to parse XML output: {}".format(e)))
-                # return False
-            return True
-        except (asyncio.TimeoutError, asyncio.CancelledError) as e:
-            if process is not None:
-                if gentle_kill:
-                    process.terminate()
-                else:
-                    process.kill()
-                stdout, _ = await process.communicate()
-            if isinstance(e, asyncio.TimeoutError):
-                report_error("Test timed out")
-            elif isinstance(e, asyncio.CancelledError):
-                print(test.name, end=" ")
-                report_error("Test was cancelled")
-        except Exception as e:
-            report_error("Failed to run the test:\n{e}".format(e=e))
-    return False
-
-
-def setup_signal_handlers(loop, signaled):
-
-    async def shutdown(loop, signo, signaled):
-        print("\nShutdown requested... Aborting tests:"),
-        signaled.signo = signo
-        signaled.set()
-
-    # Use a lambda to avoid creating a coroutine until
-    # the signal is delivered to the loop - otherwise
-    # the coroutine will be dangling when the loop is over,
-    # since it's never going to be invoked
-    for signo in [signal.SIGINT, signal.SIGTERM]:
-        loop.add_signal_handler(signo, lambda: asyncio.create_task(shutdown(loop, signo, signaled)))
-
-
-def parse_cmd_line():
+def parse_cmd_line() -> argparse.Namespace:
     """ Print usage and process command line options. """
+    parser = argparse.ArgumentParser(description='Scylla test runner', formatter_class=argparse.RawTextHelpFormatter)
 
-    parser = argparse.ArgumentParser(description="Scylla test runner")
+    name_help = textwrap.dedent("""\
+        Can be empty. List of test names or path to test files, to look for.
+        
+        provide the path to the test file for execution or path to the directory
+        to narrow you can use function name 'test/boost/aggregate_fcts_test.cc::test_aggregate_avg'
+        """)
+
     parser.add_argument(
         "name",
         nargs="*",
         action="store",
-        help="""Can be empty. List of test names, to look for in
-                suites. Each name is used as a substring to look for in the
-                path to test file, e.g. "mem" will run all tests that have
-                "mem" in their name in all suites, "boost/mem" will only enable
-                tests starting with "mem" in "boost" suite. Default: run all
-                tests in all suites.""",
+        help=name_help,
     )
-    parser.add_argument(
-        "--tmpdir",
-        action="store",
-        default="testlog",
-        help="""Path to temporary test data and log files. The data is
-        further segregated per build mode. Default: ./testlog.""",
-    )
-    parser.add_argument('--mode', choices=all_modes, action="append", dest="modes",
+    parser.add_argument("--tmpdir", action="store", default=str(TOP_SRC_DIR / "testlog"),
+                        help="Path to temporary test data and log files.  The data is further segregated per build mode.")
+    parser.add_argument("--gather-metrics", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max-failures", type=int, default=0,
+                        help="Maximum number of failures to tolerate before cancelling rest of tests.")
+    parser.add_argument('--mode', choices=ALL_MODES, action="append", dest="modes",
                         help="Run only tests for given build mode(s)")
     parser.add_argument('--repeat', action="store", default="1", type=int,
                         help="number of times to repeat test execution")
-    parser.add_argument('--timeout', action="store", default="24000", type=int,
-                        help="timeout value for test execution")
+    parser.add_argument('--timeout', action="store", default="3600", type=int,
+                        help="timeout value for single test execution")
+    parser.add_argument('--session-timeout', action="store", default="24000", type=int,
+                        help="timeout value for test.py/pytest session execution")
     parser.add_argument('--verbose', '-v', action='store_true', default=False,
                         help='Verbose reporting')
-    parser.add_argument('--jobs', '-j', action="store", type=int,
+    parser.add_argument('--quiet', '-q', action='store_true', default=False,
+                        help='Quiet reporting')
+    threads = parser.add_mutually_exclusive_group(required=False)
+    threads.add_argument('--jobs', '-j', action="store", type=int,
                         help="Number of jobs to use for running the tests")
+    threads.add_argument('--threads-multiplier', type=float, default=1.0,
+                         dest="threads_multiplier", action="store",
+                         help="Multiplier for the number of threads to use for running the tests. Default is) 1.0, "
+                              "which means no change. Use a value less than 1.0 to reduce the number of threads, or a"
+                              "value greater than 1.0 to increase the number of threads.")
     parser.add_argument('--save-log-on-success', "-s", default=False,
                         dest="save_log_on_success", action="store_true",
-                        help="Save test log output on success.")
+                        help="Save test log output on success and skip cleanup before the run.")
     parser.add_argument('--list', dest="list_tests", action="store_true", default=False,
                         help="Print list of tests instead of executing them")
-    parser.add_argument('--skip', default="",
-                        dest="skip_pattern", action="store",
+    parser.add_argument('--skip',
+                        dest="skip_patterns", action="append",
                         help="Skip tests which match the provided pattern")
     parser.add_argument('--no-parallel-cases', dest="parallel_cases", action="store_false", default=True,
                         help="Do not run individual test cases in parallel")
     parser.add_argument('--cpus', action="store",
-                        help="Run the tests on those CPUs only (in taskset acceptible format). Consider using --jobs too")
+                        help="Run the tests on those CPUs only (in taskset"
+                        " acceptable format). Consider using --jobs too")
+    parser.add_argument('--log-level', action="store",
+                        help="Log level for Python logging module. The log "
+                        "is in {tmpdir}/test.py.log. Default: INFO",
+                        default="INFO",
+                        choices=["CRITICAL", "ERROR", "WARNING", "INFO",
+                                 "DEBUG"],
+                        dest="log_level")
+    parser.add_argument('-k', metavar="EXPRESSION", action="store",
+                        help="Only run tests which match the given substring expression. An expression is a Python evaluable expression where all names are "
+                        "substring-matched against test names and their parent classes. Example: -k 'test_method or test_other' matches all test functions and "
+                        "classes whose name contains 'test_method' or 'test_other', while -k 'not test_method' matches those that don't contain 'test_method' "
+                        "in their names. -k 'not test_method and not test_other' will eliminate the matches. Additionally keywords are matched to classes and "
+                        "functions containing extra names in their 'extra_keyword_matches' set, as well as functions which have names assigned directly to "
+                        "them. The matching is case-insensitive.")
+    parser.add_argument('--markers', action='store', metavar='MARKEXPR',
+                        help="Only run tests that match the given mark expression. The syntax is the same "
+                             "as in pytest, for example: --markers 'mark1 and not mark2'. The parameter "
+                             "is only supported by python tests for now, other tests ignore it. "
+                             "By default, the marker filter is not applied and all tests will be run without exception."
+                             "To exclude e.g. slow tests you can write --markers 'not slow'.")
+    parser.add_argument('--coverage', action = 'store_true', default = False,
+                        help="When running code instrumented with coverage support"
+                             "Will route the profiles to `tmpdir`/mode/coverage/`suite` and post process them in order to generate "
+                             "lcov file per suite, lcov file per mode, and an lcov file for the entire run, "
+                             "The lcov files can eventually be used for generating coverage reports")
+    parser.add_argument("--coverage-mode",action = 'append', type = str, dest = "coverage_modes",
+                        help = "Collect and process coverage only for the modes specified. implies: --coverage, default: All built modes")
+    parser.add_argument("--coverage-keep-raw",action = 'store_true',
+                        help = "Do not delete llvm raw profiles when processing coverage reports.")
+    parser.add_argument("--coverage-keep-indexed",action = 'store_true',
+                        help = "Do not delete llvm indexed profiles when processing coverage reports.")
+    parser.add_argument("--coverage-keep-lcovs",action = 'store_true',
+                        help = "Do not delete intermediate lcov traces when processing coverage reports.")
+    parser.add_argument("--artifacts_dir_url", action='store', type=str, default=None, dest="artifacts_dir_url",
+                        help="Provide the URL to artifacts directory to generate the link to failed tests directory "
+                             "with logs")
+    parser.add_argument('--manual-execution', action='store_true', default=False,
+                        help='Let me manually run the test executable at the moment this script would run it')
+    parser.add_argument('--byte-limit', action="store", default=randint(0, 2000), type=int,
+                        help="Specific byte limit for failure injection (random by default)")
+    parser.add_argument('--skip-internet-dependent-tests', action="store_true",
+                        help="Skip tests which depend on artifacts from the internet.")
+    parser.add_argument('--keep-duplicates', action='store_true', default=False,
+                        help="Do not deduplicate test arguments.")
+    parser.add_argument("--pytest-arg", action='store', type=str,
+                        default=None, dest="pytest_arg",
+                        help="Additional command line arguments to pass to pytest, for example ./test.py --pytest-arg=\"-v -x\"")
+    parser.add_argument('--exe-path', default=False,
+                     dest="exe_path", action="store",
+                     help="Path to the executable to run. Not working with `mode`")
+    parser.add_argument('--exe-url', default=False,
+                     dest="exe_url", action="store",
+                     help="URL of a relocatable server or unified package to download and run, "
+                          "or a shortcut: `latest` / `master:latest` / `branch-2026.3:latest` for a branch's "
+                          "latest build, `release:2026.1` / `release:2026.1.9` for a release. Not working with `mode`")
+    scylla_additional_options = parser.add_argument_group('Additional options for Scylla tests')
+    scylla_additional_options.add_argument('--extra-scylla-cmdline-options', action="store", default="", type=str,
+                                           help="Passing extra scylla cmdline options for all tests. Options should be space separated:"
+                                                "'--logger-log-level raft=trace --default-log-level error'")
+
+    boost_group = parser.add_argument_group('boost suite options')
+    boost_group.add_argument('--random-seed', action="store",
+                             help="Random number generator seed to be used by boost tests")
+
     args = parser.parse_args()
+
+    if args.skip_patterns and args.k:
+        parser.error(palette.fail('arguments --skip and -k are mutually exclusive, please use only one of them'))
+
+    if args.exe_path or args.exe_url:
+        if args.modes:
+            parser.error(palette.fail('arguments --exe-path/--exe-url and --mode are mutually exclusive, please use only one of them'))
+        # The executable under test is given explicitly, so no configured
+        # build is required; the pytest runner derives the "custom_exe" mode
+        # from the executable options.
+        args.modes = []
+    elif not args.modes:
+        try:
+            args.modes = get_configured_modes()
+        except Exception:
+            print(palette.fail("Failed to read output of `ninja mode_list`: please run ./configure.py first"))
+            raise
 
     if not args.jobs:
         if not args.cpus:
             nr_cpus = multiprocessing.cpu_count()
         else:
-            nr_cpus = int(subprocess.check_output(['taskset', '-c', args.cpus, 'python', '-c', 'import os; print(len(os.sched_getaffinity(0)))']))
+            nr_cpus = int(subprocess.check_output(
+                ['taskset', '-c', args.cpus, 'python3', '-c',
+                 'import os; print(len(os.sched_getaffinity(0)))']))
+        args.jobs = ThreadsCalculator(args.modes, args.threads_multiplier).get_number_of_threads(nr_cpus)
 
-        cpus_per_test_job = 1
-        sysmem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-        testmem = 6e9 if os.sysconf('SC_PAGE_SIZE') > 4096 else 2e9
-        default_num_jobs_mem = ((sysmem - 4e9) // testmem)
-        args.jobs = min(default_num_jobs_mem, nr_cpus // cpus_per_test_job)
-
-    if not output_is_a_tty:
-        args.verbose = True
-
-    if not args.modes:
-        try:
-            out = subprocess.Popen(['ninja', 'mode_list'], stdout=subprocess.PIPE).communicate()[0].decode()
-            # [1/1] List configured modes
-            # debug release dev
-            args.modes= re.sub(r'.* List configured modes\n(.*)\n', r'\1', out, 1, re.DOTALL).split("\n")[-1].split(' ')
-        except Exception as e:
-            print(palette.fail("Failed to read output of `ninja mode_list`: please run ./configure.py first"))
-            raise
-
-    def prepare_dir(dirname, pattern):
-        # Ensure the dir exists
-        pathlib.Path(dirname).mkdir(parents=True, exist_ok=True)
-        # Remove old artefacts
-        for p in glob.glob(os.path.join(dirname, pattern), recursive=True):
-            pathlib.Path(p).unlink()
+    if not args.coverage_modes and args.coverage:
+        args.coverage_modes = list(args.modes)
+        if not args.coverage_modes:
+            args.coverage = False
+    elif args.coverage_modes:
+        missing_coverage_modes = set(args.coverage_modes).difference(set(args.modes))
+        if len(missing_coverage_modes) > 0:
+            raise RuntimeError(f"The following modes weren't built or ran (using the '--mode' option): {missing_coverage_modes}")
+        args.coverage = True
 
     args.tmpdir = os.path.abspath(args.tmpdir)
-    prepare_dir(args.tmpdir, "*.log")
-
-    for mode in args.modes:
-        prepare_dir(os.path.join(args.tmpdir, mode), "*.log")
-        prepare_dir(os.path.join(args.tmpdir, mode), "*.reject")
-        prepare_dir(os.path.join(args.tmpdir, mode, "xml"), "*.xml")
-
-    # Get the list of tests configured by configure.py
-    try:
-        out = subprocess.Popen(['ninja', 'unit_test_list'], stdout=subprocess.PIPE).communicate()[0].decode()
-        # [1/1] List configured unit tests
-        args.tests = set(re.sub(r'.* List configured unit tests\n(.*)\n', r'\1', out, 1, re.DOTALL).split("\n"))
-    except Exception as e:
-        print(palette.fail("Failed to read output of `ninja unit_test_list`: please run ./configure.py first"))
-        raise
 
     return args
 
 
-def find_tests(options):
+# TODO: Remove _CollectionArgument and _deduplicate_test_args once we update
+# to pytest 9.x, which fixes argument deduplication:
+# https://github.com/pytest-dev/pytest/issues/12083
+@dataclasses.dataclass(frozen=True, order=True)
+class _CollectionArgument:
+    """Resolved collection argument for deduplication.
 
-    for f in glob.glob(os.path.join("test", "*")):
-        if os.path.isdir(f) and os.path.isfile(os.path.join(f, "suite.yaml")):
-            for mode in options.modes:
-                suite = TestSuite.opt_create(f)
-                suite.add_test_list(mode, options)
+    A version-independent subset of pytest's CollectionArgument that
+    includes the fields needed for normalization (parametrization and
+    original_index were added in pytest 9.0).
 
-    if not TestSuite.test_count():
-        if len(options.name):
-            print("Test {} not found".format(palette.path(options.name[0])))
-            sys.exit(1)
-        else:
-            print(palette.warn("No tests found. Please enable tests in ./configure.py first."))
-            sys.exit(0)
+    ``a in b`` means ``b`` subsumes (contains) ``a``.  Adapted from
+    pytest 9.0.3 ``_pytest.main.is_collection_argument_subsumed_by``.
+    """
+    path: pathlib.Path
+    parts: tuple[str, ...]
+    parametrization: str
+    original_index: int
 
-    logging.info("Found %d tests, repeat count is %d, starting %d concurrent jobs",
-                 TestSuite.test_count(), options.repeat, options.jobs)
-
-
-async def run_all_tests(signaled, options):
-    console = TabularConsoleOutput(options.verbose, TestSuite.test_count())
-    signaled_task = asyncio.create_task(signaled.wait())
-    pending = set([signaled_task])
-
-    async def cancel(pending):
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        print("... done.")
-        raise asyncio.CancelledError
-
-    async def reap(done, pending, signaled):
-        nonlocal console
-        if signaled.is_set():
-            await cancel(pending)
-        for coro in done:
-            result = coro.result()
-            if isinstance(result, bool):
-                continue    # skip signaled task result
-            console.print_progress(result)
-    console.print_start_blurb()
-    try:
-        for test in TestSuite.tests():
-            # +1 for 'signaled' event
-            if len(pending) > options.jobs:
-                # Wait for some task to finish
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                await reap(done, pending, signaled)
-            pending.add(asyncio.create_task(test.run(options)))
-        # Wait & reap ALL tasks but signaled_task
-        # Do not use asyncio.ALL_COMPLETED to print a nice progress report
-        while len(pending) > 1:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            await reap(done, pending, signaled)
-
-    except asyncio.CancelledError:
-        return
-
-    console.print_end_blurb()
+    def __contains__(self, other: _CollectionArgument) -> bool:
+        if self.path != other.path:
+            return not self.parts and other.path.is_relative_to(self.path)
+        if len(self.parts) > len(other.parts) or other.parts[:len(self.parts)] != self.parts:
+            return False
+        return not self.parametrization or self.parametrization == other.parametrization
 
 
-def read_log(log_filename):
-    """Intelligently read test log output"""
-    try:
-        with open(log_filename, "r") as log:
-            msg = log.read()
-            return msg if len(msg) else "===Empty log output==="
-    except FileNotFoundError:
-        return "===Log {} not found===".format(log_filename)
-    except OSError as e:
-        return "===Error reading log {}===".format(e)
+def _deduplicate_test_args(args: list[str]) -> list[str]:
+    """Remove duplicate and subsumed test arguments.
+
+    Resolves and normalizes CLI test arguments, then applies the normalization
+    algorithm from pytest 9.0.3 to remove exact duplicates and arguments whose
+    paths are contained within another argument's path.
+    For example, ``["test/cql", "test/cql/lua_test.cql"]`` becomes ``["test/cql"]``.
+    """
+    if not args:
+        return args
+    invocation_path = pathlib.Path.cwd()
+    resolved_sorted: list[_CollectionArgument] = []
+    unresolved_indices: set[int] = set()
+    for i, arg in enumerate(args):
+        # Adapted from pytest 9.0.3 _pytest.main.resolve_collection_argument.
+        base, squacket, rest = arg.partition("[")
+        strpath, *parts = base.split("::")
+        fspath = pathlib.Path(os.path.abspath(invocation_path / strpath))
+        if not fspath.exists():
+            # Keep unresolved args — let pytest report the error.
+            unresolved_indices.add(i)
+            continue
+        insort(resolved_sorted, _CollectionArgument(
+            path=fspath,
+            parts=tuple(parts),
+            parametrization=squacket + rest,
+            original_index=i,
+        ))
+
+    # Normalize: remove duplicates and subsumed arguments using an O(n log n)
+    # sort-based algorithm adapted from pytest 9.0.3.
+    normalized = resolved_sorted[:1]
+    for ca in resolved_sorted[1:]:
+        if ca not in normalized[-1]:
+            normalized.append(ca)
+
+    kept_indices = {ca.original_index for ca in normalized} | unresolved_indices
+    return [arg for i, arg in enumerate(args) if i in kept_indices]
 
 
-def print_summary(failed_tests):
-    if failed_tests:
-        print("The following test(s) have failed: {}".format(
-            palette.path(" ".join([t.name for t in failed_tests]))))
-        if not output_is_a_tty:
-            for test in failed_tests:
-                test.print_summary()
-                print("-"*78)
-        print("Summary: {} of the total {} tests failed".format(
-            len(failed_tests), TestSuite.test_count()))
+def run_pytest(options: argparse.Namespace) -> int:
+    # When tests are executed in parallel on different hosts, we need to distinguish results from them.
+    # So HOST_ID needed to not overwrite results from different hosts during Jenkins will copy to one directory.
+
+    temp_dir = pathlib.Path(options.tmpdir).absolute()
+
+    report_dir =  temp_dir / 'report'
+    junit_output_file = report_dir / f'pytest_cpp_{HOST_ID}.xml'
+    files_to_run = options.name if options.keep_duplicates else _deduplicate_test_args(options.name)
+    # runner.py treats a custom executable as the "custom_exe" mode.
+    files_to_run = drop_disabled_tests(files_to_run, options.modes or ["custom_exe"])
+    if options.name and not files_to_run:
+        return pytest.ExitCode.NO_TESTS_COLLECTED
+    files_to_run = files_to_run or [str(TOP_SRC_DIR / 'test/')]
+    args = [
+        '--color=yes',
+        f'--repeat={options.repeat}',
+        *[f'--mode={mode}' for mode in options.modes],
+    ]
+    if options.list_tests:
+        args.extend(['--collect-only', '--quiet', '--no-header'])
+    else:
+        args.extend([
+            f'--junit-xml={junit_output_file}',
+            "-rf",
+            f'-n{options.jobs}',
+            f'--tmpdir={temp_dir}',
+            f'--maxfail={options.max_failures}',
+            f'--alluredir={report_dir / f"allure_{HOST_ID}"}',
+            f'--dist=worksteal',
+        ])
+    if options.verbose:
+        args.append('-v')
+    if options.keep_duplicates:
+        args.append('--keep-duplicates')
+    if options.quiet:
+        args.append('--quiet')
+        args.extend(['-p','no:sugar'])
+    if options.pytest_arg:
+        # If pytest_arg is provided, it should be a string with arguments to pass to pytest
+        args.extend(shlex.split(options.pytest_arg))
+    if options.random_seed:
+        args.append(f'--random-seed={options.random_seed}')
+    if options.gather_metrics:
+        args.append('--gather-metrics')
+    if options.coverage:
+        args.append('--coverage')
+        args.extend(f'--coverage-mode={mode}' for mode in options.coverage_modes)
+    if options.artifacts_dir_url:
+        args.append(f'--artifacts_dir_url={options.artifacts_dir_url}')
+    if options.timeout:
+        args.append(f'--timeout={options.timeout}')
+    if options.session_timeout:
+        args.append(f'--session-timeout={options.session_timeout}')
+    if options.skip_patterns:
+        args.append(f'-k={" and ".join([f"not {pattern}" for pattern in options.skip_patterns])}')
+    if options.k:
+        args.append(f'-k={options.k}')
+    if options.extra_scylla_cmdline_options:
+        args.append(f'--extra-scylla-cmdline-options={options.extra_scylla_cmdline_options}')
+    if options.exe_path:
+        args.append(f'--exe-path={options.exe_path}')
+    if options.exe_url:
+        args.append(f'--exe-url={options.exe_url}')
+    if not options.save_log_on_success:
+        args.append('--allure-no-capture')
+    else:
+        args.append('--save-log-on-success')
+    if options.markers:
+        args.append(f'-m={options.markers}')
+    if options.log_level:
+        args.append(f'--log-level={options.log_level}')
+    args.extend(files_to_run)
+    exit_code = pytest.main(args=args)
+
+    rusage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu_used = rusage.ru_stime + rusage.ru_utime
+    cpu_available = (time.monotonic() - launch_time) * multiprocessing.cpu_count()
+    print(f"CPU utilization: {cpu_used / cpu_available * 100:.1f}%")
+
+    return exit_code
 
 
-def print_unidiff(fromfile, tofile):
-    with open(fromfile, "r") as frm, open(tofile, "r") as to:
-        diff = difflib.unified_diff(
-            frm.readlines(),
-            to.readlines(),
-            fromfile=fromfile,
-            tofile=tofile,
-            fromfiledate=time.ctime(os.stat(fromfile).st_mtime),
-            tofiledate=time.ctime(os.stat(tofile).st_mtime),
-            n=10)           # Number of context lines
-
-        for i, line in enumerate(diff):
-            if i > 60:
-                break
-            if line.startswith('+'):
-                line = palette.diff_in(line)
-            elif line.startswith('-'):
-                line = palette.diff_out(line)
-            elif line.startswith('@'):
-                line = palette.diff_mark(line)
-            sys.stdout.write(line)
-
-
-def write_junit_report(tmpdir, mode):
-    junit_filename = os.path.join(tmpdir, mode, "xml", "junit.xml")
-    total = 0
-    failed = 0
-    xml_results = ET.Element("testsuite", name="non-boost tests", errors="0")
-    for suite in TestSuite.suites.values():
-        for test in suite.junit_tests():
-            if test.mode != mode:
-                continue
-            total += 1
-            xml_res = ET.SubElement(xml_results, 'testcase',
-                                    name="{}.{}.{}".format(test.shortname, mode, test.id))
-            if test.success is True:
-                continue
-            failed += 1
-            xml_fail = ET.SubElement(xml_res, 'failure')
-            xml_fail.text = "Test {} {} failed, check the log at {}".format(
-                test.path,
-                " ".join(test.args),
-                test.log_filename)
-    if total == 0:
-        return
-    xml_results.set("tests", str(total))
-    xml_results.set("failures", str(failed))
-    with open(junit_filename, "w") as f:
-        ET.ElementTree(xml_results).write(f, encoding="unicode")
-
-def write_consolidated_boost_junit_xml(tmpdir, mode):
-    xml = ET.Element("TestLog")
-    for suite in TestSuite.suites.values():
-        for test in suite.tests:
-            if test.mode != mode:
-                continue
-            test_xml = test.get_junit_etree()
-            if test_xml is not None:
-                xml.extend(test_xml.getroot().findall('.//TestSuite'))
-    et = ET.ElementTree(xml)
-    et.write(f'{tmpdir}/{mode}/xml/boost.xunit.xml', encoding='unicode')
-
-def open_log(tmpdir):
-    pathlib.Path(tmpdir).mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        filename=os.path.join(tmpdir, "test.py.log"),
-        filemode="w",
-        level=logging.INFO,
-        format="%(asctime)s.%(msecs)03d %(levelname)s> %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    logging.critical("Started %s", " ".join(sys.argv))
-
-
-async def main():
+async def main() -> int:
 
     options = parse_cmd_line()
 
-    open_log(options.tmpdir)
-
-    find_tests(options)
     if options.list_tests:
-        print('\n'.join([t.name for t in TestSuite.tests()]))
-        return 0
+        return run_pytest(options)
 
-    signaled = asyncio.Event()
-
-    setup_signal_handlers(asyncio.get_event_loop(), signaled)
-
-    await run_all_tests(signaled, options)
-
-    if signaled.is_set():
-        return -signaled.signo
-
-    failed_tests = [t for t in TestSuite.tests() if t.success is not True]
-
-    print_summary(failed_tests)
-
-    for mode in options.modes:
-        write_junit_report(options.tmpdir, mode)
-        write_consolidated_boost_junit_xml(options.tmpdir, mode)
-
+    try:
+        logging.info('running all tests')
+        # Run pytest in the default thread pool executor so the event loop stays
+        # responsive (e.g. signal handlers continue to work while pytest runs).
+        loop = asyncio.get_running_loop()
+        exit_code = await loop.run_in_executor(None, run_pytest, options)
+        logging.info('after running all tests')
+    except asyncio.CancelledError:
+        print('\ntests cancelled by signal')
+        return 1
+    except Exception as e:
+        print(palette.fail(e))
+        raise
+    if exit_code == 5:
+        print(palette.fail("No tests were collected. Please check the test names and modes you provided, as well as"
+                           "the test markers if you used the '--markers' option."
+                           "Alternatively you can check with --list option if there any errors."))
     if 'coverage' in options.modes:
-        coverage.generate_coverage_report("build/coverage", "tests")
+        coverage.generate_coverage_report(
+            str(coverage_utils.coverage_dir(pathlib.Path(options.tmpdir) / "coverage")),
+            path_to("coverage", "test"),
+        )
+
+    if options.coverage:
+        await process_coverage(options)
 
     # Note: failure codes must be in the ranges 0-124, 126-127,
     #       to cooperate with git bisect's expectations
-    return 0 if not failed_tests else 1
+    return exit_code
+
+
+async def process_coverage(options):
+    total_processing_time = time.time()
+    logger = LogPrefixAdapter(logging.getLogger("coverage"), {'prefix' : 'coverage'})
+    modes_for_coverage = options.coverage_modes
+    # use about 75% of the machine's processing power.
+    concurrency = max(int(multiprocessing.cpu_count() * 0.75), 1)
+    logger.info(f"Processing coverage information for modes: {modes_for_coverage}, using {concurrency} cpus")
+    semaphore = asyncio.Semaphore(concurrency)
+    build_paths = [pathlib.Path(f"build/{mode}") for mode in modes_for_coverage]
+    paths_for_id_search = [bp / p for bp, p in itertools.product(build_paths, ["scylla", "test", "seastar"])]
+    logger.info("Getting binary ids for coverage conversion...")
+    files_to_ids_map = await coverage_utils.get_binary_ids_map(paths = paths_for_id_search,
+                                                               filter = coverage_utils.PROFILED_ELF_TYPES,
+                                                               semaphore = semaphore,
+                                                               logger = logger)
+    logger.debug(f"Binary ids map is: {files_to_ids_map}")
+    logger.info("Done getting binary ids for coverage conversion")
+    sources_to_exclude = [line for line in open("coverage_excludes.txt", 'r').read().split('\n') if line and not line.startswith('#')]
+
+    # The retired TestSuite registry used to hand out the suites that ran; the
+    # pytest runner instead writes per-suite raw profiles to
+    # `<tmpdir>/<mode>/coverage/<suite>/*.profraw`, so discover them from disk.
+    ran_suites = []
+    for mode in modes_for_coverage:
+        coverage_root = coverage_utils.coverage_dir(pathlib.Path(options.tmpdir) / mode)
+        if not coverage_root.is_dir():
+            continue
+        for suite_dir in sorted(p for p in coverage_root.iterdir() if p.is_dir()):
+            ran_suites.append((suite_dir.name, mode, suite_dir))
+
+    def pathsize(path : pathlib.Path):
+        if path.is_file():
+            return os.path.getsize(path)
+        elif path.is_dir():
+            return sum([os.path.getsize(f) for f in path.glob("**/*") if f.is_file()])
+        else:
+            return 0
+    class Stats:
+        def __init__(self, name = "", size = 0, time = 0) -> None:
+            self.name = name
+            self.size = size
+            self.time = time
+        def __add__(self, other):
+            return Stats(self.name,
+                         size = self.size + other.size,
+                         time = self.time + other.time)
+        def __str__(self):
+            name = f"{self.name} - " if self.name else ""
+            fields = []
+            if self.size:
+                fields.append(f"size: {humanfriendly.format_size(self.size)}")
+            if self.time:
+                fields.append(f"time: {humanfriendly.format_timespan(self.time)}")
+            fields = ', '.join(fields)
+            return f"{name}{fields}"
+        @property
+        def asstring(self):
+            return str(self)
+
+    # a nested map of: mode -> suite -> unified_coverage_file
+    suits_trace_files = {}
+    stats = treelib.Tree()
+
+    RAW_PROFILE_STATS = "raw profiles"
+    INDEXED_PROFILE_STATS = "indexed profiles"
+    LCOV_CONVERSION_STATS = "lcov conversion"
+    LCOV_SUITES_MEREGE_STATS = "lcov per suite merge"
+    LCOV_MODES_MERGE_STATS = "lcov merge for mode"
+    LCOV_MERGE_ALL_STATS = "lcov merge all stats"
+    ROOT_NODE = stats.create_node(tag = time.time(),
+                                  identifier = "root",
+                                  data = Stats("Coverage Processing Stats", 0, 0))
+
+    for name, mode, coverage_path in ran_suites:
+        # 1. Transform every suite raw profiles into indexed profiles
+        raw_profiles = list(coverage_path.glob("*.profraw"))
+        if len(raw_profiles) == 0:
+            logger.warning(f"Couldn't find any raw profiles for suite '{name}' in mode '{mode}' ({coverage_path}):\n\t"
+                "1. The binaries are killed instead of terminating which bypasses profile dump.\n\t"
+                "2. The suite tempres with the LLVM_PROFILE_FILE which causes the profile to be dumped\n\t"
+                "   to somewhere else.")
+            continue
+        mode_stats = stats.get_node(mode)
+        if not mode_stats:
+            mode_stats = stats.create_node(tag = time.time(),
+                                           identifier = mode,
+                                           parent = ROOT_NODE,
+                                           data = Stats(f"{mode} mode processing stats", 0, 0))
+
+        raw_stats_node = stats.get_node(mode_stats.identifier + RAW_PROFILE_STATS)
+        if not raw_stats_node:
+            raw_stats_node = stats.create_node(tag = time.time(),
+                                               identifier = mode_stats.identifier + RAW_PROFILE_STATS,
+                                               parent = mode_stats,
+                                               data = Stats(RAW_PROFILE_STATS, 0, 0))
+        stat = stats.create_node(tag = time.time(),
+                                 identifier = raw_stats_node.identifier + name,
+                                 parent = raw_stats_node,
+                                 data = Stats(name, pathsize(coverage_path), 0))
+        raw_stats_node.data += stat.data
+        mode_stats.data.time += stat.data.time
+        mode_stats.data.size = max(mode_stats.data.size, raw_stats_node.data.size)
+
+
+        logger.info(f"{name}: Converting raw profiles into indexed profiles - {stat.data}.")
+        start_time = time.time()
+        merge_result = await coverage_utils.merge_profiles(profiles = raw_profiles,
+                                            path_for_merged = coverage_path,
+                                            clear_on_success = (not options.coverage_keep_raw),
+                                            semaphore = semaphore,
+                                            logger = logger)
+        indexed_stats_node = stats.get_node(mode_stats.identifier +INDEXED_PROFILE_STATS)
+        if not indexed_stats_node:
+            indexed_stats_node = stats.create_node(tag = time.time(),
+                                                   identifier = mode_stats.identifier +INDEXED_PROFILE_STATS,
+                                                   parent = mode_stats,
+                                                   data = Stats(INDEXED_PROFILE_STATS, 0, 0))
+        stat = stats.create_node(tag = time.time(),
+                                 identifier = indexed_stats_node.identifier + name,
+                                 parent = indexed_stats_node,
+                                 data = Stats(name, pathsize(coverage_path), time.time() - start_time))
+        indexed_stats_node.data += stat.data
+        mode_stats.data.time += stat.data.time
+        mode_stats.data.size = max(mode_stats.data.size, indexed_stats_node.data.size)
+
+        logger.info(f"{name}: Done converting raw profiles into indexed profiles - {humanfriendly.format_timespan(stat.data.time)}.")
+
+        # 2. Transform every indexed profile into an lcov trace file,
+        #    after this step, the dependency upon the build artifacts
+        #    ends and processing of the files can be done using the source
+        #    code only.
+
+        logger.info(f"{name}: Converting indexed profiles into lcov trace files.")
+        start_time = time.time()
+        if len(merge_result.errors) > 0:
+            raise RuntimeError(merge_result.errors)
+        await coverage_utils.profdata_to_lcov(profiles = merge_result.generated_profiles,
+                                              excludes = sources_to_exclude,
+                                              known_file_ids = files_to_ids_map,
+                                              clear_on_success = (not options.coverage_keep_indexed),
+                                              semaphore = semaphore,
+                                              logger = logger
+                                              )
+        lcov_conversion_stats_node = stats.get_node(mode_stats.identifier + LCOV_CONVERSION_STATS)
+        if not lcov_conversion_stats_node:
+            lcov_conversion_stats_node = stats.create_node(tag = time.time(),
+                                                           identifier = mode_stats.identifier + LCOV_CONVERSION_STATS,
+                                                           parent = mode_stats,
+                                                           data = Stats(LCOV_CONVERSION_STATS, 0, 0))
+        stat = stats.create_node(tag = time.time(),
+                                 identifier = lcov_conversion_stats_node.identifier + name,
+                                 parent = lcov_conversion_stats_node,
+                                 data = Stats(name, pathsize(coverage_path), time.time() - start_time))
+        lcov_conversion_stats_node.data += stat.data
+        mode_stats.data.time += stat.data.time
+        mode_stats.data.size = max(mode_stats.data.size, lcov_conversion_stats_node.data.size)
+
+        logger.info(f"{name}: Done converting indexed profiles into lcov trace files - {humanfriendly.format_timespan(stat.data.time)}.")
+
+        # 3. combine all tracefiles
+        logger.info(f"{name} in mode {mode}: Combinig lcov trace files.")
+        start_time = time.time()
+        trace_files = list(coverage_path.glob("**/*.info"))
+        target_trace_file = coverage_path / (name + ".info")
+        if len(trace_files) == 0: # No coverage data, can skip
+            logger.warning(f"{name} in mode  {mode}: No coverage tracefiles found")
+            continue
+        elif len(trace_files) == 1: # No need to merge, we can just rename the file
+            trace_files[0].rename(str(target_trace_file))
+        else:
+            await coverage_utils.lcov_combine_traces(lcovs = trace_files,
+                                                     output_lcov = target_trace_file,
+                                                     clear_on_success = (not options.coverage_keep_lcovs),
+                                                     files_per_chunk = 10,
+                                                     semaphore = semaphore,
+                                                     logger = logger)
+        lcov_merge_stats_node = stats.get_node(mode_stats.identifier + LCOV_SUITES_MEREGE_STATS)
+        if not lcov_merge_stats_node:
+            lcov_merge_stats_node = stats.create_node(tag = time.time(),
+                                                      identifier = mode_stats.identifier + LCOV_SUITES_MEREGE_STATS,
+                                                      parent = mode_stats,
+                                                      data = Stats(LCOV_SUITES_MEREGE_STATS, 0, 0))
+        stat = stats.create_node(tag = time.time(),
+                                 identifier = lcov_merge_stats_node.identifier + name,
+                                 parent = lcov_merge_stats_node,
+                                 data = Stats(name, pathsize(coverage_path), time.time() - start_time))
+        lcov_merge_stats_node.data += stat.data
+        mode_stats.data.time += stat.data.time
+        mode_stats.data.size = max(mode_stats.data.size, lcov_merge_stats_node.data.size)
+
+        suits_trace_files.setdefault(mode, {})[name] = target_trace_file
+        logger.info(f"{name}: Done combinig lcov trace files - {humanfriendly.format_timespan(stat.data.time)}")
+
+    #4. combine the suite lcovs into per mode trace files
+    modes_trace_files  = {}
+    for mode, suite_traces in suits_trace_files.items():
+
+        target_trace_file = coverage_utils.coverage_dir(pathlib.Path(options.tmpdir) / mode) / f"{mode}_coverage.info"
+        start_time = time.time()
+        logger.info(f"Consolidating trace files for mode {mode}.")
+        await coverage_utils.lcov_combine_traces(lcovs = suite_traces.values(),
+                                                 output_lcov = target_trace_file,
+                                                 clear_on_success = False,
+                                                 files_per_chunk = 10,
+                                                 semaphore = semaphore,
+                                                 logger = logger)
+        mode_stats = stats[mode]
+        stat = stats.create_node(tag = time.time(),
+                                 identifier = mode_stats.identifier + LCOV_MODES_MERGE_STATS,
+                                 parent = mode_stats,
+                                 data = Stats(LCOV_MODES_MERGE_STATS, None, time.time() - start_time))
+        mode_stats.data.time += stat.data.time
+        ROOT_NODE.data.size += mode_stats.data.size
+        modes_trace_files[mode] = target_trace_file
+        logger.info(f"Done consolidating trace files for mode {mode} - time: {humanfriendly.format_timespan(stat.data.time)}.")
+    #5. create one consolidated file with all trace information
+    logger.info(f"Consolidating all trace files for this run.")
+    start_time = time.time()
+    target_trace_file = pathlib.Path(options.tmpdir) / "test_coverage.info"
+    await coverage_utils.lcov_combine_traces(lcovs = modes_trace_files.values(),
+                                             output_lcov = target_trace_file,
+                                             clear_on_success = False,
+                                             files_per_chunk = 10,
+                                             semaphore = semaphore,
+                                             logger = logger)
+    stats.create_node(tag = time.time(),
+                      identifier = LCOV_MERGE_ALL_STATS,
+                      parent = ROOT_NODE,
+                      data = Stats(LCOV_MERGE_ALL_STATS, None, time.time() - start_time))
+    logger.info(f"Done consolidating all trace files for this run - time: {humanfriendly.format_timespan(time.time() - start_time)}.")
+
+    logger.info(f"Creating textual report.")
+    proc = await asyncio.create_subprocess_shell(f"lcov --summary --rc lcov_branch_coverage=1 {options.tmpdir}/test_coverage.info 2>/dev/null > {options.tmpdir}/test_coverage_report.txt")
+    await proc.wait()
+    with open(pathlib.Path(options.tmpdir) /"test_coverage_report.txt") as f:
+        summary = f.readlines()
+    proc = await asyncio.create_subprocess_shell(f"lcov --list --rc lcov_branch_coverage=1 {options.tmpdir}/test_coverage.info  2>/dev/null >> {options.tmpdir}/test_coverage_report.txt")
+    await proc.wait()
+    logger.info(f"Done creating textual report. ({options.tmpdir}/test_coverage_report.txt)")
+    total_processing_time = time.time() - total_processing_time
+    ROOT_NODE.data.time = total_processing_time
+
+    stats_str ="\n" + stats.show(stdout=False,
+                                 data_property="asstring")
+    summary = ["\n" + l for l in summary]
+    logger.info(stats_str)
+    logger.info("".join(summary))
+
 
 if __name__ == "__main__":
     colorama.init()
+    # gh-16583: ignore the inherited client host's ScyllaDB environment,
+    # since it may break the tests
+    if "SCYLLA_CONF" in os.environ:
+        del os.environ["SCYLLA_CONF"]
+    if "SCYLLA_HOME" in os.environ:
+        del os.environ["SCYLLA_HOME"]
 
-    if sys.version_info < (3, 7):
-        print("Python 3.7 or newer is required to run this program")
+    if sys.version_info < (3, 14):
+        print("Python 3.14 or newer is required to run this program")
         sys.exit(-1)
     sys.exit(asyncio.run(main()))

@@ -1,3 +1,8 @@
+-- Error messages contain a keyspace name. Make the output stable.
+CREATE KEYSPACE ks
+    WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1};
+USE ks;
+
 CREATE TABLE ks.tbl_cnt (pk int PRIMARY KEY, c1 counter);
 
 -- insert some values in one column
@@ -23,7 +28,7 @@ SELECT pk, c1 FROM ks.tbl_cnt WHERE c1 = 1 ALLOW FILTERING;
 SELECT pk, c1 FROM ks.tbl_cnt WHERE c1 <= 1000 ALLOW FILTERING;
 SELECT pk, c1 FROM ks.tbl_cnt WHERE c1 > -1000 ALLOW FILTERING;
 
-
+-- Test case for gh-7330, counter signed integer overflow in debug mode
 CREATE TABLE counter_bug (t int, c counter, primary key(t));
 UPDATE counter_bug SET c = c + 9223372036854775807 where t = 0;
 SELECT * from counter_bug;
@@ -31,3 +36,6 @@ UPDATE counter_bug SET c = c + 1 where t = 0;
 SELECT * from counter_bug;
 UPDATE counter_bug SET c = c - 1 where t = 0;
 SELECT * from counter_bug;
+
+-- cleanup
+DROP KEYSPACE ks;

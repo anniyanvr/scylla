@@ -3,14 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "mutation_fragment.hh"
-#include "clustering_ranges_walker.hh"
-#include "clustering_key_filter.hh"
+#include "exceptions.hh"
+#include "mutation/mutation_fragment.hh"
+#include "keys/clustering_ranges_walker.hh"
+#include "keys/clustering_key_filter.hh"
+#include "readers/mutation_reader_fwd.hh"
 
 namespace sstables {
 
@@ -128,7 +130,7 @@ public:
      * query ranges tracked by _walker.
      */
     std::optional<position_in_partition_view> fast_forward_to(position_range r) {
-        assert(_fwd);
+        parse_assert(bool(_fwd));
         _fwd_end = std::move(r).end();
         _out_of_range = !_walker.advance_to(r.start(), _fwd_end);
 

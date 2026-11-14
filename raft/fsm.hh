@@ -3,59 +3,162 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #pragma once
 
+#include <ranges>
+
 #include <seastar/core/condition-variable.hh>
 #include <seastar/core/on_internal_error.hh>
+#include "utils/assert.hh"
+#include "utils/chunked_vector.hh"
+#include "utils/small_vector.hh"
 #include "raft.hh"
 #include "tracker.hh"
 #include "log.hh"
 
 namespace raft {
 
+// The ids (index and term) of a contiguous run of log entries,
+// [first_idx(), last_idx]. The terms are stored run-length encoded: one
+// (first index, term) pair per stretch of equal terms, in index order.
+// Nearly always a single pair.
+struct entry_id_range {
+    index_t last_idx = index_t{0};
+    utils::small_vector<std::pair<index_t, term_t>, 1> terms;
+
+    bool empty() const {
+        return terms.empty();
+    }
+    index_t first_idx() const {
+        return terms.front().first;
+    }
+    size_t size() const {
+        return empty() ? 0 : (last_idx - first_idx()).value() + 1;
+    }
+    // Appends the id of the entry right after last_idx (or of the first
+    // entry, when empty).
+    void append(index_t idx, term_t term) {
+        SCYLLA_ASSERT(empty() || idx == last_idx + index_t{1});
+        if (terms.empty() || terms.back().second != term) {
+            terms.emplace_back(idx, term);
+        }
+        last_idx = idx;
+    }
+};
+
+// The entries that became committed with one fsm output.
+struct committed_batch {
+    entry_id_range ids;
+    // A non-joint configuration entry is among them.
+    bool non_joint_conf_committed = false;
+};
+
 // State of the FSM that needs logging & sending.
 struct fsm_output {
     struct applied_snapshot {
         snapshot_descriptor snp;
         bool is_local;
-        snapshot_id prev_snp_id;
+
+        // Always 0 for non-local snapshots.
+        size_t preserved_log_entries;
     };
     std::optional<std::pair<term_t, server_id>> term_and_vote;
-    std::vector<log_entry_ptr> log_entries;
-    std::vector<std::pair<server_id, rpc_message>> messages;
-    // Entries to apply.
-    std::vector<log_entry_ptr> committed;
+    log_entry_ptr_list log_entries;
+    utils::chunked_vector<std::pair<server_id, rpc_message>> messages;
+    // Empty when the commit index did not advance. Only the entry ids are
+    // reported: the entries themselves stay in the log, the consumer reads
+    // them from there while the log still holds them, and the terms let it
+    // resolve the waiters even after a snapshot has replaced the entries.
+    committed_batch committed;
     std::optional<applied_snapshot> snp;
+    // In a typical scenario contains only one item, occasionally more.
+    utils::small_vector<snapshot_id, 1> snps_to_drop;
     // Latest configuration obtained from the log in case it has changed
     // since last fsm output poll.
-    std::optional<server_address_set> configuration;
+    std::optional<config_member_set> configuration;
     std::optional<read_id> max_read_id_with_quorum;
+    // True if there was a state change.
+    // Events can be coalesced, so this cannot be used to get
+    // all state changes, only to know that the state changed
+    // at least once
+    bool state_changed = false;
     // Set to true if a leadership transfer was aborted since the last output
     bool abort_leadership_transfer;
-
-    // True if there is no new output
-    bool empty() const {
-        return !term_and_vote &&
-            log_entries.size() == 0 && messages.size() == 0 &&
-            committed.size() == 0 && !snp &&
-            !configuration;
-    }
 };
 
 struct fsm_config {
     // max size of appended entries in bytes
     size_t append_request_threshold;
-    // Max number of entries of in-memory part of the log after
+    // Limit in bytes on the size of in-memory part of the log after
     // which requests are stopped to be admitted until the log
     // is shrunk back by a snapshot. Should be greater than
-    // whatever the default number of trailing log entries
-    // is configured by the snapshot, otherwise the state
+    // the sum of sizes of trailing log entries, otherwise the state
     // machine will deadlock.
     size_t max_log_size;
+    // Limit in bytes on the size of the in-memory part of the log while this
+    // server is not a leader. A follower appends only the prefix of an
+    // append_request which fits into this limit and reports back the index it
+    // actually reached, which makes the leader stop replicating to it until a
+    // snapshot shrinks the log again.
+    //
+    // At least max_log_size + snapshot_trailing_size, which is what a follower
+    // legitimately holds: the leader's entire log, plus its own trailing
+    // entries, which the leader may already have dropped.
+    //
+    // The escape hatch in append_entries() - while can_shrink_log() is false
+    // we let one entry through per request - keeps this bound, because while
+    // it is open the leader's log bounds ours. We cannot shrink while nothing
+    // above our snapshot index is committed, and append_entries() reads a
+    // request's commit index before it decides, so the leader has committed
+    // nothing above our snapshot index either. Its snapshot index is then at
+    // or below ours, so its log holds every entry above our snapshot index it
+    // can send us, and our log is a subset of it.
+    //
+    // A leader's log is at most this large: it admits up to max_log_size, and
+    // become_leader() charges the log it already holds to
+    // log_limiter_semaphore, so a leader elected with a full follower's log
+    // admits nothing more until that log shrinks.
+    //
+    // The hatch closes on the first request whose commit index passes our
+    // snapshot index.
+    //
+    // Members configured with different max_log_size are supported, and bound
+    // a follower by the leader's log: a leader configured larger pushes a
+    // smaller follower past this value, and the follower throttles it from
+    // there, so replication runs at the pace of the smallest limit in the
+    // group.
+    //
+    // Zero means unlimited.
+    size_t max_follower_log_size;
     // If set to true will enable prevoting stage during election
     bool enable_prevoting;
+    // Enables fast bootstrap and selects which voting member becomes the initial
+    // leader on a fresh multi-node group (empty log). When set, that member
+    // starts an election immediately on construction instead of waiting for the
+    // randomized election timeout, which speeds up the initial leader election.
+    // The chosen member is the one at rank (*fast_bootstrap_seed % num_voters) in
+    // ascending server_id order. Callers that manage many groups (e.g. one per
+    // tablet) can derive the seed from the group id so that leadership is spread
+    // across nodes instead of always landing on the smallest-id one; a seed of 0
+    // selects the smallest-id voter. When unset (the default), fast bootstrap is
+    // disabled and a bare fsm starts as a follower; raft::server sets it.
+    std::optional<uint64_t> fast_bootstrap_seed;
+    // LeaseGuard leader-lease parameters. Absent unless leases are enabled for
+    // this server. When present, the leader records `clock.interval_now()` in
+    // each log entry it creates, defers committing writes until a deposed
+    // leader's lease has expired, and may serve linearizable reads locally
+    // while its own lease is valid.
+    struct leaseguard_config {
+        // Source of bounded-uncertainty time readings. Non-owning: must outlive
+        // the fsm.
+        bounded_clock& clock;
+        // Lease duration (Δ). Should be on the order of the election timeout.
+        // (arXiv:2512.15659 "Raft Leases Done  Right", Section 5.2)
+        lease_clock::duration delta;
+    };
+    std::optional<leaseguard_config> leaseguard;
 };
 
 class fsm;
@@ -84,10 +187,10 @@ struct candidate {
 struct leader {
     // A state for each follower
     raft::tracker tracker;
-    // Used to acces new leader to set semaphore exception
+    // Used to access new leader to set semaphore exception
     const raft::fsm& fsm;
     // Used to limit log size
-    std::unique_ptr<seastar::semaphore> log_limiter_semaphore;
+    lw_shared_ptr<seastar::semaphore> log_limiter_semaphore;
     // If the leader is in the process of transferring the leadership
     // contains a time point in the future the transfer will be aborted at
     // unless completes successfully till then.
@@ -95,6 +198,9 @@ struct leader {
     // If timeout_now was already sent to one of the followers contains the id of the follower
     // it was sent to
     std::optional<server_id> timeout_now_sent;
+    // If set, leadership transfer must select this voting follower once it has
+    // caught up with the leader's log.
+    std::optional<server_id> leadership_transfer_target;
     // A source of read ids - a monotonically growing (in single term) identifiers of
     // reads issued by the state machine. Using monotonic ids allows the leader to
     // resolve all preceding read requests when a quorum of acks from followers arrive
@@ -104,7 +210,57 @@ struct leader {
     bool last_read_id_changed = false;
     read_id max_read_id_with_quorum{0};
 
-    leader(size_t max_log_size, const class fsm& fsm_) : fsm(fsm_), log_limiter_semaphore(std::make_unique<seastar::semaphore>(max_log_size)) {}
+    // LeaseGuard: a linearizable read was served in this leadership term since
+    // the last lease-renewal no-op. Gates proactive lease extension in
+    // tick_leader() so that a read-only workload keeps the lease alive, while an
+    // idle group (no reads) appends nothing.
+    bool read_since_renewal = false;
+
+    // LeaseGuard: index of the newest log entry that predates this leader's
+    // term (i.e. the deposed leader's lease), captured at election time as
+    // last_idx(). Non-zero whenever the group has any prior entry -- including
+    // when the in-memory log is empty but a snapshot covers earlier entries, in
+    // which case it equals the snapshot index. Zero only for a genesis cluster
+    // with no entries at all (in memory or snapshot), where there is no deposed
+    // lease to wait for.
+    index_t last_prev_term_idx{0};
+    // LeaseGuard: a bounded-uncertainty time reading taken at or shortly after
+    // this node became leader. Every prior-term entry was created before the
+    // election, so once this reading is more than delta old the deposed lease is
+    // guaranteed expired. Used as the age reference when the deposed leader's
+    // entry is not available in memory (folded into a snapshot, empty log at
+    // election, or no recorded interval of its own). Set lazily on the first
+    // available clock reading, so it may be empty until then.
+    std::optional<time_bounds> lease_wait_start;
+    // LeaseGuard: elapsed-time reading taken when this node became leader. Every
+    // prior-term entry was created before the election, so once delta of physical
+    // time has passed since this anchor the deposed lease is certainly expired.
+    // Unlike lease_wait_start this needs no synchronized clock, so it is the path
+    // that lets a leader with an unusable clock make progress at all rather than
+    // stalling. See prev_term_lease_expired().
+    mono_clock::time_point lease_wait_mono_start{};
+    // LeaseGuard: set once the deferred-commit restriction no longer applies
+    // for this leadership term -- either because there was no deposed lease to
+    // wait for (no prior-term entry at election) or because that lease has
+    // expired.
+    bool lease_wait_done = false;
+    // LeaseGuard: true once we have warned that the clock is unusable while a
+    // commit is deferred, so the warning is emitted once per leadership term
+    // rather than once per tick.
+    bool clock_unavailable_warned = false;
+    // LeaseGuard: elapsed-time reading at which our clock last became unusable,
+    // or empty while it is usable. A leader with no clock can serve no local
+    // reads, stamp nothing and renew nothing, so once this has persisted we hand
+    // leadership to a replica whose clock works. Measured on the monotonic clock
+    // precisely because the clock being judged is the one that failed.
+    std::optional<mono_clock::time_point> clock_unusable_since;
+    // LeaseGuard: per-group delay added to that wait. Scylla runs one raft group
+    // per strongly-consistent tablet, so without it a single node's clock
+    // failure would transfer every group it leads at the same instant -- and
+    // again in reverse when the clock recovers. Drawn once per leadership term.
+    mono_clock::duration clock_stepdown_jitter{0};
+
+    leader(size_t max_log_size, const class fsm& fsm_) : fsm(fsm_), log_limiter_semaphore(make_lw_shared<seastar::semaphore>(max_log_size)) {}
     leader(leader&&) = default;
     ~leader();
 };
@@ -135,9 +291,13 @@ struct leader {
 // in-memory state machine with a catch-all API step(message)
 // method. The method handles any kind of input and performs the
 // needed state machine state transitions. To get state machine output
-// poll_output() function has to be called. This call produces an output
+// get_output() function has to be called. To check first if
+// any new output is present, call has_output(). To wait for new
+// new output events, use the sm_events condition variable passed
+// to fsm constructor; fs` signals it each time new output may appear.
+// The get_output() call produces an output
 // object, which encapsulates a list of actions that must be
-// performed until the next poll_output() call can be made. The time is
+// performed until the next get_output() call can be made. The time is
 // represented with a logical timer. The client is responsible for
 // periodically invoking tick() method, which advances the state
 // machine time and allows it to track such events as election or
@@ -145,6 +305,8 @@ struct leader {
 class fsm {
     // id of this node
     server_id _my_id;
+    // Human-readable tag for log messages (distinguishes raft instances)
+    sstring _tag;
     // What state the server is in. The default is follower.
     std::variant<follower, candidate, leader> _state;
     // _current_term, _voted_for && _log are persisted in persistence
@@ -165,6 +327,41 @@ class fsm {
     fsm_config _config;
     // This is set to true when leadership transfer process is aborted due to a timeout
     bool _abort_leadership_transfer = false;
+    // Set if we want to actively search for a leader.
+    // Can be true only if the leader is not known
+    bool _ping_leader = false;
+    // LeaseGuard: whether our bounded clock was usable at the last tick, i.e.
+    // whether we could hold a lease. Reported to the leader in
+    // append_reply::clock_ok so it can hand leadership to a node that still can.
+    //
+    // Sampled once per tick rather than per reply on purpose: append_entries is
+    // the hottest path in raft and a follower otherwise never reads the clock
+    // (interval_now() is a syscall on the adjtimex backend), while the value
+    // only feeds a leadership decision gated on the failure persisting for
+    // multiples of delta -- a tick of staleness cannot matter.
+    bool _clock_ok = false;
+    // memory_usage_of() the first entry the last append_request that carried
+    // entries had no room for, or 0 if it had room for all of them. The log is
+    // contiguous, so it is the entry a leader has to send us next.
+    //
+    // A new leader may have a different entry at that index, so the value is
+    // stale until that leader sends us entries. It never makes us report full
+    // to that leader: every request it sends us until we accept one carries
+    // entries, since it starts at the dummy it appends on election and walks
+    // back from there. One that does not match our log is rejected with
+    // log_full = false, and the first one that matches goes through
+    // maybe_append(), which overwrites the value before the reply reports
+    // log_full.
+    size_t _refused_entry_size = 0;
+    // The value of log_is_full() report_log_full() last reported to a leader.
+    // Its log lines mark the transitions, and apply_snapshot() prods the leader
+    // to resume while it is true and the log has room.
+    bool _log_full_reported = false;
+    // Pace the two lines report_log_full() logs, one per direction of the
+    // transition: a follower whose state machine stays slow crosses the limit
+    // once per snapshot cycle.
+    seastar::logger::rate_limit _log_full_rate_limit{std::chrono::seconds(10)};
+    seastar::logger::rate_limit _log_has_room_rate_limit{std::chrono::seconds(10)};
 
     // Stores the last state observed by get_output().
     // Is updated with the actual state of the FSM after
@@ -219,16 +416,35 @@ private:
     // If a server receives a request with a stale term number, it
     // rejects the request.
     // TLA+ line 328
-    std::vector<std::pair<server_id, rpc_message>> _messages;
+    utils::chunked_vector<std::pair<server_id, rpc_message>> _messages;
 
     // Signaled when there is a IO event to process.
-    seastar::condition_variable _sm_events;
+    seastar::condition_variable& _sm_events;
 
     // Called when one of the replicas advances its match index
     // so it may be the case that some entries are committed now.
     // Signals _sm_events. May resign leadership if we committed
     // a configuration change.
     void maybe_commit();
+    // LeaseGuard: true if the deposed leader's lease is known to be more than
+    // delta old, so it is safe to advance the commit index past all prior-term
+    // entries. Uses the deposed entry's own recorded interval when it is still
+    // in the in-memory log, otherwise a delta wait since this node became
+    // leader. An unsynchronized clock only delays this -- the elapsed-time path
+    // still discharges it a little over delta after the election -- so it never
+    // defers indefinitely.
+    // Precondition: is_leader(), leases enabled, last_prev_term_idx > 0.
+    bool prev_term_lease_expired();
+    // LeaseGuard: true if this leader currently holds a valid lease, i.e. its
+    // newest committed entry (which the caller has verified is in the current
+    // term) is present in memory, carries a recorded interval, and is less than
+    // delta old. When true the leader may serve a linearizable read locally
+    // without a quorum round-trip. Precondition: is_leader().
+    bool can_serve_lease_read();
+    // LeaseGuard: hand leadership to a replica whose clock still works, if ours
+    // has been unusable long enough and such a replica exists. A no-op unless
+    // leases are enabled. Precondition: is_leader(), not already stepping down.
+    void maybe_transfer_leadership_on_clock_loss();
     // Check if the randomized election timeout has expired.
     bool is_past_election_timeout() const {
         return election_elapsed() >= _randomized_election_timeout;
@@ -245,15 +461,35 @@ private:
     // A helper to update the FSM's current term.
     void update_current_term(term_t current_term);
 
+    // True if LeaseGuard leader leases are enabled for this fsm.
+    bool leaseguard_enabled() const noexcept {
+        return _config.leaseguard.has_value();
+    }
+    // The bounded-uncertainty time interval to stamp on a new log entry, or
+    // nullopt when leases are disabled or the clock is unsynchronized.
+    std::optional<time_bounds> lease_time_now() const {
+        if (!_config.leaseguard) {
+            return std::nullopt;
+        }
+        return _config.leaseguard->clock.interval_now();
+    }
+
     void check_is_leader() const {
         if (!is_leader()) {
             throw not_a_leader(current_leader());
         }
     }
 
+    bool is_stepping_down() const {
+        return is_leader() && bool(leader_state().stepdown);
+    }
+
     void become_leader();
 
     void become_candidate(bool is_prevote, bool is_leadership_transfer = false);
+    // Send ping messages (append_reply rejected) to all peers to solicit
+    // a response from the leader. Called from ping_leader() and tick().
+    void send_ping_messages();
 
     // Controls whether the follower has been responsive recently,
     // so it makes sense to send more data to it.
@@ -261,6 +497,15 @@ private:
     // Replicate entries to a follower. If there are no entries to send
     // and allow_empty is true, send a heartbeat.
     void replicate_to(follower_progress& progress, bool allow_empty);
+    // Send an empty append_entries request to a follower which reported a full
+    // log, bypassing follower_progress::can_send_to(). Sends no entries, so it
+    // cannot grow the follower's log; it refreshes follower_progress::log_full
+    // and carries leader_commit_idx so that the follower can drain what it
+    // already has.
+    void send_throttled_heartbeat(follower_progress& progress);
+    // Return log_is_full(), logging whenever the answer changes since the last
+    // time we reported it to a leader. Used to fill in append_reply::log_full.
+    bool report_log_full();
     void replicate();
     void append_entries(server_id from, append_request&& append_request);
 
@@ -269,6 +514,7 @@ private:
 
     void request_vote(server_id from, vote_request&& vote_request);
     void request_vote_reply(server_id from, vote_reply&& vote_reply);
+    void maybe_resend_vote_request(server_id to);
 
     void install_snapshot_reply(server_id from, snapshot_reply&& reply);
 
@@ -304,7 +550,7 @@ private:
 
     // Issue the next read identifier
     read_id next_read_id() {
-        assert(is_leader());
+        SCYLLA_ASSERT(is_leader());
         ++leader_state().last_read_id;
         leader_state().last_read_id_changed = true;
         _sm_events.signal();
@@ -333,11 +579,27 @@ protected: // For testing
     }
 
 public:
-    explicit fsm(server_id id, term_t current_term, server_id voted_for, log log,
-            index_t commit_idx, failure_detector& failure_detector, fsm_config conf);
+    class memory_permit {
+    private:
+        lw_shared_ptr<seastar::semaphore> _semaphore;
+        seastar::semaphore_units<> _units;
 
-    explicit fsm(server_id id, term_t current_term, server_id voted_for, log log,
-            failure_detector& failure_detector, fsm_config conf);
+        memory_permit(lw_shared_ptr<seastar::semaphore> semaphore, seastar::semaphore_units<> units)
+                : _semaphore(std::move(semaphore)), _units(std::move(units))
+        {}
+
+    public:
+        size_t release() {
+            return _units.release();
+        }
+
+        memory_permit() = default;
+        friend class fsm;
+    };
+
+    explicit fsm(server_id id, sstring tag, term_t current_term, server_id voted_for, log log,
+            index_t commit_idx, failure_detector& failure_detector, fsm_config conf,
+            seastar::condition_variable& sm_events);
 
     bool is_leader() const {
         return std::holds_alternative<leader>(_state);
@@ -348,9 +610,24 @@ public:
     bool is_candidate() const {
         return std::holds_alternative<candidate>(_state);
     }
+    std::string_view current_state() const {
+        static constexpr std::string_view leader_state = "Leader";
+        static constexpr std::string_view follower_state = "Follower";
+        static constexpr std::string_view candidate_state = "Candidate";
+        if (is_leader()) {
+            return leader_state;
+        }
+        return is_follower() ? follower_state : candidate_state;
+    }
     bool is_prevote_candidate() const {
         return is_candidate() && std::get<candidate>(_state).is_prevote;
     }
+    size_t state_to_metric() const {
+        return _state.index();
+    }
+    // Everything reported about this server on demand. The applied index and
+    // the entries waiting for their turn to be appended are the caller's to add.
+    server_status get_status() const;
     index_t log_last_idx() const {
         return _log.last_idx();
     }
@@ -365,6 +642,9 @@ public:
     }
     index_t log_last_snapshot_idx() const {
         return _log.get_snapshot().idx;
+    }
+    index_t log_last_conf_idx() const {
+        return _log.last_conf_idx();
     }
 
     // Return the last configuration entry with index smaller than or equal to `idx`.
@@ -383,23 +663,43 @@ public:
         }
     }
 
-    // Call this function to wait for the number of log entries to
-    // go below  max_log_size.
-    future<> wait_max_log_size();
+    // Forget the leader this follower knows of, so that current_leader()
+    // is empty until a leader sends us a message again. For a caller which
+    // knows from outside of raft that the reported leader is gone - e.g. it
+    // was removed from the configuration - but this follower hasn't heard
+    // from the new leader yet. Does nothing on a leader or a candidate.
+    void forget_leader() {
+        if (is_follower()) {
+            follower_state().current_leader = server_id{};
+        }
+    }
 
-    // Return current configuration. Throws if not a leader.
+    // Ask to search for a leader if one is not known.
+    // Immediately sends ping messages to all peers and keeps pinging
+    // on subsequent ticks until a leader is found.
+    void ping_leader() {
+        SCYLLA_ASSERT(!current_leader());
+        _ping_leader = true;
+        send_ping_messages();
+    }
+
+    // Call this function to wait for the total size in bytes of log entries to
+    // go below max_log_size.
+    // Can only be called on a leader. Counts a wait that had to block in `stats`.
+    // On abort throws `semaphore_aborted`.
+    future<memory_permit> wait_for_memory_permit(seastar::abort_source* as, size_t size,
+            server_stats& stats);
+
+    // Return current configuration.
     const configuration& get_configuration() const;
 
     // Add an entry to in-memory log. The entry has to be
     // committed to the persistent Raft log afterwards.
     template<typename T> const log_entry& add_entry(T command);
 
-    // Wait until there is, and return state machine output that
-    // needs to be handled.
-    // This includes a list of the entries that need
-    // to be logged. The logged entries are eventually
-    // discarded from the state machine after applying a snapshot.
-    future<fsm_output> poll_output();
+    // Check if there is any state machine output
+    // that `get_output()` will return.
+    bool has_output() const;
 
     // Get state machine output, if there is any. Doesn't
     // wait. It is public for use in testing.
@@ -412,7 +712,7 @@ public:
 
     // Feed one Raft RPC message into the state machine.
     // Advances the state machine state and generates output,
-    // accessible via poll_output().
+    // accessible via get_output().
     template <typename Message>
     void step(server_id from, Message&& msg);
 
@@ -430,7 +730,12 @@ public:
     // sends timeout_now rpc to it and makes it initiate new election.
     // Can be used for leader stepdown if new configuration does not contain
     // current leader.
-    void transfer_leadership(logical_clock::duration timeout = logical_clock::duration(0));
+    // If a target is selected, the leadership transfer will be attempted to that target only.
+    // The target must be a voting member of the current configuration other than the leader
+    // itself. Nobody but the target is ever sent timeout_now, so any other target leaves the
+    // transfer with no one to hand leadership to. It then waits out `timeout` with the log limiter
+    // consumed - the group takes no writes for that whole time - before tick_leader() cancels it.
+    void transfer_leadership(logical_clock::duration timeout = logical_clock::duration(0), server_id target = {});
 
     void stop();
 
@@ -445,19 +750,60 @@ public:
     }
 
     // This call will update the log to point to the new snapshot
-    // and will truncate the log prefix up to (snp.idx - trailing)
-    // entry. Returns false if the snapshot is older than existing one.
-    bool apply_snapshot(snapshot_descriptor snp, size_t traling, bool local);
+    // and will truncate the log prefix so that the number of
+    // remaining applied entries is <= max_trailing_entries and their total size is <= max_trailing_bytes.
+    // Returns false if the snapshot is older than existing one,
+    // the passed snapshot will be dropped in this case.
+    bool apply_snapshot(snapshot_descriptor snp, size_t max_trailing_entries, size_t max_trailing_bytes, bool local);
 
     std::optional<std::pair<read_id, index_t>> start_read_barrier(server_id requester);
 
     size_t in_memory_log_size() const {
         return _log.in_memory_size();
+    }
+
+    size_t log_memory_usage() const {
+        return _log.memory_usage();
     };
+
+    // Returns the log entry at the given index, which must be present in
+    // the log: above the last snapshot index and at most the last index
+    // (it is a programming error otherwise, the function will abort).
+    const log_entry_ptr& log_entry_at(index_t idx) {
+        return _log[idx.value()];
+    }
+
+    // True if the applier fiber can shrink the log on its own: it takes a
+    // snapshot whenever log_is_full() and it has applied past the snapshot
+    // index, and it applies only committed entries, so something has to be
+    // committed above the snapshot.
+    //
+    // While this is false append_entries() lets one entry through per request;
+    // see max_follower_log_size for the bound that costs.
+    bool can_shrink_log() const {
+        return _commit_idx > _log.get_snapshot().idx;
+    }
+
+    // True if the entry a leader has to send us next does not fit into
+    // max_follower_log_size, so we will refuse it until a snapshot shrinks the
+    // log. Reported to the leader in every append_reply, so it can stop
+    // replicating to us. Turns false by itself once the log has room for that
+    // entry. Always false if the limit is disabled.
+    //
+    // Requires can_shrink_log(): while we cannot shrink we let one entry
+    // through per request, so the flag would promise a refusal we do not make.
+    // A leader that stops replicating on that promise can commit nothing - not
+    // its election dummy, nor the entries that overwrite a diverged tail of our
+    // log - and those are what let us shrink again.
+    bool log_is_full() const {
+        return _config.max_follower_log_size != 0 &&
+               _log.memory_usage() + _refused_entry_size > _config.max_follower_log_size &&
+               can_shrink_log();
+    }
 
     server_id id() const { return _my_id; }
 
-    friend std::ostream& operator<<(std::ostream& os, const fsm& f);
+    friend fmt::formatter<fsm>;
     friend leader;
 };
 
@@ -490,6 +836,8 @@ void fsm::step(server_id from, const candidate& c, Message&& msg) {
     } else if constexpr (std::is_same_v<Message, install_snapshot>) {
         send_to(from, snapshot_reply{.current_term = _current_term,
                      .success = false });
+    } else if constexpr (std::is_same_v<Message, append_reply>) {
+        maybe_resend_vote_request(from);
     }
 }
 
@@ -501,14 +849,14 @@ void fsm::step(server_id from, const follower& c, Message&& msg) {
         request_vote(from, std::move(msg));
     } else if constexpr (std::is_same_v<Message, install_snapshot>) {
         send_to(from, snapshot_reply{.current_term = _current_term,
-                    .success = apply_snapshot(std::move(msg.snp), 0, false)});
+                    .success = apply_snapshot(std::move(msg.snp), 0, 0, false)});
     } else if constexpr (std::is_same_v<Message, timeout_now>) {
         // Leadership transfers never use pre-vote; we know we are not
         // recovering from a partition so there is no need for the
         // extra round trip.
         become_candidate(false, true);
     } else if constexpr (std::is_same_v<Message, read_quorum>) {
-        logger.trace("[{}] receive read_quorum from {} for read id {}", _my_id, from, msg.id);
+        logger.trace("[{}] receive read_quorum from {} for read id {}", _tag, from, msg.id);
         advance_commit_idx(msg.leader_commit_idx);
         send_to(from, read_quorum_reply{_current_term, _commit_idx, msg.id});
     }
@@ -537,7 +885,7 @@ void fsm::step(server_id from, Message&& msg) {
         server_id leader{};
 
         logger.trace("{} [term: {}] received a message with higher term from {} [term: {}]",
-            _my_id, _current_term, from, msg.current_term);
+            _tag, _current_term, from, msg.current_term);
 
         if constexpr (std::is_same_v<Message, append_request> ||
                       std::is_same_v<Message, install_snapshot> ||
@@ -547,7 +895,7 @@ void fsm::step(server_id from, Message&& msg) {
             // Got a reply to read barrier with higher term. This should not happen.
             // Log and ignore
             logger.error("{} [term: {}] ignoring read barrier reply with higher term {}",
-                _my_id, _current_term, msg.current_term);
+                _tag, _current_term, msg.current_term);
             return;
         }
 
@@ -580,10 +928,23 @@ void fsm::step(server_id from, Message&& msg) {
             if (msg.is_prevote) {
                 send_to(from, vote_reply{_current_term, false, true});
             }
+        } else if constexpr (std::is_same_v<Message, append_reply>) {
+            // A peer that is looking for a leader pings us with a stale-term
+            // append_reply (see ping_leader()/send_ping_messages()). If we are a
+            // candidate and that peer hasn't responded to our vote request yet,
+            // re-send it: the peer is clearly alive now and our original request
+            // may have been lost (e.g. the peer's raft server wasn't ready when we
+            // first became a candidate). We skip peers that already responded for
+            // this term -- re-sending to them would be pointless (a vote is final
+            // for a term), though it would be harmless since the receiver is
+            // idempotent.
+            if (is_candidate()) {
+                maybe_resend_vote_request(from);
+            }
         } else {
             // Ignore other cases
             logger.trace("{} [term: {}] ignored a message with lower term from {} [term: {}]",
-                _my_id, _current_term, from, msg.current_term);
+                _tag, _current_term, from, msg.current_term);
         }
         return;
 
@@ -606,6 +967,7 @@ void fsm::step(server_id from, Message&& msg) {
                 // leader to avoid starting an election if the
                 // leader becomes idle.
                 follower_state().current_leader = from;
+                _ping_leader = false;
             }
 
             // 3.4. Leader election
@@ -614,13 +976,15 @@ void fsm::step(server_id from, Message&& msg) {
             _last_election_time = _clock.now();
 
             if (current_leader() != from) {
-                on_internal_error_noexcept(logger, "Got append request/install snapshot/read_quorum from an unexpected leader");
+                on_internal_error_noexcept(logger, format(
+                    "Got append request/install snapshot/read_quorum from an unexpected leader,"
+                    " expected leader: {}, message from: {}", current_leader(), from));
             }
         }
     }
 
     auto visitor = [this, from, msg = std::move(msg)](const auto& state) mutable {
-        step(from, state, std::move(msg));
+        this->step(from, state, std::move(msg));
     };
 
     std::visit(visitor, _state);
@@ -628,3 +992,6 @@ void fsm::step(server_id from, Message&& msg) {
 
 } // namespace raft
 
+template <> struct fmt::formatter<raft::fsm> : fmt::formatter<string_view> {
+    auto format(const raft::fsm&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

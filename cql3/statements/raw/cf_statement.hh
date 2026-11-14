@@ -1,19 +1,17 @@
 /*
- */
-
-/*
  * Copyright (C) 2014-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include "cql3/cf_name.hh"
+#include "service/pager/query_plan.hh"
 
 #include <optional>
 
@@ -39,11 +37,20 @@ public:
     virtual void prepare_keyspace(const service::client_state& state);
 
     // Only for internal calls, use the version with ClientState for user queries
-    void prepare_keyspace(std::string_view keyspace);
+    virtual void prepare_keyspace(std::string_view keyspace);
+
+    // Only SELECT is ever paged, so only SELECT overrides this. See #18992.
+    virtual void set_pinned_plan(std::optional<service::pager::query_plan>) {}
+
+    virtual bool has_keyspace() const;
 
     virtual const sstring& keyspace() const;
 
     virtual const sstring& column_family() const;
+
+    virtual audit::audit_info_ptr audit_info() const override {
+        return audit::audit::create_audit_info(category(), keyspace(), column_family());
+    }
 };
 
 }

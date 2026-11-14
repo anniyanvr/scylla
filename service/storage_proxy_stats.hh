@@ -3,20 +3,22 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "gms/inet_address.hh"
 #include "utils/estimated_histogram.hh"
 #include "utils/histogram.hh"
 #include <seastar/core/metrics.hh>
+#include "locator/host_id.hh"
+
+namespace locator { class topology; }
 
 namespace service {
 
 namespace storage_proxy_stats {
-
+using cas_contention_histogram = utils::estimated_histogram_with_max<128>;
 // split statistics counters
 struct split_stats {
     static seastar::metrics::label datacenter_label;
@@ -30,9 +32,9 @@ private:
     stats_counter _local;
     // counters of operations performed on external Nodes aggregated per Nodes' DCs
     std::unordered_map<sstring, stats_counter> _dc_stats;
-    // collectd registrations container
+    // metrics registrations container
     seastar::metrics::metric_groups _metrics;
-    // a prefix string that will be used for a collectd counters' description
+    // a prefix string that will be used for a counters' description
     sstring _short_description_prefix;
     sstring _long_description_prefix;
     // a statistics category, e.g. "client" or "replica"
@@ -42,6 +44,7 @@ private:
     // whether to register per-endpoint metrics automatically
     bool _auto_register_metrics;
 
+    scheduling_group _sg;
 public:
     /**
      * @param category a statistics category, e.g. "client" or "replica"
@@ -51,7 +54,7 @@ public:
     split_stats(const sstring& category, const sstring& short_description_prefix, const sstring& long_description_prefix, const sstring& op_type, bool auto_register_metrics = true);
 
     void register_metrics_local();
-    void register_metrics_for(gms::inet_address ep);
+    void register_metrics_for(sstring dc);
 
     /**
      * Get a reference to the statistics counter corresponding to the given
@@ -61,7 +64,7 @@ public:
      *
      * @return a reference to the requested counter
      */
-    uint64_t& get_ep_stat(gms::inet_address ep) noexcept;
+    uint64_t& get_ep_stat(const locator::topology& topo, locator::host_id ep) noexcept;
 };
 
 struct write_stats {
@@ -75,17 +78,17 @@ struct write_stats {
 
     utils::timed_rate_moving_average write_unavailables;
     utils::timed_rate_moving_average write_timeouts;
+    utils::timed_rate_moving_average write_rate_limited_by_replicas;
+    utils::timed_rate_moving_average write_rate_limited_by_coordinator;
 
-    utils::timed_rate_moving_average_and_histogram write;
-    utils::time_estimated_histogram estimated_write;
+    utils::timed_rate_moving_average_summary_and_histogram write;
 
     utils::timed_rate_moving_average cas_write_unavailables;
     utils::timed_rate_moving_average cas_write_timeouts;
 
-    utils::timed_rate_moving_average_and_histogram cas_write;
-    utils::time_estimated_histogram estimated_cas_write;
+    utils::timed_rate_moving_average_summary_and_histogram cas_write;
 
-    utils::estimated_histogram cas_write_contention;
+    cas_contention_histogram cas_write_contention;
 
     uint64_t writes = 0;
     // A CQL write query arrived to a non-replica node and was
@@ -97,6 +100,7 @@ struct write_stats {
     uint64_t background_writes = 0; // client no longer waits for the write
     uint64_t throttled_writes = 0; // total number of writes ever delayed due to throttling
     uint64_t throttled_base_writes = 0; // current number of base writes delayed due to view update backlog
+    uint64_t total_throttled_base_writes = 0; // total number of base writes delayed due to view update backlog
     uint64_t background_writes_failed = 0;
     uint64_t writes_failed_due_to_too_many_in_flight_hints = 0;
 
@@ -109,33 +113,36 @@ struct write_stats {
     uint64_t cas_coordinator_dropped_prune = 0;
     uint64_t cas_replica_dropped_prune = 0;
 
+    seastar::metrics::metric_groups _metrics;
 
     std::chrono::microseconds last_mv_flow_control_delay; // delay added for MV flow control in the last request
+    uint64_t mv_flow_control_delay = 0; // total delay added for MV flow control (in microseconds)
 public:
     write_stats();
     write_stats(const sstring& category, bool auto_register_stats);
 
     void register_stats();
     void register_split_metrics_local();
-protected:
-    seastar::metrics::metric_groups _metrics;
 };
 
 struct stats : public write_stats {
     seastar::metrics::metric_groups _metrics;
     utils::timed_rate_moving_average read_timeouts;
     utils::timed_rate_moving_average read_unavailables;
+    utils::timed_rate_moving_average read_rate_limited_by_replicas;
+    utils::timed_rate_moving_average read_rate_limited_by_coordinator;
     utils::timed_rate_moving_average range_slice_timeouts;
     utils::timed_rate_moving_average range_slice_unavailables;
 
     utils::timed_rate_moving_average cas_read_timeouts;
     utils::timed_rate_moving_average cas_read_unavailables;
 
-    utils::estimated_histogram cas_read_contention;
+    cas_contention_histogram cas_read_contention;
 
     uint64_t read_repair_attempts = 0;
     uint64_t read_repair_repaired_blocking = 0;
     uint64_t read_repair_repaired_background = 0;
+    uint64_t read_repair_diff_found = 0;
     uint64_t global_read_repairs_canceled_due_to_concurrent_write = 0;
 
     // number of mutations received as a coordinator
@@ -155,14 +162,13 @@ struct stats : public write_stats {
 
     uint64_t replica_cross_shard_ops = 0;
 
-    utils::timed_rate_moving_average_and_histogram read;
-    utils::timed_rate_moving_average_and_histogram range;
-    utils::time_estimated_histogram estimated_read;
-    utils::time_estimated_histogram estimated_range;
+    // number of requests that resulted in a stale_topology_exception
+    uint64_t replica_fenced_out_requests = 0;
 
-    utils::timed_rate_moving_average_and_histogram cas_read;
-    utils::time_estimated_histogram estimated_cas_read;
+    utils::timed_rate_moving_average_summary_and_histogram read;
+    utils::timed_rate_moving_average_summary_and_histogram range;
 
+    utils::timed_rate_moving_average_summary_and_histogram cas_read;
     uint64_t reads = 0;
     uint64_t foreground_reads = 0; // client still waits for the read
     uint64_t read_retries = 0; // read is retried with new limit
@@ -178,16 +184,22 @@ struct stats : public write_stats {
     split_stats data_read_attempts;
     split_stats data_read_completed;
     split_stats data_read_errors;
+    split_stats data_read_cancelled;
 
     // Digest read attempts
     split_stats digest_read_attempts;
     split_stats digest_read_completed;
     split_stats digest_read_errors;
+    split_stats digest_read_cancelled;
 
     // Mutation data read attempts
     split_stats mutation_data_read_attempts;
     split_stats mutation_data_read_completed;
     split_stats mutation_data_read_errors;
+
+    // Received hints
+    uint64_t received_hints_total = 0;
+    uint64_t received_hints_bytes_total = 0;
 
 public:
     stats();

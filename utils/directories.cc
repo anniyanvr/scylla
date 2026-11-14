@@ -3,27 +3,30 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <fmt/std.h>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
+#include <seastar/util/closeable.hh>
 #include "init.hh"
 #include "supervisor.hh"
 #include "directories.hh"
+#include "sstables/open_info.hh"
 #include "utils/disk-error-handler.hh"
-#include "utils/fmt-compat.hh"
-#include "db/config.hh"
-#include "lister.hh"
+#include "utils/lister.hh"
 
 namespace utils {
 
 static future<> disk_sanity(fs::path path, bool developer_mode) {
-    return check_direct_io_support(path.native()).then([] {
-        return make_ready_future<>();
-    }).handle_exception([path](auto ep) {
-        startlog.error("Could not access {}: {}", path, ep);
-        return make_exception_future<>(ep);
-    });
+    try {
+        co_await check_direct_io_support(path.native());
+    } catch (...) {
+        startlog.error("Coould not access {}: {:t}", path, std::current_exception());
+        throw;
+    }
 };
 
 static future<file_lock> touch_and_lock(fs::path path) {
@@ -44,7 +47,7 @@ static future<file_lock> touch_and_lock(fs::path path) {
                 }
             });
         } catch (...) {
-            startlog.error("Directory '{}' cannot be initialized. Tried to do it but failed with: {}", path, std::current_exception());
+            startlog.error("Directory '{}' cannot be initialized. Tried to do it but failed with: {:t}", path, std::current_exception());
             throw;
         }
     });
@@ -67,7 +70,7 @@ void directories::set::add(std::vector<sstring> paths) {
 void directories::set::add_sharded(sstring p) {
     fs::path path(p);
 
-    for (unsigned i = 0; i < smp::count; i++) {
+    for (unsigned i = 0; i < this_smp_shard_count(); i++) {
         add(path / seastar::to_sstring(i).c_str());
     }
 }
@@ -76,71 +79,111 @@ directories::directories(bool developer_mode)
         : _developer_mode(developer_mode)
 { }
 
-future<> directories::create_and_verify(directories::set dir_set) {
-    return do_with(std::vector<file_lock>(), [this, dir_set = std::move(dir_set)] (std::vector<file_lock>& locks) {
-        return parallel_for_each(dir_set.get_paths(), [this, &locks] (fs::path path) {
-            return touch_and_lock(path).then([path = std::move(path), developer_mode = _developer_mode, &locks] (file_lock lock) {
-                locks.emplace_back(std::move(lock));
-                return disk_sanity(path, developer_mode).then([path = std::move(path)] {
-                    return directories::verify_owner_and_mode(path).handle_exception([](auto ep) {
-                        startlog.error("Failed owner and mode verification: {}", ep);
-                        return make_exception_future<>(ep);
-                    });
-                });
-            });
-        }).then([this, &locks] {
-            std::move(locks.begin(), locks.end(), std::back_inserter(_locks));
-        });
+future<> directories::create_and_verify(directories::set dir_set, recursive recursive) {
+    std::vector<file_lock> locks;
+    locks.reserve(dir_set.get_paths().size());
+    co_await coroutine::parallel_for_each(dir_set.get_paths(), [this, &locks, recursive] (fs::path path) -> future<> {
+        file_lock lock = co_await touch_and_lock(path);
+        locks.emplace_back(std::move(lock));
+        co_await disk_sanity(path, _developer_mode);
+        try {
+            co_await directories::verify_owner_and_mode(path, recursive);
+        } catch (...) {
+            startlog.error("Failed owner and mode verification: {:t}", std::current_exception());
+            throw;
+        }
     });
+    std::move(locks.begin(), locks.end(), std::back_inserter(_locks));
 }
 
 template <typename... Args>
+[[noreturn]]
 static inline
-future<> verification_error(fs::path path, const char* fstr, Args&&... args) {
+void verification_error(const fs::path& path, const char* fstr, Args&&... args) {
     auto emsg = fmt::format(fmt::runtime(fstr), std::forward<Args>(args)...);
     startlog.error("{}: {}", path.string(), emsg);
-    return make_exception_future<>(std::runtime_error(emsg));
+    throw std::runtime_error(emsg);
 }
 
 // Verify that all files and directories are owned by current uid
 // and that files can be read and directories can be read, written, and looked up (execute)
 // No other file types may exist.
-future<> directories::verify_owner_and_mode(fs::path path) {
-    return file_stat(path.string(), follow_symlink::no).then([path = std::move(path)] (stat_data sd) {
-        // Under docker, we run with euid 0 and there is no reasonable way to enforce that the
-        // in-container uid will have the same uid as files mounted from outside the container. So
-        // just allow euid 0 as a special case. It should survive the file_accessible() checks below.
-        // See #4823.
-        if (geteuid() != 0 && sd.uid != geteuid()) {
-            return verification_error(std::move(path), "File not owned by current euid: {}. Owner is: {}", geteuid(), sd.uid);
+// If a 'do_verify_subpath' function is provided, only the subpaths
+// that return true when called with that function will be verified.
+future<> directories::do_verify_owner_and_mode(fs::path path, recursive recurse, int level, lister::filter_type do_verify_subpath) {
+    seastar::stat_data sd;
+    try {
+        sd = co_await file_stat(path.string(), follow_symlink::no);
+    } catch (const std::exception& e) {
+        startlog.warn("Could not stat {}: '{}'. Skipping the file", path, e.what());
+        co_return;
+    }
+
+    // Under docker, we run with euid 0 and there is no reasonable way to enforce that the
+    // in-container uid will have the same uid as files mounted from outside the container. So
+    // just allow euid 0 as a special case. It should survive the file_accessible() checks below.
+    // See #4823.
+    if (geteuid() != 0 && sd.uid != geteuid()) {
+        verification_error(path, "File not owned by current euid: {}. Owner is: {}", geteuid(), sd.uid);
+    }
+    switch (sd.type) {
+    case directory_entry_type::regular: {
+        bool can_access = co_await file_accessible(path.string(), access_flags::read);
+        if (!can_access) {
+            verification_error(path, "File cannot be accessed for read");
         }
-        switch (sd.type) {
-        case directory_entry_type::regular: {
-            auto f = file_accessible(path.string(), access_flags::read);
-            return f.then([path = std::move(path)] (bool can_access) {
-                if (!can_access) {
-                    return verification_error(std::move(path), "File cannot be accessed for read");
-                }
-                return make_ready_future<>();
-            });
-            break;
+        break;
+    }
+    case directory_entry_type::directory: {
+        bool can_access = co_await file_accessible(path.string(), access_flags::read | access_flags::write | access_flags::execute);
+        if (!can_access) {
+            verification_error(path, "Directory cannot be accessed for read, write, and execute");
         }
-        case directory_entry_type::directory: {
-            auto f = file_accessible(path.string(), access_flags::read | access_flags::write | access_flags::execute);
-            return f.then([path = std::move(path)] (bool can_access) {
-                if (!can_access) {
-                    return verification_error(std::move(path), "Directory cannot be accessed for read, write, and execute");
-                }
-                return lister::scan_dir(path, {}, [] (fs::path dir, directory_entry de) {
-                    return verify_owner_and_mode(dir / de.name);
-                });
-            });
-            break;
+        if (level && !recurse) {
+            co_return;
         }
-        default:
-            return verification_error(std::move(path), "Must be either a regular file or a directory (type={})", static_cast<int>(sd.type));
-        }
-    });
+        auto lister = directory_lister(path, lister::dir_entry_types::full(), do_verify_subpath, lister::show_hidden::no);
+        co_await with_closeable(std::move(lister), coroutine::lambda([&] (auto& lister) -> future<> {
+            while (auto de = co_await lister.get()) {
+                co_await do_verify_owner_and_mode(path / de->name, recurse, level + 1, do_verify_subpath);
+            }
+        }));
+        break;
+    }
+    default:
+        verification_error(path, "Must be either a regular file or a directory (type={})", static_cast<int>(sd.type));
+    }
 };
+
+future<> directories::verify_owner_and_mode(fs::path path, recursive recursive) {
+    return do_verify_owner_and_mode(std::move(path), recursive, 0);
+}
+
+// Verify the data directory contents in a specific order so as to prevent
+// memory fragmentation in the inode/dentry cache. All the data and index files,
+// which will be held open for a longer duration are verified first and the
+// other files that will be closed immediately are verified later to ensure
+// their separation in the dentry/inode cache.
+future<> directories::verify_owner_and_mode_of_data_dir(directories::set dir_set) {
+    // verify data and index files in the first iteration and the other files in the second iteration.
+    for (auto verify_data_and_index_files : { true, false }) {
+        co_await coroutine::parallel_for_each(dir_set.get_paths(), [verify_data_and_index_files] (const auto &path) {
+            return do_verify_owner_and_mode(std::move(path), recursive::yes, 0, [verify_data_and_index_files] (const fs::path& dir, const directory_entry& de) {
+                auto path = dir / de.name;
+                component_type path_component_type;
+                // use parse_path to deduce the component type as using system calls
+                // like stat/lstat will load the inode/dentry into the cache.
+                auto result = sstables::parse_path(path);
+                if (!result) {
+                    // path is not a SSTable component - do not filter it out
+                    return true;
+                }
+                path_component_type = std::get<0>(*result).component;
+                auto data_or_index_file = (path_component_type == component_type::Data || path_component_type == component_type::Index);
+                return verify_data_and_index_files ? data_or_index_file : !data_or_index_file;
+            });
+        });
+    }
+}
 
 } // namespace utils

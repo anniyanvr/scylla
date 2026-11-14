@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -18,6 +18,8 @@
 
 #include "expressions_types.hh"
 #include "utils/rjson.hh"
+#include "utils/updateable_value.hh"
+#include "stats.hh"
 
 namespace alternator {
 
@@ -26,9 +28,29 @@ public:
     using runtime_error::runtime_error;
 };
 
-parsed::update_expression parse_update_expression(std::string query);
-std::vector<parsed::path> parse_projection_expression(std::string query);
-parsed::condition_expression parse_condition_expression(std::string query);
+namespace parsed {
+class expression_cache_impl;
+class expression_cache {
+    std::unique_ptr<expression_cache_impl> _impl;
+public:
+    struct config {
+        utils::updateable_value<uint32_t> max_cache_entries;
+    };
+    expression_cache(config cfg, stats& stats);
+    ~expression_cache();
+    // stop background tasks, if any
+    future<> stop();
+
+    update_expression parse_update_expression(std::string_view query);
+    std::vector<path> parse_projection_expression(std::string_view query);
+    condition_expression parse_condition_expression(std::string_view query, const char* caller);
+};
+} // namespace parsed
+
+// Preferably use parsed::expression_cache instance instead of this free functions.
+parsed::update_expression parse_update_expression(std::string_view query);
+std::vector<parsed::path> parse_projection_expression(std::string_view query);
+parsed::condition_expression parse_condition_expression(std::string_view query, const char* caller);
 
 void resolve_update_expression(parsed::update_expression& ue,
         const rjson::value* expression_attribute_names,
@@ -43,6 +65,7 @@ void resolve_condition_expression(parsed::condition_expression& ce,
         const rjson::value* expression_attribute_values,
         std::unordered_set<std::string>& used_attribute_names,
         std::unordered_set<std::string>& used_attribute_values);
+void validate_filter_expression(const parsed::condition_expression& ce);
 
 void validate_value(const rjson::value& v, const char* caller);
 
@@ -60,23 +83,29 @@ enum class calculate_value_caller {
     UpdateExpression, ConditionExpression, ConditionExpressionAlone
 };
 
-inline std::ostream& operator<<(std::ostream& out, calculate_value_caller caller) {
-    switch (caller) {
-        case calculate_value_caller::UpdateExpression:
-            out << "UpdateExpression";
-            break;
-        case calculate_value_caller::ConditionExpression:
-            out << "ConditionExpression";
-            break;
-        case calculate_value_caller::ConditionExpressionAlone:
-            out << "ConditionExpression";
-            break;
-        default:
-            out << "unknown type of expression";
-            break;
-    }
-    return out;
 }
+
+template <> struct fmt::formatter<alternator::calculate_value_caller> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(alternator::calculate_value_caller caller, fmt::format_context& ctx) const {
+        std::string_view name = "unknown type of expression";
+        switch (caller) {
+            using enum alternator::calculate_value_caller;
+            case UpdateExpression:
+                name = "UpdateExpression";
+                break;
+            case ConditionExpression:
+                name = "ConditionExpression";
+                break;
+            case ConditionExpressionAlone:
+                name = "ConditionExpression";
+                break;
+        }
+        return fmt::format_to(ctx.out(), "{}", name);
+    }
+};
+
+namespace alternator {
 
 rjson::value calculate_value(const parsed::value& v,
         calculate_value_caller caller,
@@ -84,6 +113,8 @@ rjson::value calculate_value(const parsed::value& v,
 
 rjson::value calculate_value(const parsed::set_rhs& rhs,
         const rjson::value* previous_item);
+
+void validate_attr_name_length(std::string_view supplementary_context, size_t attr_name_length, bool is_key, std::string_view error_msg_prefix = {});
 
 
 } /* namespace alternator */

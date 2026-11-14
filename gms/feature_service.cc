@@ -1,151 +1,103 @@
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  *
  * Copyright (C) 2020-present ScyllaDB
  */
 
-#include <any>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/smp.hh>
-#include "log.hh"
-#include "db/config.hh"
+#include "db/schema_features.hh"
+#include "utils/log.hh"
 #include "gms/feature.hh"
 #include "gms/feature_service.hh"
+#include "db/cluster_config_registry.hh"
 #include "db/system_keyspace.hh"
-#include "db/query_context.hh"
-#include "to_string.hh"
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include "gms/gossiper.hh"
+#include "gms/i_endpoint_state_change_subscriber.hh"
+#include "utils/assert.hh"
+#include "utils/error_injection.hh"
+#include "service/storage_service.hh"
 
 namespace gms {
 
-// Deprecated features - sent to other nodes via gossip, but assumed true in the code
-constexpr std::string_view features::RANGE_TOMBSTONES = "RANGE_TOMBSTONES";
-constexpr std::string_view features::LARGE_PARTITIONS = "LARGE_PARTITIONS";
-constexpr std::string_view features::MATERIALIZED_VIEWS = "MATERIALIZED_VIEWS";
-constexpr std::string_view features::COUNTERS = "COUNTERS";
-constexpr std::string_view features::INDEXES = "INDEXES";
-constexpr std::string_view features::DIGEST_MULTIPARTITION_READ = "DIGEST_MULTIPARTITION_READ";
-constexpr std::string_view features::CORRECT_COUNTER_ORDER = "CORRECT_COUNTER_ORDER";
-constexpr std::string_view features::SCHEMA_TABLES_V3 = "SCHEMA_TABLES_V3";
-constexpr std::string_view features::CORRECT_NON_COMPOUND_RANGE_TOMBSTONES = "CORRECT_NON_COMPOUND_RANGE_TOMBSTONES";
-constexpr std::string_view features::WRITE_FAILURE_REPLY = "WRITE_FAILURE_REPLY";
-constexpr std::string_view features::XXHASH = "XXHASH";
-constexpr std::string_view features::ROLES = "ROLES";
-constexpr std::string_view features::LA_SSTABLE = "LA_SSTABLE_FORMAT";
-constexpr std::string_view features::STREAM_WITH_RPC_STREAM = "STREAM_WITH_RPC_STREAM";
-constexpr std::string_view features::ROW_LEVEL_REPAIR = "ROW_LEVEL_REPAIR";
-constexpr std::string_view features::TRUNCATION_TABLE = "TRUNCATION_TABLE";
-constexpr std::string_view features::CORRECT_STATIC_COMPACT_IN_MC = "CORRECT_STATIC_COMPACT_IN_MC";
-constexpr std::string_view features::UNBOUNDED_RANGE_TOMBSTONES = "UNBOUNDED_RANGE_TOMBSTONES";
-constexpr std::string_view features::MC_SSTABLE = "MC_SSTABLE_FORMAT";
-
-// Up-to-date features
-constexpr std::string_view features::UDF = "UDF";
-constexpr std::string_view features::MD_SSTABLE = "MD_SSTABLE_FORMAT";
-constexpr std::string_view features::VIEW_VIRTUAL_COLUMNS = "VIEW_VIRTUAL_COLUMNS";
-constexpr std::string_view features::DIGEST_INSENSITIVE_TO_EXPIRY = "DIGEST_INSENSITIVE_TO_EXPIRY";
-constexpr std::string_view features::COMPUTED_COLUMNS = "COMPUTED_COLUMNS";
-constexpr std::string_view features::CDC = "CDC";
-constexpr std::string_view features::NONFROZEN_UDTS = "NONFROZEN_UDTS";
-constexpr std::string_view features::HINTED_HANDOFF_SEPARATE_CONNECTION = "HINTED_HANDOFF_SEPARATE_CONNECTION";
-constexpr std::string_view features::LWT = "LWT";
-constexpr std::string_view features::PER_TABLE_PARTITIONERS = "PER_TABLE_PARTITIONERS";
-constexpr std::string_view features::PER_TABLE_CACHING = "PER_TABLE_CACHING";
-constexpr std::string_view features::DIGEST_FOR_NULL_VALUES = "DIGEST_FOR_NULL_VALUES";
-constexpr std::string_view features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX = "CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX";
-constexpr std::string_view features::ALTERNATOR_STREAMS = "ALTERNATOR_STREAMS";
-constexpr std::string_view features::ALTERNATOR_TTL = "ALTERNATOR_TTL";
-constexpr std::string_view features::RANGE_SCAN_DATA_VARIANT = "RANGE_SCAN_DATA_VARIANT";
-constexpr std::string_view features::CDC_GENERATIONS_V2 = "CDC_GENERATIONS_V2";
-constexpr std::string_view features::UDA = "UDA";
-constexpr std::string_view features::SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT = "SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT";
-constexpr std::string_view features::SUPPORTS_RAFT_CLUSTER_MANAGEMENT = "SUPPORTS_RAFT_CLUSTER_MANAGEMENT";
-constexpr std::string_view features::USES_RAFT_CLUSTER_MANAGEMENT = "USES_RAFT_CLUSTER_MANAGEMENT";
-constexpr std::string_view features::TOMBSTONE_GC_OPTIONS = "TOMBSTONE_GC_OPTIONS";
-
 static logging::logger logger("features");
 
-feature_config::feature_config() {
+static const char* enable_test_feature_error_injection_name = "features_enable_test_feature";
+static const char* enable_test_feature_as_deprecated_error_injection_name = "features_enable_test_feature_as_deprecated";
+
+static bool is_test_only_feature_deprecated() {
+    return utils::get_local_injector().enter(enable_test_feature_as_deprecated_error_injection_name);
 }
 
-feature_service::feature_service(feature_config cfg) : _config(cfg)
-        , _udf_feature(*this, features::UDF)
-        , _md_sstable_feature(*this, features::MD_SSTABLE)
-        , _view_virtual_columns(*this, features::VIEW_VIRTUAL_COLUMNS)
-        , _digest_insensitive_to_expiry(*this, features::DIGEST_INSENSITIVE_TO_EXPIRY)
-        , _computed_columns(*this, features::COMPUTED_COLUMNS)
-        , _cdc_feature(*this, features::CDC)
-        , _nonfrozen_udts(*this, features::NONFROZEN_UDTS)
-        , _hinted_handoff_separate_connection(*this, features::HINTED_HANDOFF_SEPARATE_CONNECTION)
-        , _lwt_feature(*this, features::LWT)
-        , _per_table_partitioners_feature(*this, features::PER_TABLE_PARTITIONERS)
-        , _per_table_caching_feature(*this, features::PER_TABLE_CACHING)
-        , _digest_for_null_values_feature(*this, features::DIGEST_FOR_NULL_VALUES)
-        , _correct_idx_token_in_secondary_index_feature(*this, features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX)
-        , _alternator_streams_feature(*this, features::ALTERNATOR_STREAMS)
-        , _alternator_ttl_feature(*this, features::ALTERNATOR_TTL)
-        , _range_scan_data_variant(*this, features::RANGE_SCAN_DATA_VARIANT)
-        , _cdc_generations_v2(*this, features::CDC_GENERATIONS_V2)
-        , _uda(*this, features::UDA)
-        , _separate_page_size_and_safety_limit(*this, features::SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT)
-        , _supports_raft_cluster_mgmt(*this, features::SUPPORTS_RAFT_CLUSTER_MANAGEMENT)
-        , _uses_raft_cluster_mgmt(*this, features::USES_RAFT_CLUSTER_MANAGEMENT)
-        , _tombstone_gc_options(*this, features::TOMBSTONE_GC_OPTIONS)
-        , _raft_support_listener(_supports_raft_cluster_mgmt.when_enabled([this] {
-            // When the cluster fully supports raft-based cluster management,
-            // we can re-enable support for the second gossip feature to trigger
-            // actual use of raft-based cluster management procedures.
-            support(features::USES_RAFT_CLUSTER_MANAGEMENT);
-        }))
-{}
+bool is_test_only_feature_enabled() {
+    return utils::get_local_injector().enter(enable_test_feature_error_injection_name)
+            || is_test_only_feature_deprecated();
+}
 
-feature_config feature_config_from_db_config(db::config& cfg, std::set<sstring> disabled) {
-    feature_config fcfg;
+feature_service::feature_service(feature_config cfg) : _config(cfg) {
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+    initialize_suppressed_features_set();
+#endif
 
-    fcfg._disabled_features = std::move(disabled);
-
-    if (!cfg.enable_sstables_md_format()) {
-        fcfg._disabled_features.insert(sstring(gms::features::MD_SSTABLE));
-    }
-    if (!cfg.enable_user_defined_functions()) {
-        fcfg._disabled_features.insert(sstring(gms::features::UDF));
-    } else {
-        if (!cfg.check_experimental(db::experimental_features_t::UDF)) {
-            throw std::runtime_error(
-                    "You must use both enable_user_defined_functions and experimental_features:udf "
-                    "to enable user-defined functions");
-        }
+    if (is_test_only_feature_deprecated()) {
+        // Assume it's enabled
+        test_only_feature.enable();
+        unregister_feature(test_only_feature);
     }
 
-    if (!cfg.check_experimental(db::experimental_features_t::ALTERNATOR_STREAMS)) {
-        fcfg._disabled_features.insert(sstring(gms::features::ALTERNATOR_STREAMS));
+    for (const auto& opt : db::cluster_config_registry::options()) {
+        add_cluster_config_option_feature(opt.name);
     }
-    if (!cfg.check_experimental(db::experimental_features_t::ALTERNATOR_TTL)) {
-        fcfg._disabled_features.insert(sstring(gms::features::ALTERNATOR_TTL));
+    // A retired name must not be reused by a live option or a declared feature, or the
+    // feature would stand for two different things.
+    for (const std::string_view name : db::cluster_config_registry::retired_feature_names()) {
+        SCYLLA_ASSERT(!_registered_features.contains(sstring(name)));
     }
-    if (!cfg.check_experimental(db::experimental_features_t::RAFT)) {
-        fcfg._disabled_features.insert(sstring(gms::features::SUPPORTS_RAFT_CLUSTER_MANAGEMENT));
-        fcfg._disabled_features.insert(sstring(gms::features::USES_RAFT_CLUSTER_MANAGEMENT));
-    } else {
-        // Disable support for using raft cluster management so that it cannot
-        // be enabled by accident.
-        // This prevents the `USES_RAFT_CLUSTER_MANAGEMENT` feature from being
-        // advertised via gossip ahead of time.
-        fcfg._masked_features.insert(sstring(gms::features::USES_RAFT_CLUSTER_MANAGEMENT));
-    }
+}
 
-    return fcfg;
+feature& feature_service::add_cluster_config_option_feature(std::string_view option_name) {
+    if (const auto it = _cluster_config_option_features.find(option_name); it != _cluster_config_option_features.end()) {
+        return it->second.get();
+    }
+    const auto name = db::cluster_config_registry::feature_name(option_name);
+    // A clash with a declared feature would alias two unrelated things.
+    SCYLLA_ASSERT(!_registered_features.contains(name));
+    auto& f = add_feature(name);
+    _cluster_config_option_features.emplace(option_name, f);
+    return f;
+}
+
+const feature* feature_service::cluster_config_option_feature(std::string_view option_name) const {
+    const auto it = _cluster_config_option_features.find(option_name);
+    return it == _cluster_config_option_features.end() ? nullptr : &it->second.get();
+}
+
+feature& feature_service::add_feature(const sstring& name) {
+    if (const auto it = _registered_features.find(name); it != _registered_features.end()) {
+        return it->second.get();
+    }
+    const auto [it, inserted] = _dynamic_features.try_emplace(name, *this, std::string_view(name));
+    return it->second;
 }
 
 future<> feature_service::stop() {
     return make_ready_future<>();
 }
 
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+void feature_service::initialize_suppressed_features_set() {
+    if (const auto features_list = utils::get_local_injector().inject_parameter<std::string_view>("suppress_features"); features_list) {
+        boost::split(_suppressed_features, *features_list, boost::is_any_of(";"));
+    }
+}
+#endif
+
 void feature_service::register_feature(feature& f) {
     auto i = _registered_features.emplace(f.name(), f);
-    assert(i.second);
+    SCYLLA_ASSERT(i.second);
 }
 
 void feature_service::unregister_feature(feature& f) {
@@ -153,89 +105,78 @@ void feature_service::unregister_feature(feature& f) {
 }
 
 
-void feature_service::enable(const sstring& name) {
-    if (auto it = _registered_features.find(name); it != _registered_features.end()) {
-        auto&& f = it->second;
-        auto& f_ref = f.get();
-        if (db::qctx && !f_ref) {
-            persist_enabled_feature_info(f_ref);
-        }
-        f_ref.enable();
-    }
-}
-
-void feature_service::support(const std::string_view& name) {
-    _config._masked_features.erase(sstring(name));
-}
-
-std::set<std::string_view> feature_service::known_feature_set() {
-    // Add features known by this local node. When a new feature is
-    // introduced in scylla, update it here, e.g.,
-    // return sstring("FEATURE1,FEATURE2")
+std::set<std::string_view> feature_service::supported_feature_set() const {
     std::set<std::string_view> features = {
         // Deprecated features - sent to other nodes via gossip, but assumed true in the code
-        gms::features::RANGE_TOMBSTONES,
-        gms::features::LARGE_PARTITIONS,
-        gms::features::COUNTERS,
-        gms::features::DIGEST_MULTIPARTITION_READ,
-        gms::features::CORRECT_COUNTER_ORDER,
-        gms::features::SCHEMA_TABLES_V3,
-        gms::features::CORRECT_NON_COMPOUND_RANGE_TOMBSTONES,
-        gms::features::WRITE_FAILURE_REPLY,
-        gms::features::XXHASH,
-        gms::features::ROLES,
-        gms::features::LA_SSTABLE,
-        gms::features::STREAM_WITH_RPC_STREAM,
-        gms::features::MATERIALIZED_VIEWS,
-        gms::features::INDEXES,
-        gms::features::ROW_LEVEL_REPAIR,
-        gms::features::TRUNCATION_TABLE,
-        gms::features::CORRECT_STATIC_COMPACT_IN_MC,
-        gms::features::UNBOUNDED_RANGE_TOMBSTONES,
-        gms::features::MC_SSTABLE,
-
-        // Up-to-date features
-        gms::features::VIEW_VIRTUAL_COLUMNS,
-        gms::features::DIGEST_INSENSITIVE_TO_EXPIRY,
-        gms::features::COMPUTED_COLUMNS,
-        gms::features::NONFROZEN_UDTS,
-        gms::features::HINTED_HANDOFF_SEPARATE_CONNECTION,
-        gms::features::PER_TABLE_PARTITIONERS,
-        gms::features::PER_TABLE_CACHING,
-        gms::features::LWT,
-        gms::features::MD_SSTABLE,
-        gms::features::UDF,
-        gms::features::CDC,
-        gms::features::DIGEST_FOR_NULL_VALUES,
-        gms::features::CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX,
-        gms::features::ALTERNATOR_STREAMS,
-        gms::features::ALTERNATOR_TTL,
-        gms::features::RANGE_SCAN_DATA_VARIANT,
-        gms::features::CDC_GENERATIONS_V2,
-        gms::features::UDA,
-        gms::features::SEPARATE_PAGE_SIZE_AND_SAFETY_LIMIT,
-        gms::features::SUPPORTS_RAFT_CLUSTER_MANAGEMENT,
-        gms::features::USES_RAFT_CLUSTER_MANAGEMENT,
-        gms::features::TOMBSTONE_GC_OPTIONS,
+        "RANGE_TOMBSTONES"sv,
+        "LARGE_PARTITIONS"sv,
+        "COUNTERS"sv,
+        "DIGEST_MULTIPARTITION_READ"sv,
+        "CORRECT_COUNTER_ORDER"sv,
+        "SCHEMA_TABLES_V3"sv,
+        "CORRECT_NON_COMPOUND_RANGE_TOMBSTONES"sv,
+        "WRITE_FAILURE_REPLY"sv,
+        "XXHASH"sv,
+        "ROLES"sv,
+        "LA_SSTABLE_FORMAT"sv,
+        "STREAM_WITH_RPC_STREAM"sv,
+        "MATERIALIZED_VIEWS"sv,
+        "INDEXES"sv,
+        "ROW_LEVEL_REPAIR"sv,
+        "TRUNCATION_TABLE"sv,
+        "CORRECT_STATIC_COMPACT_IN_MC"sv,
+        "UNBOUNDED_RANGE_TOMBSTONES"sv,
+        "MC_SSTABLE_FORMAT"sv,
+        "COMPUTED_COLUMNS"sv,
+        "SCHEMA_COMMITLOG"sv,
+        "MD_SSTABLE_FORMAT"sv,
+        "ME_SSTABLE_FORMAT"sv,
+        "VIEW_VIRTUAL_COLUMNS"sv,
+        "DIGEST_INSENSITIVE_TO_EXPIRY"sv,
+        "CDC"sv,
+        "NONFROZEN_UDTS"sv,
+        "HINTED_HANDOFF_SEPARATE_CONNECTION"sv,
+        "LWT"sv,
+        "PER_TABLE_PARTITIONERS"sv,
+        "PER_TABLE_CACHING"sv,
+        "DIGEST_FOR_NULL_VALUES"sv,
+        "CORRECT_IDX_TOKEN_IN_SECONDARY_INDEX"sv,
+        "UUID_SSTABLE_IDENTIFIERS"sv,
+        "GROUP0_SCHEMA_VERSIONING"sv,
+        "VIEW_BUILD_STATUS_ON_GROUP0"sv,
+        "CDC_GENERATIONS_V2"sv,
+        "HOST_ID_BASED_HINTED_HANDOFF"sv,
     };
 
-    for (const sstring& s : _config._disabled_features) {
+    // Deprecated in the same sense: the features of cluster config options that were
+    // removed, still advertised so that a cluster which enabled them stays joinable.
+    for (const std::string_view name : db::cluster_config_registry::retired_feature_names()) {
+        features.insert(name);
+    }
+
+    if (is_test_only_feature_deprecated()) {
+        features.insert(test_only_feature.name());
+    }
+
+    for (auto& [name, f_ref] : _registered_features) {
+        features.insert(name);
+    }
+
+    for (const sstring& s : _config.disabled_features) {
         features.erase(s);
     }
+
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+    for (auto& sf: _suppressed_features) {
+        features.erase(sf);
+    }
+#endif
+
     return features;
 }
 
 const std::unordered_map<sstring, std::reference_wrapper<feature>>& feature_service::registered_features() const {
     return _registered_features;
-}
-
-std::set<std::string_view> feature_service::supported_feature_set() {
-    auto features = known_feature_set();
-
-    for (const sstring& s : _config._masked_features) {
-        features.erase(s);
-    }
-    return features;
 }
 
 feature::feature(feature_service& service, std::string_view name, bool enabled)
@@ -273,11 +214,17 @@ void feature::enable() {
 
 db::schema_features feature_service::cluster_schema_features() const {
     db::schema_features f;
-    f.set_if<db::schema_feature::VIEW_VIRTUAL_COLUMNS>(bool(_view_virtual_columns));
-    f.set_if<db::schema_feature::DIGEST_INSENSITIVE_TO_EXPIRY>(bool(_digest_insensitive_to_expiry));
-    f.set_if<db::schema_feature::COMPUTED_COLUMNS>(bool(_computed_columns));
-    f.set_if<db::schema_feature::CDC_OPTIONS>(bool(_cdc_feature));
-    f.set_if<db::schema_feature::PER_TABLE_PARTITIONERS>(bool(_per_table_partitioners_feature));
+    f.set<db::schema_feature::DIGEST_INSENSITIVE_TO_EXPIRY>();
+    f.set<db::schema_feature::COMPUTED_COLUMNS>();
+    f.set_if<db::schema_feature::SCYLLA_KEYSPACES>(keyspace_storage_options);
+    f.set_if<db::schema_feature::SCYLLA_KEYSPACES>(tablets);
+    f.set_if<db::schema_feature::SCYLLA_AGGREGATES>(aggregate_storage_options);
+    f.set_if<db::schema_feature::TABLE_DIGEST_INSENSITIVE_TO_EXPIRY>(table_digest_insensitive_to_expiry);
+    f.set<db::schema_feature::GROUP0_SCHEMA_VERSIONING>();
+    f.set<db::schema_feature::IN_MEMORY_TABLES>();
+    f.set_if<db::schema_feature::TABLET_OPTIONS>(bool(tablet_options));
+    f.set_if<db::schema_feature::KEYSPACE_MULTI_RF_CHANGE>(bool(keyspace_multi_rf_change));
+    f.set_if<db::schema_feature::CLUSTER_CONFIG_TABLES>(bool(cluster_config));
     return f;
 }
 
@@ -288,53 +235,94 @@ std::set<sstring> feature_service::to_feature_set(sstring features_string) {
     return features;
 }
 
-void feature_service::persist_enabled_feature_info(const gms::feature& f) const {
-    // Executed in seastar::async context, because `gms::feature::enable`
-    // is only allowed to run within a thread context
-
-    std::optional<sstring> raw_old_value = db::system_keyspace::get_scylla_local_param(ENABLED_FEATURES_KEY).get0();
-    if (!raw_old_value) {
-        db::system_keyspace::set_scylla_local_param(ENABLED_FEATURES_KEY, f.name()).get0();
-        return;
-    }
-    auto feats_set = to_feature_set(*raw_old_value);
-    feats_set.emplace(f.name());
-    db::system_keyspace::set_scylla_local_param(ENABLED_FEATURES_KEY, ::join(",", feats_set)).get0();
+future<> feature_service::on_system_tables_loaded(db::system_keyspace& sys_ks) {
+    return enable_features_on_startup(sys_ks);
 }
 
-void feature_service::enable(const std::set<std::string_view>& list) {
-    for (gms::feature& f : {
-        std::ref(_udf_feature),
-        std::ref(_md_sstable_feature),
-        std::ref(_view_virtual_columns),
-        std::ref(_digest_insensitive_to_expiry),
-        std::ref(_computed_columns),
-        std::ref(_cdc_feature),
-        std::ref(_nonfrozen_udts),
-        std::ref(_hinted_handoff_separate_connection),
-        std::ref(_lwt_feature),
-        std::ref(_per_table_partitioners_feature),
-        std::ref(_per_table_caching_feature),
-        std::ref(_digest_for_null_values_feature),
-        std::ref(_correct_idx_token_in_secondary_index_feature),
-        std::ref(_alternator_streams_feature),
-        std::ref(_alternator_ttl_feature),
-        std::ref(_range_scan_data_variant),
-        std::ref(_cdc_generations_v2),
-        std::ref(_uda),
-        std::ref(_separate_page_size_and_safety_limit),
-        std::ref(_supports_raft_cluster_mgmt),
-        std::ref(_uses_raft_cluster_mgmt),
-        std::ref(_tombstone_gc_options),
-    })
-    {
-        if (list.contains(f.name())) {
-            if (db::qctx && !f) {
-                persist_enabled_feature_info(f);
-            }
-            f.enable();
+future<> feature_service::enable_features_on_startup(db::system_keyspace& sys_ks) {
+    std::set<sstring> features_to_enable;
+    std::set<sstring> persisted_features;
+    std::set<sstring> persisted_unsafe_to_disable_features;
+
+    auto topo_features = co_await sys_ks.load_topology_features_state();
+    if (topo_features) {
+        persisted_unsafe_to_disable_features = topo_features->calculate_not_yet_enabled_features();
+        persisted_features = std::move(topo_features->enabled_features);
+    } else {
+        persisted_features = co_await sys_ks.load_local_enabled_features();
+    }
+
+    check_features(persisted_features, persisted_unsafe_to_disable_features);
+
+    for (auto&& f : persisted_features) {
+        logger.debug("Enabling persisted feature '{}'", f);
+        if (_registered_features.contains(sstring(f))) {
+            features_to_enable.insert(std::move(f));
         }
     }
+
+    co_await container().invoke_on_all([&features_to_enable] (auto& srv) -> future<> {
+        auto feat = features_to_enable | std::ranges::to<std::set<std::string_view>>();
+        co_await srv.enable(std::move(feat));
+    });
+}
+
+void feature_service::check_features(const std::set<sstring>& enabled_features,
+            const std::set<sstring>& unsafe_to_disable_features) {
+
+    if (enabled_features.empty() && unsafe_to_disable_features.empty()) {
+        return;
+    }
+
+    const auto known_features = supported_feature_set();
+    for (auto&& f : enabled_features) {
+        const bool is_registered_feat = _registered_features.contains(sstring(f));
+        if (!known_features.contains(f)) {
+            if (is_registered_feat) {
+                throw unsupported_feature_exception(format(
+                    "Feature '{}' was previously enabled in the cluster but its support is disabled by this node. "
+                    "Set the corresponding configuration option to enable the support for the feature.", f));
+            } else {
+                throw unsupported_feature_exception(format("Unknown feature '{}' was previously enabled in the cluster. "
+                    " That means this node is performing a prohibited downgrade procedure"
+                    " and should not be allowed to boot.", f));
+            }
+        }
+        // If a feature is not in `registered_features` but still in `known_features` list
+        // that means the feature name is used for backward compatibility and should be implicitly
+        // enabled in the code by default, so just skip it.
+    }
+
+    // With raft cluster features, it is also unsafe to disable support for features
+    // that are supported by everybody but not enabled yet. There is a possibility
+    // that the feature became enabled and this node didn't notice it.
+    for (auto&& f : unsafe_to_disable_features) {
+        const bool is_registered_feat = _registered_features.contains(sstring(f));
+        if (!known_features.contains(f)) {
+            if (is_registered_feat) {
+                throw unsupported_feature_exception(format(
+                    "Feature '{}' was previously supported by all nodes in the cluster. It is unknown whether "
+                    "the feature became enabled or not, therefore it is not safe for this node to boot. "
+                    "Set the corresponding configuration option to enable the support for the feature.", f));
+            } else {
+                throw unsupported_feature_exception(format(
+                    "Unknown feature '{}' was previously supported by all nodes in the cluster. "
+                    "That means this node is performing a prohibited downgrade procedure "
+                    "and should not be allowed to boot.", f));
+            }
+        }
+    }
+}
+
+future<> feature_service::enable(std::set<std::string_view> list) {
+    // `gms::feature::enable` should be run within a seastar thread context
+    return seastar::async([this, list = std::move(list)] {
+        for (gms::feature& f : _registered_features | std::views::values) {
+            if (list.contains(f.name())) {
+                f.enable();
+            }
+        }
+    });
 }
 
 } // namespace gms

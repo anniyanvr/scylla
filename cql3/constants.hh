@@ -1,23 +1,19 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "cql3/abstract_marker.hh"
 #include "cql3/update_parameters.hh"
 #include "cql3/operation.hh"
 #include "cql3/values.hh"
-#include "mutation.hh"
+#include "mutation/mutation.hh"
 #include <seastar/core/shared_ptr.hh>
 
 namespace cql3 {
@@ -31,61 +27,43 @@ public:
     private static final Logger logger = LoggerFactory.getLogger(Constants.class);
 #endif
 public:
-    class setter : public operation {
+    class setter : public operation_skip_if_unset {
+        bool _requires_read;
     public:
-        using operation::operation;
+        setter(const column_definition& column, expr::expression e);
 
-        virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override {
-            auto value = expr::evaluate(*_e, params._options);
-            execute(m, prefix, params, column, value.view());
+        virtual bool requires_read() const override { return _requires_read; }
+        virtual bool requires_lwt() const override {
+            // An expression that requires reading a value from the row, e.g.,
+            // SET r = r + 1, requires LWT for atomicity and should not be allowed
+            // on non-LWT requests. In one special case, namely a list update
+            // "UPDATE t SET mylist[0] = 5 WHERE ...", we do allow reading the old
+            // row without LWT or atomicity - but this case is not handled by
+            // constants::setter so we don't need to support it here.
+            return _requires_read;
         }
+        virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
 
-        static void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const column_definition& column, cql3::raw_value_view value) {
-            if (value.is_null()) {
-                m.set_cell(prefix, column, params.make_dead_cell());
-            } else if (value.is_value()) {
-                m.set_cell(prefix, column, params.make_cell(*column.type, value));
-            }
-        }
+        static void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params, const column_definition& column, cql3::raw_value_view value);
+
     };
 
-    struct adder final : operation {
-        using operation::operation;
+    struct adder final : operation_skip_if_unset {
+        using operation_skip_if_unset::operation_skip_if_unset;
 
-        virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override {
-            auto value = expr::evaluate(*_e, params._options);
-            if (value.is_null()) {
-                throw exceptions::invalid_request_exception("Invalid null value for counter increment");
-            } else if (value.is_unset_value()) {
-                return;
-            }
-            auto increment = value.view().deserialize<int64_t>(*long_type);
-            m.set_cell(prefix, column, params.make_counter_update_cell(increment));
-        }
+        virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
     };
 
-    struct subtracter final : operation {
-        using operation::operation;
+    struct subtracter final : operation_skip_if_unset {
+        using operation_skip_if_unset::operation_skip_if_unset;
 
-        virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override {
-            auto value = expr::evaluate(*_e, params._options);
-            if (value.is_null()) {
-                throw exceptions::invalid_request_exception("Invalid null value for counter increment");
-            } else if (value.is_unset_value()) {
-                return;
-            }
-            auto increment = value.view().deserialize<int64_t>(*long_type);
-            if (increment == std::numeric_limits<int64_t>::min()) {
-                throw exceptions::invalid_request_exception(format("The negation of {:d} overflows supported counter precision (signed 8 bytes integer)", increment));
-            }
-            m.set_cell(prefix, column, params.make_counter_update_cell(-increment));
-        }
+        virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;
     };
 
-    class deleter : public operation {
+    class deleter : public operation_no_unset_support {
     public:
         deleter(const column_definition& column)
-            : operation(column, std::nullopt)
+            : operation_no_unset_support(column, std::nullopt)
         { }
 
         virtual void execute(mutation& m, const clustering_key_prefix& prefix, const update_parameters& params) override;

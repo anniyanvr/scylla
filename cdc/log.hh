@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 /*
@@ -14,10 +14,6 @@
 
 #pragma once
 
-#include <functional>
-#include <optional>
-#include <map>
-#include <string>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -25,8 +21,8 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 
-#include "exceptions/exceptions.hh"
-#include "timestamp.hh"
+#include "cql3/untyped_result_set.hh"
+#include "mutation/timestamp.hh"
 #include "tracing/trace_state.hh"
 #include "utils/UUID.hh"
 
@@ -56,9 +52,46 @@ class database;
 
 namespace cdc {
 
+using cell_map = std::unordered_map<const column_definition*, managed_bytes_opt>;
+using row_states_map = std::unordered_map<clustering_key, cell_map, clustering_key::hashing, clustering_key::equality>;
+
+// cdc log table operation
+enum class operation : int8_t {
+    // note: these values will eventually be read by a third party, probably not privvy to this
+    // enum decl, so don't change the constant values (or the datatype).
+    pre_image = 0, update = 1, insert = 2, row_delete = 3, partition_delete = 4,
+    range_delete_start_inclusive = 5, range_delete_start_exclusive = 6, range_delete_end_inclusive = 7, range_delete_end_exclusive = 8,
+    post_image = 9,
+
+    // Operations initiated internally by Scylla. Currently used only by Alternator
+    service_row_delete = -3, service_partition_delete = -4,
+};
+
+struct per_request_options {
+    // The value of the base row before current operation, queried by higher
+    // layers than CDC. We assume that CDC could have seen the row in this
+    // state, i.e. the value isn't 'stale'/'too recent'.
+    lw_shared_ptr<cql3::untyped_result_set> preimage;
+    // Whether this mutation is a result of an internal operation initiated by
+    // Scylla. Currently, only TTL expiration implementation for Alternator
+    // uses this.
+    const bool is_system_originated = false;
+    // True if this mutation was emitted by Alternator.
+    const bool alternator = false;
+    // Sacrifice performance for the sake of better compatibility with DynamoDB
+    // Streams. It's important for correctness that
+    // alternator_streams_increased_compatibility config flag be read once per
+    // request, because it's live-updateable. As a result, the flag may change
+    // between reads.
+    const bool alternator_streams_increased_compatibility = false;
+};
+
 struct operation_result_tracker;
 class db_context;
 class metadata;
+
+bool is_log_name(const std::string_view& table_name);
+bool is_log_schema(const schema& s);
 
 /// \brief CDC service, responsible for schema listeners
 ///
@@ -78,13 +111,14 @@ public:
     // appropriate augments to set the log entries.
     // Iff post-image is enabled for any of these, a non-empty callback is also
     // returned to be invoked post the mutation query.
-    future<std::tuple<std::vector<mutation>, lw_shared_ptr<operation_result_tracker>>> augment_mutation_call(
+    future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<operation_result_tracker>>> augment_mutation_call(
         lowres_clock::time_point timeout,
-        std::vector<mutation>&& mutations,
+        utils::chunked_vector<mutation>&& mutations,
         tracing::trace_state_ptr tr_state,
-        db::consistency_level write_cl
-        );
-    bool needs_cdc_augmentation(const std::vector<mutation>&) const;
+        db::consistency_level write_cl,
+        per_request_options options = {}
+    );
+    bool needs_cdc_augmentation(const utils::chunked_vector<mutation>&) const;
 };
 
 struct db_context final {
@@ -95,19 +129,12 @@ struct db_context final {
         : _proxy(proxy), _migration_notifier(notifier), _cdc_metadata(cdc_meta) {}
 };
 
-// cdc log table operation
-enum class operation : int8_t {
-    // note: these values will eventually be read by a third party, probably not privvy to this
-    // enum decl, so don't change the constant values (or the datatype).
-    pre_image = 0, update = 1, insert = 2, row_delete = 3, partition_delete = 4,
-    range_delete_start_inclusive = 5, range_delete_start_exclusive = 6, range_delete_end_inclusive = 7, range_delete_end_exclusive = 8,
-    post_image = 9,
-};
-
 bool is_log_for_some_table(const replica::database& db, const sstring& ks_name, const std::string_view& table_name);
 
 schema_ptr get_base_table(const replica::database&, const schema&);
-schema_ptr get_base_table(const replica::database&, sstring_view, std::string_view);
+schema_ptr get_base_table(const replica::database&, std::string_view, std::string_view);
+
+bool cdc_enabled(const schema& s);
 
 seastar::sstring base_name(std::string_view log_name);
 seastar::sstring log_name(std::string_view table_name);
@@ -125,5 +152,8 @@ bytes log_data_column_deleted_elements_name_bytes(const bytes& column_name);
 bool is_cdc_metacolumn_name(const sstring& name);
 
 utils::UUID generate_timeuuid(api::timestamp_type t);
+
+cell_map* get_row_state(row_states_map& row_states, const clustering_key& ck);
+const cell_map* get_row_state(const row_states_map& row_states, const clustering_key& ck);
 
 } // namespace cdc

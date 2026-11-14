@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 /*
@@ -74,13 +74,57 @@ options {
  */
 @parser::context {
     void displayRecognitionError(ANTLR_UINT8** token_names, ExceptionBaseType* ex) {
-        throw expressions_syntax_error("syntax error");
+        const char* err;
+        switch (ex->getType()) {
+        case antlr3::ExceptionType::FAILED_PREDICATE_EXCEPTION:
+            err = "expression nested too deeply";
+            break;
+        default:
+            err = "syntax error";
+            break;
+        }
+        // Alternator expressions are always single line so ex->get_line()
+        // is always 1, no sense to print it.
+        // TODO: return the position as part of the exception, so the
+        // caller in expressions.cc that knows the expression string can
+        // mark the error position in the final error message.
+        throw expressions_syntax_error(format("{} at char {}", err,
+            ex->get_charPositionInLine()));
+    }
+
+    // ANTLR3 tries to recover missing tokens - it tries to finish parsing
+    // and create valid objects, as if the missing token was there.
+    // But it has a bug and leaks these tokens.
+    // We override offending method and handle abandoned pointers.
+    std::vector<std::unique_ptr<TokenType>> _missing_tokens;
+    TokenType* getMissingSymbol(IntStreamType* istream, ExceptionBaseType* e,
+                                ANTLR_UINT32 expectedTokenType, BitsetListType* follow) {
+        auto token = BaseType::getMissingSymbol(istream, e, expectedTokenType, follow);
+        _missing_tokens.emplace_back(token);
+        return token;
     }
 }
 @lexer::context {
     void displayRecognitionError(ANTLR_UINT8** token_names, ExceptionBaseType* ex) {
         throw expressions_syntax_error("syntax error");
     }
+}
+
+/* Unfortunately, ANTLR uses recursion - not the heap - to parse recursive
+ * expressions. To make things even worse, ANTLR has no way to limit the
+ * depth of this recursion (unlike Yacc which has YYMAXDEPTH). So deeply-
+ * nested expression like "(((((((((((((..." can easily crash Scylla on a
+ * stack overflow (see issue #14477).
+ *
+ * We are lucky that in the grammar for DynamoDB expressions (below),
+ * only a few specific rules can recurse, so it was fairly easy to add a
+ * "depth" counter to a few specific rules, and then use a predicate
+ * "{depth<MAX_DEPTH}?" to avoid parsing if the depth exceeds this limit,
+ * and throw a FAILED_PREDICATE_EXCEPTION in that case, which we will
+ * report to the user as a "expression nested too deeply" error.
+ */
+@parser::members {
+    static constexpr int MAX_DEPTH = 400;
 }
 
 /*
@@ -152,22 +196,29 @@ path_component: NAME | NAMEREF;
 path returns [parsed::path p]:
     root=path_component           { $p.set_root($root.text); }
     (   '.' name=path_component   { $p.add_dot($name.text); }
-      | '[' INTEGER ']'           { $p.add_index(std::stoi($INTEGER.text)); }
+      | '[' INTEGER ']'           {
+                try {
+                    $p.add_index(std::stoi($INTEGER.text));
+                } catch(std::out_of_range&) {
+                    throw expressions_syntax_error("list index out of integer range");
+                }
+            }
     )*;
 
-value returns [parsed::value v]:
+/* See comment above why the "depth" counter was needed here */
+value[int depth] returns [parsed::value v]:
       VALREF       { $v.set_valref($VALREF.text); }
     | path         { $v.set_path($path.p); }
-    | NAME         { $v.set_func_name($NAME.text); }
-     '(' x=value   { $v.add_func_parameter($x.v); }
-     (',' x=value  { $v.add_func_parameter($x.v); })*
+    | {depth<MAX_DEPTH}? NAME { $v.set_func_name($NAME.text); }
+     '(' x=value[depth+1]    { $v.add_func_parameter($x.v); }
+     (',' x=value[depth+1]   { $v.add_func_parameter($x.v); })*
      ')'
     ;
 
 update_expression_set_rhs returns [parsed::set_rhs rhs]:
-    v=value  { $rhs.set_value(std::move($v.v)); }
-    (   '+' v=value  { $rhs.set_plus(std::move($v.v)); }
-      | '-' v=value  { $rhs.set_minus(std::move($v.v)); }
+    v=value[0]  { $rhs.set_value(std::move($v.v)); }
+    (   '+' v=value[0]  { $rhs.set_plus(std::move($v.v)); }
+      | '-' v=value[0]  { $rhs.set_minus(std::move($v.v)); }
     )?
     ;
 
@@ -197,7 +248,7 @@ update_expression_clause returns [parsed::update_expression e]:
 // Note the "EOF" token at the end of the update expression. We want to the
 //  parser to match the entire string given to it - not just its beginning!
 update_expression returns [parsed::update_expression e]:
-    (update_expression_clause { e.append($update_expression_clause.e); })* EOF;
+    (update_expression_clause { e.append($update_expression_clause.e); })+ EOF;
 
 projection_expression returns [std::vector<parsed::path> v]:
     p=path      { $v.push_back(std::move($p.p)); }
@@ -205,7 +256,7 @@ projection_expression returns [std::vector<parsed::path> v]:
 
 
 primitive_condition returns [parsed::primitive_condition c]:
-      v=value         { $c.add_value(std::move($v.v));
+      v=value[0]      { $c.add_value(std::move($v.v));
                         $c.set_operator(parsed::primitive_condition::type::VALUE); }
       (  (  '='       { $c.set_operator(parsed::primitive_condition::type::EQ); }
           | '<' '>'   { $c.set_operator(parsed::primitive_condition::type::NE); }
@@ -214,16 +265,23 @@ primitive_condition returns [parsed::primitive_condition c]:
           | '>'       { $c.set_operator(parsed::primitive_condition::type::GT); }
           | '>' '='   { $c.set_operator(parsed::primitive_condition::type::GE); }
          )
-         v=value      { $c.add_value(std::move($v.v)); }
+         v=value[0]   { $c.add_value(std::move($v.v)); }
        | BETWEEN      { $c.set_operator(parsed::primitive_condition::type::BETWEEN); }
-         v=value      { $c.add_value(std::move($v.v)); }
+         v=value[0]   { $c.add_value(std::move($v.v)); }
          AND
-         v=value      { $c.add_value(std::move($v.v)); }
+         v=value[0]   { $c.add_value(std::move($v.v)); }
        | IN '('       { $c.set_operator(parsed::primitive_condition::type::IN); }
-         v=value      { $c.add_value(std::move($v.v)); }
-         (',' v=value { $c.add_value(std::move($v.v)); })*
+         v=value[0]   { $c.add_value(std::move($v.v)); }
+         (',' v=value[0] { $c.add_value(std::move($v.v)); })*
          ')'
       )?
+      {
+          // Post-parse check to reject non-function single values
+          if ($c._op == parsed::primitive_condition::type::VALUE &&
+              !$c._values.front().is_func()) {
+              throw expressions_syntax_error("Single value must be a function");
+          }
+      }
     ;
 
 // The following rules for parsing boolean expressions are verbose and
@@ -231,19 +289,20 @@ primitive_condition returns [parsed::primitive_condition c]:
 // common rule prefixes, and (lack of) support for operator precedence.
 // These rules could have been written more clearly using a more powerful
 // parser generator - such as Yacc.
-boolean_expression returns [parsed::condition_expression e]:
-	  b=boolean_expression_1       { $e.append(std::move($b.e), '|'); }
-	  (OR b=boolean_expression_1   { $e.append(std::move($b.e), '|'); } )*
+// See comment above why the "depth" counter was needed here.
+boolean_expression[int depth] returns [parsed::condition_expression e]:
+	  b=boolean_expression_1[depth]       { $e.append(std::move($b.e), '|'); }
+	  (OR b=boolean_expression_1[depth]   { $e.append(std::move($b.e), '|'); } )*
 	;
-boolean_expression_1 returns [parsed::condition_expression e]:
-	  b=boolean_expression_2       { $e.append(std::move($b.e), '&'); }
-	  (AND b=boolean_expression_2  { $e.append(std::move($b.e), '&'); } )*
+boolean_expression_1[int depth] returns [parsed::condition_expression e]:
+	  b=boolean_expression_2[depth]       { $e.append(std::move($b.e), '&'); }
+	  (AND b=boolean_expression_2[depth]  { $e.append(std::move($b.e), '&'); } )*
 	;
-boolean_expression_2 returns [parsed::condition_expression e]:
+boolean_expression_2[int depth] returns [parsed::condition_expression e]:
 	  p=primitive_condition        { $e.set_primitive(std::move($p.c)); }
-	| NOT b=boolean_expression_2   { $e = std::move($b.e); $e.apply_not(); }
-	| '(' b=boolean_expression ')' { $e = std::move($b.e); }
+	| {depth<MAX_DEPTH}? NOT b=boolean_expression_2[depth+1]   { $e = std::move($b.e); $e.apply_not(); }
+	| {depth<MAX_DEPTH}? '(' b=boolean_expression[depth+1] ')' { $e = std::move($b.e); }
     ;
 
 condition_expression returns [parsed::condition_expression e]:
-    boolean_expression { e=std::move($boolean_expression.e); } EOF;
+    boolean_expression[0] { e=std::move($boolean_expression.e); } EOF;

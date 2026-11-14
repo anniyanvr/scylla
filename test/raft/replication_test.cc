@@ -3,9 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <fmt/std.h>
 #include "replication.hh"
 
 // Test Raft library with declarative test definitions
@@ -158,8 +159,26 @@ RAFT_TEST_CASE(take_snapshot, (test_case{
 // 2 nodes doing simple replication/snapshoting while leader's log size is limited
 RAFT_TEST_CASE(backpressure, (test_case{
          .nodes = 2,
-         .config = {{.snapshot_threshold = 10, .snapshot_trailing = 5, .max_log_size = 20}, {.snapshot_threshold = 20, .snapshot_trailing = 10}},
-         .updates = {entries{100}}}));
+         .config = {
+             []() {
+                 const auto max_command_size = sizeof(size_t);
+                 return raft::server::configuration {
+                     .snapshot_threshold = 10,
+                     .snapshot_threshold_log_size = 2 * (max_command_size + sizeof(raft::log_entry)),
+                     .snapshot_trailing = 5,
+                     .snapshot_trailing_size = 1 * (max_command_size + sizeof(raft::log_entry)),
+                     .max_log_size = 5 * (max_command_size + sizeof(raft::log_entry)),
+                     .max_command_size = max_command_size
+                 };
+             }(),
+             {
+                 .snapshot_threshold = 20,
+                 .snapshot_trailing = 10
+             }
+         },
+         .updates = {entries{100, {}, true}},
+         .commutative_hash = true,
+         .verify_persisted_snapshots = false}));
 
 // 3 nodes, add entries, drop leader 0, add entries [implicit re-join all]
 RAFT_TEST_CASE(drops_01, (test_case{
@@ -267,7 +286,7 @@ RAFT_TEST_CASE(etcd_test_leader_cycle, (test_case{
 RAFT_TEST_CASE(rpc_load_conf_from_snapshot, (test_case{
          .nodes = 1, .total_values = 0,
          .initial_snapshots = {{.snap = {
-                .config = raft::configuration{to_raft_id(0)}}}},
+                .config = config_from_ids({to_raft_id(0)})}}},
          .updates = {check_rpc_config{node_id{0},
                      rpc_address_set{node_id{0}}}
          }}));
@@ -276,17 +295,19 @@ RAFT_TEST_CASE(rpc_load_conf_from_snapshot, (test_case{
 // Initial configuration is taken from the persisted log.
 RAFT_TEST_CASE(rpc_load_conf_from_log, (test_case{
          .nodes = 1, .total_values = 0,
-         .initial_states = {{.le = {{1, raft::configuration{to_raft_id(0)}}}}},
+         .initial_states = {{.le = {{1, config_from_ids({to_raft_id(0)})}}}},
          .updates = {check_rpc_config{node_id{0},
                      rpc_address_set{node_id{0}}}
          }}));
 
 
 // 3 node cluster {A, B, C}.
-// Shrinked later to 2 nodes and then expanded back to 3 nodes.
+// Shrunk later to 2 nodes and then expanded back to 3 nodes.
 // Test that both configuration changes update RPC configuration correspondingly
 // on all nodes.
-RAFT_TEST_CASE(rpc_propose_conf_change, (test_case{
+// TODO: change to RAFT_TEST_CASE once it's stable for handling packet drops
+SEASTAR_THREAD_TEST_CASE(rpc_propose_conf_change) {
+    replication_test<lowres_clock>((test_case{
          .nodes = 3, .total_values = 0,
          .updates = {
             // Remove node C from the cluster configuration.
@@ -297,11 +318,13 @@ RAFT_TEST_CASE(rpc_propose_conf_change, (test_case{
                              rpc_address_set{node_id{0},node_id{1}}},
             // Re-add node C to the cluster configuration.
             set_config{0,1,2},
-            // Check that both A (leader) and B (follower) call `rpc::add_server`,
+            // Check that both A (leader) and B (follower) call `rpc::on_configuration_change()`,
             // also the newly integrated node gets the actual RPC configuration, too.
             check_rpc_config{{node_id{0},node_id{1},node_id{2}},
                              rpc_address_set{node_id{0},node_id{1},node_id{2}}},
-         }}));
+         }})
+    , false, tick_delta);
+}
 
 // 3 node cluster {A, B, C}.
 // Test that leader elections don't change RPC configuration.
@@ -326,7 +349,7 @@ RAFT_TEST_CASE(rpc_voter_non_voter_transision, (test_case{
                              rpc_address_set{node_id{0},node_id{1},node_id{2}}},
             rpc_reset_counters{{node_id{0},node_id{1},node_id{2}}},
             // Make C a non-voting member.
-            set_config{0, 1, set_config_entry(2, false)},
+            set_config{0, 1, set_config_entry(2, raft::is_voter::no)},
             // Check that RPC configuration didn't change.
             check_rpc_added{{node_id{0},node_id{1},node_id{2}},0},
             check_rpc_removed{{node_id{0},node_id{1},node_id{2}},0},
@@ -375,7 +398,7 @@ RAFT_TEST_CASE(rpc_configuration_truncate_restore_from_snp, (test_case{
                 .log = { raft::log_entry{raft::term_t(1), raft::index_t(1),
                         config{.curr = {node_id{0},node_id{1},node_id{2},node_id{3}},
                                .prev = {node_id{0},node_id{1},node_id{2}}}}},
-                .snapshot = {.config  = raft::configuration{address_set({node_id{0},node_id{1},node_id{2}})}
+                .snapshot = {.config  = raft::configuration{config_set({node_id{0},node_id{1},node_id{2}})}
                 }
             }},
             // A should see {A, B, C, D} as RPC config since
@@ -422,7 +445,7 @@ RAFT_TEST_CASE(rpc_configuration_truncate_restore_from_snp, (test_case{
 // the crash + network partition and synchronization with B, since
 // the effective RPC cfg would be {A, B, C} both for
 // joint cfg = {.current = {A, B}, .previous = {A, B, C}}
-// and the previously commited cfg = {A, B, C}.
+// and the previously committed cfg = {A, B, C}.
 //
 // After that, test for the second case: switch leader back to A and
 // try to expand the cluster back to initial state (re-add
@@ -472,7 +495,7 @@ RAFT_TEST_CASE(rpc_configuration_truncate_restore_from_log, (test_case{
                         },
                 },
                 // all nodes in snapshot config {A, B, C, D} (original)
-                .snapshot = {.config  = raft::configuration{address_set({node_id{0},node_id{1},node_id{2},node_id{3}})}
+                .snapshot = {.config  = raft::configuration{config_set({node_id{0},node_id{1},node_id{2},node_id{3}})}
                 }
             }},
 
@@ -522,7 +545,7 @@ RAFT_TEST_CASE(rpc_configuration_truncate_restore_from_log, (test_case{
                         },
                 },
                 // all nodes in snapshot config {A, B, C, D} (original)
-                .snapshot = {.config  = raft::configuration{address_set({node_id{0},node_id{1},node_id{2},node_id{3}})}
+                .snapshot = {.config  = raft::configuration{config_set({node_id{0},node_id{1},node_id{2},node_id{3}})}
                 }
             }},
 

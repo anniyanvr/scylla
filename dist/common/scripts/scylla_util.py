@@ -1,25 +1,54 @@
 #  Copyright (C) 2017-present ScyllaDB
 
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 import configparser
-import glob
 import io
 import os
 import re
-import shlex
-import shutil
 import subprocess
 import yaml
 import sys
+import time
 from pathlib import Path, PurePath
-from subprocess import run, DEVNULL
+from subprocess import run, DEVNULL, PIPE, CalledProcessError
+from datetime import datetime, timedelta
 
 import distro
 from scylla_sysconfdir import SYSCONFDIR
-from scylla_product import PRODUCT
 
 from multiprocessing import cpu_count
+
+import traceback
+import traceback_with_variables
+import logging
+
+def scylla_excepthook(etype, value, tb):
+    os.makedirs('/var/tmp/scylla', mode=0o755, exist_ok=True)
+    traceback.print_exception(etype, value, tb)
+    exc_logger = logging.getLogger(__name__)
+    exc_logger.setLevel(logging.DEBUG)
+    exc_logger_file = f'/var/tmp/scylla/{os.path.basename(sys.argv[0])}-{os.getpid()}-debug.log'
+    exc_logger.addHandler(logging.FileHandler(exc_logger_file))
+    traceback_with_variables.print_exc(e=value, file_=traceback_with_variables.LoggerAsFile(exc_logger))
+    print(f'Debug log created: {exc_logger_file}')
+
+sys.excepthook = scylla_excepthook
+
+
+def out(cmd, shell=True, timeout=None, encoding='utf-8', ignore_error=False, user=None, group=None):
+    res = subprocess.run(cmd, capture_output=True, shell=shell, timeout=timeout, check=False, encoding=encoding, user=user, group=group)
+    if not ignore_error and res.returncode != 0:
+        print(f'Command \'{cmd}\' returned non-zero exit status: {res.returncode}')
+        print('----------  stdout  ----------')
+        print(res.stdout, end='')
+        print('------------------------------')
+        print('----------  stderr  ----------')
+        print(res.stderr, end='')
+        print('------------------------------')
+        res.check_returncode()
+    return res.stdout.strip()
+
 
 def scriptsdir_p():
     p = Path(sys.argv[0]).resolve()
@@ -36,6 +65,9 @@ def is_nonroot():
 
 def is_offline():
     return Path(scylladir_p() / 'SCYLLA-OFFLINE-FILE').exists()
+
+def is_container():
+    return Path(scylladir_p() / 'SCYLLA-CONTAINER-FILE').exists()
 
 def bindir_p():
     if is_nonroot():
@@ -158,13 +190,15 @@ SYSTEM_PARTITION_UUIDS = [
 ]
 
 def get_partition_uuid(dev):
-    return run(f'lsblk -n -oPARTTYPE {dev}', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+    return out(f'lsblk -n -oPARTTYPE {dev}')
 
 def is_system_partition(dev):
     uuid = get_partition_uuid(dev)
     return (uuid in SYSTEM_PARTITION_UUIDS)
 
 def is_unused_disk(dev):
+    # resolve symlink to real path
+    dev = os.path.realpath(dev)
     # dev is not in /sys/class/block/, like /dev/nvme[0-9]+
     if not os.path.isdir('/sys/class/block/{dev}'.format(dev=dev.replace('/dev/', ''))):
         return False
@@ -195,7 +229,7 @@ def parse_scylla_dirs_with_default(conf='/etc/scylla/scylla.yaml'):
             not len(y['data_file_directories']) or \
             not " ".join(y['data_file_directories']).strip():
         y['data_file_directories'] = [os.path.join(y['workdir'], 'data')]
-    for t in [ "commitlog", "hints", "view_hints", "saved_caches" ]:
+    for t in [ "commitlog", "schema_commitlog", "hints", "view_hints", "saved_caches" ]:
         key = "%s_directory" % t
         if key not in y or not y[key]:
             y[key] = os.path.join(y['workdir'], t)
@@ -212,6 +246,7 @@ def get_scylla_dirs():
     dirs = []
     dirs.extend(y['data_file_directories'])
     dirs.append(y['commitlog_directory'])
+    dirs.append(y['schema_commitlog_directory'])
 
     if 'hints_directory' in y and y['hints_directory']:
         dirs.append(y['hints_directory'])
@@ -254,33 +289,79 @@ def get_set_nic_and_disks_config_value(cfg):
 
 
 def swap_exists():
-    swaps = run('swapon --noheadings --raw', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+    swaps = out('swapon --noheadings --raw')
     return True if swaps != '' else False
 
-def pkg_error_exit(pkg):
-    print(f'Package "{pkg}" required.')
-    sys.exit(1)
+def check_sysfs_numa_topology_is_valid():
+    # Verify that the sysfs entry exists correctly, same as the checks
+    # performed by hwloc code (check_sysfs_cpu_path() on topology-linux.c)
+    if os.path.isdir("/sys/devices/system/cpu"):
+        if os.path.exists("/sys/devices/system/cpu/cpu0/topology/package_cpus") or os.path.exists("/sys/devices/system/cpu/cpu0/topology/core_cpus"):
+            return True
+        if os.path.exists("/sys/devices/system/cpu/cpu0/topology/core_siblings") or os.path.exists("/sys/devices/system/cpu/cpu0/topology/thread_siblings"):
+            return True
+    return False
 
-def yum_install(pkg):
+def pkg_error_exit(pkg, offline_exit=True):
+    print(f'Package "{pkg}" required.')
+    if offline_exit:
+        sys.exit(1)
+
+def yum_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
     return run(f'yum install -y {pkg}', shell=True, check=True)
 
-def apt_install(pkg):
+def apt_is_updated():
+    if os.path.exists('/var/lib/apt/periodic/update-success-stamp'):
+        cache_mtime = os.stat('/var/lib/apt/periodic/update-success-stamp').st_mtime
+    elif os.path.exists('/var/lib/apt/lists'):
+        cache_mtime = os.stat('/var/lib/apt/lists').st_mtime
+    else:
+        return False
+    return datetime.now() - datetime.fromtimestamp(cache_mtime) <= timedelta(days=1)
+
+APT_GET_UPDATE_NUM_RETRY = 30
+APT_GET_UPDATE_RETRY_INTERVAL = 10
+def apt_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
+
+    # The lock for update and install/remove are different, and
+    # DPkg::Lock::Timeout will only wait for install/remove lock.
+    # So we need to manually retry apt-get update.
+    for i in range(APT_GET_UPDATE_NUM_RETRY):
+        if apt_is_updated():
+            break
+        try:
+            run('apt-get update', shell=True, check=True, stderr=PIPE, encoding='utf-8')
+            break
+        except CalledProcessError as e:
+            print(e.stderr, end='')
+            # if error is "Could not get lock", wait a while and retry
+            match = re.match('^E: Could not get lock ', e.stderr, re.MULTILINE)
+            if match:
+                print('Sleep 10 seconds to wait for apt lock...')
+                time.sleep(APT_GET_UPDATE_RETRY_INTERVAL)
+                # if this is last time to retry, re-raise exception
+                if i == APT_GET_UPDATE_NUM_RETRY - 1:
+                    raise
+            # if error is not "Could not get lock", re-raise Exception
+            else:
+                raise
+
     apt_env = os.environ.copy()
     apt_env['DEBIAN_FRONTEND'] = 'noninteractive'
-    return run(f'apt-get install -y {pkg}', shell=True, check=True, env=apt_env)
+    return run(f'apt-get -o DPkg::Lock::Timeout=300 install -y {pkg}', shell=True, check=True, env=apt_env)
 
-def emerge_install(pkg):
+def emerge_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
     return run(f'emerge -uq {pkg}', shell=True, check=True)
 
-def zypper_install(pkg):
+def zypper_install(pkg, offline_exit=True):
     if is_offline():
-        pkg_error_exit(pkg)
+        pkg_error_exit(pkg, offline_exit)
     return run(f'zypper install -y {pkg}', shell=True, check=True)
 
 def pkg_distro():
@@ -293,18 +374,20 @@ def pkg_distro():
     else:
         return distro.id()
 
-pkg_xlat = {'cpupowerutils': {'debian': 'linux-cpupower', 'gentoo':'sys-power/cpupower', 'arch':'cpupower', 'suse': 'cpupower'}}
-def pkg_install(pkg):
+pkg_xlat = {'cpupowerutils': {'debian': 'linux-cpupower', 'gentoo':'sys-power/cpupower', 'arch':'cpupower', 'suse': 'cpupower'},
+            'policycoreutils-python-utils': {'amzn2': 'policycoreutils-python'}}
+
+def pkg_install(pkg, offline_exit=True):
     if pkg in pkg_xlat and pkg_distro() in pkg_xlat[pkg]:
         pkg = pkg_xlat[pkg][pkg_distro()]
     if is_redhat_variant():
-        return yum_install(pkg)
+        return yum_install(pkg, offline_exit)
     elif is_debian_variant():
-        return apt_install(pkg)
+        return apt_install(pkg, offline_exit)
     elif is_gentoo():
-        return emerge_install(pkg)
+        return emerge_install(pkg, offline_exit)
     elif is_suse_variant():
-        return zypper_install(pkg)
+        return zypper_install(pkg, offline_exit)
     else:
         pkg_error_exit(pkg)
 
@@ -314,7 +397,7 @@ def yum_uninstall(pkg):
 def apt_uninstall(pkg):
     apt_env = os.environ.copy()
     apt_env['DEBIAN_FRONTEND'] = 'noninteractive'
-    return run(f'apt-get remove -y {pkg}', shell=True, check=True, env=apt_env)
+    return run(f'apt-get -o DPkg::Lock::Timeout=300 remove -y {pkg}', shell=True, check=True, env=apt_env)
 
 def emerge_uninstall(pkg):
     return run(f'emerge --deselect {pkg}', shell=True, check=True)
@@ -364,7 +447,7 @@ class systemd_unit:
         return run('systemctl {} disable {}'.format(self.ctlparam, self._unit), shell=True, check=True)
 
     def is_active(self):
-        return run('systemctl {} is-active {}'.format(self.ctlparam, self._unit), shell=True, capture_output=True, encoding='utf-8').stdout.strip()
+        return out('systemctl {} is-active {}'.format(self.ctlparam, self._unit), ignore_error=True)
 
     def mask(self):
         return run('systemctl {} mask {}'.format(self.ctlparam, self._unit), shell=True, check=True)
@@ -387,13 +470,21 @@ class sysconfig_parser:
         f = io.StringIO('[global]\n{}'.format(self._data))
         self._cfg = configparser.ConfigParser()
         self._cfg.optionxform = str
-        self._cfg.readfp(f)
+        self._cfg.read_file(f)
 
     def __escape(self, val):
         return re.sub(r'"', r'\"', val)
 
+    def __unescape(self, val):
+        return re.sub(r'\\"', r'"', val)
+
+    def __format_line(self, key, val):
+        need_quotes = any([ch.isspace() for ch in val])
+        esc_val = self.__escape(val)
+        return f'{key}="{esc_val}"' if need_quotes else f'{key}={esc_val}'
+
     def __add(self, key, val):
-        self._data += '{}="{}"\n'.format(key, self.__escape(val))
+        self._data += self.__format_line(key, val) + '\n'
         self.__load()
 
     def __init__(self, filename):
@@ -408,7 +499,8 @@ class sysconfig_parser:
         self.__load()
 
     def get(self, key):
-        return self._cfg.get('global', key).strip('"')
+        val = self._cfg.get('global', key).strip('"')
+        return self.__unescape(val)
 
     def has_option(self, key):
         return self._cfg.has_option('global', key)
@@ -416,9 +508,19 @@ class sysconfig_parser:
     def set(self, key, val):
         if not self.has_option(key):
             return self.__add(key, val)
-        self._data = re.sub('^{}=[^\n]*$'.format(key), '{}="{}"'.format(key, self.__escape(val)), self._data, flags=re.MULTILINE)
+        new_line = self.__format_line(key, val)
+        self._data = re.sub(f'^{key}=[^\n]*$', new_line, self._data, flags=re.MULTILINE)
         self.__load()
 
     def commit(self):
         with open(self._filename, 'w') as f:
             f.write(self._data)
+
+def get_product(dir):
+    if dir is None:
+        dir = etcdir()
+    try:
+        with open(os.path.join(dir, 'SCYLLA-PRODUCT-FILE')) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return 'scylla'

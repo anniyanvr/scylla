@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include <concepts>
 #include <zlib.h>
-#include "libdeflate/libdeflate.h"
+#include <libdeflate.h>
 #include "utils/gz/crc_combine.hh"
 
 template<typename Checksum>

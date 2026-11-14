@@ -3,24 +3,24 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
 #include "UUID.hh"
 #include <seastar/net/byteorder.hh>
 #include <random>
-#include <boost/iterator/function_input_iterator.hpp>
-#include <boost/algorithm/string.hpp>
+#include <boost/algorithm/string/erase.hpp>
 #include <string>
+#include <fmt/ostream.h>
+#include <seastar/core/format.hh>
 #include <seastar/core/sstring.hh>
-#include "utils/serialization.hh"
 #include "marshal_exception.hh"
 
 namespace utils {
 
 UUID
-make_random_uuid() {
+make_random_uuid() noexcept {
     static thread_local std::mt19937_64 engine(std::random_device().operator()());
     static thread_local std::uniform_int_distribution<uint64_t> dist;
     uint64_t msb, lsb;
@@ -34,21 +34,45 @@ make_random_uuid() {
 }
 
 std::ostream& operator<<(std::ostream& out, const UUID& uuid) {
-    return out << uuid.to_sstring();
+    fmt::print(out, "{}", uuid);
+    return out;
 }
 
-UUID::UUID(sstring_view uuid) {
+std::istream& operator>>(std::istream& in, UUID& uuid) {
+    sstring uuid_string;
+    in >> uuid_string;
+    uuid = UUID(uuid_string);
+    return in;
+}
+
+UUID::UUID(std::string_view uuid) {
     sstring uuid_string(uuid.begin(), uuid.end());
     boost::erase_all(uuid_string, "-");
     auto size = uuid_string.size() / 2;
     if (size != 16) {
-        throw marshal_exception(format("UUID string size mismatch: '{}'", uuid));
+        throw marshal_exception(seastar::format("UUID string size mismatch: '{}'", uuid));
     }
     sstring most = sstring(uuid_string.begin(), uuid_string.begin() + size);
     sstring least = sstring(uuid_string.begin() + size, uuid_string.end());
     int base = 16;
-    this->most_sig_bits = std::stoull(most, nullptr, base);
-    this->least_sig_bits = std::stoull(least, nullptr, base);
+    try {
+        std::size_t pos = 0;
+        this->most_sig_bits = std::stoull(most, &pos, base);
+        if (pos != most.size()) {
+            throw std::invalid_argument("");
+        }
+        this->least_sig_bits = std::stoull(least, &pos, base);
+        if (pos != least.size()) {
+            throw std::invalid_argument("");
+        }
+    } catch (const std::logic_error&) {
+        throw marshal_exception(seastar::format("invalid UUID: '{}'", uuid));
+    }
+}
+
+uint32_t uuid_xor_to_uint32(const UUID& uuid) {
+    size_t h = std::hash<utils::UUID>{}(uuid);
+    return uint32_t(h);
 }
 
 }

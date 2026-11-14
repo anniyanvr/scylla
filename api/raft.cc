@@ -1,0 +1,209 @@
+/*
+ * Copyright (C) 2024-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#include <seastar/core/coroutine.hh>
+
+#include "api/api-doc/raft.json.hh"
+#include "api/utils.hh"
+
+#include "service/raft/raft_group_registry.hh"
+#include "utils/log.hh"
+
+using namespace seastar::httpd;
+
+extern logging::logger apilog;
+
+namespace api {
+
+struct http_context;
+namespace r = httpd::raft_json;
+using namespace json;
+
+
+namespace {
+
+::service::raft_timeout get_request_timeout(const http::request& req) {
+    const auto timeout = try_get_query_param<std::chrono::seconds>(req, "timeout");
+    if (!timeout) {
+        return ::service::raft_timeout{};
+    }
+    if (*timeout <= std::chrono::seconds::zero()) {
+        throw bad_param_exception{"Timeout must be a positive number."};
+    }
+    return ::service::raft_timeout{.value = lowres_clock::now() + *timeout};
+}
+
+}  // namespace
+
+
+void set_raft(http_context&, httpd::routes& r, sharded<service::raft_group_registry>& raft_gr) {
+    r::trigger_snapshot.set(r, [&raft_gr] (std::unique_ptr<http::request> req) -> future<json_return_type> {
+        const auto gid = require_path_param<raft::group_id>(*req, "group_id");
+        auto timeout = get_request_timeout(*req);
+
+        std::atomic<bool> found_srv{false};
+        co_await raft_gr.invoke_on_all([gid, timeout, &found_srv] (service::raft_group_registry& raft_gr) -> future<> {
+            if (!raft_gr.find_server(gid)) {
+                co_return;
+            }
+
+            found_srv = true;
+            apilog.info("Triggering Raft group {} snapshot", gid);
+            auto srv = raft_gr.get_server_with_timeouts(gid);
+            auto result = co_await srv.trigger_snapshot(nullptr, timeout);
+            if (result) {
+                apilog.info("New snapshot for Raft group {} created", gid);
+            } else {
+                apilog.info("Could not create new snapshot for Raft group {}, no new entries applied", gid);
+            }
+        });
+
+        if (!found_srv) {
+            throw bad_param_exception{fmt::format("Server for group ID {} not found", gid)};
+        }
+
+        co_return json_void{};
+    });
+    r::get_leader_host.set(r, [&raft_gr] (std::unique_ptr<http::request> req) -> future<json_return_type> {
+        const auto gid_param = try_get_query_param<raft::group_id>(*req, "group_id");
+        if (!gid_param) {
+            const auto leader_id = co_await raft_gr.invoke_on(0, [] (service::raft_group_registry& raft_gr) {
+                auto& srv = raft_gr.group0();
+                return srv.current_leader();
+            });
+            co_return json_return_type{leader_id.to_sstring()};
+        }
+
+        const raft::group_id gid = *gid_param;
+
+        std::atomic<bool> found_srv{false};
+        std::atomic<raft::server_id> leader_id = raft::server_id::create_null_id();
+        co_await raft_gr.invoke_on_all([gid, &found_srv, &leader_id] (service::raft_group_registry& raft_gr) {
+            if (raft_gr.find_server(gid)) {
+                found_srv = true;
+                leader_id = raft_gr.get_server(gid).current_leader();
+            }
+            return make_ready_future<>();
+        });
+
+        if (!found_srv) {
+            throw bad_param_exception{fmt::format("Server for group ID {} not found", gid)};
+        }
+
+        co_return json_return_type(leader_id.load().to_sstring());
+    });
+    r::read_barrier.set(r, [&raft_gr] (std::unique_ptr<http::request> req) -> future<json_return_type> {
+        auto timeout = get_request_timeout(*req);
+
+        const auto gid_param = try_get_query_param<raft::group_id>(*req, "group_id");
+        if (!gid_param) {
+            // Read barrier on group 0 by default
+            co_await raft_gr.invoke_on(0, [timeout] (service::raft_group_registry& raft_gr) -> future<> {
+                co_await raft_gr.group0_with_timeouts().read_barrier(nullptr, timeout);
+            });
+            co_return json_void{};
+        }
+
+        const raft::group_id gid = *gid_param;
+
+        std::atomic<bool> found_srv{false};
+        co_await raft_gr.invoke_on_all([gid, timeout, &found_srv] (service::raft_group_registry& raft_gr) -> future<> {
+            if (!raft_gr.find_server(gid)) {
+                co_return;
+            }
+            found_srv = true;
+            co_await raft_gr.get_server_with_timeouts(gid).read_barrier(nullptr, timeout);
+        });
+
+        if (!found_srv) {
+            throw bad_param_exception{fmt::format("Server for group ID {} not found", gid)};
+        }
+
+        co_return json_void{};
+    });
+    r::wait_for_apply_committed.set(r, [&raft_gr] (std::unique_ptr<http::request> req) -> future<json_return_type> {
+        auto timeout = get_request_timeout(*req);
+
+        const auto gid_param = try_get_query_param<raft::group_id>(*req, "group_id");
+        if (!gid_param) {
+            // Wait on group 0 by default
+            const auto idx = co_await raft_gr.invoke_on(0, [timeout] (service::raft_group_registry& raft_gr) -> future<raft::index_t> {
+                const auto idx = raft_gr.group0().get_status().commit_idx;
+                co_await raft_gr.group0_with_timeouts().wait_for_apply(idx, nullptr, timeout);
+                co_return idx;
+            });
+            co_return json_return_type(idx.value());
+        }
+
+        const raft::group_id gid = *gid_param;
+
+        static constexpr auto no_server = std::numeric_limits<uint64_t>::max();
+        const auto idx = co_await raft_gr.map_reduce0([gid, timeout] (service::raft_group_registry& raft_gr) -> future<uint64_t> {
+            if (!raft_gr.find_server(gid)) {
+                co_return no_server;
+            }
+            const auto idx = raft_gr.get_server(gid).get_status().commit_idx;
+            co_await raft_gr.get_server_with_timeouts(gid).wait_for_apply(idx, nullptr, timeout);
+            co_return idx.value();
+        }, no_server, std::ranges::min);
+
+        if (idx == no_server) {
+            throw bad_param_exception{fmt::format("Server for group ID {} not found", gid)};
+        }
+
+        co_return json_return_type(idx);
+    });
+    r::trigger_stepdown.set(r, [&raft_gr] (std::unique_ptr<http::request> req) -> future<json_return_type> {
+        auto timeout = get_request_timeout(*req);
+        auto dur = timeout.value ? *timeout.value - lowres_clock::now() : std::chrono::seconds(60);
+        const auto stepdown_timeout_ticks = dur / service::raft_tick_interval;
+        auto timeout_dur = raft::logical_clock::duration(stepdown_timeout_ticks);
+
+        // A null id lets the leader pick any up-to-date voter as its successor.
+        const auto target = get_query_param<raft::server_id>(*req, "target_host_id");
+
+        const auto gid_param = try_get_query_param<raft::group_id>(*req, "group_id");
+        if (!gid_param) {
+            // Stepdown on group 0 by default
+            co_await raft_gr.invoke_on(0, [timeout_dur, target] (service::raft_group_registry& raft_gr) {
+                apilog.info("Triggering stepdown for group0, target {}", target);
+                return raft_gr.group0().stepdown(timeout_dur, target);
+            });
+            co_return json_void{};
+        }
+        const raft::group_id gid = *gid_param;
+
+        std::atomic<bool> found_srv{false};
+        co_await raft_gr.invoke_on_all([gid, timeout_dur, target, &found_srv] (service::raft_group_registry& raft_gr) -> future<> {
+            auto* srv = raft_gr.find_server(gid);
+            if (!srv) {
+                co_return;
+            }
+
+            found_srv = true;
+            apilog.info("Triggering stepdown for group {}, target {}", gid, target);
+            co_await srv->stepdown(timeout_dur, target);
+        });
+
+        if (!found_srv) {
+            throw std::runtime_error{fmt::format("Server for group ID {} not found", gid)};
+        }
+
+        co_return json_void{};
+    });
+}
+
+void unset_raft(http_context&, httpd::routes& r) {
+    r::trigger_snapshot.unset(r);
+    r::get_leader_host.unset(r);
+    r::read_barrier.unset(r);
+    r::wait_for_apply_committed.unset(r);
+    r::trigger_stepdown.unset(r);
+}
+
+}

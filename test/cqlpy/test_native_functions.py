@@ -1,0 +1,322 @@
+# Copyright 2023-present ScyllaDB
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+
+###############################################################################
+# Tests for various native (built-in) scalar functions that can be used in
+# various SELECT, INSERT or UPDATE requests. Note we also have tests for
+# some of these functions in many other test files. For example, the tests
+# for the cast() function are in test_cast_data.py.
+###############################################################################
+
+import pytest
+from .util import new_test_table, unique_key_int
+from datetime import datetime
+from cassandra.protocol import InvalidRequest
+
+@pytest.fixture(scope="module")
+def table1(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace, "p int, i int, g bigint, b blob, s text, t timestamp, u timeuuid, d date, PRIMARY KEY (p)") as table:
+        yield table
+
+@pytest.fixture(scope="module")
+def tbl_set(cql, test_keyspace):
+    with new_test_table(cql, test_keyspace,
+                        "p int PRIMARY KEY, s1 set<int>, s2 set<int>,"
+                        "s3 set<tinyint>, m map<int, int>, s4 frozen<set<int>>") as table:
+        yield table
+
+# Check that a function that can take a column name as a parameter, can also
+# take a constant. This feature is barely useful for WHERE clauses, and
+# even less useful for selectors, but should be allowed for both.
+# Reproduces #12607.
+def test_constant_function_parameter(cql, table1):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, b) VALUES ({p}, 0x03)")
+    assert [(p,)] == list(cql.execute(f"SELECT p FROM {table1} WHERE p={p} AND b=tinyintAsBlob(3) ALLOW FILTERING"))
+    assert [(b'\x04',)] == list(cql.execute(f"SELECT tinyintAsBlob(4) FROM {table1} WHERE p={p}"))
+
+# According to the documentation, "The `minTimeuuid` function takes a
+# `timestamp` value t, either a timestamp or a date string.". But although
+# both cases are supported with constant parameters in WHERE restrictions,
+# in a *selector* (the first part of the SELECT, saying what to select), it
+# turns out that ONLY a timestamp column is allowed. Although this is
+# undocumented behavior, both Cassandra and Scylla share it so we deem it
+# correct.
+def test_selector_mintimeuuid(cql, table1):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, s, t, i) VALUES ({p}, '2013-02-02 10:00+0000', 123, 456)")
+    # We just check this works, not what the value is:
+    cql.execute(f"SELECT mintimeuuid(t) FROM {table1} WHERE p={p}")
+    # This doesn't work - despite the documentation, in a selector a
+    # date string is not supported by mintimeuuid.
+    with pytest.raises(InvalidRequest, match='of type timestamp'):
+        cql.execute(f"SELECT mintimeuuid(s) FROM {table1} WHERE p={p}")
+    # Other integer types also don't work, it must be a timestamp:
+    with pytest.raises(InvalidRequest, match='of type timestamp'):
+        cql.execute(f"SELECT mintimeuuid(i) FROM {table1} WHERE p={p}")
+
+# Cassandra allows the implicit (and wrong!) casting of a bigint returned
+# by writetime() to the timestamp type required by mintimeuuid(). Scylla
+# doesn't. I'm not sure which behavior we should consider correct, but it's
+# useful to have a test that demonstrates this incompatibility.
+# Reproduces #14319.
+@pytest.mark.xfail(reason="issue #14319")
+def test_selector_mintimeuuid_64bit(cql, table1):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, g) VALUES ({p}, 123)")
+    cql.execute(f"SELECT mintimeuuid(g) FROM {table1} WHERE p={p}")
+    cql.execute(f"SELECT mintimeuuid(writetime(g)) FROM {table1} WHERE p={p}")
+
+# blobasbigint() must insist to receive a properly-sized (8-byte) blob.
+# If it accepts a shorter blob (e.g., 4 bytes) and returns that to the driver,
+# it will confuse the driver (the driver will expect to read 8 bytes for the
+# bigint but will get only 4).
+def test_blobas_wrong_size(cql, table1):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, i) VALUES ({p}, 123)")
+    # Cassandra and Scylla print: "In call to function system.blobasbigint,
+    # value 0x0000007b is not a valid binary representation for type bigint".
+    with pytest.raises(InvalidRequest, match='blobasbigint'):
+        cql.execute(f"SELECT blobasbigint(intasblob(i)) FROM {table1} WHERE p={p}")
+
+# The mintimeuuid() function works with valid "timestamp"-type values, which
+# are 64-bit *signed* integers representing milliseconds since the epoch.
+# In particular, negative timestamps are allowed and should not be rejected.
+# The function tounixtimestamp can be used to extract the timestamp back from
+# the timeuuid. In this test we use "reasonably"-low timestamps (referring
+# to dates in this and the previous century - not to the age of the
+# dinosaurs). The test that follows will look at extreme, not-useful-in-
+# practice, timestamp values.
+@pytest.mark.parametrize("timestamp", [-1706638779000, -123, 123, 1706638779000])
+def test_mintimeuuid_reasonable(cql, table1, timestamp):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, t) VALUES ({p}, {timestamp})")
+    assert [(timestamp,)] == list(cql.execute(f"SELECT tounixtimestamp(mintimeuuid(t)) FROM {table1} WHERE p={p}"))
+
+# The "timestamp" column type stores a 64-bit number of milliseconds, but
+# Scylla's and Cassandra's implementation of timeuuids cannot store this
+# entire range. This test expects mintimeuuid() to either return the *right*
+# thing (converted back to the original timestamp via tounixtimestamp),
+# or to throw an exception. Crashing is not acceptable (reproduces #17035),
+# and so is returning a value, but it having the wrong timestamp (this
+# happens in Cassandra, so this test is marked a cassandra_bug)
+@pytest.mark.parametrize("timestamp", [-2**63+123, -2**62, -2**58, 2**62, 2**63-123])
+def test_mintimeuuid_extreme(cql, table1, timestamp, cassandra_bug):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, t) VALUES ({p}, {timestamp})")
+    try:
+        res = list(cql.execute(f"SELECT tounixtimestamp(mintimeuuid(t)) FROM {table1} WHERE p={p}"))
+    except:
+        # If mintimeuuid() refuses these extreme values, it's fine.
+        # The real bug is to return something, which is wrong (the
+        # assert below), or to crash the server (issue #17035).
+        pass
+    else:
+        assert [(timestamp,)] == res
+
+# An example of an extreme negative timestamp is what totimestamp(123)
+# returns: As shown in test_type_date.py, the number "123" is converted to
+# a date very long in the past (2**31 is the day of the epoch), and results
+# in a very negative timestamp.
+# We don't expect much from this test - it may report strange errors (this
+# happens in both Cassandra and Scylla), but it mustn't crash as it did in
+# issue #17035.
+def test_mintimeuuid_extreme_from_totimestamp(cql, table1):
+    p = unique_key_int()
+    try:
+        cql.execute(f"SELECT * FROM {table1} WHERE p={p} and u < mintimeuuid(totimestamp(123)) ALLOW FILTERING")
+    except:
+        pass
+
+# According to the documentation, the toTimestamp() function can take either
+# a "timeuuid" or a "date" value and convert it to a "timestamp" type
+# (64-bit signed integer representing number of milliseconds since the UNIX
+# epoch). Let's test these conversions, and their error cases (especially,
+# the range dates covered by the different types isn't identical).
+# In test_type_date.py we have test coverage on the different ways a "date"
+# value can initialized, so we don't need to cover all of these here.
+def test_totimestamp_date(cql, table1):
+    p = unique_key_int()
+    # The date 2**31 is the day of the epoch, so 2**31+1 is one day later,
+    # Midnight January 2nd, 1970:
+    cql.execute(f"INSERT INTO {table1} (p, d) VALUES ({p}, {2**31+1})")
+    assert [(datetime(1970,1,2,0,0),)] == list(cql.execute(f"SELECT totimestamp(d) FROM {table1} WHERE p={p}"))
+    # The day 2**31-1 is one day before the epoch, and this (negative
+    # timestamps) is allowed:
+    cql.execute(f"INSERT INTO {table1} (p, d) VALUES ({p}, {2**31-1})")
+    assert [(datetime(1969,12,31,0,0),)] == list(cql.execute(f"SELECT totimestamp(d) FROM {table1} WHERE p={p}"))
+
+# Same as above test test_totimestame_date(), but use extreme dates
+# millions of years in the past. These tests cannot be run with the
+# current Python driver because of bugs it has in converting extreme
+# timestamps - https://github.com/scylladb/python-driver/issues/255 -
+# so the test is skipped.
+@pytest.mark.skip_bug(
+    link="https://github.com/scylladb/python-driver/issues/255",
+    reason="Python driver bug",
+)
+def test_totimestamp_date_extreme(cql, table1):
+    p = unique_key_int()
+    # The day 2**31-2**29 is 2**29 days before the epoch - it's a useless date
+    # (more than a million years before our time), but at 4e16 milliseconds
+    # before the epoch, it should still fit nicely into 63 bits (9e18
+    # milliseconds), and should work fine.
+    cql.execute(f"INSERT INTO {table1} (p, d) VALUES ({p}, {2**31-2**29})")
+    cql.execute(f"SELECT totimestamp(d) FROM {table1} WHERE p={p}")
+    # The day 2**30 is 2**30 days before the epoch - it's a useless date
+    # (almost 3 million years before our time), but at 10^17 milliseconds
+    # before the epoch, it should still fit 63 bits (10^19 milliseconds)
+    # and work fine.
+    cql.execute(f"INSERT INTO {table1} (p, d) VALUES ({p}, {2**30})")
+    cql.execute(f"SELECT totimestamp(d) FROM {table1} WHERE p={p}")
+
+# The functions dateOf(timeuuid) and unixTimestampOf(timeuuid) were
+# deprecated in Cassandra 2.2 (CASSANDRA-9229), in favor of the more general
+# toTimestamp() and toUnixTimestamp(), which also accept other types besides
+# timeuuid. Cassandra 5.0 removed the deprecated functions (CASSANDRA-18328),
+# but Scylla still supports them, for backward compatibility with existing
+# applications. These tests check that they still work, so are Scylla-only.
+# They were moved here from the translations of Cassandra's TimeuuidTest
+# and TypeTest in cassandra_tests/, when Cassandra removed these checks from
+# those tests.
+def test_dateof_unixtimestampof(cql, table1, scylla_only):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, i, u) VALUES ({p}, 1, now())")
+    # dateOf() and unixTimestampOf() return the same as their replacements
+    [(d, ts, expected_d, expected_ts)] = list(cql.execute(f"SELECT dateOf(u), unixTimestampOf(u), toTimestamp(u), toUnixTimestamp(u) FROM {table1} WHERE p={p}"))
+    assert d == expected_d
+    assert ts == expected_ts
+    # The deprecated functions only accept a timeuuid, not an int
+    with pytest.raises(InvalidRequest):
+        cql.execute(f"SELECT dateOf(i) FROM {table1} WHERE p={p}")
+    with pytest.raises(InvalidRequest):
+        cql.execute(f"SELECT unixTimestampOf(i) FROM {table1} WHERE p={p}")
+
+# Check that the results of dateOf() (a timestamp) and unixTimestampOf() (a
+# bigint) can be written into columns of a compatible type - a timestamp
+# can be set from a bigint, and a bigint or varint from a timestamp.
+def test_dateof_unixtimestampof_compatibility(cql, test_keyspace, scylla_only):
+    with new_test_table(cql, test_keyspace, "a int, b timestamp, c bigint, d varint, PRIMARY KEY (a, b, c, d)") as table:
+        cql.execute(f"INSERT INTO {table} (a, b, c, d) VALUES (1, unixTimestampOf(now()), dateOf(now()), dateOf(now()))")
+        assert len(list(cql.execute(f"SELECT * FROM {table} WHERE a=1 AND b <= toUnixTimestamp(now())"))) == 1
+
+# Test set_intersection() function. Not supported in Cassandra.
+def test_set_intersection_fn(cql, tbl_set, scylla_only):
+    p1 = unique_key_int()
+    p2 = unique_key_int()
+    cql.execute(f"INSERT INTO {tbl_set} (p, s1, s2, s3, m, s4) VALUES ({p1}, {{1,2,3}}, {{2,3,4}}, {{1}}, {{1:2, 2:3}}, {{-1,2}})")
+    cql.execute(f"INSERT INTO {tbl_set} (p, s1, s2, s3, m, s4) VALUES ({p2}, {{1,2,3}}, NULL, {{1}}, {{1:2, 2:3}}, {{-1,2}})")
+    # Normal intersection.
+    assert [(set([2,3]),)] == list(cql.execute(f"SELECT set_intersection(s1, s2) FROM {tbl_set} WHERE p={p1}"))
+    # Intersecting with NULL.
+    assert [(None,)] == list(cql.execute(f"SELECT set_intersection(s1, s2) FROM {tbl_set} WHERE p={p2}"))
+    # Frozen and non-frozen.
+    assert [(set([2]),)] == list(cql.execute(f"SELECT set_intersection(s1, s4) FROM {tbl_set} WHERE p={p1}"))
+    # Nesting
+    assert [(set([2]),)] == list(cql.execute(f"SELECT set_intersection(s1, set_intersection(s2, s4)) FROM {tbl_set} WHERE p={p1}"))
+    # Some error cases
+    with pytest.raises(InvalidRequest, match='accepts 2 arguments'):
+        cql.execute(f"SELECT set_intersection(s1, s2, s3) FROM {tbl_set} WHERE p={p1}")
+    with pytest.raises(InvalidRequest, match='accepts 2 arguments'):
+        cql.execute(f"SELECT set_intersection(s1) FROM {tbl_set} WHERE p={p1}")
+    with pytest.raises(InvalidRequest, match='both arguments are of set type'):
+        cql.execute(f"SELECT set_intersection(s1, p) FROM {tbl_set} WHERE p={p1}")
+    with pytest.raises(InvalidRequest, match='both arguments are of the same set type'):
+        cql.execute(f"SELECT set_intersection(s1, s3) FROM {tbl_set} WHERE p={p1}")
+
+# An unqualified native function (e.g. intAsBlob) called against a `system`
+# keyspace table used to be added as a candidate twice. It was registered once
+# under the native "system" name, and once under the current keyspace, which is
+# also "system". A weakly-assignable argument then matched both copies and
+# raised a spurious "Ambiguous call to function" InvalidRequest error.
+# Reproduces SCYLLADB-1682.
+#
+# "Ambiguous call to function" is a hard error, so the regression check is
+# simply that these queries execute without raising: if the duplicate candidate
+# came back, the call would throw InvalidRequest and fail the test.
+def test_native_function_in_system_keyspace_query(cql):
+    # Literal: weakly assignable to int under the current type inference.
+    list(cql.execute("SELECT intAsBlob(4) FROM system.local"))
+    # Bind marker: untyped by construction, so the canonical reproducer.
+    stmt = cql.prepare("SELECT intAsBlob(?) FROM system.local")
+    list(cql.execute(stmt, [4]))
+    # Nested unqualified calls.
+    stmt = cql.prepare("SELECT blobAsInt(intAsBlob(?)) FROM system.local")
+    list(cql.execute(stmt, [4]))
+    # Fully-qualified call takes the single-candidate path; regression guard.
+    list(cql.execute("SELECT system.intAsBlob(4) FROM system.local"))
+
+# Cassandra 5 (CASSANDRA-18037) gave snake_case names to the native functions
+# whose names were several words run together, e.g., to_timestamp instead of
+# totimestamp, and kept the old names as deprecated aliases. The old name is
+# always the new name without underscores. Check that each new name works, and
+# gives the same result as the old name. Each case is the new function name
+# and its arguments. test_snake_case_function_column_names checks the names of
+# the result columns.
+# Reproduces SCYLLADB-5141.
+@pytest.mark.parametrize('name,args', [
+    ('min_timeuuid', 't'), ('max_timeuuid', 't'),
+    ('to_date', 'u'), ('to_date', 't'),
+    ('to_timestamp', 'u'), ('to_timestamp', 'd'),
+    ('to_unix_timestamp', 'u'), ('to_unix_timestamp', 't'), ('to_unix_timestamp', 'd'),
+    ('ascii_as_blob', "'abc'"), ('blob_as_ascii', "asciiasblob('abc')"),
+    ('bigint_as_blob', '3'), ('blob_as_bigint', 'bigintasblob(3)'),
+    ('boolean_as_blob', 'true'), ('blob_as_boolean', 'booleanasblob(true)'),
+    ('date_as_blob', "'2024-01-02'"), ('blob_as_date', "dateasblob('2024-01-02')"),
+    ('decimal_as_blob', '1.5'), ('blob_as_decimal', 'decimalasblob(1.5)'),
+    ('double_as_blob', '1.5'), ('blob_as_double', 'doubleasblob(1.5)'),
+    ('duration_as_blob', '1h'), ('blob_as_duration', 'durationasblob(1h)'),
+    ('float_as_blob', '1.5'), ('blob_as_float', 'floatasblob(1.5)'),
+    ('inet_as_blob', "'1.2.3.4'"), ('blob_as_inet', "inetasblob('1.2.3.4')"),
+    ('int_as_blob', 'i'), ('blob_as_int', 'intasblob(i)'),
+    ('smallint_as_blob', '3'), ('blob_as_smallint', 'smallintasblob(3)'),
+    ('text_as_blob', 's'), ('blob_as_text', 'textasblob(s)'),
+    ('time_as_blob', "'01:02:03'"), ('blob_as_time', "timeasblob('01:02:03')"),
+    ('timestamp_as_blob', 't'), ('blob_as_timestamp', 'timestampasblob(t)'),
+    ('timeuuid_as_blob', 'u'), ('blob_as_timeuuid', 'timeuuidasblob(u)'),
+    ('tinyint_as_blob', '3'), ('blob_as_tinyint', 'tinyintasblob(3)'),
+    ('uuid_as_blob', '123e4567-e89b-12d3-a456-426614174000'), ('blob_as_uuid', 'uuidasblob(123e4567-e89b-12d3-a456-426614174000)'),
+    ('varchar_as_blob', "'abc'"), ('blob_as_varchar', "varcharasblob('abc')"),
+    ('varint_as_blob', '3'), ('blob_as_varint', 'varintasblob(3)'),
+])
+def test_snake_case_function_names(cql, table1, name, args):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, i, s, t, u, d) VALUES ({p}, 7, 'hello', '2024-01-02 03:04:05+0000', 5ad1d2e0-0a5b-11ef-8000-000000000000, '2024-01-02')")
+    old_name = name.replace('_', '')
+    [(new_value, old_value)] = list(cql.execute(f'SELECT {name}({args}), {old_name}({args}) FROM {table1} WHERE p = {p}'))
+    assert new_value == old_value
+
+# The name of a result column of a function call uses the name with which the
+# function was called - its new snake_case name or its old name (see
+# test_snake_case_function_names). We use column arguments, because Scylla
+# names the result of a call with only constant arguments by its value.
+# Reproduces SCYLLADB-5141.
+def test_snake_case_function_column_names(cql, table1):
+    p = unique_key_int()
+    cql.execute(f'INSERT INTO {table1} (p, i, u) VALUES ({p}, 7, 5ad1d2e0-0a5b-11ef-8000-000000000000)')
+    result = cql.execute(f'SELECT to_unix_timestamp(u), tounixtimestamp(u), int_as_blob(i), intasblob(i) FROM {table1} WHERE p = {p}')
+    assert result.column_names == ['system.to_unix_timestamp(u)', 'system.tounixtimestamp(u)', 'system.int_as_blob(i)', 'system.intasblob(i)']
+
+# The snake_case names of the functions which return the current time (see
+# test_snake_case_function_names) can't be compared to the old names'
+# results, because these change between calls, so just check that they work.
+# Reproduces SCYLLADB-5141.
+@pytest.mark.parametrize('name', ['current_timestamp', 'current_date', 'current_time', 'current_timeuuid'])
+def test_snake_case_current_time_function_names(cql, table1, name):
+    p = unique_key_int()
+    cql.execute(f'INSERT INTO {table1} (p) VALUES ({p})')
+    result = cql.execute(f'SELECT {name}() FROM {table1} WHERE p = {p}')
+    assert result.column_names[0] == f'system.{name}()'
+    [(value,)] = list(result)
+    assert value is not None
+
+# toJson() and fromJson() also got the snake_case names to_json() and
+# from_json() (see test_snake_case_function_names).
+# Reproduces SCYLLADB-5141.
+def test_snake_case_json_function_names(cql, table1):
+    p = unique_key_int()
+    cql.execute(f"INSERT INTO {table1} (p, i) VALUES ({p}, from_json('17'))")
+    result = cql.execute(f'SELECT to_json(i), tojson(i) FROM {table1} WHERE p = {p}')
+    assert result.column_names[0] == 'system.to_json(i)'
+    assert list(result) == [('17', '17')]

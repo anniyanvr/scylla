@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #define BOOST_TEST_MODULE core
@@ -19,7 +19,7 @@
 #include "cql3/util.hh"
 
 //
-// Test basic CQL string quoting
+// Test basic CQL identifier quoting
 //
 BOOST_AUTO_TEST_CASE(maybe_quote) {
     std::string s(65536, 'x');
@@ -54,6 +54,60 @@ BOOST_AUTO_TEST_CASE(maybe_quote) {
     BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("\"\""), "\"\"\"\"\"\"");
     BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("\"hell0\""), "\"\"\"hell0\"\"\"");
     BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("hello \"my\" world"), "\"hello \"\"my\"\" world\"");
+
+    // Reproducer for issue #9450. Reserved keywords like "to" or "where"
+    // need quoting, but unreserved keywords like "ttl", "int" or "as",
+    // do not.
+    BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("to"), "\"to\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("where"), "\"where\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("ttl"), "ttl");
+    BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("int"), "int");
+    BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("as"), "as");
+    // The OBJECT keyword of ALL OBJECT STORAGE is unreserved, as `object` is a common column name.
+    BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("object"), "object");
+    BOOST_REQUIRE_EQUAL(cql3::util::maybe_quote("ttl hi"), "\"ttl hi\"");
+}
+
+BOOST_AUTO_TEST_CASE(quote) {
+    std::string s(65536, 'x');
+    BOOST_REQUIRE_EQUAL(cql3::util::quote(s), "\"" + s + "\"");
+    s += " " + std::string(65536, 'y');
+    BOOST_REQUIRE_EQUAL(cql3::util::quote(s), "\"" + s + "\"");
+
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("a"), "\"a\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("z"), "\"z\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("b0"), "\"b0\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("y9"), "\"y9\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("c_d"), "\"c_d\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("x8_"), "\"x8_\"");
+
+    BOOST_REQUIRE_EQUAL(cql3::util::quote(""), "\"\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("0"), "\"0\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("9"), "\"9\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("_"), "\"_\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("A"), "\"A\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("To"), "\"To\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("zeD"), "\"zeD\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello world"), "\"hello world\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello_world01234"), "\"hello_world01234\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello world01234"), "\"hello world01234\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello world\"1234"), "\"hello world\"\"1234\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello_world01234hello_world01234"), "\"hello_world01234hello_world01234\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello world01234hello_world01234"), "\"hello world01234hello_world01234\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello world\"1234hello_world\"1234"), "\"hello world\"\"1234hello_world\"\"1234\"");
+
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("\""), "\"\"\"\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("[\"]"), "\"[\"\"]\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("\"\""), "\"\"\"\"\"\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("\"hell0\""), "\"\"\"hell0\"\"\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("hello \"my\" world"), "\"hello \"\"my\"\" world\"");
+
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("to"), "\"to\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("where"), "\"where\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("ttl"), "\"ttl\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("int"), "\"int\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("as"), "\"as\"");
+    BOOST_REQUIRE_EQUAL(cql3::util::quote("ttl hi"), "\"ttl hi\"");
 }
 
 //
@@ -80,7 +134,7 @@ using modifier_rule_ptr = void (cql3_parser::CqlParser::*)(T&);
 template <typename T>
 static T test_valid(std::string_view cql_fragment, producer_rule_ptr<T> rule) {
     T v;
-    BOOST_REQUIRE_NO_THROW(v = cql3::util::do_with_parser(cql_fragment, std::mem_fn(rule)));
+    BOOST_REQUIRE_NO_THROW(v = cql3::util::do_with_parser(cql_fragment, cql3::dialect{}, std::mem_fn(rule)));
     return v;
 }
 
@@ -91,7 +145,7 @@ static T test_valid(std::string_view cql_fragment, producer_rule_ptr<T> rule) {
 template <typename T>
 void test_valid(std::string_view cql_fragment, modifier_rule_ptr<T> rule, T& v) {
     BOOST_REQUIRE_NO_THROW(
-            cql3::util::do_with_parser(cql_fragment, [rule, &v](cql3_parser::CqlParser& parser) {
+            cql3::util::do_with_parser(cql_fragment, cql3::dialect{}, [rule, &v](cql3_parser::CqlParser& parser) {
                 (parser.*rule)(v);
                  // Any non-`void` value will do.
                  return 0;
@@ -127,7 +181,7 @@ BOOST_AUTO_TEST_CASE(user_name) {
 
     // Not worth generalizing `test_valid`.
     BOOST_REQUIRE_THROW(
-            (cql3::util::do_with_parser("\"Ring-bearer\"", std::mem_fn(&cql3_parser::CqlParser::username))),
+            (cql3::util::do_with_parser("\"Ring-bearer\"", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::username))),
             exceptions::syntax_exception);
 }
 
@@ -267,4 +321,38 @@ BOOST_AUTO_TEST_CASE(grant_role) {
 
 BOOST_AUTO_TEST_CASE(revoke_role) {
     test_valid("REVOKE soldier FROM boromir;");
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_password) {
+    test_valid("CREATE ROLE adam WITH HASHED PASSWORD = 'something';");
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED = 'something';", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_underscore_password) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED_PASSWORD = 'something';", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hash) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASH = 'something';", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_password_double_quotation_marks) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED PASSWORD = \"something\";", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
+}
+
+BOOST_AUTO_TEST_CASE(create_role_with_hashed_no_quotation_marks) {
+    BOOST_REQUIRE_THROW(
+        cql3::util::do_with_parser("CREATE ROLE jane WITH HASHED = something;", cql3::dialect{}, std::mem_fn(&cql3_parser::CqlParser::query)),
+        exceptions::syntax_exception);
 }

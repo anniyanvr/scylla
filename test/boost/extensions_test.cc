@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <variant>
@@ -12,6 +12,7 @@
 #include <seastar/core/future-util.hh>
 #include <seastar/core/sleep.hh>
 
+#undef SEASTAR_TESTING_MAIN
 #include <seastar/testing/test_case.hh>
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/cql_assertions.hh"
@@ -25,14 +26,22 @@
 #include "db/paxos_grace_seconds_extension.hh"
 #include "transport/messages/result_message.hh"
 #include "utils/overloaded_functor.hh"
+#include "replica/database.hh"
+
+BOOST_AUTO_TEST_SUITE(extensions_test)
 
 class dummy_ext : public schema_extension {
 public:
+    // dummy_ext was written before schema_extension was deprecated, so support it
+    // without warnings
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
     dummy_ext(bytes b) : _bytes(b) {}
     dummy_ext(const std::map<sstring, sstring>& map) : _bytes(ser::serialize_to_buffer<bytes>(map)) {}
     dummy_ext(const sstring&) {
         throw std::runtime_error("should not reach");
     }
+#pragma clang diagnostic pop
     bytes serialize() const override {
         return _bytes;
     }
@@ -68,7 +77,7 @@ SEASTAR_TEST_CASE(simple_sstable_extension) {
 
     class dummy_ext : public file_io_extension {
     public:
-        future<file> wrap_file(sstable& t, component_type type, file, open_flags flags) override {
+        future<file> wrap_file(const sstable& t, component_type type, file, open_flags flags) override {
             if (type == component_type::Data && t.get_schema()->cf_name() == "cf") {
                 ++counter;
             }
@@ -89,10 +98,7 @@ SEASTAR_TEST_CASE(simple_sstable_extension) {
             // minimal data
             return e.execute_cql("insert into ks.cf (id, value) values (1, 100);").discard_result().then([&e] {
                 // flush all shards
-                return e.db().invoke_on_all([](replica::database& db) {
-                    auto& cf = db.find_column_family("ks", "cf");
-                    return cf.flush();
-                }).then([] {
+                return replica::database::flush_table_on_all_shards(e.db(), "ks", "cf").then([] {
                     BOOST_REQUIRE(counter > 1);
                 });
             });
@@ -129,6 +135,8 @@ SEASTAR_TEST_CASE(paxos_grace_seconds_extension) {
     auto ext = std::make_shared<db::extensions>();
     ext->add_schema_extension<db::paxos_grace_seconds_extension>(db::paxos_grace_seconds_extension::NAME);
     auto cfg = ::make_shared<db::config>(ext);
+    cql_test_config cql_cfg(cfg);
+    cql_cfg.need_remote_proxy = true;
 
     return do_with_cql_env([] (cql_test_env& e) {
         // Verify that paxos_grace_seconds extensions gets recognized properly
@@ -145,7 +153,7 @@ SEASTAR_TEST_CASE(paxos_grace_seconds_extension) {
             return e.execute_prepared(prep_id, {cql3::raw_value::make_value(int32_type->decompose(1))});
         }).discard_result().then([&e] {
             return e.execute_cql("SELECT row_key, TTL(promise) FROM system.paxos")
-                .then([&e] (::shared_ptr<cql_transport::messages::result_message> msg) {
+                .then([] (::shared_ptr<cql_transport::messages::result_message> msg) {
                     assert_that(msg)
                         .is_rows()
                         .with_size(1);
@@ -159,7 +167,7 @@ SEASTAR_TEST_CASE(paxos_grace_seconds_extension) {
         });
 
         return f;
-    }, cfg);
+    }, std::move(cql_cfg));
 }
 
 SEASTAR_TEST_CASE(test_extension_remove) {
@@ -207,3 +215,5 @@ SEASTAR_TEST_CASE(test_extension_remove) {
         });
     }, ::make_shared<db::config>(ext));
 }
+
+BOOST_AUTO_TEST_SUITE_END()

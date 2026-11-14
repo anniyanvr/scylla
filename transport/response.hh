@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include "server.hh"
-#include "utils/reusable_buffer.hh"
 
 namespace cql_transport {
 
@@ -31,6 +30,7 @@ enum class cql_binary_opcode : uint8_t {
     AUTH_CHALLENGE = 14,
     AUTH_RESPONSE  = 15,
     AUTH_SUCCESS   = 16,
+    OPCODES_COUNT
 };
 
 class response {
@@ -53,11 +53,20 @@ public:
         }
     }
 
+    // Construct a response with pre-serialized body
+    response(int16_t stream, cql_binary_opcode opcode, uint8_t flags, bytes_ostream body)
+        : _stream{stream}
+        , _opcode{opcode}
+        , _flags{flags}
+        , _body{std::move(body)}
+    { }
+
     void set_frame_flag(cql_frame_flags flag) noexcept {
         _flags |= flag;
     }
 
     void serialize(const event::schema_change& event, uint8_t version);
+    void serialize(const event::client_routes_change& event, uint8_t version);
     void write_byte(uint8_t b);
     void write_int(int32_t n);
     placeholder<int32_t> write_int_placeholder();
@@ -68,19 +77,20 @@ public:
     void write_long_string(const sstring& s);
     void write_string_list(std::vector<sstring> string_list);
     void write_bytes(bytes b);
-    void write_short_bytes(bytes b);
+    void write_short_bytes(bytes_view b);
     void write_inet(socket_address inet);
+    // Writes an [inetaddr]: the address size followed by the address, without a port.
+    void write_inetaddr(const net::inet_address& addr);
     void write_consistency(db::consistency_level c);
     void write_string_map(std::map<sstring, sstring> string_map);
     void write_string_multimap(std::multimap<sstring, sstring> string_map);
+    void write_string_bytes_map(const std::unordered_map<sstring, bytes>& map);
     void write_value(bytes_opt value);
-    void write_value(std::optional<query::result_bytes_view> value);
-    void write(const cql3::metadata& m, bool skip = false);
+    void write_value(std::optional<managed_bytes_view> value);
+    void write(const cql3::metadata& m, const cql_metadata_id_wrapper& request_metadata_id, bool no_metadata = false);
     void write(const cql3::prepared_metadata& m, uint8_t version);
 
-    // Make a non-owning scattered_message of the response. Remains valid as long
-    // as the response object is alive.
-    scattered_message<char> make_message(uint8_t version, cql_compression compression);
+    future<> write_message(output_stream<char>& out, uint8_t version, cql_compression compression, seastar::deleter);
 
     cql_binary_opcode opcode() const {
         return _opcode;
@@ -88,15 +98,23 @@ public:
     size_t size() const {
         return _body.size();
     }
+    uint8_t flags() const {
+        return _flags;
+    }
+
+    bytes_ostream extract_body() && {
+        return std::move(_body);
+    }
+
 private:
     void compress(cql_compression compression);
     void compress_lz4();
     void compress_snappy();
 
     template <typename CqlFrameHeaderType>
-    sstring make_frame_one(uint8_t version, size_t length) {
-        sstring frame_buf = uninitialized_string(sizeof(CqlFrameHeaderType));
-        auto* frame = reinterpret_cast<CqlFrameHeaderType*>(frame_buf.data());
+    temporary_buffer<char> make_frame_one(uint8_t version, size_t length) {
+        temporary_buffer<char> frame_buf(sizeof(CqlFrameHeaderType));
+        auto* frame = reinterpret_cast<CqlFrameHeaderType*>(frame_buf.get_write());
         frame->version = version | 0x80;
         frame->flags   = _flags;
         frame->opcode  = static_cast<uint8_t>(_opcode);
@@ -106,16 +124,12 @@ private:
         return frame_buf;
     }
 
-    sstring make_frame(uint8_t version, size_t length) {
+    utils::result_with_exception_ptr<temporary_buffer<char>> make_frame(uint8_t version, size_t length) {
         if (version > 0x04) {
-            throw exceptions::protocol_exception(format("Invalid or unsupported protocol version: {:d}", version));
+            return bo::failure(std::make_exception_ptr(exceptions::protocol_exception(format("Invalid or unsupported protocol version: {:d}", version))));
         }
 
-        if (version > 0x02) {
-            return make_frame_one<cql_binary_frame_v3>(version, length);
-        } else {
-            return make_frame_one<cql_binary_frame_v1>(version, length);
-        }
+        return make_frame_one<cql_binary_frame_v3>(version, length);
     }
 };
 

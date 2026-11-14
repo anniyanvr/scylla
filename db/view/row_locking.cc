@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include "utils/assert.hh"
 #include "row_locking.hh"
-#include "log.hh"
-#include "utils/latency.hh"
-
-#include <seastar/core/when_all.hh>
+#include "utils/log.hh"
 
 static logging::logger mylog("row_locking");
 
@@ -18,6 +16,8 @@ row_locker::row_locker(schema_ptr s)
     : _schema(s)
     , _two_level_locks(1, decorated_key_hash(), decorated_key_equals_comparator(this))
 {
+    // Increase max load factor to allow up to ~128K concurrent requests without oversized allocations.
+    _two_level_locks.max_load_factor(8);
 }
 
 void row_locker::upgrade(schema_ptr new_schema) {
@@ -52,23 +52,34 @@ row_locker::lock_holder::lock_holder(row_locker* locker, const dht::decorated_ke
     , _row_exclusive(exclusive) {
 }
 
+row_locker::latency_stats_tracker::latency_stats_tracker(row_locker::single_lock_stats& stats)
+    : lock_stats(stats)
+{
+    waiting_latency.start();
+    lock_stats.operations_currently_waiting_for_lock++;
+}
+
+row_locker::latency_stats_tracker::~latency_stats_tracker() {
+    lock_stats.operations_currently_waiting_for_lock--;
+    waiting_latency.stop();
+    lock_stats.estimated_waiting_for_lock.add(waiting_latency.latency());
+}
+
+void row_locker::latency_stats_tracker::lock_acquired() {
+    lock_stats.lock_acquisitions++;
+}
+
 future<row_locker::lock_holder>
 row_locker::lock_pk(const dht::decorated_key& pk, bool exclusive, db::timeout_clock::time_point timeout, stats& stats) {
     mylog.debug("taking {} lock on entire partition {}", (exclusive ? "exclusive" : "shared"), pk);
+    auto tracker = latency_stats_tracker(exclusive ? stats.exclusive_partition : stats.shared_partition);
     auto i = _two_level_locks.try_emplace(pk, this).first;
-    single_lock_stats &single_lock_stats = exclusive ? stats.exclusive_partition : stats.shared_partition;
-    single_lock_stats.operations_currently_waiting_for_lock++;
-    utils::latency_counter waiting_latency;
-    waiting_latency.start();
     auto f = exclusive ? i->second._partition_lock.write_lock(timeout) : i->second._partition_lock.read_lock(timeout);
     // Note: we rely on the fact that &i->first, the pointer to a key, never
     // becomes invalid (as long as the item is actually in the hash table),
     // even in the case of rehashing.
-    return f.then([this, pk = &i->first, exclusive, &single_lock_stats, waiting_latency = std::move(waiting_latency)] () mutable {
-        waiting_latency.stop();
-        single_lock_stats.estimated_waiting_for_lock.add(waiting_latency.latency());
-        single_lock_stats.lock_acquisitions++;
-        single_lock_stats.operations_currently_waiting_for_lock--;
+    return f.then([this, pk = &i->first, exclusive, tracker = std::move(tracker)] () mutable {
+        tracker.lock_acquired();
         return lock_holder(this, pk, exclusive);
     });
 }
@@ -76,42 +87,30 @@ row_locker::lock_pk(const dht::decorated_key& pk, bool exclusive, db::timeout_cl
 future<row_locker::lock_holder>
 row_locker::lock_ck(const dht::decorated_key& pk, const clustering_key_prefix& cpk, bool exclusive, db::timeout_clock::time_point timeout, stats& stats) {
     mylog.debug("taking shared lock on partition {}, and {} lock on row {} in it", pk, (exclusive ? "exclusive" : "shared"), cpk);
+    auto tracker = latency_stats_tracker(exclusive ? stats.exclusive_row : stats.shared_row);
+    auto ck = cpk;
+    // Create a two-level lock entry for the partition if it doesn't exist already.
     auto i = _two_level_locks.try_emplace(pk, this).first;
+    // The two-level lock entry we've just created is guaranteed to be kept alive as long as it's locked.
+    // Initiating read locking in the background below ensures that even if the two-level lock is currently
+    // write-locked, releasing the write-lock will synchronously engage any waiting
+    // locks and will keep the entry alive.
     future<lock_type::holder> lock_partition = i->second._partition_lock.hold_read_lock(timeout);
-    auto j = i->second._row_locks.find(cpk);
-    if (j == i->second._row_locks.end()) {
-        // Not yet locked, need to create the lock. This makes a copy of cpk.
-        try {
-            j = i->second._row_locks.emplace(cpk, lock_type()).first;
-        } catch(...) {
-            // If this emplace() failed, e.g., out of memory, we fail. We
-            // could do nothing - the partition lock we already started
-            // taking will be unlocked automatically after being locked.
-            // But it's better form to wait for the work we started, and it
-            // will also allow us to remove the hash-table row we added.
-            return lock_partition.then([ex = std::current_exception()] (auto lock) {
-                // The lock is automatically released when "lock" goes out of scope.
-                // TODO: unlock (lock = {}) now, search for the partition in the
-                // hash table (we know it's still there, because we held the lock until
-                // now) and remove the unused lock from the hash table if still unused.
-                return make_exception_future<row_locker::lock_holder>(std::current_exception());
-            });
-        }
-    }
-    single_lock_stats &single_lock_stats = exclusive ? stats.exclusive_row : stats.shared_row;
-    single_lock_stats.operations_currently_waiting_for_lock++;
-    utils::latency_counter waiting_latency;
-    waiting_latency.start();
-    future<lock_type::holder> lock_row = exclusive ? j->second.hold_write_lock(timeout) : j->second.hold_read_lock(timeout);
-    return when_all_succeed(std::move(lock_partition), std::move(lock_row))
-    .then_unpack([this, pk = &i->first, cpk = &j->first, exclusive, &single_lock_stats, waiting_latency = std::move(waiting_latency)] (auto lock1, auto lock2) mutable {
-        lock1.release();
-        lock2.release();
-        waiting_latency.stop();
-        single_lock_stats.estimated_waiting_for_lock.add(waiting_latency.latency());
-        single_lock_stats.lock_acquisitions++;
-        single_lock_stats.operations_currently_waiting_for_lock--;
-        return lock_holder(this, pk, cpk, exclusive);
+    return lock_partition.then([this, pk = &i->first, row_locks = &i->second._row_locks, ck = std::move(ck), exclusive, tracker = std::move(tracker), timeout] (auto lock1) mutable {
+        // Create a row_lock entry if it doesn't exist already.
+        auto j = row_locks->try_emplace(std::move(ck), lock_type()).first;
+        auto* cpk = &j->first;
+        auto& row_lock = j->second;
+        // Like to the two-level lock entry above, the row_lock entry we've just created
+        // is guaranteed to be kept alive as long as it's locked.
+        // Initiating read/write locking in the background below ensures that.
+        auto lock_row = exclusive ? row_lock.hold_write_lock(timeout) : row_lock.hold_read_lock(timeout);
+        return lock_row.then([this, pk, cpk, exclusive, tracker = std::move(tracker), lock1 = std::move(lock1)] (auto lock2) mutable {
+            lock1.release();
+            lock2.release();
+            tracker.lock_acquired();
+            return lock_holder(this, pk, cpk, exclusive);
+        });
     });
 }
 
@@ -153,17 +152,17 @@ row_locker::unlock(const dht::decorated_key* pk, bool partition_exclusive,
         auto pli = _two_level_locks.find(*pk);
         if (pli == _two_level_locks.end()) {
             // This shouldn't happen... We can't unlock this lock if we can't find it...
-            mylog.error("column_family::local_base_lock_holder::~local_base_lock_holder() can't find lock for partition", *pk);
+            mylog.error("column_family::local_base_lock_holder::~local_base_lock_holder() can't find lock for partition {}", *pk);
             return;
         }
-        assert(&pli->first == pk);
+        SCYLLA_ASSERT(&pli->first == pk);
         if (cpk) {
             auto rli = pli->second._row_locks.find(*cpk);
             if (rli == pli->second._row_locks.end()) {
-                mylog.error("column_family::local_base_lock_holder::~local_base_lock_holder() can't find lock for row", *cpk);
+                mylog.error("column_family::local_base_lock_holder::~local_base_lock_holder() can't find lock for row {}", *cpk);
                 return;
             }
-            assert(&rli->first == cpk);
+            SCYLLA_ASSERT(&rli->first == cpk);
             mylog.debug("releasing {} lock for row {} in partition {}", (row_exclusive ? "exclusive" : "shared"), *cpk, *pk);
             auto& lock = rli->second;
             if (row_exclusive) {

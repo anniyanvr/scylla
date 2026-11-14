@@ -4,18 +4,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <fmt/format.h>
-#include <fmt/ostream.h>
-#include <unordered_map>
-#include <iosfwd>
-#include <string_view>
 
-#include <boost/program_options.hpp>
+#include <unordered_map>
+#include <string_view>
 
 #include <seastar/core/sstring.hh>
 #include <seastar/core/future.hh>
@@ -28,6 +25,13 @@
 namespace seastar { class file; }
 namespace seastar::json { class json_return_type; }
 namespace YAML { class Node; }
+
+namespace boost::program_options {
+
+class options_description;
+class options_description_easy_init;
+
+}
 
 namespace utils {
 
@@ -51,7 +55,18 @@ public:
 };
 
 template <typename T>
-extern const config_type config_type_for;
+extern const config_type& config_type_for();
+
+// Thrown when the configuration references an option value that has been
+// deliberately retired/removed. Unlike ordinary parse errors (typos, unknown
+// options from a newer version), which are tolerated and merely reported via
+// the error_handler, a retired value is a hard misconfiguration: this exception
+// escapes read_from_yaml so startup fails with a readable message asking the
+// operator to remove it.
+class retired_config_value_error : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class config_file {
     static thread_local unsigned s_shard_id;
@@ -66,9 +81,32 @@ public:
     typedef std::vector<sstring> string_list;
 
     enum class value_status {
-        Used,
-        Unused,
-        Invalid,
+        Used, ///< a valid option which changes scylla's behavior. only the
+              ///< "Used" options are added to the command line options,
+              ///< and can be specified with command line.
+        Unused, ///< an option inherited or not yet implemented.
+                ///< We want to minimize their "visibility" from user. So
+                ///< despite that they are still accepted in the config file,
+                ///< they are not considered as valid options if specified
+                ///< using the command line anymore.
+                ///< initially, we had loads of these options from Cassandra.
+                ///< they are also used for options supported by the older
+                ///< versions of Scylla.
+                ///< (In the past used to deprecate an option,
+                ///< now there's a separate Deprecated enumerator for that purpose)
+        Invalid, ///< an option inherited, but we don't intend to
+                 ///< implement it. on the contrary, we print a warning message
+                 ///< at seeing each of these options if specified when booting
+                 ///< up. these options are kept around only to ease the
+                 ///< migration process so user can keep using their existing
+                 ///< settings.
+                 ///< (In the past used to deprecate an option,
+                 ///< now there's a separate Deprecated enumerator for that purpose)
+        Deprecated, ///< an option that was used once, but became deprecated.
+                    ///< If specified in configuration file or as a cmd line param,
+                    ///< we'll parse it and print a warning saying it's deprecated.
+                    ///< You may expect such option will become Unused/Invalid
+                    ///< or will be removed altogether some day.
     };
 
     enum class liveness {
@@ -81,7 +119,11 @@ public:
         SettingsFile,
         CommandLine,
         CQL,
-        Internal
+        Internal,
+        API,
+        // Set by a cluster config override. Ranks above SettingsFile so a yaml reload
+        // leaves the value alone, like an API value.
+        ClusterConfig,
     };
 
     struct config_src {
@@ -124,11 +166,14 @@ public:
         }
         bool matches(std::string_view name) const;
         virtual void add_command_line_option(bpo::options_description_easy_init&) = 0;
-        virtual void set_value(const YAML::Node&) = 0;
-        virtual bool set_value(sstring, config_source = config_source::Internal) = 0;
+        virtual void set_value(const YAML::Node&, config_source) = 0;
+        virtual bool set_value(sstring, config_source) = 0;
+        virtual future<bool> set_value_on_all_shards(sstring, config_source) = 0;
         virtual value_status status() const noexcept = 0;
         virtual config_source source() const noexcept = 0;
+        virtual liveness get_liveness() const noexcept = 0;
         sstring source_name() const noexcept;
+        std::string_view status_name() const noexcept;
         json::json_return_type value_as_json() const;
     };
 
@@ -139,106 +184,64 @@ public:
         config_source _source = config_source::None;
         value_status _value_status;
         struct the_value_type final : any_value {
-            the_value_type(T value) : value(std::move(value)) {}
+            the_value_type(T value);
             utils::updateable_value_source<T> value;
-            virtual std::unique_ptr<any_value> clone() const override {
-                return std::make_unique<the_value_type>(value());
-            }
-            virtual void update_from(const any_value* source) override {
-                auto typed_source = static_cast<const the_value_type*>(source);
-                value.set(typed_source->value());
-            }
+            std::unique_ptr<any_value> clone() const override;
+            void update_from(const any_value* source) override;
         };
         liveness _liveness;
         std::vector<T> _allowed_values;
+        void check_write_allowed(const T& t, config_source src) const;
     protected:
-        updateable_value_source<T>& the_value() {
-            any_value* av =_cf->_per_shard_values[_cf->s_shard_id][_per_shard_values_offset].get();
-            return static_cast<the_value_type*>(av)->value;
-        }
-        const updateable_value_source<T>& the_value() const {
-            return const_cast<named_value*>(this)->the_value();
-        }
-        virtual const void* current_value() const override {
-            return &the_value().get();
-        }
+        updateable_value_source<T>& the_value();
+        const updateable_value_source<T>& the_value() const;
+        const void* current_value() const override;
     public:
         typedef T type;
         typedef named_value<T> MyType;
 
         named_value(config_file* file, std::string_view name, std::string_view alias, liveness liveness_, value_status vs, const T& t = T(), std::string_view desc = {},
-                std::initializer_list<T> allowed_values = {})
-            : config_src(file, name, alias, &config_type_for<T>, desc)
-            , _value_status(vs)
-            , _liveness(liveness_)
-            , _allowed_values(std::move(allowed_values)) {
-            file->add(*this, std::make_unique<the_value_type>(std::move(t)));
-        }
+                std::initializer_list<T> allowed_values = {});
         named_value(config_file* file, std::string_view name, liveness liveness_, value_status vs, const T& t = T(), std::string_view desc = {},
-                std::initializer_list<T> allowed_values = {})
-            : named_value(file, name, {}, liveness_, vs, t, desc) {
-        }
+                std::initializer_list<T> allowed_values = {});
         named_value(config_file* file, std::string_view name, std::string_view alias, value_status vs, const T& t = T(), std::string_view desc = {},
-                std::initializer_list<T> allowed_values = {})
-                : named_value(file, name, alias, liveness::MustRestart, vs, t, desc, allowed_values) {
-        }
+                std::initializer_list<T> allowed_values = {});
         named_value(config_file* file, std::string_view name, value_status vs, const T& t = T(), std::string_view desc = {},
-                std::initializer_list<T> allowed_values = {})
-                : named_value(file, name, {}, liveness::MustRestart, vs, t, desc, allowed_values) {
-        }
-        value_status status() const noexcept override {
-            return _value_status;
-        }
-        config_source source() const noexcept override {
-            return _source;
-        }
-        bool is_set() const {
-            return _source > config_source::None;
-        }
-        MyType & operator()(const T& t, config_source src = config_source::Internal) {
-            if (!_allowed_values.empty() && std::find(_allowed_values.begin(), _allowed_values.end(), t) == _allowed_values.end()) {
-                throw std::invalid_argument(format("Invalid value for {}: got {} which is not inside the set of allowed values {}", name(), t, _allowed_values));
-            }
-            the_value().set(t);
-            if (src > config_source::None) {
-                _source = src;
-            }
-            return *this;
-        }
-        MyType & operator()(T&& t, config_source src = config_source::Internal) {
-            if (!_allowed_values.empty() && std::find(_allowed_values.begin(), _allowed_values.end(), t) == _allowed_values.end()) {
-                throw std::invalid_argument(format("Invalid value for {}: got {} which is not inside the set of allowed values {}", name(), t, _allowed_values));
-            }
-            the_value().set(std::move(t));
-            if (src > config_source::None) {
-                _source = src;
-            }
-            return *this;
-        }
-        void set(T&& t, config_source src = config_source::None) {
-            operator()(std::move(t), src);
-        }
-        const T& operator()() const {
-            return the_value().get();
-        }
+                std::initializer_list<T> allowed_values = {});
+        value_status status() const noexcept override;
+        config_source source() const noexcept override;
+        liveness get_liveness() const noexcept override;
+        bool is_set() const;
+        // Throws std::invalid_argument for an API or CQL write while the value is owned by
+        // a cluster config override (source() == ClusterConfig).
+        MyType & operator()(const T& t, config_source src = config_source::Internal);
+        MyType & operator()(T&& t, config_source src = config_source::Internal);
+        void set(T&& t, config_source src = config_source::None);
+        // Sets the value and the source unconditionally (unlike operator(), which keeps the
+        // current source for src == None). Used to put back a pre-cluster-config baseline.
+        void restore(const T& t, config_source src);
+        const T& operator()() const;
 
-        operator updateable_value<T>() const & {
-            return updateable_value<T>(the_value());
-        }
+        operator updateable_value<T>() const &;
 
-        observer<T> observe(std::function<void (const T&)> callback) const {
-            return the_value().observe(std::move(callback));
-        }
+        observer<T> observe(std::function<void (const T&)> callback) const;
 
         void add_command_line_option(bpo::options_description_easy_init&) override;
-        void set_value(const YAML::Node&) override;
-        bool set_value(sstring, config_source = config_source::Internal) override;
+        void set_value(const YAML::Node&, config_source) override;
+        bool set_value(sstring, config_source) override;
+        // For setting a single value on all shards,
+        // without having to call broadcast_to_all_shards
+        // that broadcasts all values to all shards.
+
+        future<bool> set_value_on_all_shards(sstring, config_source) override;
     };
 
     typedef std::reference_wrapper<config_src> cfg_ref;
 
     config_file(std::initializer_list<cfg_ref> = {});
     config_file(const config_file&) = delete;
+
+    virtual ~config_file() = default;
 
     void add(cfg_ref, std::unique_ptr<any_value> value);
     void add(std::initializer_list<cfg_ref>);
@@ -249,6 +252,8 @@ public:
 
     boost::program_options::options_description_easy_init&
     add_options(boost::program_options::options_description_easy_init&);
+    boost::program_options::options_description_easy_init&
+    add_deprecated_options(boost::program_options::options_description_easy_init&);
 
     /**
      * Default behaviour for yaml parser is to throw on
@@ -279,9 +284,17 @@ public:
     }
     future<> broadcast_to_all_shards();
 private:
+    virtual bool are_live_updatable_config_params_changeable_via_cql() const {
+        return false;
+    }
+
     configs
         _cfgs;
+    bool _initialization_completed;
 };
+
+// The name shown for a source in system.config, e.g. "config" for SettingsFile.
+sstring config_source_name(config_file::config_source src) noexcept;
 
 template <typename T>
 requires requires (const config_file::named_value<T>& nv) {
@@ -292,6 +305,25 @@ const config_file::named_value<T>& operator||(const config_file::named_value<T>&
 }
 
 extern template struct config_file::named_value<seastar::log_level>;
+
+// Explicit instantiation declarations for the most common named_value<T>
+// specializations. The definitions are in db/config.cc (which is the only
+// TU that includes config_file_impl.hh and therefore has the full template
+// bodies). This avoids re-compiling the heavy boost::program_options /
+// boost::lexical_cast / yaml-cpp machinery in every TU that includes
+// config.hh.
+extern template struct config_file::named_value<bool>;
+extern template struct config_file::named_value<uint16_t>;
+extern template struct config_file::named_value<uint32_t>;
+extern template struct config_file::named_value<uint64_t>;
+extern template struct config_file::named_value<int32_t>;
+extern template struct config_file::named_value<int64_t>;
+extern template struct config_file::named_value<float>;
+extern template struct config_file::named_value<double>;
+extern template struct config_file::named_value<sstring>;
+extern template struct config_file::named_value<std::string>;
+extern template struct config_file::named_value<config_file::string_map>;
+extern template struct config_file::named_value<config_file::string_list>;
 
 }
 

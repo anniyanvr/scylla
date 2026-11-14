@@ -1,0 +1,1840 @@
+# Copyright 2026-present ScyllaDB
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+
+# Tests for the DynamoDB ExportTableToPointInTime, DescribeExport, and
+# ListExports APIs (part of SCYLLADB-1939).
+
+import base64
+import collections
+import logging
+from urllib import response
+
+import pytest
+import boto3
+import time
+import uuid
+import json
+import hashlib
+import datetime
+import gzip
+import decimal
+import re
+
+from botocore.exceptions import ClientError
+from cassandra import ConsistencyLevel
+from cassandra.query import SimpleStatement
+from contextlib import contextmanager, ExitStack
+
+from test.alternator.util import get_table_arn, is_aws, new_test_table, create_test_table, random_string, manual_request
+
+# NOTE: tests here use `pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")` as xfail marker as the implementation is ongoing.
+# The tests will pass against AWS.
+
+# Helper to check if table is deleted.
+def is_table_deleted(dynamodb, table_name: str) -> bool:
+    try:
+        dynamodb.describe_table(TableName=table_name)
+        return False  # table still exists (or is in DELETING/ACTIVE/etc.)
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            return True
+        raise
+
+# Bucket names allow neither uppercase letters nor underscores, so
+# unique_table_name() cannot be used.
+def unique_bucket_name():
+    return f"alternator-export-test-{uuid.uuid4().hex[:12]}"
+
+# An S3 client in the "dynamodb" fixture's region. DynamoDB allows a bucket
+# in another region, but keeping it in the table's region saves cost and
+# latency. Local testing does not run an S3 server (such as MinIO) yet.
+def make_s3_client(dynamodb):
+    if is_aws(dynamodb):
+        return boto3.client('s3', region_name=dynamodb.meta.client.meta.region_name)
+    raise NotImplementedError(
+        'local testing does not run an S3 server (such as MinIO) yet')
+
+# Create an S3 bucket and delete it, with its contents, on exit.
+@contextmanager
+def new_s3_bucket(s3_client, bucket_name=None):
+    if bucket_name is None:
+        bucket_name = unique_bucket_name()
+    region = s3_client.meta.region_name
+    kwargs: dict = {'Bucket': bucket_name}
+    # us-east-1 does not accept a LocationConstraint - in other words if you want `us-east-1` bucket, you need to omit `LocationConstraint` entirely,
+    # in all other cases supply `LocationConstraint` - this is AWS quirk.
+    if region and region != 'us-east-1':
+        kwargs['CreateBucketConfiguration'] = {'LocationConstraint': region}
+    s3_client.create_bucket(**kwargs)
+    try:
+        yield bucket_name
+    finally:
+        # We try hard to clean up: a bucket left behind on AWS costs money.
+        # DynamoDB cannot cancel an export. An export the test did not wait
+        # for keeps writing, so delete_bucket would fail with BucketNotEmpty
+        # and leak the bucket. Denying Put makes the export's next write
+        # fail, so DynamoDB ends the export as FAILED and stops writing.
+        # Delete/List stay allowed for our cleanup.
+        policy = {
+            'Version': '2012-10-17',
+            'Statement': [{
+                'Sid': 'BlockWrites',
+                'Effect': 'Deny',
+                'Principal': '*',
+                'Action': ['s3:PutObject', 's3:PutObjectAcl'],
+                'Resource': f'arn:aws:s3:::{bucket_name}/*',
+            }],
+        }
+        try:
+            s3_client.put_bucket_policy(Bucket=bucket_name, Policy=json.dumps(policy))
+        except ClientError as ce:
+            logging.error("Failed to block bucket writes on S3 for bucket %s: %s", bucket_name, ce)
+            # Not yet fatal - fall through to the retry loop below.
+
+        # Delete all objects, then the bucket.
+        deadline = time.time() + 60 # 60-second timeout for bucket deletion
+        while time.time() < deadline:
+            paginator = s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket_name):
+                if 'Contents' in page:
+                    s3_client.delete_objects(
+                        Bucket=bucket_name,
+                        Delete={'Objects': [{'Key': obj['Key']} for obj in page['Contents']]}
+                    )
+            try:
+                s3_client.delete_bucket(Bucket=bucket_name)
+                break
+            except ClientError as ce:
+                if ce.response['Error']['Code'] != 'BucketNotEmpty':
+                    raise
+                time.sleep(2)
+        else:
+            assert False, f"Failed to delete S3 bucket {bucket_name} within the timeout of 1 minute"
+
+
+# This creates an empty table with string partition key and no sort key. We do
+# not use the shared test_table_s fixture because exports may take longer for a
+# table with data written by other tests.
+@pytest.fixture(scope='module')
+def test_table_s_for_export_only(dynamodb):
+    table = create_test_table(dynamodb,
+        KeySchema=[ { 'AttributeName': 'p', 'KeyType': 'HASH' }, ],
+        AttributeDefinitions=[ { 'AttributeName': 'p', 'AttributeType': 'S' } ])
+    try:
+        enable_pitr(table)
+    except Exception:
+        table.delete()
+        raise
+    yield table
+    table.delete()
+
+
+# Helper: enable PITR on a table (required for ExportTableToPointInTime on
+# DynamoDB). Returns the client used.
+def enable_pitr(table, timeout=120):
+    client = table.meta.client
+
+    # We need to enable PITR on AWS, but not on scylla (in fact the call itself in scylla is not handled and will fail).
+    if not is_aws(table):
+        return client
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            client.update_continuous_backups(
+                TableName=table.name,
+                PointInTimeRecoverySpecification={'PointInTimeRecoveryEnabled': True}
+            )
+            break
+        except ClientError as e:
+            # After table creation there's a delay until PITR can be enabled (and then another delay
+            # until PITR is actually active) - the first delay is notified to the user by ContinuousBackupsUnavailableException
+            # exception. So we catch it here and try again.
+            if e.response['Error']['Code'] == 'ContinuousBackupsUnavailableException':
+                # This is run against AWS (see `if` above), which is slow, so no point in testing often
+                time.sleep(2)
+            else:
+                raise
+    else:
+        raise TimeoutError(f"UpdateContinuousBackups did not succeed on {table.name} within {timeout}s")
+    # Wait until PITR is actually active — there is a propagation delay on AWS.
+    while time.time() < deadline:
+        resp = client.describe_continuous_backups(TableName=table.name)
+        pitr = resp['ContinuousBackupsDescription'].get('PointInTimeRecoveryDescription', {})
+        if pitr.get('PointInTimeRecoveryStatus') == 'ENABLED':
+            return client
+        # This is run against AWS (see `if` above), which is slow, so no point in testing often
+        time.sleep(2)
+    raise TimeoutError(f"PITR did not become ENABLED on {table.name} within {timeout}s")
+
+
+# Helper: wait for an export to reach a terminal status (COMPLETED or FAILED).
+# My actual tests show export takes approximately 10-12 minutes on AWS hence hefty timeout.
+def wait_for_export(client, export_arn):
+    timeout = 60 * 60 if is_aws(client) else 60
+    sleep_time = 5 if is_aws(client) else 0.1
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        desc = client.describe_export(ExportArn=export_arn)['ExportDescription']
+        status = desc['ExportStatus']
+        if status in ('COMPLETED', 'FAILED'):
+            return desc
+        time.sleep(sleep_time)
+    raise TimeoutError(f"Export {export_arn} did not complete within {timeout}s")
+
+
+# ---------------------------------------------------------------------------
+# ExportTableToPointInTime tests
+# ---------------------------------------------------------------------------
+
+# Test that ExportTableToPointInTime starts an export and returns an
+# ExportDescription with expected fields.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_basic(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+
+    with new_s3_bucket(s3) as bucket:
+        response = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+        )
+        desc = response['ExportDescription']
+        assert 'ExportArn' in desc
+        assert desc['ExportStatus'] in ('IN_PROGRESS', 'COMPLETED')
+        assert desc['TableArn'] == table_arn
+        assert desc['S3Bucket'] == bucket
+
+        # Amazon returns an unique ClientToken in response, even if user did not supply one.
+        assert desc['ClientToken']
+
+        assert desc['ExportFormat'] == 'DYNAMODB_JSON'  # default format is DYNAMODB_JSON
+        assert 'ExportType' not in desc # default is FULL_EXPORT, but AWS does not return it in the response for some reason.
+        # Wait for completion and verify
+        final = wait_for_export(client, desc['ExportArn'])
+        assert final['ExportStatus'] == 'COMPLETED'
+        assert 'ExportType' not in final # default is FULL_EXPORT, but AWS does not return it in the response for some reason.
+
+
+# Test that ExportTableToPointInTime starts an export and then table is deleted,
+# after which ListExports will not return the export (with TableArn and TableId), but DescribeExport will work.
+# Amazon seems to delete the table asynchronously - after the delete request, the table exists for some time and export still goes on
+# (IN_PROGRESS status). Once the table gets actually deleted the export status (asynchronously) goes to FAILED / COMPLETED.
+# Note, that it's theoritically possible in this test to complete an export before the table actually gets deleted.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_start_and_delete_table(dynamodb):
+    s3 = make_s3_client(dynamodb)
+    with new_s3_bucket(s3) as bucket:
+        with new_test_table(dynamodb,
+            KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}],
+        ) as table:
+            client = enable_pitr(table)
+            table_arn = get_table_arn(table)
+
+            response = client.export_table_to_point_in_time(
+                TableArn=table_arn,
+                S3Bucket=bucket,
+            )
+            desc = response['ExportDescription']
+            assert 'ExportArn' in desc
+            export_arn = desc['ExportArn']
+            assert desc['ExportStatus'] in ('IN_PROGRESS', 'COMPLETED')
+            assert desc['TableArn'] == table_arn
+            assert desc['S3Bucket'] == bucket
+            assert desc['ExportFormat'] == 'DYNAMODB_JSON'  # default format is DYNAMODB_JSON
+            assert 'ExportType' not in desc # default is FULL_EXPORT, but AWS does not return it in the response for some reason.
+
+        now = time.time()
+        while time.time() < now + 60:
+            if is_table_deleted(client, table.name):
+                break
+            time.sleep(2 if is_aws(client) else 0.1)
+        else:
+            assert False, f"Table {table.name} should be deleted after exiting the context manager"
+
+        # For some reason Amazon doesn't list the export in ListExports.
+        for ex in iterate_over_exports(client, table_arn):
+            if ex['ExportArn'] == export_arn:
+                assert False, f"Export {export_arn} found in list_exports"
+
+        desc = client.describe_export(ExportArn=export_arn)['ExportDescription']
+        assert desc['ExportArn'] == export_arn
+        assert desc['TableArn'] == table_arn
+        assert desc['S3Bucket'] == bucket
+        # We might be fast enough here to still get IN_PROGRESS (rare, but happens)
+        assert desc['ExportStatus'] in ('IN_PROGRESS', 'COMPLETED', 'FAILED')
+        assert 'StartTime' in desc
+        assert 'ExportFormat' in desc
+
+
+# Test that ExportTableToPointInTime starts an export and returns an
+# ExportDescription with expected fields. Wait for completion and verify that final description
+# is also valid.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_basic_with_export_type(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+
+    with new_s3_bucket(s3) as bucket:
+        response = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+            ExportType='FULL_EXPORT'
+        )
+        desc = response['ExportDescription']
+        assert 'ExportArn' in desc
+        assert desc['ExportStatus'] in ('IN_PROGRESS', 'COMPLETED')
+        assert desc['TableArn'] == table_arn
+        assert desc['S3Bucket'] == bucket
+        assert desc['ExportFormat'] == 'DYNAMODB_JSON'  # default format is DYNAMODB_JSON
+        assert desc['ExportType'] == 'FULL_EXPORT'
+        # Wait for completion and verify
+        final = wait_for_export(client, desc['ExportArn'])
+        assert final['ExportStatus'] == 'COMPLETED'
+        assert final['ExportType'] == 'FULL_EXPORT'
+
+
+def fetch_all_exported_items(s3, bucket):
+    result = {}
+    response = s3.list_objects_v2(Bucket=bucket)
+    objects = response.get('Contents', [])
+    while response.get('IsTruncated'):
+        response = s3.list_objects_v2(Bucket=bucket,
+                                      ContinuationToken=response['NextContinuationToken'])
+        objects.extend(response.get('Contents', []))
+    for obj in objects:
+        key = obj['Key']
+        # Strip the prefix to get the relative path
+        rel_path = key.lstrip('/')
+        parts = rel_path.split('/')
+        node = result
+        for part in parts[:-1]:
+            if part not in node:
+                node[part] = {}
+            node = node[part]
+        # Leaf: fetch content as bytes
+        content = s3.get_object(Bucket=bucket, Key=key)['Body'].read()
+        node[parts[-1]] = content
+    return result
+
+# Test that an export of a table with data completes.
+# Test will fetch S3 files and verify that they contain expected items and that manifest files are correct.
+# Test for ION will skip S3 file content verification for now until we get python ion library set up for testing -
+#   directory content will still be verified and as will be manifest files.
+# Test is parameterized to run with both supported export formats and with/without S3 prefix.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+@pytest.mark.parametrize('s3_prefix_value', [None, 'dira/dirb/dirc'])
+@pytest.mark.parametrize('export_format_value', ['DYNAMODB_JSON', 'ION'])
+def test_export_with_data_full(dynamodb, s3_prefix_value, export_format_value):
+    with new_test_table(dynamodb,
+        KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+        AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}],
+    ) as table:
+        # Insert some items
+        inserted_items_as_text = []
+
+        num_items = 10
+        for i in range(num_items):
+            table.put_item(Item={'p': f'item{i}',
+                                 'd01': f'value{i}',
+                                 'd02': (i + 10),
+                                 'd03': b"qwerty" + str(i).encode('utf-8'),
+                                 'd04': { 'a' + str(i), 'b' + str(i), 'c' + str(i) },
+                                 'd05': { decimal.Decimal(1.5 + i), decimal.Decimal(2.5 + i), decimal.Decimal(3.875 + i) },
+                                 'd06': { b'qwe' + str(i).encode('utf-8'), b'rty' + str(i).encode('utf-8'), b'abc' + str(i).encode('utf-8') },
+                                 'd07': { str(i):i - 10, str(i + 10): i - 20 },
+                                 'd08': { 'nested' + str(i): { 'v1' + str(i): 'v2' + str(i), 'v3' + str(i): 'v4' + str(i) } },
+                                 'd09': [ i + 5, 'qwerty' ],
+                                 'd10': None,
+                                 'd11': bool(i & 1 == 0),
+                                 })
+
+            # Note: sets are not ordered, so for text-based comparison we will sort them here.
+            # The same fields loaded from export files will be sorted as well.
+            item = {"Item":{
+                'p': { 'S':f'item{i}' },
+                'd01': { 'S':f'value{i}' },
+                'd02': { 'N':f'{i + 10}' },
+                'd03': { 'B': base64.b64encode(b'qwerty' + str(i).encode('utf-8')).decode('utf-8') },
+                'd04': { 'SS': list(sorted(( 'a' + str(i), 'b' + str(i), 'c' + str(i) )) ) },
+                'd05': { 'NS': list(sorted(( str(decimal.Decimal(1.5 + i)), str(decimal.Decimal(2.5 + i)), str(decimal.Decimal(3.875 + i)) )) ) },
+                'd06': { 'BS': list(sorted((
+                    base64.b64encode(b'qwe' + str(i).encode('utf-8')).decode('utf-8'),
+                    base64.b64encode(b'rty' + str(i).encode('utf-8')).decode('utf-8'),
+                    base64.b64encode(b'abc' + str(i).encode('utf-8')).decode('utf-8')
+                )) ) },
+                'd07': { 'M': { str(i): { 'N': str(i - 10) }, str(i + 10): { 'N': str(i - 20) } } },
+                'd08': { 'M': { 'nested' + str(i): { 'M': { 'v1' + str(i): { 'S': 'v2' + str(i) }, 'v3' + str(i): { 'S': 'v4' + str(i) } } } } },
+                'd09': { 'L': [ { 'N': str(i + 5) }, { 'S': 'qwerty' } ] },
+                'd10': { 'NULL': True },
+                'd11': { 'BOOL': bool(i & 1 == 0) },
+            }}
+
+            #  we insert items as text, because text lines can be sorted.
+            inserted_items_as_text.append(json.dumps(item, indent=None, sort_keys=True))
+
+        client = enable_pitr(table)
+        table_arn = get_table_arn(table)
+        s3 = make_s3_client(dynamodb)
+
+        with new_s3_bucket(s3) as bucket:
+            # Initialize an export
+            args = {}
+            if s3_prefix_value is not None:
+                args['S3Prefix'] = s3_prefix_value
+            response = client.export_table_to_point_in_time(
+                TableArn=table_arn,
+                S3Bucket=bucket,
+                ExportFormat=export_format_value,
+                **args
+            )
+
+
+            # Wait for a completion of the export (successful).
+            final = wait_for_export(client, response['ExportDescription']['ExportArn'])
+            assert final['ExportStatus'] == 'COMPLETED'
+            assert final['ItemCount'] == num_items
+
+            # Download all exported files as a in-memory dictionary representing a directory structure.
+            root_dir = downloaded_root_dir = fetch_all_exported_items(s3, bucket)
+
+            def simplify_downloaded_dir(dr):
+                for k, v in dr.items():
+                    if isinstance(v, dict):
+                        simplify_downloaded_dir(v)
+                    else:
+                        dr[k] = ''
+
+            if s3_prefix_value:
+                # Every entry must start with `s3_prefix_value`
+                for p in s3_prefix_value.split('/'):
+                    if p not in root_dir:
+                        # Something is wrong, so we will print whole tree for easier debugging.
+                        # since values in the tree contain a lot of data, which is not really useful,
+                        # we update all values to an empty string.
+                        simplify_downloaded_dir(downloaded_root_dir)
+                        assert p in root_dir, downloaded_root_dir
+                    root_dir = root_dir[p]
+            def get_content_by_path(pth):
+                if pth.startswith('/'):
+                    pth = pth[1:]
+                parts = pth.split('/')
+                node = downloaded_root_dir
+                for part in parts:
+                    assert part in node, f"Path {pth} not found in exported files"
+                    node = node[part]
+                assert type(node) is bytes, f"Path {pth} is expected to be a file but is a {type(node)}"
+                return node
+
+            # We're expecting this directory structure:
+            # AWSDynamoDB/<some-unique-str>/
+            #                    data/
+            #                         <unique-string>.json.gz # note - files might be empty
+            #                         <unique-string>.json.gz
+            #                         <unique-string>.json.gz
+            #                         <unique-string>.json.gz
+            #                         ...
+            #                    manifest-files.json
+            #                    manifest-files.md5
+            #                    manifest-summary.json
+            #                    manifest-summary.md5
+            #                    _started
+            # Note: this test was run against real AWS export and this structure was observed.
+
+            # Validate downloaded directory structure.
+
+            # Must start with `AWSDynamoDB`
+            assert set(root_dir.keys()) == { 'AWSDynamoDB' }
+            root_dir = root_dir['AWSDynamoDB']
+
+            # Next is some unique-str (randomly choosen by AWS) - there must be an single entry, so we just take it.
+            assert len(root_dir) == 1
+            root_dir = next(iter(root_dir.values()))
+
+            # Top level content directory (the one with `data` and `_started`)
+            assert set(root_dir.keys()) == { 'data', 'manifest-files.json', 'manifest-files.md5', 'manifest-summary.json', 'manifest-summary.md5', '_started' }
+
+            data_dir = root_dir['data']
+            items = []
+
+            # Helper to sort a field in a nested dictionary by a dot-separated path. This is used to sort sets (SS, NS, BS) before comparing exported items with inserted items.
+            # AWS will return sets in a random order.
+            def sort_field(obj, field_path):
+                field_list = field_path.split('.')
+                for f in field_list[:-1]:
+                    obj = obj.get(f, None)
+                    if type(obj) is not dict:
+                        # We will return here - something is wrong as we can't find our object
+                        # but the text comparison assert will fail as well and printed object there should be easier to decipher.
+                        return
+                val = obj[field_list[-1]]
+                if type(val) is list:
+                    val = list(sorted(val))
+                    obj[field_list[-1]] = val
+
+            # There might be any number of files and some of them might be empty, we need to read them all to verify that they contain the expected items.
+            # We also need to count items in each file to verify manifest file later on.
+            item_count_map = collections.defaultdict(int)
+            for data_file, data_file_content in data_dir.items():
+                # For now we validate content file only for json format.
+                if export_format_value == 'DYNAMODB_JSON':
+                    # Decipher and read file with items. Insert read items into `items` list and count them in `item_count_map`.
+                    assert data_file.endswith('.json.gz')
+
+                    content = gzip.decompress(data_file_content).decode('utf-8')
+                    for line in content.splitlines():
+                        line = line.strip()
+                        js = json.loads(line)
+                        # Note: sets are not ordered, so we will sort them here before text comparison.
+                        sort_field(js, 'Item.d04.SS')
+                        sort_field(js, 'Item.d05.NS')
+                        sort_field(js, 'Item.d06.BS')
+
+                        items.append(json.dumps(js, indent=None, sort_keys=True))
+                        item_count_map[data_file] += 1
+                else:
+                    assert data_file.endswith('.ion.gz')
+
+
+            # We've read all files with data content, so `items` should contain all items exported and `item_count_map` should contain count of items in each file
+            # (that will be checked later).
+            # For now we validate content file only for json format.
+            if export_format_value == 'DYNAMODB_JSON':
+                # we assert with message here, as pytest will shorten output of `items` and `inserted_items_as_text` if the assert fails and even `-vv` sometimes doesn't help.
+                assert set(items) == set(inserted_items_as_text), f"items1: {list(sorted(items))}\nitems2: {list(sorted(inserted_items_as_text))}"
+
+            def calculate_md5(content):
+                h = hashlib.md5()
+                if type(content) is str:
+                    content = content.encode('utf-8')
+                h.update(content)
+                return base64.b64encode(h.digest())
+
+            # Verify two main manifest files in `data` directory (each has their own md5 file).
+            for path1, path2 in (
+                ('manifest-files.json', 'manifest-files.md5'),
+                ('manifest-summary.json', 'manifest-summary.md5'),
+            ):
+                expected_md5 = root_dir[path2].strip()
+                calculated_md5 = calculate_md5(root_dir[path1])
+                assert calculated_md5 == expected_md5, f"{calculated_md5} != {expected_md5} for file {path1}"
+
+            # Verify main manifest files content.
+            manifest_files_json = root_dir['manifest-files.json'].decode('utf-8')
+            total_real_item_count = 0
+            for line in manifest_files_json.splitlines():
+                js = json.loads(line.strip())
+                assert 'itemCount' in js
+                assert 'dataFileS3Key' in js
+                assert 'etag' in js
+                assert 'md5Checksum' in js
+
+                # Path to the data file seems to be relative from bucket root and should start with `<optionally s3_prefix_value/>AWSDynamoDB/`.
+                # The path itself is verified by the call to `get_content_by_path` later on.
+                p = js['dataFileS3Key']
+                if s3_prefix_value is None:
+                    assert p.startswith('AWSDynamoDB/')
+                else:
+                    t = s3_prefix_value + ('' if s3_prefix_value.endswith('/') else '/')
+                    assert p.startswith(t + 'AWSDynamoDB/')
+
+                # We counted items in each file while reading them, now we verify that the count matches the manifest file.
+                # This is done only for json export format.
+                if export_format_value == 'DYNAMODB_JSON':
+                    real_item_count = item_count_map[p.split('/')[-1]]
+                    assert js['itemCount'] == real_item_count
+                    total_real_item_count += real_item_count
+                # The etag in the manifest has to be the one S3 reports for the data file. The
+                # file is uploaded in multiple parts, so its etag is not the md5 of the content
+                # and Scylla cannot compute it on its own - see `s3_storage_sink` in
+                # alternator/export.cc.
+                s3_etag = s3.head_object(Bucket=bucket, Key=p)['ETag'].strip('"')
+                assert js['etag'] == s3_etag, f"{js['etag']} != {s3_etag} for file {p}"
+
+                # There is md5 file for each data file, we verify that the md5 in manifest matches the calculated md5 of the downloaded file.
+                md5_checksum = js['md5Checksum'].encode('utf-8')
+                assert md5_checksum
+                calculated_md5 = calculate_md5(get_content_by_path(p))
+                assert calculated_md5 == md5_checksum, f"{calculated_md5} != {md5_checksum} for file {p}"
+
+            # Verify total item count in manifest files matches the number of items inserted into the table.
+            # We count items only with json export format.
+            if export_format_value == 'DYNAMODB_JSON':
+                assert total_real_item_count == num_items
+
+            # Read and verify manifest-summary.json file.
+            manifest_summary_json = root_dir['manifest-summary.json'].decode('utf-8')
+            manifest_summary = json.loads(manifest_summary_json)
+            assert 'version' in manifest_summary
+            assert 'exportArn' in manifest_summary
+            assert manifest_summary['exportArn'] == final['ExportArn']
+            assert 'startTime' in manifest_summary
+            assert 'endTime' in manifest_summary
+
+            start_time = datetime.datetime.fromisoformat(manifest_summary['startTime'])
+            end_time = datetime.datetime.fromisoformat(manifest_summary['endTime'])
+            assert start_time < end_time
+            # This is only few items on test instance, so 1h seems reasonable.
+            assert end_time - start_time < datetime.timedelta(hours=1)
+
+            assert 'tableArn' in manifest_summary
+            assert manifest_summary['tableArn'] == table_arn
+
+            assert 'tableId' in manifest_summary
+            assert 'exportTime' in manifest_summary
+
+            export_time = datetime.datetime.fromisoformat(manifest_summary['exportTime'])
+
+            # The export time should be close to the start time (certainly within a day, but let's be more strict and require it to be within an hour).
+            # It's unclear if export_time must be before (or equal) to start_time, so we don't check it.
+            assert start_time - export_time < datetime.timedelta(hours=1)
+
+            assert 's3Bucket' in manifest_summary
+            assert manifest_summary['s3Bucket'] == bucket
+
+            assert 's3Prefix' in manifest_summary
+            assert 's3SseAlgorithm' in manifest_summary
+            assert 's3SseKmsKeyId' in manifest_summary
+            assert 'manifestFilesS3Key' in manifest_summary
+            assert get_content_by_path(manifest_summary['manifestFilesS3Key']) == root_dir['manifest-files.json']
+
+            assert 'billedSizeBytes' in manifest_summary
+            assert manifest_summary['billedSizeBytes'] >= 0
+
+            assert 'itemCount' in manifest_summary
+            assert manifest_summary['itemCount'] == num_items
+
+            assert 'outputFormat' in manifest_summary
+            assert manifest_summary['outputFormat'] == export_format_value
+
+# Test that sending the same ClientToken twice returns the same export.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_client_token_idempotent(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+    token = str(uuid.uuid4())
+
+    with new_s3_bucket(s3) as bucket:
+        resp1 = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+            ClientToken=token,
+        )
+        resp2 = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+            ClientToken=token,
+        )
+        assert resp1['ExportDescription']['ExportArn'] == resp2['ExportDescription']['ExportArn']
+        assert resp1['ExportDescription']['ClientToken'] == resp2['ExportDescription']['ClientToken'] == token
+
+
+# Following tests check idempotency of export with respect to ClientToken - they verify that
+# if we change some parameter of the export but keep the same ClientToken,
+# the second call will fail with ExportConflictException.
+# Note: we postpone test for `S3SseKmsKeyId` (due to complexity of setting up KMS)
+
+# Test that trying to export a different table reusing the same client token fails with ExportConflictException.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_client_token_changed_export_format(dynamodb, test_table_s, test_table_s_2):
+    client1 = enable_pitr(test_table_s)
+    table_arn1 = get_table_arn(test_table_s)
+    client2 = enable_pitr(test_table_s_2)
+    table_arn2 = get_table_arn(test_table_s_2)
+    s3 = make_s3_client(dynamodb)
+    token = str(uuid.uuid4())
+
+    with new_s3_bucket(s3) as bucket:
+        client1.export_table_to_point_in_time(
+            TableArn=table_arn1,
+            S3Bucket=bucket,
+            ExportFormat='DYNAMODB_JSON',
+            ClientToken=token,
+        )
+        with pytest.raises(ClientError, match='ExportConflictException.*Duplicate request detected'):
+            client2.export_table_to_point_in_time(
+                TableArn=table_arn2,
+                S3Bucket=bucket,
+                ExportFormat='ION',
+                ClientToken=token,
+                )
+
+
+# Test that trying to export the table twice using the same client token but changing some parameter value fails with ExportConflictException.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+@pytest.mark.parametrize("param_values", [
+    ('ExportFormat', 'DYNAMODB_JSON', 'ION'),
+    ('S3Bucket', unique_bucket_name(), unique_bucket_name() + 'a' ),
+    ('S3BucketOwner', None, '000000000000'),
+    ('S3Prefix', None, 'prefix' ),
+    ('S3SseAlgorithm', 'AES256', 'KMS'),
+])
+def test_export_client_token_some_value_changed(dynamodb, test_table_s, param_values):
+    client1 = enable_pitr(test_table_s)
+    table_arn1 = get_table_arn(test_table_s)
+    s3 = make_s3_client(dynamodb)
+    token = str(uuid.uuid4())
+    param_name, first_param_value, second_param_value = param_values
+
+    with new_s3_bucket(s3, bucket_name=(first_param_value if param_name == 'S3Bucket' else None)) as bucket:
+        kwargs = {
+            'S3Bucket': bucket,
+        }
+        kwargs[param_name] = first_param_value
+        client1.export_table_to_point_in_time(
+            TableArn=table_arn1,
+            ClientToken=token,
+            **{ k: v for k, v in kwargs.items() if v is not None }
+        )
+        with pytest.raises(ClientError, match='ExportConflictException.*Duplicate request detected'):
+            kwargs = {
+                'S3Bucket': bucket,
+            }
+            kwargs[param_name] = second_param_value
+            client1.export_table_to_point_in_time(
+                TableArn=table_arn1,
+                ClientToken=token,
+                **{ k: v for k, v in kwargs.items() if v is not None }
+            )
+
+
+# Test that setting fields to unsupported, weird values fail with consistent error.
+# (<exception name>, <field name>, <error text>, <value>)
+# exception name - Name of the exception, that should be raised
+# field name - Name of the field that should be set to an invalid value
+# error text - Text of the error message that should be raised
+# value - value that should be set to the field. If None, the field will be not set at all.
+# Both <exception name> and <error text> are must appear in the error message, first <exception name>, then (after possibly some text) <error text>.
+# We can't add ExportArn field testing here - boto3 raises strange exception (looks like a bug in boto3).
+@pytest.mark.parametrize('exception_field_error_and_value', [
+    ('ValidationException', 'ExportType', '[eE]xportType', 'QWERTY'),
+    ('ValidationException', 'ExportType', '[eE]xportType', ''),
+    ('ValidationException', 'ClientToken', '[cC]lientToken', ''),
+    ('ValidationException', 'ExportFormat', '[eE]xportFormat', ''),
+    ('ValidationException', 'ExportFormat', '[eE]xportFormat', 'QWERTY'),
+    ('InvalidExportTimeException', 'ExportTime', 'Export ?Time', -1),
+    ('ValidationException', 'S3Prefix', '[sS]3Prefix', ''),
+    ('ValidationException', 'S3Bucket', '[sS]3Bucket', ''),
+    ('ValidationException', 'S3Bucket', '[sS]3Bucket', None),
+    ('ValidationException', 'TableArn', '[tT]ableArn', None),
+    ('ValidationException', 'TableArn', '[tT]ableArn', ''),
+    ('ValidationException', 'TableArn', '[tT]ableArn', '\t'),
+    ('ValidationException', 'TableArn', '[tT]ableArn', 'QWERTY'),
+    ('ValidationException', 'S3BucketOwner', '[sS]3BucketOwner', ''),
+    ('ValidationException', 'S3SseAlgorithm', '[sS]3SseAlgorithm', ''),
+    ('ValidationException', 'S3SseAlgorithm', '[sS]3SseAlgorithm', 'QWERTY'),
+])
+def test_export_setting_fields_to_weird_values_or_skipping_fail(dynamodb, test_table_s, exception_field_error_and_value):
+    client = enable_pitr(test_table_s)
+    table_arn = get_table_arn(test_table_s)
+    exception, field, error, value = exception_field_error_and_value
+    with pytest.raises(ClientError, match=f'{exception}.*({error})'):
+        kw = {
+            'TableArn': table_arn,
+            'S3Bucket': unique_bucket_name()
+        }
+        kw[field] = value
+        client.export_table_to_point_in_time(**{ k:v for k, v in kw.items() if v is not None })
+
+
+# The same as test_export_setting_fields_to_weird_values_or_skipping_fail but only for S3SseKmsKeyId field
+# as it requires S3SseAlgorithm to be set
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+@pytest.mark.parametrize('exception_field_error_and_value', [
+    ('ValidationException', 'S3SseKmsKeyId', 's3SseKmsKeyId', ''),
+])
+def test_export_setting_fields_to_weird_values_or_skipping_fail_for_S3SseKmsKeyId(dynamodb, test_table_s, exception_field_error_and_value):
+    client = enable_pitr(test_table_s)
+    table_arn = get_table_arn(test_table_s)
+    exception, field, error, value = exception_field_error_and_value
+    with pytest.raises(ClientError, match=f'{exception}.*{error}'):
+        kw = {
+            'TableArn': table_arn,
+            'S3Bucket': 'my-bucket',
+            'S3SseAlgorithm': 'KMS',
+        }
+        kw[field] = value
+        client.export_table_to_point_in_time(**{ k:v for k, v in kw.items() if v is not None })
+
+
+# Test that trying to export the table with incremental export specifications times (ExportFromTime and ExportToTime) too close to each other -
+# (less than 15 minutes) - should fail with InvalidExportTimeException
+@pytest.mark.xfail(reason="Not yet implemented on Scylla")
+def test_export_incremental_export_time_too_close(dynamodb, test_table_s):
+    client1 = enable_pitr(test_table_s)
+    table_arn1 = get_table_arn(test_table_s)
+    s3 = make_s3_client(dynamodb)
+    token = str(uuid.uuid4())
+    export_time = int(datetime.datetime.now().timestamp())
+    with new_s3_bucket(s3) as bucket:
+        with pytest.raises(ClientError, match='InvalidExportTimeException.*Difference between export period'):
+            client1.export_table_to_point_in_time(
+                TableArn=table_arn1,
+                S3Bucket=bucket,
+                ClientToken=token,
+                ExportType='INCREMENTAL_EXPORT',
+                IncrementalExportSpecification={
+                    'ExportFromTime': export_time - 2,
+                    'ExportToTime': export_time,
+                    'ExportViewType': 'NEW_IMAGE',
+                }
+            )
+
+
+# Test that trying to export the table twice using the same client token but different IncrementalExportSpecification fails with ExportConflictException.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_client_token_changed_incremental_export_spec_fields(dynamodb, test_table_s, test_table_s_2):
+    client1 = enable_pitr(test_table_s)
+    table_arn1 = get_table_arn(test_table_s)
+    client2 = enable_pitr(test_table_s_2)
+    table_arn2 = get_table_arn(test_table_s_2)
+    s3 = make_s3_client(dynamodb)
+    token = str(uuid.uuid4())
+    export_time = int(datetime.datetime.now().timestamp())
+    min_export_time_diff = 1
+
+    if is_aws(client1):
+        min_export_time_diff = 15 * 60
+        # Amazon requires from and to times to be at least 15 minutes apart and we can't set to time in the future, so we need to wait.
+        time.sleep(min_export_time_diff + 1)
+
+    with new_s3_bucket(s3) as bucket:
+        client1.export_table_to_point_in_time(
+            TableArn=table_arn1,
+            S3Bucket=bucket,
+            ClientToken=token,
+            ExportType='INCREMENTAL_EXPORT',
+            IncrementalExportSpecification={
+                'ExportFromTime': export_time,
+                'ExportToTime': export_time + min_export_time_diff + 1,
+                'ExportViewType': 'NEW_IMAGE',
+            }
+        )
+        # ExportFromTime is different
+        with pytest.raises(ClientError, match='ExportConflictException.*Duplicate request detected'):
+            client2.export_table_to_point_in_time(
+                TableArn=table_arn1,
+                S3Bucket=bucket,
+                ClientToken=token,
+                ExportType='INCREMENTAL_EXPORT',
+                IncrementalExportSpecification={
+                    'ExportFromTime': export_time + 1,
+                    'ExportToTime': export_time + min_export_time_diff + 1,
+                    'ExportViewType': 'NEW_IMAGE',
+                }
+            )
+
+        # ExportToTime is different
+        with pytest.raises(ClientError, match='ExportConflictException.*Duplicate request detected'):
+            client2.export_table_to_point_in_time(
+                TableArn=table_arn1,
+                S3Bucket=bucket,
+                ClientToken=token,
+                ExportType='INCREMENTAL_EXPORT',
+                IncrementalExportSpecification={
+                    'ExportFromTime': export_time,
+                    'ExportToTime': export_time + min_export_time_diff,
+                    'ExportViewType': 'NEW_IMAGE',
+                }
+            )
+
+        # ExportViewType is different
+        with pytest.raises(ClientError, match='ExportConflictException.*Duplicate request detected'):
+            client2.export_table_to_point_in_time(
+                TableArn=table_arn1,
+                S3Bucket=bucket,
+                ClientToken=token,
+                ExportType='INCREMENTAL_EXPORT',
+                IncrementalExportSpecification={
+                    'ExportFromTime': export_time,
+                    'ExportToTime': export_time + min_export_time_diff + 1,
+                    'ExportViewType': 'NEW_AND_OLD_IMAGES',
+                }
+            )
+
+
+# Test that starts two exports on the same table (no ClientToken)
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_two_exports_without_client_token(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+
+    with new_s3_bucket(s3) as bucket:
+        resp1 = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket
+        )
+        resp2 = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket
+        )
+        assert resp1['ExportDescription']['ExportArn'] != resp2['ExportDescription']['ExportArn']
+
+
+# Test that trying to export from two tables using the same client token fails.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_client_token_doesnt_work_on_two_tables(dynamodb, test_table_s, test_table_s_2):
+    client1 = enable_pitr(test_table_s)
+    table_arn1 = get_table_arn(test_table_s)
+    client2 = enable_pitr(test_table_s_2)
+    table_arn2 = get_table_arn(test_table_s_2)
+    s3 = make_s3_client(dynamodb)
+    token = str(uuid.uuid4())
+
+    with new_s3_bucket(s3) as bucket:
+        client1.export_table_to_point_in_time(
+            TableArn=table_arn1,
+            S3Bucket=bucket,
+            ClientToken=token,
+        )
+        with pytest.raises(ClientError, match='ExportConflictException.*Duplicate request detected'):
+            client2.export_table_to_point_in_time(
+                TableArn=table_arn2,
+                S3Bucket=bucket,
+                ClientToken=token,
+            )
+
+# Test that exporting a nonexistent table returns TableNotFoundException.
+def test_export_nonexistent_table(dynamodb, test_table_s):
+    client = dynamodb.meta.client
+    fake_arn = get_table_arn(test_table_s) + '_nonexistent'
+
+    with pytest.raises(ClientError, match='TableNotFoundException.*not found'):
+        client.export_table_to_point_in_time(
+            TableArn=fake_arn,
+            S3Bucket=unique_bucket_name(),
+        )
+
+
+# Test that exporting to a nonexistent S3 bucket fails.
+# This one is little different, as - it seems - DynamoDB actually accepts nonexistent bucket and starts the export,
+# returns the FAILED and an error message later on.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_nonexistent_bucket(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    fake_bucket = unique_bucket_name()
+
+    response = client.export_table_to_point_in_time(
+        TableArn=table_arn,
+        S3Bucket=fake_bucket,
+    )
+
+    export_arn = response['ExportDescription']['ExportArn']
+
+    desc = wait_for_export(client, export_arn)
+    assert desc['ExportArn'] == export_arn
+    assert desc['TableArn'] == table_arn
+    assert desc['S3Bucket'] == fake_bucket
+    assert desc['ExportStatus'] == 'FAILED'
+    assert desc['FailureCode'] == 'S3NoSuchBucket'
+    assert 'bucket does not exist' in desc['FailureMessage']
+
+    for ex in iterate_over_exports(client, table_arn):
+        if ex['ExportArn'] == export_arn:
+            assert ex['ExportStatus'] == 'FAILED'
+            break
+    else:
+        assert False, f"Export {export_arn} not found in list_exports"
+
+
+# Test that failed export that didn't start doesn't reserve ClientToken
+# and thus the same ClientToken can be used again for a new export.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_export_failed_does_not_reserve_client_token(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+    token = str(uuid.uuid4())
+
+    with pytest.raises(ClientError, match='ValidationException.*s3Bucket.*failed'):
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket='',
+            ClientToken=token,
+        )
+
+    # We don't care about export result here, we just want to verify that ClientToken can be passed again to start a new export
+    # (the call did not raise an exception).
+    with new_s3_bucket(s3) as bucket:
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+            ClientToken=token,
+        )
+
+# ---------------------------------------------------------------------------
+# DescribeExport tests
+# ---------------------------------------------------------------------------
+
+# Test that DescribeExport returns the full ExportDescription for a
+# known export.
+@pytest.mark.xfail(reason="Not yet implemented on Scylla and MinIO is not started")
+def test_describe_export(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+
+    with new_s3_bucket(s3) as bucket:
+        response = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+        )
+        export_arn = response['ExportDescription']['ExportArn']
+
+        desc = client.describe_export(ExportArn=export_arn)['ExportDescription']
+        assert desc['ExportArn'] == export_arn
+        assert desc['TableArn'] == table_arn
+        assert desc['S3Bucket'] == bucket
+        assert desc['ExportStatus'] in ('IN_PROGRESS', 'COMPLETED')
+        assert 'StartTime' in desc
+        assert 'ExportFormat' in desc
+
+        wait_for_export(client, export_arn)
+
+        # this should return description with ExportStatus=COMPLETED and additional fields like EndTime, ExportManifest, ItemCount, BilledSizeBytes etc.
+        desc = client.describe_export(ExportArn=export_arn)['ExportDescription']
+        assert desc['ExportStatus'] == 'COMPLETED'
+        assert desc['ExportArn'] == export_arn
+        assert desc['TableArn'] == table_arn
+        assert 'EndTime' in desc
+        assert 'ExportManifest' in desc
+        assert 'ItemCount' in desc
+        assert 'BilledSizeBytes' in desc
+
+
+# An export id that no export has, in the format of DynamoDB's export ids: the StartTime of the
+# export in milliseconds since the epoch, padded to 14 digits, a dash, and 8 hex digits.
+def unknown_export_id():
+    return f'{int(time.time() * 1000):014d}-{uuid.uuid4().hex[:8]}'
+
+
+# Test that DescribeExport rejects with ValidationException an ARN which carries no export id: an
+# absent or empty one, the ARN of a table, whether the table exists or not, and a table ARN which
+# stops at `/export/`.
+def test_describe_export_no_export_id(test_table_s):
+    client = test_table_s.meta.client
+    table_arn = get_table_arn(test_table_s)
+    with pytest.raises(ClientError, match='ValidationException.*Export ?(ARN|Arn)'):
+        client.describe_export()
+    with pytest.raises(ClientError, match='ValidationException.*Export ?(ARN|Arn)'):
+        client.describe_export(ExportArn='')
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+        client.describe_export(ExportArn=table_arn.rsplit('/', 1)[0] + '/nonexistent_table_xyz')
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+        client.describe_export(ExportArn=table_arn)
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+        client.describe_export(ExportArn=table_arn + '/export/')
+
+
+# Test that DescribeExport reports a well-formed ARN of an export that was never started as
+# ExportNotFoundException, whether the table it names exists or not.
+def test_describe_export_unknown(test_table_s):
+    client = test_table_s.meta.client
+    table_arn = get_table_arn(test_table_s)
+    for export_arn in [f'{table_arn}/export/{unknown_export_id()}', f'{table_arn}_nonexistent/export/{unknown_export_id()}']:
+        with pytest.raises(ClientError, match=f'ExportNotFoundException.*{re.escape(export_arn)}') as error:
+            client.describe_export(ExportArn=export_arn)
+        assert error.value.response['ResponseMetadata']['HTTPStatusCode'] == 400
+
+
+# An ARN with the part at `index` - arn, partition, service, region, account, resource - replaced by
+# `value`, or dropped if `value` is None.
+def arn_with_part(arn, index, value):
+    parts = arn.split(':', 5)
+    parts[index:index + 1] = [] if value is None else [value]
+    return ':'.join(parts)
+
+
+# The ARN of an export of `table` that does not exist; `table` itself may exist. On Alternator, the
+# ARN has the format of the export ARNs that ExportTableToPointInTime returns, not of the table ARN.
+def unknown_export_arn(table):
+    table_arn = get_table_arn(table)
+    if table_arn.startswith('arn:scylla:'):
+        keyspace = table_arn.split(':')[3]
+        table_arn = f'arn:aws:dynamodb:us-east-1:000000000000:table/{keyspace}@{table.name}'
+    return f'{table_arn}/export/{unknown_export_id()}'
+
+
+# Test that DescribeExport reports as ValidationException an export ARN without the `arn:` prefix,
+# one with too few parts, and one naming another resource type.
+def test_describe_export_incorrect_arns(test_table_s):
+    client = test_table_s.meta.client
+    export_arn = unknown_export_arn(test_table_s)
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+        client.describe_export(ExportArn=arn_with_part(export_arn, 0, 'qwerty'))  # arn -> qwerty
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+        client.describe_export(ExportArn=arn_with_part(export_arn, 4, None))  # account dropped
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+        client.describe_export(ExportArn=export_arn.replace(':table/', ':qwerty/', 1))
+
+
+# Test that DescribeExport reports as ValidationException an export ARN naming another partition,
+# service or region, and as AccessDeniedException one naming another account.
+@pytest.mark.xfail(reason='Alternator does not check the partition, service, region or account of an ARN')
+def test_describe_export_incorrect_arn_parts(test_table_s):
+    client = test_table_s.meta.client
+    export_arn = unknown_export_arn(test_table_s)
+    with pytest.raises(ClientError, match='ValidationException.*Export ARN'):
+        client.describe_export(ExportArn=arn_with_part(export_arn, 1, 'qwerty'))  # partition -> qwerty
+    with pytest.raises(ClientError, match='ValidationException.*Export ARN'):
+        client.describe_export(ExportArn=arn_with_part(export_arn, 2, 'qwerty'))  # service -> qwerty
+    with pytest.raises(ClientError, match='ValidationException.*Export ARN'):
+        client.describe_export(ExportArn=arn_with_part(export_arn, 3, 'qwerty'))  # region -> qwerty
+    with pytest.raises(ClientError, match='AccessDeniedException'):
+        client.describe_export(ExportArn=arn_with_part(export_arn, 4, '123456789012'))  # account -> 123456789012
+
+
+# Test that DescribeExport reports as ValidationException an export ARN that names a table which
+# no table can be. A table name is not valid if it has fewer than 3 characters, more than 255
+# characters, or a character other than a-z, A-Z, 0-9, `_`, `-` and `.`. The test also uses an ARN
+# with `@` before the table name. For Alternator, the keyspace name in that ARN is empty. For
+# DynamoDB, `@` is a character that a table name cannot have. A valid table name gives
+# ExportNotFoundException. The test does not use the lengths from 193 to 255, because Alternator
+# does not accept them as table names (issue #4480).
+def test_describe_export_invalid_table_name(test_table_s):
+    client = test_table_s.meta.client
+    export_arn = unknown_export_arn(test_table_s)
+    for name in ['ab', 'a' * 256, 'a b']:
+        with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+            client.describe_export(ExportArn=export_arn.replace(test_table_s.name, name))
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Export ARN'):
+        client.describe_export(ExportArn=re.sub('table/[^/]*/', 'table/@abc/', export_arn))
+    for name in ['abc', 'a' * 192]:
+        with pytest.raises(ClientError, match='ExportNotFoundException'):
+            client.describe_export(ExportArn=export_arn.replace(test_table_s.name, name))
+
+
+# ---------------------------------------------------------------------------
+# ListExports tests
+# ---------------------------------------------------------------------------
+
+# Test that ListExports returns an ExportSummaries list. In our case it must be empty
+# as we use it on a freshly created table.
+def test_list_exports_empty(dynamodb):
+    with new_test_table(dynamodb,
+        KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+        AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}],
+    ) as table:
+        client = table.meta.client
+        table_arn = get_table_arn(table)
+        response = client.list_exports(TableArn=table_arn)
+        assert 'ExportSummaries' in response
+        # The list should be empty for a freshly-created table
+        assert len(response['ExportSummaries']) == 0
+
+
+# Test that ListExports with the TableArn of a table that does not exist returns an empty body,
+# without an ExportSummaries list. On Alternator, a table outside Alternator counts as one that does
+# not exist.
+def test_list_exports_nonexistent_table(dynamodb, test_table_s):
+    client = dynamodb.meta.client
+    response = client.list_exports(TableArn=get_table_arn(test_table_s) + '_nonexistent')
+    assert 'ExportSummaries' not in response
+    if not is_aws(dynamodb):
+        assert 'ExportSummaries' not in client.list_exports(TableArn='arn:aws:dynamodb:us-east-1:000000000000:table/system@peers')
+
+
+def iterate_over_exports(client, table_arn = None, max_results = None):
+    kwargs = {}
+    if table_arn is not None:
+        kwargs['TableArn'] = table_arn
+    if max_results is not None:
+        kwargs['MaxResults'] = max_results
+
+    while True:
+        response = client.list_exports(**kwargs)
+        results = response.get('ExportSummaries', ())
+        if max_results is not None:
+            assert len(results) <= max_results
+        yield from results
+
+        next_token = response.get('NextToken', None)
+        if not next_token:
+            break
+
+        kwargs['NextToken'] = response['NextToken']
+
+
+# Test that ListExports reports ValidationException for: a MaxResults outside 1 to 25; a NextToken
+# that is not an export ARN (a hex string, a table ARN, a table ARN that ends with `/export/`), or
+# one of an export of another table than TableArn names; a TableArn that is not a table ARN (empty,
+# too long, without the `arn:` prefix, with too few parts, with another resource type, or an export
+# ARN).
+def test_list_exports_invalid_parameter(test_table_s):
+    client = test_table_s.meta.client
+    table_arn = get_table_arn(test_table_s)
+    export_arn = unknown_export_arn(test_table_s)
+    exported_table_arn = export_arn.rsplit('/export/', 1)[0]
+    with pytest.raises(ClientError, match='ValidationException.*[Mm]axResults'):
+        client.list_exports(MaxResults=0)
+    with pytest.raises(ClientError, match='ValidationException.*[Mm]axResults'):
+        client.list_exports(MaxResults=26)
+    with pytest.raises(ClientError, match='ValidationException.*[Nn]extToken') as error:
+        client.list_exports(NextToken='0123456789abcdef' * 16)
+    assert error.value.response['ResponseMetadata']['HTTPStatusCode'] == 400
+    with pytest.raises(ClientError, match='ValidationException.*[Nn]extToken'):
+        client.list_exports(NextToken=table_arn)
+    with pytest.raises(ClientError, match='ValidationException.*[Nn]extToken'):
+        client.list_exports(NextToken=table_arn + '/export/')
+    with pytest.raises(ClientError, match='ValidationException.*[Nn]extToken'):
+        client.list_exports(TableArn=exported_table_arn, NextToken=export_arn.replace(test_table_s.name, test_table_s.name + '_other'))
+    with pytest.raises(ClientError, match='ValidationException.*[Tt]ableArn'):
+        client.list_exports(TableArn='')
+    with pytest.raises(ClientError, match='ValidationException.*[Tt]ableArn'):
+        client.list_exports(TableArn='a' * 1025)
+    with pytest.raises(ClientError, match='ValidationException.*[Tt]ableArn'):
+        client.list_exports(TableArn=arn_with_part(exported_table_arn, 0, 'qwerty'))  # arn -> qwerty
+    with pytest.raises(ClientError, match='ValidationException.*[Tt]ableArn'):
+        client.list_exports(TableArn=arn_with_part(exported_table_arn, 4, None))  # account dropped
+    with pytest.raises(ClientError, match='ValidationException.*[Tt]ableArn'):
+        client.list_exports(TableArn=exported_table_arn.replace(':table/', ':qwerty/', 1))
+    with pytest.raises(ClientError, match='ValidationException.*[Tt]ableArn'):
+        client.list_exports(TableArn=export_arn)
+
+
+# Test that ListExports reports SerializationException for a MaxResults that is not a number and for
+# a NextToken that is not a string. botocore cannot send a TableArn that is not a string.
+def test_list_exports_wrong_type(test_table_s):
+    client = test_table_s.meta.client
+    with pytest.raises(ClientError, match='SerializationException.*[Ii]nteger'):
+        client.list_exports(MaxResults='5')
+    with pytest.raises(ClientError, match='SerializationException.*[Ss]tring'):
+        client.list_exports(NextToken=5)
+
+
+# Test that ListExports truncates a fractional MaxResults and ignores a null parameter, as DynamoDB
+# does: 25.9 is accepted as 25, 0.9 is rejected as 0.
+def test_list_exports_fraction_and_null(test_table_s):
+    client = test_table_s.meta.client
+    client.list_exports(MaxResults=25.9)
+    with pytest.raises(ClientError, match='ValidationException.*[Mm]axResults'):
+        client.list_exports(MaxResults=0.9)
+    client.list_exports(MaxResults=None, TableArn=None, NextToken=None)
+
+
+# Test that ListExports reports as ValidationException a TableArn naming another partition, service
+# or region, and as AccessDeniedException one naming another account.
+@pytest.mark.xfail(reason='Alternator does not check the partition, service, region or account of an ARN')
+def test_list_exports_incorrect_table_arn_parts(test_table_s):
+    client = test_table_s.meta.client
+    table_arn = unknown_export_arn(test_table_s).rsplit('/export/', 1)[0]
+    with pytest.raises(ClientError, match='ValidationException.*Table ARN'):
+        client.list_exports(TableArn=arn_with_part(table_arn, 1, 'qwerty'))  # partition -> qwerty
+    with pytest.raises(ClientError, match='ValidationException.*Table ARN'):
+        client.list_exports(TableArn=arn_with_part(table_arn, 2, 'qwerty'))  # service -> qwerty
+    with pytest.raises(ClientError, match='ValidationException.*Table ARN'):
+        client.list_exports(TableArn=arn_with_part(table_arn, 3, 'qwerty'))  # region -> qwerty
+    with pytest.raises(ClientError, match='AccessDeniedException'):
+        client.list_exports(TableArn=arn_with_part(table_arn, 4, '123456789012'))  # account -> 123456789012
+
+
+# Test that ListExports reports as ValidationException a TableArn that names a table which no table
+# can be. A table name is not valid if it has fewer than 3 characters, more than 255 characters, or
+# a character other than a-z, A-Z, 0-9, `_`, `-` and `.`. The test also uses a TableArn with `@`
+# before the table name. For Alternator, the keyspace name in that ARN is empty. For DynamoDB, `@`
+# is a character that a table name cannot have. A valid name of a table that does not exist gives
+# an empty body. The test does not use the lengths from 193 to 255, because Alternator does not
+# accept them as table names (issue #4480).
+def test_list_exports_invalid_table_name(test_table_s):
+    client = test_table_s.meta.client
+    table_arn = unknown_export_arn(test_table_s).rsplit('/export/', 1)[0]
+    for name in ['ab', 'a' * 256, 'a b']:
+        with pytest.raises(ClientError, match='ValidationException.*Invalid Table ARN'):
+            client.list_exports(TableArn=table_arn.replace(test_table_s.name, name))
+    with pytest.raises(ClientError, match='ValidationException.*Invalid Table ARN'):
+        client.list_exports(TableArn=table_arn[:table_arn.index(':table/') + len(':table/')] + '@abc')
+    for name in ['abc', 'a' * 192]:
+        assert 'ExportSummaries' not in client.list_exports(TableArn=table_arn.replace(test_table_s.name, name))
+
+
+# Test that after starting an export, ListExports includes it, both filtered by its table and
+# not filtered at all.
+@pytest.mark.xfail(reason="ExportTableToPointInTime does not persist an export yet, and MinIO is not started")
+def test_list_exports_contains_export(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+
+    with new_s3_bucket(s3) as bucket:
+        response = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+        )
+        export_arn = response['ExportDescription']['ExportArn']
+
+        for filter_table_arn in [table_arn, None]:
+            for e in iterate_over_exports(client, filter_table_arn):
+                if e['ExportArn'] == export_arn:
+                    break
+            else:
+                pytest.fail(f"Export {export_arn} not found in ListExports with TableArn={filter_table_arn}")
+
+
+# Test that ListExports pagination via MaxResults and NextToken works.
+@pytest.mark.xfail(reason="ExportTableToPointInTime does not persist an export yet")
+def test_list_exports_pagination(dynamodb):
+    max_tables = 5
+    exports_per_table = 2
+
+    created_tables = []
+    with ExitStack() as created_tables_context_manager:
+        for _ in range(max_tables):
+            created_tables.append(
+                created_tables_context_manager.enter_context(new_test_table(dynamodb,
+                    KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}]))
+            )
+
+        export_arns = []
+        # Start multiple exports to the same bucket with different prefixes
+        # Note: we intentionally use the fake bucket, as it starts the export,
+        # but fails it almost immediately, drastically reducing test runtime.
+        # The exports will still be present in ListExports results (with status FAILED),
+        # which is enough for testing pagination.
+        for table in created_tables:
+            client = enable_pitr(table)
+            table_arn = get_table_arn(table)
+            for _ in range(exports_per_table):
+                resp = client.export_table_to_point_in_time(
+                    TableArn=table_arn,
+                    S3Bucket=unique_bucket_name(),
+                    S3Prefix=f'prefix-{uuid.uuid4()}',
+                    ClientToken=str(uuid.uuid4()),
+                )
+                export_arns.append(resp['ExportDescription']['ExportArn'])
+
+        # List with max_results set to 4, so we get some pagination.
+        all_arns_by_table = collections.defaultdict(list)
+        all_arns = set()
+        for summary in iterate_over_exports(client, max_results=4):
+            assert 'ExportArn' in summary
+            sm = summary["ExportArn"]
+            all_arns.add(sm)
+
+            # It seems ARNS are reversed (newest first), but only for the same table
+            x = sm.find('/export/')
+            assert x >= 0, sm
+            arn_up_to_table = sm[:x]
+            t = all_arns_by_table[arn_up_to_table]
+            assert not t or summary['ExportArn'] < t[-1], (sm, t)
+            t.append(sm)
+
+        # we're not filtering, so we will get more stuff in the list, but at least all our exports should be there
+        assert len(export_arns) <= len(all_arns)
+        assert set(export_arns).issubset(set(all_arns))
+
+
+# Puts two exports of `table` in the export history that ListExports reads, and returns their
+# ARNs. DynamoDB gets real exports, into a bucket that does not exist, so they fail quickly but
+# stay listed. Alternator gets their rows over CQL, as nothing writes them before SCYLLADB-1893.
+@contextmanager
+def two_listed_exports(request, table):
+    client = table.meta.client
+    table_arn = get_table_arn(table)
+    if is_aws(client):
+        yield [client.export_table_to_point_in_time(TableArn=table_arn, S3Bucket=unique_bucket_name(),
+                   ClientToken=str(uuid.uuid4()))['ExportDescription']['ExportArn'] for _ in range(2)]
+        return
+    cql = request.getfixturevalue('cql')
+    arns = [unstarted_export_arn(client, table_arn) for _ in range(2)]
+    with ExitStack() as seeded:
+        for export_arn in arns:
+            seeded.enter_context(export_metadata(cql, export_arn, accepted_export_row(table_arn)))
+        yield arns
+
+
+# DynamoDB ties a NextToken to the TableArn filter of the listing that handed it out, and answers a
+# request with another filter with ValidationException. Alternator serves such a request. The tests
+# below record this difference and make sure that Alternator survives such requests: the xfail
+# covers only a request that succeeds, so any other error, such as a crashed node, fails them.
+next_token_tied_to_filter = pytest.mark.xfail(raises=pytest.fail.Exception,
+    reason='Alternator does not tie NextToken to the TableArn filter of its listing')
+
+
+# Test that a NextToken of a listing filtered by TableArn is rejected without the filter.
+@next_token_tied_to_filter
+def test_list_exports_filtered_next_token_without_filter(request, test_table_s_for_export_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    with two_listed_exports(request, test_table_s_for_export_only):
+        next_token = client.list_exports(TableArn=table_arn, MaxResults=1)['NextToken']
+        with pytest.raises(ClientError, match='ValidationException.*[Nn]ext[Tt]oken'):
+            client.list_exports(MaxResults=1, NextToken=next_token)
+
+
+# Test that a NextToken of an unfiltered listing is rejected with a TableArn filter, even one naming
+# the table of the export the token ends on.
+@next_token_tied_to_filter
+def test_list_exports_unfiltered_next_token_with_filter(request, test_table_s_for_export_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    with two_listed_exports(request, test_table_s_for_export_only) as arns:
+        # Page the unfiltered listing until a page ends on one of this table's exports.
+        kwargs = {'MaxResults': 1}
+        while True:
+            response = client.list_exports(**kwargs)
+            kwargs['NextToken'] = response['NextToken']
+            if response['ExportSummaries'][0]['ExportArn'] in arns:
+                break
+        with pytest.raises(ClientError, match='ValidationException.*[Nn]ext[Tt]oken'):
+            client.list_exports(TableArn=table_arn, MaxResults=1, NextToken=kwargs['NextToken'])
+
+
+# Test that ExportSummary from ListExports contains the expected
+# fields: ExportArn, ExportStatus, ExportType.
+@pytest.mark.xfail(reason="ExportTableToPointInTime does not persist an export yet, and MinIO is not started")
+def test_list_exports_summary_fields(dynamodb, test_table_s):
+    table = test_table_s
+    client = enable_pitr(table)
+    table_arn = get_table_arn(table)
+    s3 = make_s3_client(dynamodb)
+
+    with new_s3_bucket(s3) as bucket:
+        resp = client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket=bucket,
+        )
+        export_arn = resp['ExportDescription']['ExportArn']
+        wait_for_export(client, export_arn)
+
+        for summary in iterate_over_exports(client, table_arn):
+            if summary['ExportArn'] == export_arn:
+                assert 'ExportArn' in summary
+                assert 'ExportStatus' in summary
+                assert summary['ExportStatus'] == 'COMPLETED'
+                assert 'ExportType' in summary
+                assert summary['ExportType'] == 'FULL_EXPORT'
+                break
+        else:
+            pytest.fail(f"Export {export_arn} not found in ListExports for table {table_arn}")
+
+
+# Test that ExportTableToPointInTime accepts valid parameters.
+# for scylla test we don't want to pass real S3 bucket (as we don't yet have a minio infrastructure to supply one for scylla and we want to
+# avoid creating real S3 buckets if possible) - thus we're making this test `scylla_only`.
+# In future it will be updated to use a minio bucket and `scylla_only` marker will be removed.
+def test_export_table_basic(test_table_s_for_export_only, scylla_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    client_token = random_string(20)
+
+    response = client.export_table_to_point_in_time(
+        TableArn=table_arn,
+        S3Bucket='my-test-bucket',
+        S3Prefix='exports/test',
+        ExportFormat='DYNAMODB_JSON',
+        ClientToken=client_token,
+    )
+
+    assert 'ExportDescription' in response
+    export_desc = response['ExportDescription']
+    assert export_desc['ExportStatus'] == 'FAILED'
+    assert export_desc['S3Bucket'] == 'my-test-bucket'
+    assert export_desc['S3Prefix'] == 'exports/test'
+    assert export_desc['ExportFormat'] == 'DYNAMODB_JSON'
+    assert export_desc['ClientToken'] == client_token
+    assert export_desc['TableArn'] == table_arn
+    assert export_desc['ExportArn'].startswith("arn:aws:dynamodb:")
+
+
+# Test that ExportTableToPointInTime echoes ExportType only when the request carried one. The
+# bucket does not exist, so on DynamoDB the export fails by itself without writing anything.
+def test_export_table_export_type_echoed_only_when_requested(test_table_s_for_export_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+
+    desc = client.export_table_to_point_in_time(TableArn=table_arn, S3Bucket=unique_bucket_name())['ExportDescription']
+    assert 'ExportType' not in desc
+
+    desc = client.export_table_to_point_in_time(TableArn=table_arn, S3Bucket=unique_bucket_name(),
+                                                ExportType='FULL_EXPORT')['ExportDescription']
+    assert desc['ExportType'] == 'FULL_EXPORT'
+
+
+# Test that non-DYNAMODB_JSON format (ION) is rejected.
+def test_export_table_unsupported_format_ion(test_table_s_for_export_only, scylla_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+
+    with pytest.raises(ClientError, match='ValidationException.*[eE]xportFormat'):
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket='my-bucket',
+            ExportFormat='ION',
+        )
+
+
+# Test that call to UpdateContinuousBackups is rejected.
+def test_update_continuous_backups_rejected(test_table_s_for_export_only, scylla_only):
+    client = test_table_s_for_export_only.meta.client
+
+    with pytest.raises(ClientError, match='UnknownOperationException.*UpdateContinuousBackups'):
+        client.update_continuous_backups(
+            TableName=test_table_s_for_export_only.name,
+            PointInTimeRecoverySpecification={'PointInTimeRecoveryEnabled': True}
+        )
+
+
+# Test that incremental export is rejected.
+def test_export_table_unsupported_incremental(test_table_s_for_export_only, scylla_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+
+    with pytest.raises(ClientError, match='ValidationException.*[eE]xportType'):
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket='my-bucket',
+            ExportType='INCREMENTAL_EXPORT',
+        )
+
+
+# Test that IncrementalExportSpecification is rejected.
+def test_export_table_unsupported_incremental_spec(test_table_s_for_export_only, scylla_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+
+    with pytest.raises(ClientError, match='ValidationException.*[iI]ncrementalExportSpecification'):
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket='my-bucket',
+            IncrementalExportSpecification={
+                'ExportFromTime': int(time.time()) - 3600,
+                'ExportToTime': int(time.time()),
+                'ExportViewType': 'NEW_IMAGE',
+            },
+        )
+
+
+@pytest.mark.parametrize('unsupported_parameter, value', [
+    ('S3BucketOwner', '123456789012'),
+    ('S3SseAlgorithm', 'AES256'),
+    ('S3SseKmsKeyId', 'test-key-id'),
+])
+def test_export_table_unsupported_s3_options(test_table_s_for_export_only, scylla_only, unsupported_parameter, value):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+
+    with pytest.raises(ClientError, match=f'ValidationException.*{unsupported_parameter}'):
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket='my-bucket',
+            **{unsupported_parameter: value},
+        )
+
+
+# Test that ExportTime close to now is accepted, and reported rounded to the nearest millisecond, as
+# DynamoDB does. boto3 sends an ExportTime in whole seconds, so the request is written out here. The
+# bucket does not exist, so on DynamoDB the export fails by itself without writing anything.
+def test_export_table_export_time_now(dynamodb, test_table_s_for_export_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    # DynamoDB exports only from its point-in-time recovery window, which can start after the
+    # fixture sees recovery enabled. Alternator reports no such window.
+    pitr = client.describe_continuous_backups(TableName=test_table_s_for_export_only.name)['ContinuousBackupsDescription']
+    earliest = pitr['PointInTimeRecoveryDescription'].get('EarliestRestorableDateTime')
+    second = max(int(time.time()) - 1, int(earliest.timestamp()) + 1 if earliest else 0)
+    time.sleep(max(0, second + 1 - time.time()))
+    payload = json.dumps({'TableArn': table_arn, 'S3Bucket': unique_bucket_name(), 'ExportTime': second + 0.1236,
+                          'ClientToken': str(uuid.uuid4())})
+    response = manual_request(dynamodb, 'ExportTableToPointInTime', payload)
+    assert response['ExportDescription']['ExportTime'] == pytest.approx(second + 0.124, abs=1e-5)
+
+
+# Test that ExportTime in the past (more than 5 minutes) is rejected.
+def test_export_table_invalid_export_time_before_now(test_table_s_for_export_only, scylla_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+
+    with pytest.raises(ClientError, match='InvalidExportTimeException.*Export ?Time'):
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket='my-bucket',
+            ExportTime=int(time.time()) - 60 * 5 - 1,
+        )
+
+# Test that ExportTime in the future (more than 5 minutes) is rejected.
+# We add additional time (1 minute) to avoid a race (where enough time will pass before the request is processed).
+def test_export_table_invalid_export_time_in_future(test_table_s_for_export_only, scylla_only):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+
+    with pytest.raises(ClientError, match='InvalidExportTimeException.*Export ?Time'):
+        client.export_table_to_point_in_time(
+            TableArn=table_arn,
+            S3Bucket='my-bucket',
+            ExportTime=int(time.time()) + 60 * 5 + 60,
+        )
+
+
+# ---------------------------------------------------------------------------
+# DescribeExport and ListExports tests driven from the export metadata table
+# ---------------------------------------------------------------------------
+# FIXME: Nothing writes system_distributed.alternator_export_to_s3_exports until export
+# orchestration lands (SCYLLADB-1893), so the tests below put the rows there over CQL and let
+# DescribeExport and ListExports render them, which is how SCYLLADB-1891 and SCYLLADB-1892 ask for
+# them to be tested until then. Once it lands, replace them with tests that start real exports. They
+# only run against Scylla, since they reach into Alternator's own tables.
+
+# An export ARN in the shape ExportTableToPointInTime hands out, for an export nobody started.
+def unstarted_export_arn(client, table_arn):
+    accepted = client.export_table_to_point_in_time(TableArn=table_arn, S3Bucket='my-bucket')
+    return accepted['ExportDescription']['ExportArn'].rsplit('/', 1)[0] + '/' + unknown_export_id()
+
+
+# The columns every export row carries from the moment the export is accepted, whatever state the
+# export goes on to reach. The sub-second parts are halves and quarters of a second so that they
+# survive the trip through a double exactly.
+def accepted_export_row(table_arn, **extra_request_fields):
+    return {
+        'client_token': random_string(20),
+        'request': json.dumps({'TableArn': table_arn, 'S3Bucket': 'my-bucket'} | extra_request_fields),
+        'export_status': 'IN_PROGRESS',
+        'table_id': uuid.uuid4(),
+        'export_time': datetime.datetime(2026, 9, 20, 12, 0, 0, 500000, tzinfo=datetime.timezone.utc),  # 2026-09-20 12:00:00.500 UTC
+        'accepted_at': datetime.datetime(2026, 9, 20, 12, 0, 1, 250000, tzinfo=datetime.timezone.utc),  # 2026-09-20 12:00:01.250 UTC
+    }
+
+
+# These tests run on a single node, so use CL=ONE
+@contextmanager
+def export_metadata(cql, export_arn, columns):
+    names = ', '.join(['export_arn', *columns])
+    placeholders = ', '.join(['%s'] * (1 + len(columns)))
+    cql.execute(SimpleStatement(
+        f"INSERT INTO system_distributed.alternator_export_to_s3_exports ({names}) VALUES ({placeholders})",
+        consistency_level=ConsistencyLevel.ONE), [export_arn, *columns.values()])
+    try:
+        yield export_arn
+    finally:
+        cql.execute(SimpleStatement(
+            "DELETE FROM system_distributed.alternator_export_to_s3_exports WHERE export_arn = %s",
+            consistency_level=ConsistencyLevel.ONE), [export_arn])
+
+
+# When the finished exports below finished.
+COMPLETED_AT = datetime.datetime(2026, 9, 20, 12, 5, 0, 750000, tzinfo=datetime.timezone.utc)  # 2026-09-20 12:05:00.750 UTC
+
+# The fields of an ExportDescription which not every export has: the request fields a request may
+# omit, and what a finished export produced.
+OPTIONAL_EXPORT_DESCRIPTION_FIELDS = ['S3Prefix', 'ExportType', 'ExportManifest', 'ItemCount', 'BilledSizeBytes',
+                                      'EndTime', 'FailureCode', 'FailureMessage']
+
+
+# Test that DescribeExport shows an export correctly in each state that an export can be in:
+# accepted and not finished, completed, and failed.
+#
+# Each parameter set is one export. The test writes the row of that export to the export metadata
+# table. Then it calls DescribeExport and compares the ExportDescription with the expected values.
+# The parameters are:
+# - request_fields: the fields to add to the stored ExportTableToPointInTime request, for example
+#   S3Prefix. DescribeExport copies these fields from the stored request.
+# - columns: the columns to add to the row or to replace in it, for example export_status. These
+#   columns hold the state of the export and the results of a finished export.
+# - status: the ExportStatus that DescribeExport must show.
+# - optional_fields: the optional fields that the ExportDescription must have, with their values.
+#   The ExportDescription must not have other optional fields.
+#
+# For each export, the test also checks the fields that all ExportDescriptions have. DynamoDB has
+# only three statuses: IN_PROGRESS, COMPLETED and FAILED. DescribeExport must show all other stored
+# statuses, for example FAILING, as IN_PROGRESS.
+@pytest.mark.parametrize('request_fields, columns, status, optional_fields', [
+    pytest.param({}, {}, 'IN_PROGRESS', {}, id='in_progress'),
+    pytest.param({}, {'export_status': 'NOT_STARTED'}, 'IN_PROGRESS', {}, id='not_started'),
+    pytest.param({}, {'export_status': 'FAILING'}, 'IN_PROGRESS', {}, id='failing'),
+    pytest.param({'S3Prefix': 'exports/test', 'ExportType': 'FULL_EXPORT'}, {
+        'export_status': 'COMPLETED',
+        'export_manifest': 'AWSDynamoDB/01695353076000-06e2188f/manifest-files.json',
+        'item_count': 17,
+        'billed_size_bytes': 4096,
+        'completed_at': COMPLETED_AT,
+    }, 'COMPLETED', {
+        'S3Prefix': 'exports/test',
+        'ExportType': 'FULL_EXPORT',
+        'ExportManifest': 'AWSDynamoDB/01695353076000-06e2188f/manifest-files.json',
+        'ItemCount': 17,
+        'BilledSizeBytes': 4096,
+        'EndTime': COMPLETED_AT,
+    }, id='completed'),
+    pytest.param({}, {
+        'export_status': 'FAILED',
+        'failure_code': 'InternalServerError',
+        'failure_message': 'the export could not be written',
+        'completed_at': COMPLETED_AT,
+    }, 'FAILED', {
+        'FailureCode': 'InternalServerError',
+        'FailureMessage': 'the export could not be written',
+        'EndTime': COMPLETED_AT,
+    }, id='failed'),
+])
+def test_describe_export_states(test_table_s_for_export_only, cql, request_fields, columns, status, optional_fields):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    export_arn = unstarted_export_arn(client, table_arn)
+    row = accepted_export_row(table_arn, **request_fields) | columns
+    with export_metadata(cql, export_arn, row):
+        desc = client.describe_export(ExportArn=export_arn)['ExportDescription']
+    assert desc['ExportArn'] == export_arn
+    assert desc['ExportStatus'] == status
+    assert desc['TableArn'] == table_arn
+    assert desc['TableId'] == str(row['table_id'])
+    assert desc['ClientToken'] == row['client_token']
+    assert desc['S3Bucket'] == 'my-bucket'
+    # No request names a format, so the default it was accepted with is reported.
+    assert desc['ExportFormat'] == 'DYNAMODB_JSON'
+    assert desc['ExportTime'] == row['export_time']
+    assert desc['StartTime'] == row['accepted_at']
+    assert {field: desc[field] for field in OPTIONAL_EXPORT_DESCRIPTION_FIELDS if field in desc} == optional_fields
+
+
+# Test that DescribeExport answers a corrupt export row - one missing a column every export has, or
+# one whose request cannot be read back - with InternalServerError. The node must stay up, and
+# test.py runs it with --abort-on-internal-error, so an error reported with on_internal_error()
+# would fail this test by taking the node down.
+@pytest.mark.parametrize('corrupt', [
+    pytest.param(lambda row: row.pop('request'), id='missing_column'),
+    pytest.param(lambda row: row.update(request='not json'), id='request_not_json'),
+    pytest.param(lambda row: row.update(request=json.dumps({'S3Bucket': 'my-bucket'})), id='request_without_table_arn'),
+])
+def test_describe_export_corrupt_row(test_table_s_for_export_only, cql, corrupt):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    export_arn = unstarted_export_arn(client, table_arn)
+    row = accepted_export_row(table_arn)
+    corrupt(row)
+    with export_metadata(cql, export_arn, row):
+        with pytest.raises(ClientError, match='InternalServerError'):
+            client.describe_export(ExportArn=export_arn)
+
+
+# Test that DescribeExport still describes an export after the table it was taken from has been
+# deleted.
+def test_describe_export_table_deleted(dynamodb, cql):
+    with new_test_table(dynamodb,
+            KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+            AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}]) as table:
+        client = table.meta.client
+        table_arn = get_table_arn(table)
+        export_arn = unstarted_export_arn(client, table_arn)
+    row = accepted_export_row(table_arn)
+    with export_metadata(cql, export_arn, row):
+        desc = client.describe_export(ExportArn=export_arn)['ExportDescription']
+    assert desc['ExportArn'] == export_arn
+    assert desc['TableArn'] == table_arn
+    assert desc['TableId'] == str(row['table_id'])
+
+
+# Test that ListExports with a TableArn lists only the exports of that table, in ExportArn
+# descending order. Each ExportSummary has the ExportArn, the ExportStatus (IN_PROGRESS for a stored
+# status that DynamoDB does not have), and the ExportType of the request (FULL_EXPORT if the request
+# has no ExportType). Without TableArn, ListExports also lists the export of the other table, and
+# paging one export at a time keeps the ExportArn descending order across the two tables.
+# The request with INCREMENTAL_EXPORT, which Alternator does not accept, shows that ListExports
+# copies ExportType from the request instead of reporting the default.
+def test_list_exports_summaries(test_table_s_for_export_only, test_table_s, cql):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    other_table_arn = get_table_arn(test_table_s)
+    # export ARN -> (the stored row, the fields of the expected ExportSummary)
+    rows = {
+        unstarted_export_arn(client, table_arn): (accepted_export_row(table_arn, ExportType='INCREMENTAL_EXPORT') | {'export_status': 'COMPLETED'},
+                                                  {'ExportStatus': 'COMPLETED', 'ExportType': 'INCREMENTAL_EXPORT'}),
+        unstarted_export_arn(client, table_arn): (accepted_export_row(table_arn) | {'export_status': 'FAILED'},
+                                                  {'ExportStatus': 'FAILED', 'ExportType': 'FULL_EXPORT'}),
+        unstarted_export_arn(client, table_arn): (accepted_export_row(table_arn),
+                                                  {'ExportStatus': 'IN_PROGRESS', 'ExportType': 'FULL_EXPORT'}),
+        unstarted_export_arn(client, table_arn): (accepted_export_row(table_arn) | {'export_status': 'NOT_STARTED'},
+                                                  {'ExportStatus': 'IN_PROGRESS', 'ExportType': 'FULL_EXPORT'}),
+    }
+    other_arn = unstarted_export_arn(client, other_table_arn)
+    # ensure all export_metadata - originated objects are deleted afterwards, with what their finally: provides
+    with ExitStack() as seeded:
+        for export_arn, (row, _) in rows.items():
+            seeded.enter_context(export_metadata(cql, export_arn, row))
+        seeded.enter_context(export_metadata(cql, other_arn, accepted_export_row(other_table_arn)))
+        summaries = client.list_exports(TableArn=table_arn)['ExportSummaries']
+        unfiltered = [summary['ExportArn'] for summary in iterate_over_exports(client, max_results=1)]
+    # The filtered listing has exactly this table's exports, in ExportArn descending order, each with its expected fields.
+    assert summaries == [{'ExportArn': export_arn} | rows[export_arn][1] for export_arn in sorted(rows, reverse=True)]
+    # The unfiltered listing has all five exports, the other table's too, possibly among other exports.
+    assert set(rows) | {other_arn} <= set(unfiltered)
+    assert unfiltered == sorted(set(unfiltered), reverse=True)
+
+
+# Test that ListExports pages through a table's exports MaxResults at a time, handing out a
+# NextToken with every page but the last, and no NextToken when the exports fit the page exactly.
+def test_list_exports_paging(test_table_s_for_export_only, cql):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    arns = sorted((unstarted_export_arn(client, table_arn) for _ in range(5)), reverse=True)
+    # ensure all export_metadata - originated objects are deleted afterwards, with what their finally: provides
+    with ExitStack() as seeded:
+        for export_arn in arns:
+            seeded.enter_context(export_metadata(cql, export_arn, accepted_export_row(table_arn)))
+        pages = []
+        kwargs = {'TableArn': table_arn, 'MaxResults': 2}
+        # Request pages until a response has no NextToken, but at most len(arns) pages: more pages
+        # than exports means that the paging does not end.
+        for _ in range(len(arns)):
+            response = client.list_exports(**kwargs)
+            pages.append([summary['ExportArn'] for summary in response['ExportSummaries']])
+            if 'NextToken' not in response:
+                break
+            kwargs['NextToken'] = response['NextToken']
+        else:  # len(arns) pages, and the last one still had a NextToken
+            pytest.fail(f'ListExports keeps handing out a NextToken: {pages}')
+        exact_fit = client.list_exports(TableArn=table_arn, MaxResults=len(arns))
+    assert pages == [arns[0:2], arns[2:4], arns[4:]]
+    assert [summary['ExportArn'] for summary in exact_fit['ExportSummaries']] == arns
+    assert 'NextToken' not in exact_fit
+
+
+# Test that ListExports filtered by a table which has been deleted reports no ExportSummaries at
+# all, as DynamoDB does (test_export_start_and_delete_table), while the export the table left
+# behind is still listed without the filter.
+def test_list_exports_table_deleted(dynamodb, cql):
+    # ensure all export_metadata - originated objects are deleted afterwards, with what their finally: provides
+    with ExitStack() as seeded:
+        with new_test_table(dynamodb,
+                KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}]) as table:
+            client = table.meta.client
+            table_arn = get_table_arn(table)
+            export_arn = unstarted_export_arn(client, table_arn)
+            seeded.enter_context(export_metadata(cql, export_arn, accepted_export_row(table_arn)))
+            # Sanity check: the export is listed while its table exists.
+            assert [summary['ExportArn'] for summary in client.list_exports(TableArn=table_arn)['ExportSummaries']] == [export_arn]
+        assert 'ExportSummaries' not in client.list_exports(TableArn=table_arn)
+        assert export_arn in [summary['ExportArn'] for summary in iterate_over_exports(client)]
+
+
+# Test that ListExports leaves out a corrupt export row - one missing a column every export has, or
+# one whose ARN or request cannot be read back - and still lists the table's other exports.
+@pytest.mark.parametrize('make_arn, columns', [
+    pytest.param(lambda arn: arn, {'request': None}, id='missing_column'),
+    pytest.param(lambda arn: arn, {'request': 'not json'}, id='request_not_json'),
+    pytest.param(lambda arn: arn.rsplit('/', 1)[0] + '/', {}, id='arn_without_export_id'),
+])
+def test_list_exports_corrupt_row(test_table_s_for_export_only, cql, make_arn, columns):
+    client = test_table_s_for_export_only.meta.client
+    table_arn = get_table_arn(test_table_s_for_export_only)
+    export_arn = unstarted_export_arn(client, table_arn)
+    corrupt_arn = make_arn(unstarted_export_arn(client, table_arn))
+    with export_metadata(cql, export_arn, accepted_export_row(table_arn)), \
+         export_metadata(cql, corrupt_arn, accepted_export_row(table_arn) | columns):
+        summaries = client.list_exports(TableArn=table_arn)['ExportSummaries']
+    assert [summary['ExportArn'] for summary in summaries] == [export_arn]

@@ -3,19 +3,36 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #undef SEASTAR_TESTING_MAIN
+#include <fmt/std.h>
+#include "utils/to_string.hh"
 #include "replication.hh"
 
 seastar::logger tlogger("test");
 
 seastar::semaphore snapshot_sync(0);
-// application of a snaphot with that id will be delayed until snapshot_sync is signaled
+// application of a snapshot with that id will be delayed until snapshot_sync is signaled
 raft::snapshot_id delay_apply_snapshot{utils::UUID(0, 0xdeadbeaf)};
-// sending of a snaphot with that id will be delayed until snapshot_sync is signaled
+// sending of a snapshot with that id will be delayed until snapshot_sync is signaled
 raft::snapshot_id delay_send_snapshot{utils::UUID(0xdeadbeaf, 0)};
+
+std::optional<raft::server_id> delay_apply;
+seastar::semaphore apply_entered(0);
+seastar::semaphore apply_release(0);
+
+std::optional<raft::server_id> delay_load_snapshot;
+seastar::semaphore load_snapshot_entered(0);
+seastar::semaphore load_snapshot_release(0);
+
+std::optional<raft::server_id> notify_snapshot_received;
+seastar::semaphore snapshot_received(0);
+
+std::optional<raft::server_id> track_stored_commit_idx;
+raft::index_t stored_commit_idx{0};
+seastar::condition_variable stored_commit_idx_changed;
 
 std::vector<raft::server_id> to_raft_id_vec(std::vector<node_id> nodes) noexcept {
     std::vector<raft::server_id> ret;
@@ -29,6 +46,10 @@ raft::server_address_set address_set(std::vector<node_id> nodes) noexcept {
     return address_set(to_raft_id_vec(nodes));
 }
 
+raft::config_member_set config_set(std::vector<node_id> nodes) noexcept {
+    return config_set(to_raft_id_vec(nodes));
+}
+
 size_t test_case::get_first_val() {
     // Count existing leader snap index and entries, if present
     size_t first_val = 0;
@@ -36,7 +57,7 @@ size_t test_case::get_first_val() {
         first_val += initial_states[initial_leader].le.size();
     }
     if (initial_leader < initial_snapshots.size()) {
-        first_val = initial_snapshots[initial_leader].snap.idx;
+        first_val = initial_snapshots[initial_leader].snap.idx.value();
     }
     return first_val;
 }
@@ -53,14 +74,15 @@ int rand() noexcept {
     return dist(gen);
 }
 
-size_t apply_changes(raft::server_id id, const std::vector<raft::command_cref>& commands,
+size_t apply_changes(raft::server_id id, const raft::log_entry_ptr_list& commands,
         lw_shared_ptr<hasher_int> hasher) {
     size_t entries = 0;
     tlogger.debug("sm::apply_changes[{}] got {} entries", id, commands.size());
 
-    for (auto&& d : commands) {
+    for (auto&& entry : commands) {
+        auto&& d = std::get<raft::command>(entry->data);
         auto is = ser::as_input_stream(d);
-        int n = ser::deserialize(is, boost::type<int>());
+        int n = ser::deserialize(is, std::type_identity<int>());
         if (n != dummy_command) {
             entries++;
             hasher->update(n);      // running hash (values and snapshots)
@@ -70,16 +92,16 @@ size_t apply_changes(raft::server_id id, const std::vector<raft::command_cref>& 
     return entries;
 }
 
-std::vector<raft::log_entry> create_log(std::vector<log_entry> list, unsigned start_idx) {
+std::vector<raft::log_entry> create_log(std::vector<log_entry> list, raft::index_t start_idx) {
     std::vector<raft::log_entry> log;
 
-    unsigned i = start_idx;
+    raft::index_t i = start_idx;
     for (auto e : list) {
         if (std::holds_alternative<int>(e.data)) {
-            log.push_back(raft::log_entry{raft::term_t(e.term), raft::index_t(i++),
+            log.push_back(raft::log_entry{raft::term_t(e.term), i++,
                     create_command(std::get<int>(e.data))});
         } else {
-            log.push_back(raft::log_entry{raft::term_t(e.term), raft::index_t(i++),
+            log.push_back(raft::log_entry{raft::term_t(e.term), i++,
                     std::get<raft::configuration>(e.data)});
         }
     }

@@ -1,19 +1,16 @@
 /*
- *
- *
- */
-/*
  * Copyright (C) 2019-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 #include <variant>
-#include "query-result.hh"
+#include <fmt/core.h>
+#include "query/query-result.hh"
 #include "service/paxos/proposal.hh"
 
 namespace service {
@@ -72,8 +69,10 @@ struct promise {
 // round or repair the previous one.
 using prepare_response = std::variant<utils::UUID, promise>;
 
-std::ostream& operator<<(std::ostream& os, const promise& promise);
-
 } // end of namespace "paxos"
 
 } // end of namespace "service"
+
+template <> struct fmt::formatter<service::paxos::promise> : fmt::formatter<string_view> {
+    auto format(const service::paxos::promise&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

@@ -1,31 +1,42 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "cql3/attributes.hh"
 #include "cql3/column_identifier.hh"
+#include "cql3/expr/evaluate.hh"
+#include "cql3/expr/expr-utils.hh"
+#include "exceptions/exceptions.hh"
+#include "service/qos/service_level_controller.hh"
+#include "types/types.hh"
+#include <optional>
 
 namespace cql3 {
 
 std::unique_ptr<attributes> attributes::none() {
-    return std::unique_ptr<attributes>{new attributes{{}, {}, {}}};
+    return std::unique_ptr<attributes>{new attributes{{}, {}, {}, {}, {}, false}};
 }
 
 attributes::attributes(std::optional<cql3::expr::expression>&& timestamp,
                        std::optional<cql3::expr::expression>&& time_to_live,
-                       std::optional<cql3::expr::expression>&& timeout)
-    : _timestamp{std::move(timestamp)}
+                       std::optional<cql3::expr::expression>&& timeout,
+                       std::optional<sstring> service_level,
+                       std::optional<cql3::expr::expression>&& concurrency,
+                       bool bypass_large_data_guardrails)
+    : _timestamp_unset_guard(timestamp)
+    , _timestamp{std::move(timestamp)}
+    , _time_to_live_unset_guard(time_to_live)
     , _time_to_live{std::move(time_to_live)}
     , _timeout{std::move(timeout)}
+    , _service_level(std::move(service_level))
+    , _concurrency{std::move(concurrency)}
+    , _bypass_large_data_guardrails{bypass_large_data_guardrails}
 { }
 
 bool attributes::is_timestamp_set() const {
@@ -40,40 +51,46 @@ bool attributes::is_timeout_set() const {
     return bool(_timeout);
 }
 
+bool attributes::is_service_level_set() const {
+    return bool(_service_level);
+}
+
+bool attributes::is_concurrency_set() const {
+    return bool(_concurrency);
+}
+
+bool attributes::is_bypass_large_data_guardrails() const {
+    return _bypass_large_data_guardrails;
+}
+
 int64_t attributes::get_timestamp(int64_t now, const query_options& options) {
-    if (!_timestamp.has_value()) {
+    if (!_timestamp.has_value() || _timestamp_unset_guard.is_unset(options)) {
         return now;
     }
 
-    expr::constant tval = expr::evaluate(*_timestamp, options);
+    cql3::raw_value tval = expr::evaluate(*_timestamp, options);
     if (tval.is_null()) {
         throw exceptions::invalid_request_exception("Invalid null value of timestamp");
     }
-    if (tval.is_unset_value()) {
-        return now;
-    }
     try {
-        return tval.view().validate_and_deserialize<int64_t>(*long_type, cql_serialization_format::internal());
+        return tval.view().validate_and_deserialize<int64_t>(*long_type);
     } catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception("Invalid timestamp value");
     }
 }
 
-int32_t attributes::get_time_to_live(const query_options& options) {
-    if (!_time_to_live.has_value())
-        return 0;
+std::optional<int32_t> attributes::get_time_to_live(const query_options& options) {
+    if (!_time_to_live.has_value() || _time_to_live_unset_guard.is_unset(options))
+        return std::nullopt;
 
-    expr::constant tval = expr::evaluate(*_time_to_live, options);
+    cql3::raw_value tval = expr::evaluate(*_time_to_live, options);
     if (tval.is_null()) {
         throw exceptions::invalid_request_exception("Invalid null value of TTL");
-    }
-    if (tval.is_unset_value()) {
-        return 0;
     }
 
     int32_t ttl;
     try {
-        ttl = tval.view().validate_and_deserialize<int32_t>(*int32_type, cql_serialization_format::internal());
+        ttl = tval.view().validate_and_deserialize<int32_t>(*int32_type);
     }
     catch (marshal_exception& e) {
         throw exceptions::invalid_request_exception("Invalid TTL value");
@@ -93,9 +110,9 @@ int32_t attributes::get_time_to_live(const query_options& options) {
 
 
 db::timeout_clock::duration attributes::get_timeout(const query_options& options) const {
-    expr::constant timeout = expr::evaluate(*_timeout, options);
-    if (timeout.is_null() || timeout.is_unset_value()) {
-        throw exceptions::invalid_request_exception("Timeout value cannot be unset/null");
+    cql3::raw_value timeout = expr::evaluate(*_timeout, options);
+    if (timeout.is_null()) {
+        throw exceptions::invalid_request_exception("Timeout value cannot be null");
     }
     cql_duration duration = timeout.view().deserialize<cql_duration>(*duration_type);
     if (duration.months || duration.days) {
@@ -110,6 +127,35 @@ db::timeout_clock::duration attributes::get_timeout(const query_options& options
     return std::chrono::duration_cast<db::timeout_clock::duration>(std::chrono::nanoseconds(duration.nanoseconds));
 }
 
+qos::service_level_options attributes::get_service_level(qos::service_level_controller& sl_controller) const {
+    auto sl_name = *_service_level;
+    if (!sl_controller.has_service_level(sl_name)) {
+        throw exceptions::invalid_request_exception(format("Service level {} doesn't exist", sl_name));
+    }
+    return sl_controller.get_service_level(sl_name).slo;
+}
+
+std::optional<int32_t> attributes::get_concurrency(const query_options& options) const {
+    if (!_concurrency.has_value()) {
+        return std::nullopt;
+    }
+
+    cql3::raw_value concurrency_raw = expr::evaluate(*_concurrency, options);
+    if (concurrency_raw.is_null()) {
+        throw exceptions::invalid_request_exception("Invalid null value of concurrency");
+    }
+    int32_t concurrency;
+    try {
+        concurrency = concurrency_raw.view().validate_and_deserialize<int32_t>(*int32_type);
+    } catch (marshal_exception& e) {
+        throw exceptions::invalid_request_exception("Invalid concurrency value");
+    }
+    if (concurrency <= 0) {
+        throw exceptions::invalid_request_exception("Concurrency must be a positive integer");
+    }
+    return concurrency;
+}
+
 void attributes::fill_prepare_context(prepare_context& ctx) {
     if (_timestamp.has_value()) {
         expr::fill_prepare_context(*_timestamp, ctx);
@@ -120,24 +166,35 @@ void attributes::fill_prepare_context(prepare_context& ctx) {
     if (_timeout.has_value()) {
         expr::fill_prepare_context(*_timeout, ctx);
     }
+    if (_concurrency.has_value()) {
+        expr::fill_prepare_context(*_concurrency, ctx);
+    }
 }
 
 std::unique_ptr<attributes> attributes::raw::prepare(data_dictionary::database db, const sstring& ks_name, const sstring& cf_name) const {
-    std::optional<expr::expression> ts, ttl, to;
+    std::optional<expr::expression> ts, ttl, to, conc;
 
     if (timestamp.has_value()) {
-        ts = prepare_expression(*timestamp, db, ks_name, timestamp_receiver(ks_name, cf_name));
+        ts = prepare_expression(*timestamp, db, ks_name, nullptr, timestamp_receiver(ks_name, cf_name));
+        verify_no_aggregate_functions(*ts, "USING clause");
     }
 
     if (time_to_live.has_value()) {
-        ttl = prepare_expression(*time_to_live, db, ks_name, time_to_live_receiver(ks_name, cf_name));
+        ttl = prepare_expression(*time_to_live, db, ks_name, nullptr, time_to_live_receiver(ks_name, cf_name));
+        verify_no_aggregate_functions(*time_to_live, "USING clause");
     }
 
     if (timeout.has_value()) {
-        to = prepare_expression(*timeout, db, ks_name, timeout_receiver(ks_name, cf_name));
+        to = prepare_expression(*timeout, db, ks_name, nullptr, timeout_receiver(ks_name, cf_name));
+        verify_no_aggregate_functions(*timeout, "USING clause");
     }
 
-    return std::unique_ptr<attributes>{new attributes{std::move(ts), std::move(ttl), std::move(to)}};
+    if (concurrency.has_value()) {
+        conc = prepare_expression(*concurrency, db, ks_name, nullptr, concurrency_receiver(ks_name, cf_name));
+        verify_no_aggregate_functions(*concurrency, "USING clause");
+    }
+
+    return std::unique_ptr<attributes>{new attributes{std::move(ts), std::move(ttl), std::move(to), std::move(service_level), std::move(conc), bypass_large_data_guardrails}};
 }
 
 lw_shared_ptr<column_specification> attributes::raw::timestamp_receiver(const sstring& ks_name, const sstring& cf_name) const {
@@ -150,6 +207,10 @@ lw_shared_ptr<column_specification> attributes::raw::time_to_live_receiver(const
 
 lw_shared_ptr<column_specification> attributes::raw::timeout_receiver(const sstring& ks_name, const sstring& cf_name) const {
     return make_lw_shared<column_specification>(ks_name, cf_name, ::make_shared<column_identifier>("[timeout]", true), duration_type);
+}
+
+lw_shared_ptr<column_specification> attributes::raw::concurrency_receiver(const sstring& ks_name, const sstring& cf_name) const {
+    return make_lw_shared<column_specification>(ks_name, cf_name, ::make_shared<column_identifier>("[concurrency]", true), data_type_for<int32_t>());
 }
 
 }

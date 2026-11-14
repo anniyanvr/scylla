@@ -3,11 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include "mutation/counters.hh"
+#include "mutation/mutation.hh"
+
+#include "utils/chunked_vector.hh"
+
+#include "idl/uuid.idl.hh"
+#include "idl/keys.idl.hh"
+#include "idl/position_in_partition.idl.hh"
+
 class counter_id final {
-    utils::UUID to_uuid();
+    utils::UUID uuid();
 };
 
 class counter_shard final {
@@ -108,6 +117,12 @@ class range_tombstone [[writable]] {
     bound_kind end_kind [[version 1.3]] = bound_kind::incl_end;
 };
 
+class range_tombstone_change stub [[writable]] {
+    clustering_key_prefix key;
+    bound_weight weight; // we are trying to move away from bound_kind
+    tombstone tomb;
+};
+
 class mutation_partition stub [[writable]] {
     tombstone tomb;
     row static_row;
@@ -117,8 +132,8 @@ class mutation_partition stub [[writable]] {
 };
 
 class mutation stub [[writable]] {
-    utils::UUID table_id;
-    utils::UUID schema_version;
+    ::table_id table_id;
+    table_schema_version schema_version;
     partition_key key;
     mutation_partition partition;
 };
@@ -129,13 +144,13 @@ class column_mapping_entry {
 };
 
 class column_mapping {
-    std::vector<column_mapping_entry> columns();
+    utils::chunked_vector<column_mapping_entry> columns();
     uint32_t n_static();
 };
 
 class canonical_mutation stub [[writable]] {
-    utils::UUID table_id;
-    utils::UUID schema_version;
+    ::table_id table_id;
+    table_schema_version schema_version;
     partition_key key;
     column_mapping mapping;
     mutation_partition partition;
@@ -162,3 +177,7 @@ class mutation_fragment stub [[writable]] {
                    partition_start, partition_end> fragment;
 };
 
+class mutation_fragment_v2 stub [[writable]] {
+    std::variant<clustering_row, static_row, range_tombstone_change,
+                   partition_start, partition_end> fragment;
+};

@@ -4,23 +4,37 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include <boost/program_options.hpp>
 #include <unordered_map>
 
 #include <seastar/core/sstring.hh>
-#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/rwlock.hh>
 #include <seastar/util/program-options.hh>
 #include <seastar/util/log.hh>
 
+#include "locator/replication_strategy_type.hh"
+#include "db/consistency_level_restriction.hh"
 #include "seastarx.hh"
 #include "utils/config_file.hh"
 #include "utils/enum_option.hh"
+#include "gms/inet_address.hh"
 #include "db/hints/host_filter.hh"
+#include "utils/error_injection.hh"
+#include "message/dict_trainer.hh"
+#include "message/advanced_rpc_compressor.hh"
+#include "db/consistency_level_type.hh"
+#include "db/tri_mode_restriction.hh"
+#include "sstables/compressor.hh"
+
+namespace boost::program_options {
+
+class options_description_easy_init;
+
+}
 
 namespace seastar {
 class file;
@@ -56,14 +70,42 @@ struct seed_provider_type {
     bool operator==(const seed_provider_type& other) const {
         return class_name == other.class_name && parameters == other.parameters;
     }
-    friend std::ostream& operator<<(std::ostream& os, const seed_provider_type&);
 };
 
-std::ostream& operator<<(std::ostream& os, const db::seed_provider_type& s);
 inline std::istream& operator>>(std::istream& is, seed_provider_type&);
+
+// Describes a single error injection that should be enabled at startup.
+struct error_injection_at_startup {
+    sstring name;
+    bool one_shot = false;
+    utils::error_injection_parameters parameters;
+
+    bool operator==(const error_injection_at_startup& other) const {
+        return name == other.name
+            && one_shot == other.one_shot
+            && parameters == other.parameters;
+    }
+};
+
+std::istream& operator>>(std::istream& is, error_injection_at_startup&);
+
+struct object_storage_endpoint_param;
 
 }
 
+namespace audit {
+
+struct audit_rule;
+
+std::istream& operator>>(std::istream& is, audit_rule&);
+
+}
+
+template<>
+struct fmt::formatter<db::error_injection_at_startup> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const db::error_injection_at_startup&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
 
 namespace utils {
 
@@ -79,24 +121,43 @@ namespace db {
 
 /// Enumeration of all valid values for the `experimental` config entry.
 struct experimental_features_t {
-    // NOTE: RAFT feature is not enabled via `experimental` umbrella flag.
-    // This option should be enabled explicitly.
-    enum feature { UNUSED, UDF, ALTERNATOR_STREAMS, ALTERNATOR_TTL, RAFT };
-    static std::unordered_map<sstring, feature> map(); // See enum_option.
+    enum class feature {
+        UNUSED,
+        // A feature that has been removed. Unlike UNUSED (a graduated,
+        // no-longer-experimental feature whose name is silently accepted),
+        // a RETIRED feature name is still recognized but rejected with a
+        // clear, fatal error at startup, so operators notice they must remove
+        // it from their configuration (e.g. after upgrading past its removal).
+        RETIRED,
+        UDF,
+        STRONGLY_CONSISTENT_TABLES,
+        LOGSTOR,
+    };
+    static std::map<sstring, feature> map(); // See enum_option.
     static std::vector<enum_option<experimental_features_t>> all();
 };
 
-/// A restriction that can be in three modes: true (the operation is disabled),
-/// false (the operation is allowed), or warn (the operation is allowed but
-/// produces a warning in the log).
-struct tri_mode_restriction_t {
-    enum class mode { FALSE, TRUE, WARN };
+struct replication_strategy_restriction_t {
+    static std::unordered_map<sstring, locator::replication_strategy_type> map(); // for enum_option<>
+};
+
+constexpr unsigned default_murmur3_partitioner_ignore_msb_bits = 12;
+
+struct tablets_mode_t {
+    // The `unset` mode is used internally for backward compatibility
+    // with the legacy `enable_tablets` option.
+    // It is defined as -1 as existing test code associates the value
+    // 0 with `false` and 1 with `true` when read from system.config.
+    enum class mode : int8_t {
+        unset = -1,
+        disabled = 0,
+        enabled = 1,
+        enforced = 2
+    };
     static std::unordered_map<sstring, mode> map(); // for enum_option<>
 };
-using tri_mode_restriction = enum_option<tri_mode_restriction_t>;
 
-
-class config : public utils::config_file {
+class config final : public utils::config_file {
 public:
     config();
     config(std::shared_ptr<db::extensions>);
@@ -104,6 +165,12 @@ public:
 
     // For testing only
     void add_cdc_extension();
+    void add_per_partition_rate_limit_extension();
+    void add_tags_extension();
+    void add_tombstone_gc_extension();
+    void add_paxos_grace_seconds_extension();
+
+    void add_all_default_extensions();
 
     /// True iff the feature is enabled.
     bool check_experimental(experimental_features_t::feature f) const;
@@ -121,30 +188,40 @@ public:
     static fs::path get_conf_dir();
     static fs::path get_conf_sub(fs::path);
 
+    future<rwlock::holder> lock_for_config_update() {
+        return _config_update_lock.hold_write_lock();
+    };
+
+    // Look up a config entry by name and return its JSON representation as a string.
+    // Runs on shard 0 under a read lock so the result is consistent with
+    // any in-progress SIGHUP reload + broadcast_to_all_shards() sequence.
+    // Returns std::nullopt if no config entry with the given name exists.
+    future<std::optional<sstring>> value_as_json_string_for_name(sstring name) const;
+
     using string_map = std::unordered_map<sstring, sstring>;
                     //program_options::string_map;
     using string_list = std::vector<sstring>;
     using seed_provider_type = db::seed_provider_type;
     using hinted_handoff_enabled_type = db::hints::host_filter;
+    using error_injection_at_startup = db::error_injection_at_startup;
+    using UUID = utils::UUID;
 
     /*
      * All values and documentation taken from
      * http://docs.datastax.com/en/cassandra/2.1/cassandra/configuration/configCassandra_yaml_r.html
      */
-    named_value<double> background_writer_scheduling_quota;
-    named_value<bool> auto_adjust_flush_quota;
-    named_value<float> memtable_flush_static_shares;
-    named_value<float> compaction_static_shares;
-    named_value<bool> compaction_enforce_min_threshold;
     named_value<sstring> cluster_name;
     named_value<sstring> listen_address;
     named_value<sstring> listen_interface;
     named_value<bool> listen_interface_prefer_ipv6;
     named_value<sstring> work_directory;
     named_value<sstring> commitlog_directory;
+    named_value<sstring> schema_commitlog_directory;
     named_value<string_list> data_file_directories;
+    named_value<uint64_t> data_file_capacity;
     named_value<sstring> hints_directory;
     named_value<sstring> view_hints_directory;
+    named_value<sstring> logstor_directory;
     named_value<sstring> saved_caches_directory;
     named_value<sstring> commit_failure_policy;
     named_value<sstring> disk_failure_policy;
@@ -157,23 +234,38 @@ public:
     named_value<uint32_t> compaction_large_partition_warning_threshold_mb;
     named_value<uint32_t> compaction_large_row_warning_threshold_mb;
     named_value<uint32_t> compaction_large_cell_warning_threshold_mb;
+    named_value<uint32_t> large_cell_fail_threshold_mb;
+    named_value<bool> large_data_cql_warnings;
+    named_value<uint32_t> large_partition_fail_threshold_mb;
+    named_value<uint32_t> rows_count_fail_threshold;
+    named_value<uint32_t> large_row_fail_threshold_mb;
+    named_value<uint32_t> large_collection_elements_fail_threshold;
     named_value<uint32_t> compaction_rows_count_warning_threshold;
+    named_value<uint32_t> compaction_collection_elements_count_warning_threshold;
+    named_value<uint32_t> compaction_large_data_records_per_sstable;
     named_value<uint32_t> memtable_total_space_in_mb;
     named_value<uint32_t> concurrent_reads;
     named_value<uint32_t> concurrent_writes;
     named_value<uint32_t> concurrent_counter_writes;
+    // FIXME: incremental backups are deprecated; remove support for them in a future release (SCYLLADB-5498).
     named_value<bool> incremental_backups;
     named_value<bool> snapshot_before_compaction;
     named_value<uint32_t> phi_convict_threshold;
     named_value<uint32_t> failure_detector_timeout_in_ms;
+    named_value<uint32_t> direct_failure_detector_ping_timeout_in_ms;
     named_value<sstring> commitlog_sync;
     named_value<uint32_t> commitlog_segment_size_in_mb;
+    named_value<uint32_t> schema_commitlog_segment_size_in_mb;
     named_value<uint32_t> commitlog_sync_period_in_ms;
     named_value<uint32_t> commitlog_sync_batch_window_in_ms;
+    named_value<uint32_t> commitlog_max_data_lifetime_in_seconds;
     named_value<int64_t> commitlog_total_space_in_mb;
-    named_value<bool> commitlog_reuse_segments;
+    named_value<bool> commitlog_reuse_segments; // unused. retained for upgrade compat
+    named_value<int64_t> commitlog_flush_threshold_in_mb;
     named_value<bool> commitlog_use_o_dsync;
     named_value<bool> commitlog_use_hard_size_limit;
+    named_value<bool> commitlog_use_fragmented_entries;
+    named_value<bool> strongly_consistent_tables_start_on_damaged_commitlog;
     named_value<bool> compaction_preheat_key_cache;
     named_value<uint32_t> concurrent_compactors;
     named_value<uint32_t> in_memory_compaction_limit_in_mb;
@@ -182,18 +274,30 @@ public:
     named_value<bool> defragment_memory_on_idle;
     named_value<sstring> memtable_allocation_type;
     named_value<double> memtable_cleanup_threshold;
+    named_value<uint32_t> logstor_disk_size_in_mb;
+    named_value<uint32_t> logstor_file_size_in_mb;
+    named_value<bool> logstor_format_on_startup;
+    named_value<bool> logstor_sparse_files;
+    named_value<double> logstor_compaction_space_floor;
+    named_value<double> logstor_compaction_utilization_threshold;
+    named_value<double> logstor_compaction_min_utilization_threshold;
+    named_value<float> logstor_compaction_max_shares;
     named_value<uint32_t> file_cache_size_in_mb;
     named_value<uint32_t> memtable_flush_queue_size;
     named_value<uint32_t> memtable_flush_writers;
     named_value<uint32_t> memtable_heap_space_in_mb;
     named_value<uint32_t> memtable_offheap_space_in_mb;
     named_value<uint32_t> column_index_size_in_kb;
+    named_value<uint32_t> column_index_auto_scale_threshold_in_kb;
     named_value<uint32_t> index_summary_capacity_in_mb;
     named_value<uint32_t> index_summary_resize_interval_in_minutes;
     named_value<double> reduce_cache_capacity_to;
     named_value<double> reduce_cache_sizes_at;
     named_value<uint32_t> stream_throughput_outbound_megabits_per_sec;
     named_value<uint32_t> inter_dc_stream_throughput_outbound_megabits_per_sec;
+    named_value<uint32_t> stream_io_throughput_mb_per_sec;
+    named_value<double> stream_plan_ranges_fraction;
+    named_value<bool> enable_file_stream;
     named_value<bool> trickle_fsync;
     named_value<uint32_t> trickle_fsync_interval_in_kb;
     named_value<bool> auto_bootstrap;
@@ -206,6 +310,7 @@ public:
     named_value<sstring> partitioner;
     named_value<uint16_t> storage_port;
     named_value<bool> auto_snapshot;
+    named_value<uint32_t> auto_snapshot_ttl;
     named_value<uint32_t> key_cache_keys_to_save;
     named_value<uint32_t> key_cache_save_period;
     named_value<uint32_t> key_cache_size_in_mb;
@@ -218,6 +323,9 @@ public:
     named_value<uint32_t> counter_cache_keys_to_save;
     named_value<uint32_t> tombstone_warn_threshold;
     named_value<uint32_t> tombstone_failure_threshold;
+    named_value<uint64_t> query_tombstone_page_limit;
+    named_value<uint64_t> query_page_size_in_bytes;
+    named_value<uint32_t> group0_tombstone_gc_refresh_interval_in_ms;
     named_value<uint32_t> range_request_timeout_in_ms;
     named_value<uint32_t> read_request_timeout_in_ms;
     named_value<uint32_t> counter_write_request_timeout_in_ms;
@@ -225,28 +333,44 @@ public:
     named_value<uint32_t> truncate_request_timeout_in_ms;
     named_value<uint32_t> write_request_timeout_in_ms;
     named_value<uint32_t> request_timeout_in_ms;
+    named_value<uint32_t> request_timeout_on_shutdown_in_seconds;
+    named_value<uint32_t> group0_raft_op_timeout_in_ms;
     named_value<bool> cross_node_timeout;
     named_value<uint32_t> internode_send_buff_size_in_bytes;
     named_value<uint32_t> internode_recv_buff_size_in_bytes;
     named_value<sstring> internode_compression;
+    named_value<float> internode_compression_zstd_max_cpu_fraction;
+    named_value<uint32_t> internode_compression_zstd_cpu_quota_refresh_period_ms;
+    named_value<float> internode_compression_zstd_max_longterm_cpu_fraction;
+    named_value<uint32_t> internode_compression_zstd_longterm_cpu_quota_refresh_period_ms;
+    named_value<uint32_t> internode_compression_zstd_min_message_size;
+    named_value<uint32_t> internode_compression_zstd_max_message_size;
+    named_value<bool> internode_compression_checksumming;
+    named_value<netw::advanced_rpc_compressor::tracker::algo_config> internode_compression_algorithms;
+    named_value<bool> internode_compression_enable_advanced;
+    named_value<enum_option<netw::dict_training_loop::when>> rpc_dict_training_when;
+    named_value<uint32_t> rpc_dict_training_min_time_seconds;
+    named_value<uint64_t> rpc_dict_training_min_bytes;
     named_value<bool> inter_dc_tcp_nodelay;
     named_value<uint32_t> streaming_socket_timeout_in_ms;
     named_value<bool> start_native_transport;
     named_value<uint16_t> native_transport_port;
+    named_value<sstring> maintenance_socket;
+    named_value<sstring> maintenance_socket_group;
+    named_value<bool> maintenance_mode;
     named_value<uint16_t> native_transport_port_ssl;
     named_value<uint16_t> native_shard_aware_transport_port;
     named_value<uint16_t> native_shard_aware_transport_port_ssl;
+    named_value<uint16_t> native_transport_port_proxy_protocol;
+    named_value<uint16_t> native_transport_port_ssl_proxy_protocol;
+    named_value<uint16_t> native_shard_aware_transport_port_proxy_protocol;
+    named_value<uint16_t> native_shard_aware_transport_port_ssl_proxy_protocol;
     named_value<uint32_t> native_transport_max_threads;
     named_value<uint32_t> native_transport_max_frame_size_in_mb;
     named_value<sstring> broadcast_rpc_address;
     named_value<uint16_t> rpc_port;
     named_value<bool> start_rpc;
     named_value<bool> rpc_keepalive;
-    named_value<uint32_t> rpc_max_threads;
-    named_value<uint32_t> rpc_min_threads;
-    named_value<uint32_t> rpc_recv_buff_size_in_bytes;
-    named_value<uint32_t> rpc_send_buff_size_in_bytes;
-    named_value<sstring> rpc_server_type;
     named_value<bool> cache_hit_rate_read_balancing;
     named_value<double> dynamic_snitch_badness_threshold;
     named_value<uint32_t> dynamic_snitch_reset_interval_in_ms;
@@ -257,11 +381,15 @@ public:
     named_value<uint32_t> max_hint_window_in_ms;
     named_value<uint32_t> max_hints_delivery_threads;
     named_value<uint32_t> batchlog_replay_throttle_in_kb;
+    named_value<uint32_t> batchlog_replay_cleanup_after_replays;
     named_value<sstring> request_scheduler;
     named_value<sstring> request_scheduler_id;
     named_value<string_map> request_scheduler_options;
-    named_value<uint32_t> thrift_framed_transport_size_in_mb;
-    named_value<uint32_t> thrift_max_message_length_in_mb;
+    named_value<sstring> vector_store_primary_uri;
+    named_value<sstring> vector_store_secondary_uri;
+    named_value<uint32_t> vector_store_unreachable_node_detection_time_in_ms;
+    named_value<string_map> vector_store_encryption_options;
+    named_value<bool> enable_cassio_compatibility;
     named_value<sstring> authenticator;
     named_value<sstring> internode_authenticator;
     named_value<sstring> authorizer;
@@ -272,11 +400,15 @@ public:
     named_value<string_map> server_encryption_options;
     named_value<string_map> client_encryption_options;
     named_value<string_map> alternator_encryption_options;
+    named_value<bool> alternator_force_read_before_write;
     named_value<uint32_t> ssl_storage_port;
     named_value<bool> enable_in_memory_data_store;
     named_value<bool> enable_cache;
     named_value<bool> enable_commitlog;
     named_value<bool> volatile_system_keyspace_for_testing;
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+    named_value<int64_t> test_clocks_offset_seconds;
+#endif
     named_value<uint16_t> api_port;
     named_value<sstring> api_address;
     named_value<sstring> api_ui_dir;
@@ -285,12 +417,21 @@ public:
     named_value<bool> consistent_rangemovement;
     named_value<bool> join_ring;
     named_value<bool> load_ring_state;
+    named_value<sstring> replace_node_first_boot;
     named_value<sstring> replace_address;
     named_value<sstring> replace_address_first_boot;
     named_value<sstring> ignore_dead_nodes_for_replace;
     named_value<bool> override_decommission;
     named_value<bool> enable_repair_based_node_ops;
     named_value<sstring> allowed_repair_based_node_ops;
+    named_value<bool> enable_compacting_data_for_streaming_and_repair;
+    named_value<bool> enable_tombstone_gc_for_streaming_and_repair;
+    named_value<double> repair_partition_count_estimation_ratio;
+    named_value<uint32_t> repair_hints_batchlog_flush_cache_time_in_ms;
+    named_value<uint64_t> repair_multishard_reader_buffer_hint_size;
+    named_value<uint64_t> repair_multishard_reader_enable_read_ahead;
+    named_value<bool> enable_small_table_optimization_for_rbno;
+    named_value<uint64_t> small_table_optimization_for_rbno_max_table_size;
     named_value<uint32_t> ring_delay_ms;
     named_value<uint32_t> shadow_round_ms;
     named_value<uint32_t> fd_max_interval_ms;
@@ -299,33 +440,66 @@ public:
     named_value<bool> developer_mode;
     named_value<int32_t> skip_wait_for_gossip_to_settle;
     named_value<int32_t> force_gossip_generation;
-    named_value<bool> experimental;
     named_value<std::vector<enum_option<experimental_features_t>>> experimental_features;
     named_value<size_t> lsa_reclamation_step;
     named_value<uint16_t> prometheus_port;
     named_value<sstring> prometheus_address;
     named_value<sstring> prometheus_prefix;
+    named_value<bool> prometheus_allow_protobuf;
     named_value<bool> abort_on_lsa_bad_alloc;
     named_value<unsigned> murmur3_partitioner_ignore_msb_bits;
-    named_value<double> virtual_dirty_soft_limit;
+    named_value<double> unspooled_dirty_soft_limit;
     named_value<double> sstable_summary_ratio;
+    named_value<uint64_t> sstable_summary_max_partitions_per_page;
+    named_value<double> components_memory_reclaim_threshold;
     named_value<size_t> large_memory_allocation_warning_threshold;
     named_value<bool> enable_deprecated_partitioners;
     named_value<bool> enable_keyspace_column_family_metrics;
+    named_value<bool> enable_node_aggregated_table_metrics;
     named_value<bool> enable_sstable_data_integrity_check;
     named_value<bool> enable_sstable_key_validation;
+    named_value<bool> ignore_component_digest_mismatch;
     named_value<bool> cpu_scheduler;
     named_value<bool> view_building;
     named_value<bool> enable_sstables_mc_format;
     named_value<bool> enable_sstables_md_format;
+    named_value<sstring> sstable_format;
+
+    // NOTE: Do not use this option directly.
+    // Use get_sstable_compression_user_table_options() instead.
+    named_value<compression_parameters> sstable_compression_user_table_options;
+
+    compression_parameters get_sstable_compression_user_table_options(bool dicts_feature_enabled) const;
+
+    named_value<bool> sstable_compression_dictionaries_allow_in_ddl;
+    named_value<bool> sstable_compression_dictionaries_enable_writing;
+    named_value<float> sstable_compression_dictionaries_memory_budget_fraction;
+    named_value<float> sstable_compression_dictionaries_retrain_period_in_seconds;
+    named_value<float> sstable_compression_dictionaries_autotrainer_tick_period_in_seconds;
+    named_value<uint64_t> sstable_compression_dictionaries_min_training_dataset_bytes;
+    named_value<float> sstable_compression_dictionaries_min_training_improvement_factor;
+    named_value<sstring> speculative_retry_user_table_default;
+    named_value<bool> uuid_sstable_identifiers_enabled;
+    named_value<bool> table_digest_insensitive_to_expiry;
     named_value<bool> enable_dangerous_direct_import_of_cassandra_counters;
     named_value<bool> enable_shard_aware_drivers;
     named_value<bool> enable_ipv6_dns_lookup;
     named_value<bool> abort_on_internal_error;
+    named_value<bool> abort_on_malformed_sstable_error;
     named_value<uint32_t> max_partition_key_restrictions_per_query;
     named_value<uint32_t> max_clustering_key_restrictions_per_query;
     named_value<uint64_t> max_memory_for_unlimited_query_soft_limit;
     named_value<uint64_t> max_memory_for_unlimited_query_hard_limit;
+    named_value<uint32_t> reader_concurrency_semaphore_serialize_limit_multiplier;
+    named_value<uint32_t> reader_concurrency_semaphore_kill_limit_multiplier;
+    named_value<uint32_t> reader_concurrency_semaphore_cpu_concurrency;
+    named_value<float> reader_concurrency_semaphore_preemptive_abort_factor;
+    named_value<double> reader_concurrency_semaphore_shared_pool_fraction;
+    named_value<uint32_t> view_update_reader_concurrency_semaphore_serialize_limit_multiplier;
+    named_value<uint32_t> view_update_reader_concurrency_semaphore_kill_limit_multiplier;
+    named_value<uint32_t> view_update_reader_concurrency_semaphore_cpu_concurrency;
+    named_value<int> maintenance_reader_concurrency_semaphore_count_limit;
+    named_value<uint32_t> twcs_max_window_count;
     named_value<unsigned> initial_sstable_loading_concurrency;
     named_value<bool> enable_3_1_0_compatibility_mode;
     named_value<bool> enable_user_defined_functions;
@@ -334,27 +508,43 @@ public:
     named_value<unsigned> user_defined_function_contiguous_allocation_limit_bytes;
     named_value<uint32_t> schema_registry_grace_period;
     named_value<uint32_t> max_concurrent_requests_per_shard;
+    named_value<uint32_t> uninitialized_connections_semaphore_cpu_concurrency;
     named_value<bool> cdc_dont_rewrite_streams;
     named_value<tri_mode_restriction> strict_allow_filtering;
-    named_value<bool> reversed_reads_auto_bypass_cache;
-    named_value<bool> enable_optimized_reversed_reads;
+    named_value<tri_mode_restriction> strict_is_not_null_in_views;
     named_value<bool> enable_cql_config_updates;
+    named_value<bool> enable_parallelized_aggregation;
+    named_value<bool> cql_duplicate_bind_variable_names_refer_to_same_variable;
+    named_value<bool> cql_in_bind_variable_name_uses_uppercase_operator;
+    named_value<uint32_t> max_relations_in_where_clause;
+    named_value<uint32_t> select_internal_page_size;
+
     named_value<uint16_t> alternator_port;
     named_value<uint16_t> alternator_https_port;
+    named_value<uint16_t> alternator_port_proxy_protocol;
+    named_value<uint16_t> alternator_https_port_proxy_protocol;
     named_value<sstring> alternator_address;
     named_value<bool> alternator_enforce_authorization;
+    named_value<bool> alternator_warn_authorization;
     named_value<sstring> alternator_write_isolation;
     named_value<uint32_t> alternator_streams_time_window_s;
+    named_value<bool> alternator_streams_increased_compatibility;
+    named_value<bool> alternator_vector_search_extra_operators;
     named_value<uint32_t> alternator_timeout_in_ms;
+    named_value<double> alternator_ttl_period_in_seconds;
+    named_value<sstring> alternator_describe_endpoints;
+    named_value<uint32_t> alternator_max_items_in_batch_write;
+    named_value<bool> alternator_allow_system_table_write;
+    named_value<uint32_t> alternator_max_expression_cache_entries_per_shard;
+    named_value<uint64_t> alternator_max_users_query_size_in_trace_output;
+    named_value<uint32_t> alternator_describe_table_info_cache_validity_in_seconds;
+    named_value<int> alternator_response_gzip_compression_level;
+    named_value<uint32_t> alternator_response_compression_threshold_in_bytes;
+    named_value<bool> alternator_http_response_disable_content_type_header;
+    named_value<bool> alternator_http_response_disable_date_header;
+    named_value<sstring> alternator_http_response_server_header;
 
     named_value<bool> abort_on_ebadf;
-
-    named_value<uint16_t> redis_port;
-    named_value<uint16_t> redis_ssl_port;
-    named_value<sstring> redis_read_consistency_level;
-    named_value<sstring> redis_write_consistency_level;
-    named_value<uint16_t> redis_database_count;
-    named_value<string_map> redis_keyspace_replication_strategy_options;
 
     named_value<bool> sanitizer_report_backtrace;
     named_value<bool> flush_schema_tables_after_modification;
@@ -364,10 +554,141 @@ public:
     // enjoy:
     named_value<tri_mode_restriction> restrict_replication_simplestrategy;
     named_value<tri_mode_restriction> restrict_dtcs;
+    named_value<tri_mode_restriction> restrict_twcs_without_default_ttl;
+    named_value<tri_mode_restriction> restrict_mixed_storage_clusters;
+    named_value<bool> restrict_future_timestamp;
+
+    named_value<bool> ignore_truncation_record;
+    named_value<bool> force_schema_commit_log;
+
+    named_value<uint32_t> task_ttl_seconds;
+    named_value<uint32_t> user_task_ttl_seconds;
+    named_value<uint32_t> nodeops_watchdog_timeout_seconds;
+    named_value<uint32_t> nodeops_heartbeat_interval_seconds;
+
+    named_value<bool> cache_index_pages;
+    named_value<double> index_cache_fraction;
+
+    named_value<bool> consistent_cluster_management;
+    named_value<bool> force_gossip_topology_changes;
+    named_value<UUID> recovery_leader;
+
+    named_value<double> wasm_cache_memory_fraction;
+    named_value<uint32_t> wasm_cache_timeout_in_ms;
+    named_value<size_t> wasm_cache_instance_size_limit;
+    named_value<uint64_t> wasm_udf_yield_fuel;
+    named_value<uint64_t> wasm_udf_total_fuel;
+    named_value<size_t> wasm_udf_memory_limit;
+    named_value<sstring> relabel_config_file;
+    // wasm_udf_reserved_memory is static because the options in db::config
+    // are parsed using seastar::app_template, while this option is used for
+    // configuring the Seastar memory subsystem.
+    static constexpr size_t wasm_udf_reserved_memory = 50 * 1024 * 1024;
+
+    named_value<bool> live_updatable_config_params_changeable_via_cql;
+    bool are_live_updatable_config_params_changeable_via_cql() const override {
+        return live_updatable_config_params_changeable_via_cql();
+    }
+
+    // authenticator options
+    named_value<std::string> auth_superuser_name;
+    named_value<std::string> auth_superuser_salted_password;
+
+    named_value<std::vector<std::unordered_map<sstring, sstring>>> auth_certificate_role_queries;
+
+    // guardrails options
+    named_value<bool> enable_create_table_with_compact_storage;
+    named_value<bool> allow_deprecated_size_tiered_compaction_strategy;
+    named_value<int> minimum_replication_factor_fail_threshold;
+    named_value<int> minimum_replication_factor_warn_threshold;
+    named_value<int> maximum_replication_factor_fail_threshold;
+    named_value<int> maximum_replication_factor_warn_threshold;
+    named_value<std::vector<enum_option<replication_strategy_restriction_t>>> replication_strategy_fail_list;
+    named_value<std::vector<enum_option<replication_strategy_restriction_t>>> replication_strategy_warn_list;
+    named_value<std::vector<enum_option<consistency_level_restriction_t>>> write_consistency_levels_disallowed;
+    named_value<std::vector<enum_option<consistency_level_restriction_t>>> write_consistency_levels_warned;
+
+    named_value<double> tablets_initial_scale_factor;
+    named_value<unsigned> tablets_per_shard_goal;
+    named_value<uint64_t> target_tablet_size_in_bytes;
+    named_value<unsigned> tablet_streaming_read_concurrency_per_shard;
+    named_value<unsigned> tablet_streaming_write_concurrency_per_shard;
+
+    named_value<uint32_t> service_levels_interval;
+
+    named_value<sstring> audit;
+    named_value<sstring> audit_categories;
+    named_value<sstring> audit_tables;
+    named_value<sstring> audit_keyspaces;
+    named_value<sstring> audit_unix_socket_path;
+    named_value<size_t> audit_syslog_write_buffer_size;
+    named_value<std::vector<audit::audit_rule>> audit_rules;
+
+    named_value<sstring> ldap_url_template;
+    named_value<sstring> ldap_attr_role;
+    named_value<sstring> ldap_bind_dn;
+    named_value<sstring> ldap_bind_passwd;
+    named_value<sstring> saslauthd_socket_path;
 
     seastar::logging_settings logging_settings(const log_cli::options&) const;
 
     const db::extensions& extensions() const;
+
+    named_value<std::vector<object_storage_endpoint_param>> object_storage_endpoints;
+    named_value<std::unordered_map<sstring, unsigned>> object_storage_connections;
+    named_value<unsigned> object_storage_connections_per_shard;
+    named_value<double> object_storage_clients_memory_fraction;
+
+    named_value<std::vector<error_injection_at_startup>> error_injections_at_startup;
+    named_value<double> topology_barrier_stall_detector_threshold_seconds;
+    named_value<bool> enable_tablets;
+    named_value<enum_option<tablets_mode_t>> tablets_mode_for_new_keyspaces;
+    named_value<bool> auto_repair_enabled_default;
+    named_value<int32_t> auto_repair_threshold_default_in_seconds;
+
+    bool enable_tablets_by_default() const noexcept {
+        switch (tablets_mode_for_new_keyspaces()) {
+        case tablets_mode_t::mode::unset:
+            return enable_tablets();
+        case tablets_mode_t::mode::disabled:
+            return false;
+        case tablets_mode_t::mode::enabled:
+        case tablets_mode_t::mode::enforced:
+            return true;
+        }
+    }
+    bool enforce_tablets() const noexcept {
+        return tablets_mode_for_new_keyspaces() == tablets_mode_t::mode::enforced;
+    }
+
+    named_value<uint32_t> view_flow_control_delay_limit_in_ms;
+
+    named_value<int> disk_space_monitor_normal_polling_interval_in_seconds;
+    named_value<int> disk_space_monitor_high_polling_interval_in_seconds;
+    named_value<float> disk_space_monitor_polling_interval_threshold;
+    named_value<float> critical_disk_utilization_level;
+
+    named_value<bool> rf_rack_valid_keyspaces;
+    named_value<bool> enforce_rack_list;
+
+    named_value<uint32_t> tablet_load_stats_refresh_interval_in_seconds;
+    named_value<bool> force_capacity_based_balancing;
+    named_value<float> size_based_balance_threshold_percentage;
+    named_value<uint64_t> minimal_tablet_size_for_balancing;
+    named_value<uint32_t> tablet_transition_abort_grace_period_in_seconds;
+
+    named_value<double> background_writer_scheduling_quota;
+    named_value<bool> auto_adjust_flush_quota;
+    named_value<float> memtable_flush_static_shares;
+    named_value<float> compaction_static_shares;
+    named_value<float> compaction_max_shares;
+    named_value<bool> compaction_enforce_min_threshold;
+    named_value<uint32_t> compaction_flush_all_tables_before_major_seconds;
+
+    named_value<uint32_t> maintenance_io_throughput_mb_per_sec;
+    named_value<uint32_t> backup_io_throughput_mb_per_sec;
+
+    named_value<bool> force_effective_capacity_to_raw_disk_capacity;
 
     static const sstring default_tls_priority;
 private:
@@ -386,12 +707,20 @@ private:
 
     log_legacy_value<seastar::log_level> default_log_level;
     log_legacy_value<std::unordered_map<sstring, seastar::log_level>> logger_log_level;
-    log_legacy_value<bool> log_to_stdout, log_to_syslog;
+    log_legacy_value<bool> log_to_stdout;
+    log_legacy_value<bool> log_to_syslog;
 
     void maybe_in_workdir(named_value<sstring>&, const char*);
     void maybe_in_workdir(named_value<string_list>&, const char*);
 
     std::shared_ptr<db::extensions> _extensions;
+
+    // Read-write lock used to synchronize config updates (SIGHUP reload +
+    // broadcast to all shards) with config value readers.
+    // The SIGHUP handler holds the write lock across read_config() +
+    // broadcast_to_all_shards().  Readers acquire the read lock on shard 0
+    // via value_as_json_string_for_name() so they always see a consistent snapshot.
+    mutable rwlock _config_update_lock;
 };
 
 }
@@ -414,4 +743,58 @@ inline bool is_true(sstring val) {
 
 future<> configure_tls_creds_builder(seastar::tls::credentials_builder& creds, db::config::string_map options);
 future<gms::inet_address> resolve(const config_file::named_value<sstring>&, gms::inet_address::opt_family family = {}, gms::inet_address::opt_family preferred = {});
-}
+
+/*!
+ * \brief read the the relabel config from a file
+ *
+ * Will throw an exception if there is a conflict with the metrics names
+ */
+future<> update_relabel_config_from_file(const std::string& name);
+
+std::vector<sstring> split_comma_separated_list(std::string_view comma_separated_list);
+
+} // namespace utils
+
+namespace utils {
+
+// Declaration of the explicit specialization for seed_provider_type's
+// add_command_line_option must appear before the extern template declaration
+// below, to satisfy [temp.expl.spec]: a member specialization must be
+// declared before any explicit instantiation (including extern template) of
+// the enclosing class template.
+template <>
+void config_file::named_value<db::config::seed_provider_type>::add_command_line_option(
+        boost::program_options::options_description_easy_init&);
+template <>
+void config_file::named_value<std::vector<audit::audit_rule>>::add_command_line_option(
+        boost::program_options::options_description_easy_init&);
+
+} // namespace utils
+
+// Explicit instantiation declarations for named_value<T> specializations
+// that use db-specific types. The definitions live in db/config.cc.
+// Together with the declarations in utils/config_file.hh (for primitive
+// types), this ensures the heavy template bodies from config_file_impl.hh
+// (boost::program_options, boost::lexical_cast, boost::regex, yaml-cpp)
+// are compiled only once.
+extern template struct utils::config_file::named_value<db::tri_mode_restriction>;
+extern template struct utils::config_file::named_value<db::seed_provider_type>;
+extern template struct utils::config_file::named_value<db::hints::host_filter>;
+extern template struct utils::config_file::named_value<utils::UUID>;
+extern template struct utils::config_file::named_value<db::error_injection_at_startup>;
+extern template struct utils::config_file::named_value<compression_parameters>;
+extern template struct utils::config_file::named_value<enum_option<db::experimental_features_t>>;
+extern template struct utils::config_file::named_value<enum_option<db::replication_strategy_restriction_t>>;
+extern template struct utils::config_file::named_value<enum_option<db::consistency_level_restriction_t>>;
+extern template struct utils::config_file::named_value<enum_option<db::tablets_mode_t>>;
+extern template struct utils::config_file::named_value<enum_option<netw::dict_training_loop::when>>;
+extern template struct utils::config_file::named_value<netw::advanced_rpc_compressor::tracker::algo_config>;
+extern template struct utils::config_file::named_value<std::vector<enum_option<db::experimental_features_t>>>;
+extern template struct utils::config_file::named_value<std::vector<enum_option<db::replication_strategy_restriction_t>>>;
+extern template struct utils::config_file::named_value<std::vector<enum_option<db::consistency_level_restriction_t>>>;
+extern template struct utils::config_file::named_value<std::vector<db::error_injection_at_startup>>;
+extern template struct utils::config_file::named_value<std::vector<std::unordered_map<sstring, sstring>>>;
+extern template struct utils::config_file::named_value<std::unordered_map<sstring, seastar::log_level>>;
+extern template struct utils::config_file::named_value<std::unordered_map<sstring, unsigned>>;
+extern template struct utils::config_file::named_value<std::vector<db::object_storage_endpoint_param>>;
+extern template struct utils::config_file::named_value<std::vector<audit::audit_rule>>;

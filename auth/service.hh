@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -12,6 +12,7 @@
 #include <memory>
 #include <optional>
 
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/bool_class.hh>
@@ -20,29 +21,37 @@
 #include "auth/authenticator.hh"
 #include "auth/authorizer.hh"
 #include "auth/permission.hh"
-#include "auth/permissions_cache.hh"
+#include "auth/cache.hh"
 #include "auth/role_manager.hh"
+#include "auth/common.hh"
+#include "cql3/description.hh"
 #include "seastarx.hh"
+#include "service/raft/group0_fwd.hh"
+#include "utils/observable.hh"
+#include "utils/serialized_action.hh"
+#include "service/maintenance_mode.hh"
+#include "auth/config.hh"
 
 namespace cql3 {
 class query_processor;
 }
 
+namespace db {
+class system_keyspace;
+}
+
 namespace service {
 class migration_manager;
-class migration_notifier;
-class migration_listener;
 }
 
 namespace auth {
 
 class role_or_anonymous;
 
-struct service_config final {
-    sstring authorizer_java_name;
-    sstring authenticator_java_name;
-    sstring role_manager_java_name;
-};
+/// Factory function types for creating auth module instances on each shard.
+using authorizer_factory = std::function<std::unique_ptr<authorizer>()>;
+using authenticator_factory = std::function<std::unique_ptr<authenticator>(const config&)>;
+using role_manager_factory = std::function<std::unique_ptr<role_manager>(const config&)>;
 
 ///
 /// Due to poor (in this author's opinion) decisions of Apache Cassandra, certain choices of one role-manager,
@@ -68,12 +77,13 @@ public:
 /// peering_sharded_service inheritance is needed to be able to access shard local authentication service
 /// given an object from another shard. Used for bouncing lwt requests to correct shard.
 class service final : public seastar::peering_sharded_service<service> {
-    permissions_cache_config _permissions_cache_config;
-    std::unique_ptr<permissions_cache> _permissions_cache;
+    cache& _cache;
 
     cql3::query_processor& _qp;
 
-    ::service::migration_notifier& _mnotifier;
+    ::service::raft_group0_client& _group0_client;
+
+    config _cfg;
 
     authorizer::ptr_type _authorizer;
 
@@ -81,33 +91,42 @@ class service final : public seastar::peering_sharded_service<service> {
 
     role_manager::ptr_type _role_manager;
 
-    // Only one of these should be registered, so we end up with some unused instances. Not the end of the world.
-    std::unique_ptr<::service::migration_listener> _migration_listener;
+    maintenance_socket_enabled _used_by_maintenance_socket;
+
+    abort_source _as;
 
 public:
     service(
-            permissions_cache_config,
+            cache& cache,
             cql3::query_processor&,
-            ::service::migration_notifier&,
+            ::service::raft_group0_client&,
             std::unique_ptr<authorizer>,
             std::unique_ptr<authenticator>,
-            std::unique_ptr<role_manager>);
+            std::unique_ptr<role_manager>,
+            maintenance_socket_enabled);
 
     ///
     /// This constructor is intended to be used when the class is sharded via \ref seastar::sharded. In that case, the
-    /// arguments must be copyable, which is why we delay construction with instance-construction instructions instead
+    /// arguments must be copyable, which is why we delay construction with instance-construction factories instead
     /// of the instances themselves.
     ///
     service(
-            permissions_cache_config,
             cql3::query_processor&,
-            ::service::migration_notifier&,
-            ::service::migration_manager&,
-            const service_config&);
+            ::service::raft_group0_client&,
+            authorizer_factory,
+            authenticator_factory,
+            role_manager_factory,
+            config,
+            maintenance_socket_enabled,
+            cache&);
 
-    future<> start(::service::migration_manager&);
+    future<> start(::service::migration_manager&, db::system_keyspace&);
 
     future<> stop();
+
+    future<> ensure_superuser_is_created();
+
+    void reset_authorization_cache();
 
     ///
     /// \returns an exceptional future with \ref nonexistant_role if the named role does not exist.
@@ -120,6 +139,11 @@ public:
     future<permission_set> get_uncached_permissions(const role_or_anonymous&, const resource&) const;
 
     ///
+    /// Notify the service that the node is entering maintenance mode.
+    ///
+    void set_maintenance_mode();
+
+    ///
     /// Query whether the named role has been granted a role that is a superuser.
     ///
     /// A role is always granted to itself. Therefore, a role that "is" a superuser also "has" superuser.
@@ -129,6 +153,23 @@ public:
     future<bool> has_superuser(std::string_view role_name) const;
 
     ///
+    /// Ensure that the role operations are enabled. Some role managers defer initialization.
+    ///
+    future<> ensure_role_operations_are_enabled();
+    
+    ///
+    /// Create a role with optional authentication information.
+    ///
+    /// \returns an exceptional future with \ref role_already_exists if the user or role exists.
+    ///
+    /// \returns an exceptional future with \ref unsupported_authentication_option if an unsupported option is included.
+    ///
+    future<> create_role(std::string_view name,
+            const role_config& config,
+            const authentication_options& options,
+            ::service::group0_batch& mc) const;
+
+    ///
     /// Return the set of all roles granted to the given role, including itself and roles granted through other roles.
     ///
     /// \returns an exceptional future with \ref nonexistent_role if the role does not exist.
@@ -136,11 +177,24 @@ public:
 
     future<bool> exists(const resource&) const;
 
-    const authenticator& underlying_authenticator() const {
+    ///
+    /// Revoke all permissions granted to any role for a particular resource.
+    ///
+    /// \throws \ref unsupported_authorization_operation if revoking permissions is not supported.
+    ///
+    future<> revoke_all(const resource&, ::service::group0_batch&) const;
+
+    ///
+    /// Produces descriptions that can be used to restore the state of auth. That encompasses
+    /// roles, role grants, and permission grants.
+    ///
+    future<std::vector<cql3::description>> describe_auth(bool with_hashed_passwords);
+
+    authenticator& underlying_authenticator() const {
         return *_authenticator;
     }
 
-    const authorizer& underlying_authorizer() const {
+    authorizer& underlying_authorizer() const {
         return *_authorizer;
     }
 
@@ -148,25 +202,25 @@ public:
         return *_role_manager;
     }
 
-private:
-    future<bool> has_existing_legacy_users() const;
+    future<> commit_mutations(::service::group0_batch&& mc);
 
-    future<> create_keyspace_if_missing(::service::migration_manager& mm) const;
+private:
+    future<> create_legacy_keyspace_if_missing(::service::migration_manager& mm) const;
+    future<bool> has_superuser(std::string_view role_name, const role_set& roles) const;
+
+    future<std::vector<cql3::description>> describe_roles(bool with_hashed_passwords);
+    future<std::vector<cql3::description>> describe_permissions() const;
 };
 
+void set_maintenance_mode(service&);
+
 future<bool> has_superuser(const service&, const authenticated_user&);
+
+future<> ensure_role_operations_are_enabled(service&);
 
 future<role_set> get_roles(const service&, const authenticated_user&);
 
 future<permission_set> get_permissions(const service&, const authenticated_user&, const resource&);
-
-///
-/// Access-control is "enforcing" when either the authenticator or the authorizer are not their "allow-all" variants.
-///
-/// Put differently, when access control is not enforcing, all operations on resources will be allowed and users do not
-/// need to authenticate themselves.
-///
-bool is_enforcing(const service&);
 
 /// A description of a CQL command from which auth::service can tell whether or not this command could endanger
 /// internal data on which auth::service depends.
@@ -175,6 +229,18 @@ struct command_desc {
     const ::auth::resource& resource; ///< Resource impacted by this command.
     enum class type {
         ALTER_WITH_OPTS, ///< Command is ALTER ... WITH ...
+        ALTER_SYSTEM_WITH_ALLOWED_OPTS,
+        OTHER
+    } type_ = type::OTHER;
+};
+
+/// Similar to command_desc, but used in cases where multiple permissions allow the access to the resource.
+struct command_desc_with_permission_set {
+    permission_set permission;
+    const ::auth::resource& resource;
+    enum class type {
+        ALTER_WITH_OPTS,
+        ALTER_SYSTEM_WITH_ALLOWED_OPTS,
         OTHER
     } type_ = type::OTHER;
 };
@@ -195,7 +261,8 @@ future<> create_role(
         const service&,
         std::string_view name,
         const role_config&,
-        const authentication_options&);
+        const authentication_options&,
+        ::service::group0_batch&);
 
 ///
 /// Alter an existing role and its authentication information.
@@ -208,14 +275,34 @@ future<> alter_role(
         const service&,
         std::string_view name,
         const role_config_update&,
-        const authentication_options&);
+        const authentication_options&,
+        ::service::group0_batch& mc);
 
 ///
 /// Drop a role from the system, including all permissions and authentication information.
 ///
 /// \returns an exceptional future with \ref nonexistant_role if the named role does not exist.
 ///
-future<> drop_role(const service&, std::string_view name);
+future<> drop_role(const service&, std::string_view name, ::service::group0_batch& mc);
+
+///
+/// Grant `role_name` to `grantee_name`.
+///
+/// \returns an exceptional future with \ref nonexistant_role if either the role or the grantee do not exist.
+///
+/// \returns an exceptional future with \ref role_already_included if granting the role would be redundant, or
+/// create a cycle.
+///
+future<> grant_role(const service&, std::string_view grantee_name, std::string_view role_name, ::service::group0_batch& mc);
+
+///
+/// Revoke `role_name` from `revokee_name`.
+///
+/// \returns an exceptional future with \ref nonexistant_role if either the role or the revokee do not exist.
+///
+/// \returns an exceptional future with \ref revoke_ungranted_role if the role was not granted.
+///
+future<> revoke_role(const service&, std::string_view revokee_name, std::string_view role_name, ::service::group0_batch& mc);
 
 ///
 /// Check if `grantee` has been granted the named role.
@@ -230,6 +317,18 @@ future<bool> has_role(const service&, std::string_view grantee, std::string_view
 ///
 future<bool> has_role(const service&, const authenticated_user&, std::string_view name);
 
+
+/// Sets `attribute_name` with `attribute_value` for `role_name`.
+/// \returns an exceptional future with nonexistant_role if the role does not exist.
+///
+future<> set_attribute(const service&, std::string_view role_name, std::string_view attribute_name, std::string_view attribute_value, ::service::group0_batch& mc);
+
+/// Removes `attribute_name` for `role_name`.
+/// \returns an exceptional future with nonexistant_role if the role does not exist.
+/// \note: This is a no-op if the role does not have the named attribute set.
+///
+future<> remove_attribute(const service&, std::string_view role_name, std::string_view attribute_name, ::service::group0_batch& mc);
+
 ///
 /// \returns an exceptional future with \ref nonexistent_role if the named role does not exist.
 ///
@@ -240,7 +339,8 @@ future<> grant_permissions(
         const service&,
         std::string_view role_name,
         permission_set,
-        const resource&);
+        const resource&,
+        ::service::group0_batch&);
 
 ///
 /// Like \ref grant_permissions, but grants all applicable permissions on the resource.
@@ -250,8 +350,8 @@ future<> grant_permissions(
 /// \returns an exceptional future with \ref unsupported_authorization_operation if granting permissions is not
 /// supported.
 ///
-future<> grant_applicable_permissions(const service&, std::string_view role_name, const resource&);
-future<> grant_applicable_permissions(const service&, const authenticated_user&, const resource&);
+future<> grant_applicable_permissions(const service&, std::string_view role_name, const resource&, ::service::group0_batch&);
+future<> grant_applicable_permissions(const service&, const authenticated_user&, const resource&, ::service::group0_batch&);
 
 ///
 /// \returns an exceptional future with \ref nonexistent_role if the named role does not exist.
@@ -263,7 +363,15 @@ future<> revoke_permissions(
         const service&,
         std::string_view role_name,
         permission_set,
-        const resource&);
+        const resource&,
+        ::service::group0_batch&);
+
+///
+/// Revoke all permissions granted to any role for a particular resource.
+///
+/// \throws \ref unsupported_authorization_operation if revoking permissions is not supported.
+///
+future<> revoke_all(const service&, const resource&, ::service::group0_batch&);
 
 using recursive_permissions = bool_class<struct recursive_permissions_tag>;
 
@@ -288,5 +396,60 @@ future<std::vector<permission_details>> list_filtered_permissions(
         permission_set,
         std::optional<std::string_view> role_name,
         const std::optional<std::pair<resource, recursive_permissions>>& resource_filter);
+
+
+// Finalizes write operations performed in auth by committing mutations via raft group0.
+future<> commit_mutations(service& ser, ::service::group0_batch&& mc);
+
+///
+/// Factory helper functions for creating auth module instances.
+/// These are intended for use with sharded<service>::start() where copyable arguments are required.
+/// The returned factories capture the sharded references and call .local() when invoked on each shard.
+///
+
+/// Creates an authorizer factory for config-selectable authorizer types.
+/// @param name The authorizer class name (e.g., "CassandraAuthorizer", "AllowAllAuthorizer")
+authorizer_factory make_authorizer_factory(
+        std::string_view name,
+        sharded<cql3::query_processor>& qp);
+
+/// Creates an authenticator factory for config-selectable authenticator types.
+/// @param name The authenticator class name (e.g., "PasswordAuthenticator", "AllowAllAuthenticator")
+authenticator_factory make_authenticator_factory(
+        std::string_view name,
+        sharded<cql3::query_processor>& qp,
+        ::service::raft_group0_client& g0,
+        sharded<::service::migration_manager>& mm,
+        sharded<cache>& cache);
+
+/// Creates a role_manager factory for config-selectable role manager types.
+/// @param name The role manager class name (e.g., "CassandraRoleManager")
+role_manager_factory make_role_manager_factory(
+        std::string_view name,
+        sharded<cql3::query_processor>& qp,
+        ::service::raft_group0_client& g0,
+        sharded<::service::migration_manager>& mm,
+        sharded<cache>& cache);
+
+/// Creates a factory for the maintenance socket authenticator.
+/// This authenticator is not config-selectable and is only used for the maintenance socket.
+authenticator_factory make_maintenance_socket_authenticator_factory(
+        sharded<cql3::query_processor>& qp,
+        ::service::raft_group0_client& g0,
+        sharded<::service::migration_manager>& mm,
+        sharded<cache>& cache);
+
+/// Creates a factory for the maintenance socket authorizer.
+/// This authorizer is not config-selectable and is only used for the maintenance socket.
+/// It grants all permissions unconditionally while delegating grant/revoke to the default authorizer.
+authorizer_factory make_maintenance_socket_authorizer_factory(sharded<cql3::query_processor>& qp);
+
+/// Creates a factory for the maintenance socket role manager.
+/// This role manager is not config-selectable and is only used for the maintenance socket.
+role_manager_factory make_maintenance_socket_role_manager_factory(
+        sharded<cql3::query_processor>& qp,
+        ::service::raft_group0_client& g0,
+        sharded<::service::migration_manager>& mm,
+        sharded<cache>& cache);
 
 }

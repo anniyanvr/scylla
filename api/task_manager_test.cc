@@ -1,0 +1,152 @@
+/*
+ * Copyright (C) 2022-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+
+#include "build_mode.hh"
+
+#ifndef SCYLLA_BUILD_MODE_RELEASE
+
+#include <seastar/core/coroutine.hh>
+
+#include "task_manager_test.hh"
+#include "api/api.hh"
+#include "api/api-doc/task_manager_test.json.hh"
+#include "tasks/test_module.hh"
+#include "tasks/virtual_task_hint.hh"
+#include "utils/overloaded_functor.hh"
+
+namespace api {
+
+namespace tmt = httpd::task_manager_test_json;
+using namespace json;
+using namespace seastar::httpd;
+
+static future<tasks::task_id> make_test_task(tasks::task_manager& task_manager, sstring module_name, unsigned shard, tasks::task_id id, std::string keyspace,
+                                      std::string table, std::string entity, tasks::task_info parent_d, tasks::is_user_task user_task) {
+    return task_manager.container().invoke_on(shard, [id, module = std::move(module_name), keyspace = std::move(keyspace), table = std::move(table), entity = std::move(entity), parent_d, user_task] (tasks::task_manager& tm) {
+        auto module_ptr = dynamic_pointer_cast<tasks::test_module>(tm.find_module(module));
+        auto task_id = id ? id : tasks::task_id::create_random_id();
+        auto finalization = seastar::make_shared<tasks::task_finalization>();
+        tasks::task_manager::task_builder task_builder{module_ptr, "test", task_id};
+        task_builder.set_sequence_number(parent_d ? 0 : module_ptr->new_sequence_number())
+                    .set_keyspace(std::move(keyspace))
+                    .set_table(std::move(table))
+                    .set_entity(std::move(entity))
+                    .set_is_user_task(user_task)
+                    .set_finalizer([module_ptr, task_id] () noexcept {
+                        module_ptr->erase_finalization(task_id);
+                        return make_ready_future<>();
+                    });
+        if (parent_d) {
+            task_builder.set_parent_info(parent_d);
+        }
+        return std::move(task_builder).build([finalization] (tasks::task_manager::task::impl&) -> future<> {
+            return finalization->finish_run.get_future();
+        }).then([module_ptr, task_id, finalization = std::move(finalization)] (auto task) mutable {
+            module_ptr->register_finalization(task_id, std::move(finalization));
+            return task->id();
+        });
+    });
+}
+
+void set_task_manager_test(http_context& ctx, routes& r, sharded<tasks::task_manager>& tm) {
+    tmt::register_test_module.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        co_await tm.invoke_on_all([] (tasks::task_manager& tm) {
+            auto m = make_shared<tasks::test_module>(tm);
+            tm.register_module("test", m);
+        });
+        co_return json_void();
+    });
+
+    tmt::unregister_test_module.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        co_await tm.invoke_on_all([] (tasks::task_manager& tm) -> future<> {
+            auto module_name = "test";
+            auto module = tm.find_module(module_name);
+            co_await module->stop();
+        });
+        co_return json_void();
+    });
+
+    tmt::register_test_task.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        sharded<tasks::task_manager>& tms = tm;
+        auto id = get_query_param<tasks::task_id>(*req, "task_id");
+        unsigned shard = get_query_param<unsigned>(*req, "shard");
+        std::string keyspace = req->get_query_param("keyspace");
+        std::string table = req->get_query_param("table");
+        std::string entity = req->get_query_param("entity");
+        auto data = tasks::make_empty_task_info();
+        if (auto pid = try_get_query_param<tasks::task_id>(*req, "parent_id")) {
+            auto parent_ptr = co_await tasks::task_manager::lookup_task_on_all_shards(tm, *pid);
+            data = tasks::make_node_task_info(*pid, parent_ptr->get_status().shard, parent_ptr->get_status().sequence_number);
+        }
+        auto user_task = get_query_param<tasks::is_user_task>(*req, "user_task");
+
+        auto module = tms.local().find_module("test");
+        id = co_await make_test_task(module->get_task_manager(), module->get_name(), shard, id, keyspace, table, entity, data, user_task);
+        co_return id.to_sstring();
+    });
+
+    tmt::unregister_test_task.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto id = require_query_param<tasks::task_id>(*req, "task_id");
+        try {
+            co_await tasks::task_manager::invoke_on_task(tm, id, [] (tasks::task_manager::task_variant task_v, tasks::virtual_task_hint) -> future<> {
+                return std::visit(overloaded_functor{
+                    [] (tasks::task_manager::task_ptr task) -> future<> {
+                        tasks::test_task test_task{task};
+                        co_await test_task.unregister_task();
+                    },
+                    [] (tasks::task_manager::virtual_task_ptr task) {
+                        return make_ready_future();
+                    }
+                }, task_v);
+            });
+        } catch (tasks::task_manager::task_not_found& e) {
+            throw bad_param_exception(e.what());
+        }
+        co_return json_void();
+    });
+
+    tmt::finish_test_task.set(r, [&tm] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto id = require_path_param<tasks::task_id>(*req, "task_id");
+        std::string error = req->get_query_param("error");
+        bool fail = !error.empty();
+
+        try {
+            co_await tasks::task_manager::invoke_on_task(tm, id, [fail, error = std::move(error)] (tasks::task_manager::task_variant task_v, tasks::virtual_task_hint) -> future<> {
+                return std::visit(overloaded_functor{
+                    [fail, error = std::move(error)] (tasks::task_manager::task_ptr task) -> future<> {
+                        tasks::test_task test_task{task};
+                        if (fail) {
+                            co_await test_task.finish_failed(std::make_exception_ptr(std::runtime_error(error)));
+                        } else {
+                            co_await test_task.finish();
+                        }
+                    },
+                    [] (tasks::task_manager::virtual_task_ptr task) {
+                        return make_ready_future();
+                    }
+                }, task_v);
+            });
+        } catch (tasks::task_manager::task_not_found& e) {
+            throw bad_param_exception(e.what());
+        }
+        co_return json_void();
+    });
+}
+
+void unset_task_manager_test(http_context& ctx, routes& r) {
+    tmt::register_test_module.unset(r);
+    tmt::unregister_test_module.unset(r);
+    tmt::register_test_task.unset(r);
+    tmt::unregister_test_task.unset(r);
+    tmt::finish_test_task.unset(r);
+}
+
+}
+
+#endif

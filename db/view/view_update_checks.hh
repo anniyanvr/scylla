@@ -3,28 +3,30 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <seastar/core/future.hh>
 #include "streaming/stream_reason.hh"
+#include "locator/token_metadata_fwd.hh"
 #include "seastarx.hh"
 
 namespace replica {
 class table;
 }
 
-namespace db {
-
-class system_distributed_keyspace;
-
-}
-
 namespace db::view {
+class view_builder;
 
-future<bool> check_view_build_ongoing(db::system_distributed_keyspace& sys_dist_ks, const sstring& ks_name, const sstring& cf_name);
-future<bool> check_needs_view_update_path(db::system_distributed_keyspace& sys_dist_ks, const replica::table& t, streaming::stream_reason reason);
+enum class sstable_destination_decision {
+    normal_directory,               // use normal sstable directory
+    staging_directly_to_generator,  // use staging directory and create view building task for the sstable
+    staging_managed_by_vbc          // use staging directory and register the sstable to view update generator
+};
+
+future<sstable_destination_decision> check_needs_view_update_path(view_builder& vb, locator::token_metadata_ptr tmptr, const replica::table& t,
+        streaming::stream_reason reason);
 
 }

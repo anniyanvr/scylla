@@ -1,16 +1,14 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
+#include "utils/assert.hh"
 #include "cql3/keyspace_element_name.hh"
 
 namespace cql3 {
@@ -27,7 +25,7 @@ bool keyspace_element_name::has_keyspace() const
 
 const sstring& keyspace_element_name::get_keyspace() const
 {
-    assert(_ks_name);
+    throwing_assert(_ks_name);
     return *_ks_name;
 }
 

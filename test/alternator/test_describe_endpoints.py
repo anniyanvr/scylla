@@ -1,15 +1,19 @@
 # Copyright 2019-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Test for the DescribeEndpoints operation
 
 import boto3
+import botocore
+from botocore import UNSIGNED
+
+from .util import get_cert
 
 # Test that the DescribeEndpoints operation works as expected: that it
 # returns one endpoint (it may return more, but it never does this in
 # Amazon), and this endpoint can be used to make more requests.
-def test_describe_endpoints(request, dynamodb):
+def test_describe_endpoints(request, dynamodb, get_valid_alternator_role):
     endpoints = dynamodb.meta.client.describe_endpoints()['Endpoints']
     # It is not strictly necessary that only a single endpoint be returned,
     # but this is what Amazon DynamoDB does today (and so does Alternator).
@@ -26,11 +30,19 @@ def test_describe_endpoints(request, dynamodb):
         url = prefix + address
         if address.endswith('.amazonaws.com'):
             boto3.client('dynamodb',endpoint_url=url, verify=verify).describe_endpoints()
+        elif request.config.getoption('mtls'):
+            # Under mTLS, identity comes from the client certificate, not
+            # from SigV4 credentials, so reconnect using the certificate
+            # instead of a role/key pair.
+            cert = get_cert(dynamodb)
+            boto3.client('dynamodb', endpoint_url=url, region_name='us-east-1', verify=verify,
+                config=botocore.client.Config(signature_version=UNSIGNED, client_cert=cert)).describe_endpoints()
         else:
             # Even though we connect to the local installation, Boto3 still
             # requires us to specify dummy region and credential parameters,
             # otherwise the user is forced to properly configure ~/.aws even
             # for local runs.
-            boto3.client('dynamodb',endpoint_url=url, region_name='us-east-1', aws_access_key_id='alternator', aws_secret_access_key='secret_pass', verify=verify).describe_endpoints()
+            user, secret = get_valid_alternator_role(url)
+            boto3.client('dynamodb',endpoint_url=url, region_name='us-east-1', aws_access_key_id=user, aws_secret_access_key=secret, verify=verify).describe_endpoints()
         # Nothing to check here - if the above call failed with an exception,
         # the test would fail.

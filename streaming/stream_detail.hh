@@ -5,25 +5,19 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "query-request.hh"
-#include "mutation_reader.hh"
-#include "utils/UUID.hh"
-#include <vector>
-#include "range.hh"
-#include "dht/i_partitioner.hh"
+#include "schema/schema_fwd.hh"
 
 namespace streaming {
 
 struct stream_detail {
-    using UUID = utils::UUID;
-    UUID cf_id;
+    table_id cf_id;
     stream_detail() = default;
-    stream_detail(UUID cf_id_)
+    stream_detail(table_id cf_id_)
         : cf_id(std::move(cf_id_)) {
     }
 };

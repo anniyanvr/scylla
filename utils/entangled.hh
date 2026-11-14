@@ -1,14 +1,16 @@
 /*
- * Copyright (C) 2020 ScyllaDB
+ * Copyright (C) 2020-present ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include <boost/intrusive/parent_from_member.hpp>
+#include <assert.h>
 
 //  A movable pointer-like object paired with exactly one other object of the same type. 
 //  The two objects which are paired with each other point at each other.
@@ -32,7 +34,7 @@ class entangled final {
 private:
     struct init_tag {};
     entangled(init_tag, entangled& other) {
-        assert(!other._ref);
+        SCYLLA_ASSERT(!other._ref);
         _ref = &other;
         other._ref = this;
     }

@@ -4,30 +4,95 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <boost/test/unit_test.hpp>
-#include <boost/range/adaptor/transformed.hpp>
+#include <fmt/ranges.h>
+#include <fmt/std.h>
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/eventually.hh"
+#include "test/lib/log.hh"
 #include "transport/messages/result_message.hh"
-#include "to_string.hh"
+#include "utils/assert.hh"
+#include "utils/to_string.hh"
 #include "bytes.hh"
+#include "cql3/query_result_printer.hh"
+#include "replica/database.hh"
+#include "locator/abstract_replication_strategy.hh"
 
-static inline void fail(sstring msg) {
-    throw std::runtime_error(msg);
+static inline void fail(std::string_view msg, std::source_location loc) {
+    throw std::runtime_error(std::format("assertion at {}:{} failed: {}", loc.file_name(), loc.line(), msg));
 }
 
-rows_assertions::rows_assertions(shared_ptr<cql_transport::messages::result_message::rows> rows)
+void columns_assertions::fail(const sstring& msg) {
+    ::fail(msg, _loc);
+}
+
+columns_assertions& columns_assertions::do_with_raw_column(const char* name, std::function<void(data_type, managed_bytes_view)> func) {
+    const auto& names = _metadata.get_names();
+
+    auto it = std::ranges::find_if(names, [name] (const auto& col) {
+        return col->name->text() == name;
+    });
+    if (it == names.end()) {
+        ::fail(seastar::format("Column {} not found in metadata", name), _loc);
+    }
+
+    const size_t index = std::distance(names.begin(), it);
+    const auto& value  = _columns.at(index);
+    if (!value) {
+        ::fail(seastar::format("Column {} is null", name), _loc);
+    }
+
+    func((*it)->type, *value);
+
+    return *this;
+}
+
+columns_assertions& columns_assertions::with_raw_column(const char* name, std::function<bool(managed_bytes_view)> predicate) {
+    return do_with_raw_column(name, [this, name, &predicate] (data_type, managed_bytes_view value) {
+        if (!predicate(value)) {
+            ::fail(seastar::format("Column {} failed predicate check: value = {}", name, value), _loc);
+        }
+    });
+}
+
+columns_assertions& columns_assertions::with_raw_column(const char* name, managed_bytes_view value) {
+    return do_with_raw_column(name, [this, name, &value] (data_type, managed_bytes_view cell_value) {
+        if (cell_value != value) {
+            ::fail(seastar::format("Expected column {} to have value {}, but got {}", name, value, cell_value), _loc);
+        }
+    });
+}
+
+rows_assertions::rows_assertions(shared_ptr<cql_transport::messages::result_message::rows> rows, tests::dump_to_logs dump, std::source_location loc)
     : _rows(rows)
-{ }
+    , _loc(loc)
+{
+    if (dump) {
+        std::stringstream ss;
+        cql3::print_query_results_text(ss, _rows->rs());
+        testlog.debug("Query results for assert_that().is_rows(dump_to_logs::yes) at {}:{}:\n{}", _loc.file_name(), _loc.line(), ss.str());
+    }
+}
 
 rows_assertions
 rows_assertions::with_size(size_t size) {
     const auto& rs = _rows->rs().result_set();
     auto row_count = rs.size();
     if (row_count != size) {
-        fail(format("Expected {:d} row(s) but got {:d}", size, row_count));
+        fail(format("Expected {:d} row(s) but got {:d}", size, row_count), _loc);
+    }
+    return {*this};
+}
+
+rows_assertions
+rows_assertions::with_size(std::function<bool(size_t)> predicate) {
+    const auto& rs = _rows->rs().result_set();
+    auto row_count = rs.size();
+    if (!predicate(row_count)) {
+        fail(format("Predicate failed for row count {}", row_count), _loc);
     }
     return {*this};
 }
@@ -38,7 +103,7 @@ rows_assertions::is_empty() {
     auto row_count = rs.size();
     if (row_count != 0) {
         auto&& first_row = *rs.rows().begin();
-        fail(format("Expected no rows, but got {:d}. First row: {}", row_count, to_string(first_row)));
+        fail(seastar::format("Expected no rows, but got {:d}. First row: {}", row_count, first_row), _loc);
     }
     return {*this};
 }
@@ -48,7 +113,7 @@ rows_assertions::is_not_empty() {
     const auto& rs = _rows->rs().result_set();
     auto row_count = rs.size();
     if (row_count == 0) {
-        fail("Expected some rows, but was result was empty");
+        fail("Expected some rows, but was result was empty", _loc);
     }
     return {*this};
 }
@@ -57,9 +122,9 @@ rows_assertions
 rows_assertions::rows_assertions::is_null() {
     const auto& rs = _rows->rs().result_set();
     for (auto&& row : rs.rows()) {
-        for (const bytes_opt& v : row) {
+        for (const managed_bytes_opt& v : row) {
             if (v) {
-                fail(format("Expected null values. Found: {}\n", v));
+                fail(seastar::format("Expected null values. Found: {}\n", v), _loc);
             }
         }
     }
@@ -70,9 +135,9 @@ rows_assertions
 rows_assertions::rows_assertions::is_not_null() {
     const auto& rs = _rows->rs().result_set();
     for (auto&& row : rs.rows()) {
-        for (const bytes_opt& v : row) {
+        for (const managed_bytes_opt& v : row) {
             if (!v) {
-                fail(format("Expected non-null values. {}\n", to_string(row)));
+                fail(seastar::format("Expected non-null values. {}\n", row), _loc);
             }
         }
     }
@@ -84,7 +149,7 @@ rows_assertions::with_column_types(std::initializer_list<data_type> column_types
     auto meta = _rows->rs().result_set().get_metadata();
     const auto& columns = meta.get_names();
     if (column_types.size() != columns.size()) {
-        fail(format("Expected {:d} columns, got {:d}", column_types.size(), meta.column_count()));
+        fail(format("Expected {:d} columns, got {:d}", column_types.size(), meta.column_count()), _loc);
     }
     auto expected_it = column_types.begin();
     auto actual_it = columns.begin();
@@ -92,7 +157,7 @@ rows_assertions::with_column_types(std::initializer_list<data_type> column_types
         const auto& expected_type = *expected_it++;
         const auto& actual_spec = *actual_it++;
         if (expected_type != actual_spec->type) {
-            fail(format("Column {:d}: expected type {}, got {}", i, expected_type->name(), actual_spec->type->name()));
+            fail(format("Column {:d}: expected type {}, got {}", i, expected_type->name(), actual_spec->type->name()), _loc);
         }
     }
     return {*this};
@@ -101,13 +166,13 @@ rows_assertions::with_column_types(std::initializer_list<data_type> column_types
 rows_assertions
 rows_assertions::with_row(std::initializer_list<bytes_opt> values) {
     const auto& rs = _rows->rs().result_set();
-    std::vector<bytes_opt> expected_row(values);
+    std::vector<managed_bytes_opt> expected_row = values | std::views::transform(to_managed_bytes_opt) | std::ranges::to<std::vector<managed_bytes_opt>>();
     for (auto&& row : rs.rows()) {
         if (row == expected_row) {
             return {*this};
         }
     }
-    fail(format("Expected row not found: {} not in {}\n", to_string(expected_row), _rows));
+    fail(seastar::format("Expected row not found: {} not in {}\n", expected_row, _rows), _loc);
     return {*this};
 }
 
@@ -120,20 +185,21 @@ rows_assertions::with_rows(std::vector<std::vector<bytes_opt>> rows) {
     int row_nr = 0;
     for (auto&& row : rows) {
         if (actual_i == actual_end) {
-            fail(format("Expected more rows ({:d}), got {:d}", rows.size(), rs.size()));
+            fail(format("Expected more rows ({:d}), got {:d}", rows.size(), rs.size()), _loc);
         }
         auto& actual = *actual_i;
-        if (!std::equal(
-            std::begin(row), std::end(row),
-            std::begin(actual), std::end(actual))) {
-            fail(format("row {:d} differs, expected {} got {}", row_nr, to_string(row), to_string(actual)));
+        auto expected_row = row | std::views::transform(to_managed_bytes_opt);
+        if (!std::ranges::equal(
+            expected_row,
+            actual)) {
+            fail(seastar::format("row {} differs, expected {} got {}", row_nr, row, actual), _loc);
         }
         ++actual_i;
         ++row_nr;
     }
     if (actual_i != actual_end) {
-        fail(format("Expected less rows ({:d}), got {:d}. Next row is: {}", rows.size(), rs.size(),
-                    to_string(*actual_i)));
+        fail(seastar::format("Expected less rows ({:d}), got {:d}. Next row is: {}", rows.size(), rs.size(),
+                    *actual_i), _loc);
     }
     return {*this};
 }
@@ -144,82 +210,101 @@ rows_assertions::with_rows_ignore_order(std::vector<std::vector<bytes_opt>> rows
     const auto& rs = _rows->rs().result_set();
     auto& actual = rs.rows();
     for (auto&& expected : rows) {
+        auto expected_row = expected | std::views::transform(to_managed_bytes_opt);
         auto found = std::find_if(std::begin(actual), std::end(actual), [&] (auto&& row) {
             return std::equal(
                     std::begin(row), std::end(row),
-                    std::begin(expected), std::end(expected));
+                    std::begin(expected_row), std::end(expected_row));
         });
         if (found == std::end(actual)) {
-            fail(format("row {} not found in result set ({})", to_string(expected),
-               ::join(", ", actual | boost::adaptors::transformed([] (auto& r) { return to_string(r); }))));
+            fail(seastar::format("row {} not found in result set ({})", expected,
+               fmt::join(actual | std::views::transform([] (auto& r) { return fmt::to_string(r); }), ", ")), _loc);
         }
     }
     if (rs.size() != rows.size()) {
-        fail(format("Expected different number of rows ({:d}), got {:d}", rows.size(), rs.size()));
+        fail(format("Expected different number of rows ({:d}), got {:d}", rows.size(), rs.size()), _loc);
     }
     return {*this};
 }
 
-result_msg_assertions::result_msg_assertions(shared_ptr<cql_transport::messages::result_message> msg)
-    : _msg(msg)
-{ }
-
-rows_assertions result_msg_assertions::is_rows() {
-    auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(_msg);
-    if (!rows) {
-        fail("Expected rows in result set");
+columns_assertions rows_assertions::with_columns_of_row(size_t row_index) {
+    const auto& rs = _rows->rs().result_set();
+    if (row_index >= rs.rows().size()) {
+        fail(format("Requested row index {} is out of range, result has {} rows", row_index, rs.rows().size()), _loc);
     }
-    return rows_assertions(rows);
+    return columns_assertions(rs.get_metadata(), rs.rows().at(row_index), _loc);
 }
 
-result_msg_assertions assert_that(shared_ptr<cql_transport::messages::result_message> msg) {
-    return result_msg_assertions(msg);
+rows_assertions& rows_assertions::assert_for_columns_of_each_row(std::function<void(columns_assertions&)> func) {
+    const auto& rs = _rows->rs().result_set();
+    for (size_t i = 0; i < rs.size(); ++i) {
+        auto columns = with_columns_of_row(i);
+        func(columns);
+    }
+    return *this;
+}
+
+result_msg_assertions::result_msg_assertions(shared_ptr<cql_transport::messages::result_message> msg, std::source_location loc)
+    : _msg(msg)
+    , _loc(loc)
+{ }
+
+rows_assertions result_msg_assertions::is_rows(tests::dump_to_logs dump) {
+    auto rows = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(_msg);
+    if (!rows) {
+        fail("Expected rows in result set", _loc);
+    }
+    return rows_assertions(rows, dump, _loc);
+}
+
+result_msg_assertions assert_that(shared_ptr<cql_transport::messages::result_message> msg, std::source_location loc) {
+    return result_msg_assertions(msg, loc);
 }
 
 rows_assertions rows_assertions::with_serialized_columns_count(size_t columns_count) {
     size_t serialized_column_count = _rows->rs().get_metadata().column_count();
     if (serialized_column_count != columns_count) {
-        fail(format("Expected {:d} serialized columns(s) but got {:d}", columns_count, serialized_column_count));
+        fail(format("Expected {:d} serialized columns(s) but got {:d}", columns_count, serialized_column_count), _loc);
     }
     return {*this};
 }
 
 shared_ptr<cql_transport::messages::result_message> cquery_nofail(
-        cql_test_env& env, sstring_view query, std::unique_ptr<cql3::query_options>&& qo, const std::experimental::source_location& loc) {
+        cql_test_env& env, std::string_view query, std::unique_ptr<cql3::query_options>&& qo, const std::source_location& loc) {
     try {
         if (qo) {
-            return env.execute_cql(query, std::move(qo)).get0();
+            return env.execute_cql(query, std::move(qo)).get();
         } else {
-            return env.execute_cql(query).get0();
+            return env.execute_cql(query).get();
         }
     } catch (...) {
-        BOOST_FAIL(format("query '{}' failed: {}\n{}:{}: originally from here",
+        BOOST_FAIL(seastar::format("query '{}' failed: {}\n{}:{}: originally from here",
                           query, std::current_exception(), loc.file_name(), loc.line()));
     }
     return shared_ptr<cql_transport::messages::result_message>(nullptr);
 }
 
 void require_rows(cql_test_env& e,
-                  sstring_view qstr,
+                  std::string_view qstr,
                   const std::vector<std::vector<bytes_opt>>& expected,
-                  const std::experimental::source_location& loc) {
+                  const std::source_location& loc) {
     try {
-        assert_that(cquery_nofail(e, qstr, nullptr, loc)).is_rows().with_rows_ignore_order(expected);
+        assert_that(cquery_nofail(e, qstr, nullptr, loc), loc).is_rows().with_rows_ignore_order(expected);
     }
     catch (const std::exception& e) {
-        BOOST_FAIL(format("query '{}' failed: {}\n{}:{}: originally from here",
+        BOOST_FAIL(seastar::format("query '{}' failed: {}\n{}:{}: originally from here",
                           qstr, e.what(), loc.file_name(), loc.line()));
     }
 }
 
-void eventually_require_rows(cql_test_env& e, sstring_view qstr, const std::vector<std::vector<bytes_opt>>& expected,
-                             const std::experimental::source_location& loc) {
+void eventually_require_rows(cql_test_env& e, std::string_view qstr, const std::vector<std::vector<bytes_opt>>& expected,
+                             const std::source_location& loc) {
     try {
         eventually([&] {
             assert_that(cquery_nofail(e, qstr, nullptr, loc)).is_rows().with_rows_ignore_order(expected);
         });
     } catch (const std::exception& e) {
-        BOOST_FAIL(format("query '{}' failed: {}\n{}:{}: originally from here",
+        BOOST_FAIL(seastar::format("query '{}' failed: {}\n{}:{}: originally from here",
                           qstr, e.what(), loc.file_name(), loc.line()));
     }
 }
@@ -228,11 +313,51 @@ void require_rows(cql_test_env& e,
                   cql3::prepared_cache_key_type id,
                   const std::vector<cql3::raw_value>& values,
                   const std::vector<std::vector<bytes_opt>>& expected,
-                  const std::experimental::source_location& loc) {
+                  const std::source_location& loc) {
     try {
-        assert_that(e.execute_prepared(id, values).get0()).is_rows().with_rows_ignore_order(expected);
+        assert_that(e.execute_prepared(id, values).get()).is_rows().with_rows_ignore_order(expected);
     } catch (const std::exception& e) {
         BOOST_FAIL(format("execute_prepared failed: {}\n{}:{}: originally from here",
                           e.what(), loc.file_name(), loc.line()));
     }
+}
+
+future<> require_column_has_value(cql_test_env& e, const sstring& table_name,
+        std::vector<data_value> pk, std::vector<data_value> ck,
+        const sstring& column_name, data_value expected) {
+    auto& db = e.local_db();
+    auto& cf = db.find_column_family("ks", table_name);
+    auto schema = cf.schema();
+    auto pkey = partition_key::from_deeply_exploded(*schema, pk);
+    auto ckey = clustering_key::from_deeply_exploded(*schema, ck);
+    auto exp = expected.type()->decompose(expected);
+    auto dk = dht::decorate_key(*schema, pkey);
+    auto shard = cf.get_effective_replication_map()->shard_for_reads(*schema, dk._token);
+    return e.db().invoke_on(shard, [&e, dk = std::move(dk),
+                                  ckey = std::move(ckey),
+                                  column_name = std::move(column_name),
+                                  exp = std::move(exp),
+                                  table_name = std::move(table_name)] (replica::database& db) mutable {
+      auto& cf = db.find_column_family("ks", table_name);
+      auto schema = cf.schema();
+      return cf.find_row(schema, make_reader_permit(e), dk, ckey).then([schema, column_name, exp] (auto row) {
+        SCYLLA_ASSERT(row != nullptr);
+        auto col_def = schema->get_column_definition(utf8_type->decompose(column_name));
+        SCYLLA_ASSERT(col_def != nullptr);
+        const atomic_cell_or_collection* cell = row->find_cell(col_def->id);
+        if (!cell) {
+            SCYLLA_ASSERT(((void)"column not set", 0));
+        }
+        bytes actual;
+        if (!col_def->type->is_multi_cell()) {
+            auto c = cell->as_atomic_cell(*col_def);
+            SCYLLA_ASSERT(c.is_live());
+            actual = c.value().linearize();
+        } else {
+            actual = linearized(serialize_for_cql(*col_def->type,
+                    cell->as_collection_mutation()));
+        }
+        SCYLLA_ASSERT(col_def->type->equal(actual, exp));
+      });
+    });
 }

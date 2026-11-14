@@ -3,27 +3,32 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 
 #include <boost/test/unit_test.hpp>
 
-#include "canonical_mutation.hh"
+#include "db/schema_tables.hh"
+#include "mutation/canonical_mutation.hh"
+#include "mutation/async_utils.hh"
 #include "test/lib/mutation_source_test.hh"
 #include "test/lib/mutation_assertions.hh"
 
-#include <seastar/testing/test_case.hh>
+#include "test/lib/scylla_test_case.hh"
 
 #include <seastar/core/thread.hh>
 
-SEASTAR_TEST_CASE(test_conversion_back_and_forth) {
-    return seastar::async([] {
-        for_each_mutation([] (const mutation& m) {
-            canonical_mutation cm(m);
-            assert_that(cm.to_mutation(m.schema())).is_equal_to(m);
-        });
-    });
+SEASTAR_THREAD_TEST_CASE(test_conversion_back_and_forth) {
+    for (auto do_make_canonical_mutation_gently : {false, true}) {
+        for (auto do_make_mutation_gently : {false, true}) {
+            for_each_mutation([&] (const mutation& m) {
+                auto cm = do_make_canonical_mutation_gently ? make_canonical_mutation_gently(m).get() : canonical_mutation{m};
+                auto m2 = do_make_mutation_gently ? to_mutation_gently(cm, m.schema()).get() : cm.to_mutation(m.schema());
+                assert_that(m2).is_equal_to(m);
+            });
+        }
+    }
 }
 
 SEASTAR_TEST_CASE(test_reading_with_different_schemas) {
@@ -48,5 +53,23 @@ SEASTAR_TEST_CASE(test_reading_with_different_schemas) {
                 assert_that(cm2.to_mutation(m1.schema())).is_equal_to(m);
             }
         });
+    });
+}
+
+SEASTAR_TEST_CASE(test_scylla_table_configs_mutation_roundtrips) {
+    return seastar::async([] {
+        auto schema = db::schema_tables::scylla_tables();
+        // The mutation is an incremental map update: an assignment becomes a live cell, a
+        // removal (nullopt) a per-key tombstone. Round-trip each cell kind and the mix.
+        const std::map<sstring, std::optional<sstring>> config_cases[] = {
+            {{"auto_repair_enabled", "false"}},
+            {{"auto_repair_enabled", std::nullopt}},
+            {{"auto_repair_enabled", "true"}, {"other_option", std::nullopt}},
+        };
+        for (const auto& configs : config_cases) {
+            auto mut = db::schema_tables::make_scylla_table_configs_mutation("ks_cfg", "tbl", configs, api::timestamp_type(1));
+            auto cm = canonical_mutation(mut);
+            assert_that(cm.to_mutation(schema)).is_equal_to(mut);
+        }
     });
 }

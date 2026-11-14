@@ -1,23 +1,20 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "cql3/restrictions/restriction.hh"
+#include "utils/assert.hh"
 #include <seastar/core/shared_ptr.hh>
-#include "to_string.hh"
-#include "exceptions/exceptions.hh"
 #include "index/secondary_index_manager.hh"
+#include "cql3/expr/expression.hh"
+#include "cql3/statements/bound.hh"
 
 namespace cql3 {
 
@@ -42,6 +39,26 @@ public:
         } else {
             return bounds_slice(std::nullopt, false, std::move(value), include);
         }
+    }
+
+    static bounds_slice from_binary_operator(const expr::binary_operator& binop) {
+        if (binop.op == expr::oper_t::LT) {
+            return new_instance(statements::bound::END, false, binop.rhs);
+        }
+
+        if (binop.op == expr::oper_t::LTE) {
+            return new_instance(statements::bound::END, true, binop.rhs);
+        }
+
+        if (binop.op == expr::oper_t::GT) {
+            return new_instance(statements::bound::START, false, binop.rhs);
+        }
+
+        if (binop.op == expr::oper_t::GTE) {
+            return new_instance(statements::bound::START, true, binop.rhs);
+        }
+
+        throw std::runtime_error(format("bounds_slice::from_binary_operator - invalid operator: {}", binop.op));
     }
 
     /**
@@ -72,10 +89,10 @@ public:
      */
     void merge(const bounds_slice& other) {
         if (has_bound(statements::bound::START)) {
-            assert(!other.has_bound(statements::bound::START));
+            throwing_assert(!other.has_bound(statements::bound::START));
             _bounds[get_idx(statements::bound::END)] = other._bounds[get_idx(statements::bound::END)];
         } else {
-            assert(!other.has_bound(statements::bound::END));
+            throwing_assert(!other.has_bound(statements::bound::END));
             _bounds[get_idx(statements::bound::START)] = other._bounds[get_idx(statements::bound::START)];
         }
     }

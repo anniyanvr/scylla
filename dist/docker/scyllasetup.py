@@ -2,7 +2,20 @@ import subprocess
 import logging
 import yaml
 import os
+import socket
+import errno
 
+def is_bind_mount(path):
+    # Check if the file or its parent is a mount point (bind mount or otherwise)
+    path = os.path.abspath(path)
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            mount_point = line.split()[4]
+            if path == mount_point or path.startswith(mount_point + "/"):
+                # If the mount point is not the root filesystem, it's a mount
+                if mount_point != "/":
+                    return True
+    return False
 
 class ScyllaSetup:
     def __init__(self, arguments, extra_arguments):
@@ -22,15 +35,19 @@ class ScyllaSetup:
         self._memory = arguments.memory
         self._reserveMemory = arguments.reserveMemory
         self._overprovisioned = arguments.overprovisioned
-        self._housekeeping = not arguments.disable_housekeeping
-        self._experimental = arguments.experimental
+        self._experimental_features = arguments.experimental_features
         self._authenticator = arguments.authenticator
         self._authorizer = arguments.authorizer
         self._clusterName = arguments.clusterName
         self._endpointSnitch = arguments.endpointSnitch
         self._replaceAddressFirstBoot = arguments.replaceAddressFirstBoot
+        self._replaceNodeFirstBoot = arguments.replaceNodeFirstBoot
         self._io_setup = arguments.io_setup
         self._extra_args = extra_arguments
+        self._dc = arguments.dc
+        self._rack = arguments.rack
+        self._blocked_reactor_notify_ms = arguments.blocked_reactor_notify_ms
+        self._coredump_dir = None
 
     def _run(self, *args, **kwargs):
         logging.info('running: {}'.format(args))
@@ -68,17 +85,109 @@ class ScyllaSetup:
 
     def cqlshrc(self):
         home = os.environ['HOME']
-        hostname = subprocess.check_output(['hostname', '-i']).decode('ascii').strip()
-        with open("%s/.cqlshrc" % home, "w") as cqlshrc:
+        if self._rpcAddress:
+            hostname = self._rpcAddress
+        elif self._listenAddress:
+            hostname = self._listenAddress
+        else:
+            hostname = socket.gethostbyname(socket.gethostname())
+        self._run(["mkdir", "-p",  "%s/.cassandra" % home])
+        with open("%s/.cassandra/cqlshrc" % home, "w") as cqlshrc:
             cqlshrc.write("[connection]\nhostname = %s\n" % hostname)
 
-    def set_housekeeping(self):
-        with open("/etc/scylla.d/housekeeping.cfg", "w") as f:
-            f.write("[housekeeping]\ncheck-version: ")
-            if self._housekeeping:
-                f.write("True\n")
+    def write_rackdc_properties(self):
+        if self._dc is None and self._rack is None:
+            return
+
+        if self._endpointSnitch is None:
+            self._endpointSnitch = "GossipingPropertyFileSnitch"
+
+        if self._endpointSnitch != "GossipingPropertyFileSnitch":
+            raise RuntimeError(
+                f"Cannot use dc and rack parameters together with endpoint snitch '{self._endpointSnitch}'. "
+                "The dc and rack parameters are only supported with the endpoint snitch 'GossipingPropertyFileSnitch'."
+            )
+
+        conf_dir = "/etc/scylla"
+        rackdc_path = os.path.join(conf_dir, "cassandra-rackdc.properties")
+
+        if is_bind_mount(rackdc_path):
+            raise RuntimeError(
+                f"Cannot write {rackdc_path}: file is a bind mount. "
+                "The dc and rack parameters cannot be used when this file is mounted from the host."
+            )
+
+        # We must specify both dc and rack in the file.
+        # If only one of them is set, write a default value for the other.
+        dc = self._dc if self._dc is not None else "datacenter1"
+        rack = self._rack if self._rack is not None else "rack1"
+        with open(rackdc_path, "w") as f:
+            f.write(f"dc={dc}\n")
+            f.write(f"rack={rack}\n")
+
+    CORE_PATTERN_PATH = '/proc/sys/kernel/core_pattern'
+
+    def _get_coredump_dir(self):
+        """Return the coredump directory, deriving it from scylla.yaml workdir if needed."""
+        if self._coredump_dir is not None:
+            return self._coredump_dir
+        conf_dir = "/etc/scylla"
+        try:
+            with open(os.path.join(conf_dir, "scylla.yaml")) as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            cfg = {}
+        workdir = cfg.get('workdir') or '/var/lib/scylla'
+        self._coredump_dir = os.path.join(workdir, 'coredump')
+        return self._coredump_dir
+
+    def coredumpSetup(self):
+        """Configure coredump handling for containers.
+
+        The host's kernel.core_pattern may pipe core dumps to a handler
+        (e.g. Ubuntu's apport) that does not exist or work correctly
+        inside the container.  This method tries to switch to a file-based
+        core_pattern so that coredumps are written directly to disk.
+
+        Writing to /proc/sys/kernel/core_pattern requires privileges
+        (root with CAP_SYS_ADMIN).  When the container lacks permission
+        a warning is logged with guidance for the operator.
+        """
+        coredump_dir = self._get_coredump_dir()
+
+        try:
+            os.makedirs(coredump_dir, exist_ok=True)
+        except OSError as e:
+            logging.warning('Could not create coredump directory %s: %s',
+                            coredump_dir, e)
+            return
+
+        try:
+            with open(self.CORE_PATTERN_PATH) as f:
+                current = f.read().strip()
+        except Exception as e:
+            logging.debug('Could not read %s: %s', self.CORE_PATTERN_PATH, e)
+            return
+
+        if not current.startswith('|'):
+            return
+
+        desired = f'{coredump_dir}/core.%e.%p.%t'
+        try:
+            with open(self.CORE_PATTERN_PATH, 'w') as f:
+                f.write(desired + '\n')
+            logging.info('kernel.core_pattern set to %s', desired)
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                logging.warning(
+                    'kernel.core_pattern pipes to a program that may not work '
+                    'inside the container, and we lack permission to override it. '
+                    'To fix this, either run with --privileged or set on the host: '
+                    'sysctl -w kernel.core_pattern="%s"', desired)
             else:
-                f.write("False\n")
+                logging.debug('Unexpected OSError setting core_pattern: %s', e)
+        except Exception as e:
+            logging.debug('Unexpected error in coredumpSetup: %s', e)
 
     def arguments(self):
         args = []
@@ -95,7 +204,7 @@ class ScyllaSetup:
             args += ["--overprovisioned"]
 
         if self._listenAddress is None:
-            self._listenAddress = subprocess.check_output(['hostname', '-i']).decode('ascii').strip()
+            self._listenAddress = socket.gethostbyname(socket.gethostname())
 
         if self._rpcAddress is None:
             self._rpcAddress = self._listenAddress
@@ -139,8 +248,9 @@ class ScyllaSetup:
         if self._authorizer is not None:
             args += ["--authorizer %s" % self._authorizer]
 
-        if self._experimental == "1":
-            args += ["--experimental=on"]
+        if self._experimental_features is not None:
+            for feature in self._experimental_features:
+                args += [f"--experimental-features {feature}"]
 
         if self._clusterName is not None:
             args += ["--cluster-name %s" % self._clusterName]
@@ -148,10 +258,12 @@ class ScyllaSetup:
         if self._endpointSnitch is not None:
             args += ["--endpoint-snitch %s" % self._endpointSnitch]
 
-        if self._replaceAddressFirstBoot is not None:
+        if self._replaceNodeFirstBoot is not None:
+            args += ["--replace-node-first-boot %s" % self._replaceNodeFirstBoot]
+        elif self._replaceAddressFirstBoot is not None:
             args += ["--replace-address-first-boot %s" % self._replaceAddressFirstBoot]
 
-        args += ["--blocked-reactor-notify-ms 999999999"]
+        args += ["--blocked-reactor-notify-ms %s" % self._blocked_reactor_notify_ms]
 
         with open("/etc/scylla.d/docker.conf", "w") as cqlshrc:
             cqlshrc.write("SCYLLA_DOCKER_ARGS=\"%s\"\n" % (" ".join(args) + " " + " ".join(self._extra_args)))

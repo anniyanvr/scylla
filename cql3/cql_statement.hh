@@ -1,19 +1,23 @@
 /*
- */
-
-/*
  * Copyright (C) 2014-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
+#include <optional>
+#include <string_view>
+
 #include "timeout_config.hh"
+#include "service/pager/query_plan.hh"
+#include "service/raft/group0_fwd.hh"
+#include "audit/audit.hh"
+#include "utils/chunked_string.hh"
 
 namespace service {
 
@@ -42,14 +46,34 @@ seastar::shared_ptr<const metadata> make_empty_metadata();
 
 class query_options;
 
+// A vector of CQL warnings generated during execution of a statement.
+using cql_warnings_vec = std::vector<sstring>;
+
 class cql_statement {
+private:
+    friend class query_processor;
+private:
     timeout_config_selector _timeout_config_selector;
+    audit::audit_info_ptr _audit_info;
+    bool _may_use_token_aware_routing = false;
+protected:
+    // Result set metadata, unset for statements which return no result
+    // set. E.g. conditional modification statements and batches return a
+    // result set and have metadata, while the same statements without
+    // conditions do not.
+    seastar::shared_ptr<metadata> _metadata;
 public:
     // CQL statement text
-    seastar::sstring raw_cql_statement;
+    utils::chunked_string raw_cql_statement;
+
+    // Returns true for statements that needs guard to be taken before the execution
+    virtual bool needs_guard(query_processor& qp, service::query_state& state) const {
+        return false;
+    }
 
     explicit cql_statement(timeout_config_selector timeout_selector) : _timeout_config_selector(timeout_selector) {}
-
+    cql_statement(cql_statement&& o) = default;
+    cql_statement(const cql_statement& o) : _timeout_config_selector(o._timeout_config_selector), _audit_info(o._audit_info ? std::make_unique<audit::audit_info>(*o._audit_info) : nullptr), _may_use_token_aware_routing(o._may_use_token_aware_routing), _metadata(o._metadata) { }
     virtual ~cql_statement()
     { }
 
@@ -65,56 +89,88 @@ public:
     virtual seastar::future<> check_access(query_processor& qp, const service::client_state& state) const = 0;
 
     /**
-     * Perform additional validation required by the statment.
-     * To be overriden by subclasses if needed.
+     * Perform additional validation required by the statement.
+     * To be overridden by subclasses if needed.
      *
      * @param state the current client state
      */
-    virtual void validate(query_processor& qp, const service::client_state& state) const = 0;
+    virtual void validate(query_processor& qp, const service::client_state& state) const {}
 
     /**
      * Execute the statement and return the resulting result or null if there is no result.
+     *
+     * In case of a failure, it must return an exceptional future. It must not use
+     * the result_message::exception to indicate failure.
      *
      * @param state the current query state
      * @param options options for this query (consistency, variables, pageSize, ...)
      */
     virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
-        execute(query_processor& qp, service::query_state& state, const query_options& options) const = 0;
+        execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const = 0;
 
-    virtual bool depends_on_keyspace(const seastar::sstring& ks_name) const = 0;
+    /**
+     * Execute the statement and return the resulting result or null if there is no result.
+     *
+     * Unlike execute(), it is allowed to return a result_message::exception which contains
+     * an exception that needs to be explicitly handled.
+     *
+     * @param state the current query state
+     * @param options options for this query (consistency, variables, pageSize, ...)
+     *
+     * Defined in query_processor.cc, because cql_statement has no .cc file of its own.
+     */
+    virtual seastar::future<seastar::shared_ptr<cql_transport::messages::result_message>>
+            execute_without_checking_exception_message(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const;
 
-    virtual bool depends_on_column_family(const seastar::sstring& cf_name) const = 0;
+    virtual bool depends_on(std::string_view ks_name, std::optional<std::string_view> cf_name) const = 0;
 
-    virtual seastar::shared_ptr<const metadata> get_result_metadata() const = 0;
-
-    virtual bool is_conditional() const {
-        return false;
+    // The plan this statement scans, to be checked against the one a paging state
+    // pins. Disengaged for statements that are never paged. See #18992.
+    virtual std::optional<service::pager::query_plan> query_plan_for_paging() const {
+        return std::nullopt;
     }
-};
 
-class cql_statement_no_metadata : public cql_statement {
-public:
-    using cql_statement::cql_statement;
-    virtual seastar::shared_ptr<const metadata> get_result_metadata() const override {
-        return make_empty_metadata();
+    // The keyspace this statement's table lives in, which re-parsing it has to
+    // resolve an unqualified table name against rather than the connection's own.
+    // Borrowed from the statement, so only valid while it lives.
+    virtual std::optional<std::string_view> keyspace_for_reparse() const {
+        return std::nullopt;
     }
-};
 
-// Conditional modification statements and batches
-// return a result set and have metadata, while same
-// statements without conditions do not.
-class cql_statement_opt_metadata : public cql_statement {
-protected:
-    // Result set metadata, may be empty for simple updates and batches
-    seastar::shared_ptr<metadata> _metadata;
-public:
-    using cql_statement::cql_statement;
-    virtual seastar::shared_ptr<const metadata> get_result_metadata() const override {
+    // Statements which keep their result set metadata elsewhere, e.g. in a
+    // selection, override this instead of setting _metadata.
+    virtual seastar::shared_ptr<const metadata> get_result_metadata() const {
         if (_metadata) {
             return _metadata;
         }
         return make_empty_metadata();
     }
+
+    virtual bool is_conditional() const {
+        return false;
+    }
+
+    // A driver's control connection runs in a dedicated scheduling group and is
+    // only meant to issue the system queries the driver needs to manage itself,
+    // never user load. Returns true when executing this statement means the
+    // connection is being misused for user load, so the CQL server can reclassify
+    // it as a regular user connection and stop using the driver scheduling group.
+    //
+    // There is deliberately no default implementation: every statement type must
+    // classify itself, so a newly introduced statement cannot silently fall
+    // through with the wrong classification. Intermediate classes may implement it
+    // once on behalf of all their sub-classes.
+    virtual bool should_reclassify_control_connection() const = 0;
+
+    audit::audit_info* get_audit_info() { return _audit_info.get(); }
+    void set_audit_info(audit::audit_info_ptr&& info) { _audit_info = std::move(info); }
+
+    // Whether the driver can compute the token the statement is routed by. It
+    // can only if it got the partition key bind indices of the statement in its
+    // PREPARED metadata.
+    bool may_use_token_aware_routing() const { return _may_use_token_aware_routing; }
+
+    virtual void sanitize_audit_info() {}
 };
 
 }

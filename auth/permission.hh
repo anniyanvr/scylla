@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -36,11 +33,16 @@ enum class permission {
     // data access
     SELECT, // required for SELECT.
     MODIFY, // required for INSERT, UPDATE, DELETE, TRUNCATE.
+    VECTOR_SEARCH_INDEXING, // required for SELECT from tables with vector indexes if SELECT permission is not granted.
+    TEXT_SEARCH_INDEXING, // required for SELECT from tables with fulltext indexes if SELECT permission is not granted.
+    PATTERN_SEARCH_INDEXING, // required for SELECT from tables with pattern indexes if SELECT permission is not granted.
 
     // permission management
     AUTHORIZE, // required for GRANT and REVOKE.
     DESCRIBE, // required on the root-level role resource to list all roles.
 
+    // function/aggregate/procedure calls
+    EXECUTE,
 };
 
 typedef enum_set<
@@ -54,7 +56,11 @@ typedef enum_set<
                 permission::SELECT,
                 permission::MODIFY,
                 permission::AUTHORIZE,
-                permission::DESCRIBE>> permission_set;
+                permission::DESCRIBE,
+                permission::EXECUTE,
+                permission::VECTOR_SEARCH_INDEXING,
+                permission::TEXT_SEARCH_INDEXING,
+                permission::PATTERN_SEARCH_INDEXING>> permission_set;
 
 bool operator<(const permission_set&, const permission_set&);
 

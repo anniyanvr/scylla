@@ -1,42 +1,72 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
+#include "utils/assert.hh"
 #include "bytes.hh"
-#include "schema_fwd.hh"
-#include "query-result-reader.hh"
+#include "cql3/expr/collection_cell_metadata.hh"
+#include "cql3/expr/temporary_allocator.hh"
+#include "schema/schema_fwd.hh"
+#include "query/query-result-reader.hh"
+#include "selector.hh"
 #include "cql3/column_specification.hh"
-#include "cql3/selection/selector.hh"
+#include "cql3/functions/function.hh"
+#include "cql3/values.hh"
 #include "exceptions/exceptions.hh"
 #include "unimplemented.hh"
 #include <seastar/core/thread.hh>
+#include <span>
 
 namespace cql3 {
 
 class result_set;
-class result_set_builder;
 class metadata;
 class query_options;
 
 namespace restrictions {
-class statement_restrictions;
+class select_restrictions;
 }
 
 namespace selection {
 
 class raw_selector;
-class selector_factories;
+class result_set_builder;
+
+// Supplies external values: read-only per-row input that doesn't come from the
+// base table, such as a BM25 relevance score or an ANN similarity score returned
+// by the vector store.
+//
+// They are external only in where they come from. Once written they live in
+// temporary slots and are read like any other - the selectors that read them,
+// via temporary{} expressions, cannot tell them from aggregation state.
+class external_values_provider {
+public:
+    virtual ~external_values_provider() = default;
+
+    // Writes the next row's external values into its slots.
+    // Returns true to keep the row, false to drop it.
+    //
+    // Called once per row the result set is built from, in that order: a
+    // provider knows what each row gets before the first call.
+    //
+    // `temporaries` is the selection's whole temporaries vector; a provider must
+    // confine itself to the slots it was allocated, since writing to any other
+    // clobbers that slot's own writer.
+    //
+    // Nothing clears a slot between rows, so a provider has to write every slot
+    // it owns on every row - with an explicit null when it has no value for one,
+    // which is how a row is kept while a value is left absent. Skipping a write
+    // silently leaves the previous row's value in place.
+    virtual bool try_fill(std::vector<cql3::raw_value>& temporaries) const = 0;
+};
 
 class selectors {
 public:
@@ -52,11 +82,21 @@ public:
     * @param rs the <code>ResultSetBuilder</code>
     * @throws InvalidRequestException
     */
-    virtual void add_input_row(cql_serialization_format sf, result_set_builder& rs) = 0;
+    virtual void add_input_row(result_set_builder& rs) = 0;
 
-    virtual std::vector<bytes_opt> get_output_row(cql_serialization_format sf) = 0;
+    virtual std::uint64_t get_input_row_count() const = 0;
+
+    virtual std::vector<managed_bytes_opt> get_output_row(result_set_builder& rs) = 0;
+
+    // When not aggregating, each input row becomes one output row.
+    virtual std::vector<managed_bytes_opt> transform_input_row(result_set_builder& rs) = 0;
 
     virtual void reset() = 0;
+
+    // Runs the provider against the current row, so its external values land in
+    // the slots it was allocated. Called once per input row, before the row is
+    // offered to the CQL filter. Returns false if the provider dropped the row.
+    virtual bool provide_external_values(const external_values_provider& provider) = 0;
 };
 
 class selection {
@@ -66,6 +106,7 @@ private:
     ::shared_ptr<metadata> _metadata;
     const bool _collect_timestamps;
     const bool _collect_TTLs;
+    const bool _collect_collection_timestamps;
     const bool _contains_static_columns;
     bool _is_trivial;
 protected:
@@ -75,11 +116,13 @@ protected:
         std::vector<const column_definition*> columns,
         std::vector<lw_shared_ptr<column_specification>> metadata_,
         bool collect_timestamps,
-        bool collect_TTLs, trivial is_trivial = trivial::no);
+        bool collect_TTLs,
+        bool collect_collection_timestamps,
+        trivial is_trivial = trivial::no);
 
     virtual ~selection() {}
 public:
-    // Overriden by SimpleSelection when appropriate.
+    // Overridden by SimpleSelection when appropriate.
     virtual bool is_wildcard() const {
         return false;
     }
@@ -99,7 +142,8 @@ public:
     bool contains_only_static_columns() const;
 
     /**
-     * Returns the index of the specified column.
+     * Returns the index of the specified column, in the un-processed domain (before applying
+     * transformations to the input columns and aggregations)
      *
      * @param def the column definition
      * @return the index of the specified column
@@ -117,18 +161,33 @@ public:
     }
 
     static ::shared_ptr<selection> wildcard(schema_ptr schema);
+    static std::vector<const column_definition*> wildcard_columns(schema_ptr schema);
     static ::shared_ptr<selection> for_columns(schema_ptr schema, std::vector<const column_definition*> columns);
 
+    // Adds a column to the selection and result set. Returns an index within the result set row.
     virtual uint32_t add_column_for_post_processing(const column_definition& c);
 
+    virtual std::vector<shared_ptr<functions::function>> used_functions() const { return {}; }
+
     query::partition_slice::option_set get_query_options();
+protected:
+    // Result of add_column: index in _columns and whether it was added now (or existed already).
+    struct add_column_result {
+        uint32_t index;
+        bool added;
+    };
+    // Adds a column to the _columns if not already present, returns add_column_result.
+    add_column_result add_column(const column_definition& c);
 private:
-    static bool processes_selection(const std::vector<::shared_ptr<raw_selector>>& raw_selectors);
+    static bool processes_selection(const std::vector<prepared_selector>& prepared_selectors);
 
     static std::vector<lw_shared_ptr<column_specification>> collect_metadata(const schema& schema,
-        const std::vector<::shared_ptr<raw_selector>>& raw_selectors, const selector_factories& factories);
+        const std::vector<prepared_selector>& prepared_selectors);
 public:
-    static ::shared_ptr<selection> from_selectors(data_dictionary::database db, schema_ptr schema, const std::vector<::shared_ptr<raw_selector>>& raw_selectors);
+    /// `temporaries_allocator` carries the temporary slots already handed out while
+    /// preparing the selectors; the selection keeps allocating from it.
+    static ::shared_ptr<selection> from_selectors(data_dictionary::database db, schema_ptr schema, const sstring& ks,
+            const std::vector<prepared_selector>& raw_selectors, expr::temporary_allocator temporaries_allocator = {});
 
     virtual std::unique_ptr<selectors> new_selectors() const = 0;
 
@@ -145,27 +204,11 @@ public:
 
     virtual bool is_aggregate() const = 0;
 
-    /**
-     * Checks that selectors are either all aggregates or that none of them is.
-     *
-     * @param selectors the selectors to test.
-     * @param messageTemplate the error message template
-     * @param messageArgs the error message arguments
-     * @throws InvalidRequestException if some of the selectors are aggregate but not all of them
-     */
-    template<typename... Args>
-    static void validate_selectors(const std::vector<::shared_ptr<selector>>& selectors, const sstring& msg, Args&&... args) {
-        int32_t aggregates = 0;
-        for (auto&& s : selectors) {
-            if (s->is_aggregate()) {
-                ++aggregates;
-            }
-        }
+    virtual bool is_count() const {return false;}
 
-        if (aggregates != 0 && aggregates != selectors.size()) {
-            throw exceptions::invalid_request_exception(fmt::format(msg, std::forward<Args>(args)...));
-        }
-    }
+    virtual bool is_reducible() const {return false;}
+
+    virtual query::mapreduce_request::reductions_info get_reductions() const {return {{}, {}};}
 
     /**
      * Returns true if the selection is trivial, i.e. there are no function
@@ -176,20 +219,31 @@ public:
     friend class result_set_builder;
 };
 
+shared_ptr<selection> selection_from_partition_slice(schema_ptr schema, const query::partition_slice& slice);
+
 class result_set_builder {
 private:
     std::unique_ptr<result_set> _result_set;
     std::unique_ptr<selectors> _selectors;
     const std::vector<size_t> _group_by_cell_indices; ///< Indices in \c current of cells holding GROUP BY values.
-    std::vector<bytes_opt> _last_group; ///< Previous row's group: all of GROUP BY column values.
+    const uint64_t _limit; ///< Maximum number of rows to return.
+    const uint64_t _per_partition_limit; ///< Maximum number of rows to return per partition.
+    uint64_t _per_partition_remaining; ///< Remaining rows to return for the current partition.
+    uint64_t _per_partition_remaining_previous_partition; ///< Value of _per_partition_remaining before the current partition.
+                                                          ///< Necessary because the next page might continue the same partition,
+                                                          ///< but accept_partition_end() and accept_new_partition() will be called anyway.
+    std::vector<managed_bytes_opt> _last_group; ///< Previous row's group: all of GROUP BY column values.
     bool _group_began; ///< Whether a group began being formed.
 public:
-    std::optional<std::vector<bytes_opt>> current;
-private:
+    std::vector<managed_bytes_opt> current;
+    std::vector<bytes> current_partition_key;
+    std::vector<bytes> current_clustering_key;
     std::vector<api::timestamp_type> _timestamps;
     std::vector<int32_t> _ttls;
+    std::vector<cql3::expr::collection_cell_metadata> _collection_element_metadata;
+    const query_options* _options;
+private:
     const gc_clock::time_point _now;
-    cql_serialization_format _cql_serialization_format;
 public:
     template<typename Func>
     auto with_thread_if_needed(Func&& func) {
@@ -212,12 +266,11 @@ public:
         }
     };
     class restrictions_filter {
-        ::shared_ptr<restrictions::statement_restrictions> _restrictions;
+        const ::shared_ptr<const restrictions::select_restrictions> _restrictions;
         const query_options& _options;
-        const bool _skip_pk_restrictions;
-        const bool _skip_ck_restrictions;
-        mutable bool _current_partition_key_does_not_match = false;
-        mutable bool _current_static_row_does_not_match = false;
+        const expr::expression& _partition_level_filter;
+        const expr::expression& _clustering_row_level_filter;
+        mutable bool _current_partition_does_not_match = false;
         mutable uint64_t _rows_dropped = 0;
         mutable uint64_t _remaining;
         schema_ptr _schema;
@@ -227,7 +280,7 @@ public:
         mutable std::optional<partition_key> _last_pkey;
         mutable bool _is_first_partition_on_page = true;
     public:
-        explicit restrictions_filter(::shared_ptr<restrictions::statement_restrictions> restrictions,
+        explicit restrictions_filter(::shared_ptr<const restrictions::select_restrictions> restrictions,
                 const query_options& options,
                 uint64_t remaining,
                 schema_ptr schema,
@@ -243,16 +296,23 @@ public:
         bool do_filter(const selection& selection, const std::vector<bytes>& pk, const std::vector<bytes>& ck, const query::result_row_view& static_row, const query::result_row_view* row) const;
     };
 
-    result_set_builder(const selection& s, gc_clock::time_point now, cql_serialization_format sf,
-                       std::vector<size_t> group_by_cell_indices = {});
+    result_set_builder(const selection& s, gc_clock::time_point now,
+                       const query_options* options = nullptr,
+                       std::vector<size_t> group_by_cell_indices = {},
+                       uint64_t limit = std::numeric_limits<uint64_t>::max(),
+                       uint64_t per_partition_limit = std::numeric_limits<uint64_t>::max());
     void add_empty();
     void add(bytes_opt value);
     void add(const column_definition& def, const query::result_atomic_cell_view& c);
     void add_collection(const column_definition& def, bytes_view c);
-    void new_row();
+    void start_new_row();
+    void complete_row();
+    void accept_new_partition(const std::vector<bytes>& key);
+    void accept_partition_end();
     std::unique_ptr<result_set> build();
     api::timestamp_type timestamp_of(size_t idx);
     int32_t ttl_of(size_t idx);
+    size_t result_set_size() const;
 
     // Implements ResultVisitor concept from query.hh
     template<typename Filter = nop_filter>
@@ -262,17 +322,22 @@ public:
         const schema& _schema;
         const selection& _selection;
         uint64_t _row_count;
-        std::vector<bytes> _partition_key;
-        std::vector<bytes> _clustering_key;
+        std::vector<bytes>& _partition_key;
+        std::vector<bytes>& _clustering_key;
         Filter _filter;
+        const external_values_provider* _external_values_provider;
     public:
         visitor(cql3::selection::result_set_builder& builder, const schema& s,
-                const selection& selection, Filter filter = Filter())
+                const selection& selection, Filter filter = Filter(),
+                const external_values_provider* external_values_provider = nullptr)
             : _builder(builder)
             , _schema(s)
             , _selection(selection)
             , _row_count(0)
+            , _partition_key(_builder.current_partition_key)
+            , _clustering_key(_builder.current_clustering_key)
             , _filter(filter)
+            , _external_values_provider(external_values_provider)
         {}
         visitor(visitor&&) = default;
 
@@ -295,12 +360,18 @@ public:
         }
 
         void accept_new_partition(const partition_key& key, uint64_t row_count) {
-            _partition_key = key.explode(_schema);
+            auto partition_key = key.explode(_schema);
+            _builder.accept_new_partition(partition_key);
+            _partition_key = std::move(partition_key);
+            // Stale from the previous partition: a partition with no rows never calls
+            // accept_new_row(), so it must not observe the old clustering key.
+            _clustering_key.clear();
             _row_count = row_count;
             _filter.reset(&key);
         }
 
         void accept_new_partition(uint64_t row_count) {
+            _clustering_key.clear();
             _row_count = row_count;
             _filter.reset();
         }
@@ -313,10 +384,17 @@ public:
         void accept_new_row(const query::result_row_view& static_row, const query::result_row_view& row) {
             auto static_row_iterator = static_row.iterator();
             auto row_iterator = row.iterator();
+
+            // Inject externally supplied values and optionally drop the row.
+            if (_external_values_provider && !_builder._selectors->provide_external_values(*_external_values_provider)) {
+                return;
+            }
+
             if (!_filter(_selection, _partition_key, _clustering_key, static_row, &row)) {
                 return;
             }
-            _builder.new_row();
+
+            _builder.start_new_row();
             for (auto&& def : _selection.get_columns()) {
                 switch (def->kind) {
                 case column_kind::partition_key:
@@ -336,17 +414,24 @@ public:
                     add_value(*def, static_row_iterator);
                     break;
                 default:
-                    assert(0);
+                    throwing_assert(0);
                 }
             }
+            _builder.complete_row();
         }
 
         uint64_t accept_partition_end(const query::result_row_view& static_row) {
             if (_row_count == 0) {
+                // Inject provider values for static-only rows.
+                if (_external_values_provider && !_builder._selectors->provide_external_values(*_external_values_provider)) {
+                    return 0;
+                }
+
                 if (!_filter(_selection, _partition_key, _clustering_key, static_row, nullptr)) {
                     return _filter.get_rows_dropped();
                 }
-                _builder.new_row();
+
+                _builder.start_new_row();
                 auto static_row_iterator = static_row.iterator();
                 for (auto&& def : _selection.get_columns()) {
                     if (def->is_partition_key()) {
@@ -357,7 +442,9 @@ public:
                         _builder.add_empty();
                     }
                 }
+                _builder.complete_row();
             }
+            _builder.accept_partition_end();
             return _filter.get_rows_dropped();
         }
     };
@@ -368,10 +455,6 @@ private:
     /// True iff the \c current row ends a previously started group, either according to
     /// _group_by_cell_indices or aggregation.
     bool last_group_ended() const;
-
-    /// If there is a valid row in this->current, process it; if \p more_rows_coming, get ready to
-    /// receive another.
-    void process_current_row(bool more_rows_coming);
 
     /// Gets output row from _selectors and resets them.
     void flush_selectors();

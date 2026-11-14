@@ -3,18 +3,16 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #define BOOST_TEST_MODULE core
 
 #include "auth/resource.hh"
-
-#include <sstream>
+#include "test/lib/test_utils.hh"
 
 #include <boost/test/unit_test.hpp>
-
-#include "to_string.hh"
+#include <fmt/ranges.h>
 
 BOOST_AUTO_TEST_CASE(root_of) {
     //
@@ -44,6 +42,14 @@ BOOST_AUTO_TEST_CASE(root_of) {
 
     const auto slr = auth::resource(auth::resource_kind::service_level);
     BOOST_REQUIRE_EQUAL(slr.kind(), auth::resource_kind::service_level);
+
+    //
+    // object_storage
+    //
+
+    const auto osr = auth::resource(auth::resource_kind::object_storage);
+    BOOST_REQUIRE_EQUAL(osr.kind(), auth::resource_kind::object_storage);
+    BOOST_REQUIRE(!osr.parent());
 }
 
 BOOST_AUTO_TEST_CASE(data) {
@@ -113,6 +119,15 @@ BOOST_AUTO_TEST_CASE(from_name) {
     BOOST_REQUIRE_THROW(auth::parse_resource("service_levels/low_priority"), auth::invalid_resource_name);
 
     //
+    // object_storage
+    //
+
+    const auto osr1 = auth::parse_resource("object_storage");
+    BOOST_REQUIRE_EQUAL(osr1, auth::root_object_storage_resource());
+
+    BOOST_REQUIRE_THROW(auth::parse_resource("object_storage/my_bucket"), auth::invalid_resource_name);
+
+    //
     // Generic errors.
     //
 
@@ -141,6 +156,12 @@ BOOST_AUTO_TEST_CASE(name) {
     //
 
     BOOST_REQUIRE_EQUAL(auth::root_service_level_resource().name(), "service_levels");
+
+    //
+    // object_storage
+    //
+
+    BOOST_REQUIRE_EQUAL(auth::root_object_storage_resource().name(), "object_storage");
 }
 
 BOOST_AUTO_TEST_CASE(parent) {
@@ -182,6 +203,12 @@ BOOST_AUTO_TEST_CASE(output) {
     //
 
     BOOST_REQUIRE_EQUAL(format("{}", auth::root_service_level_resource()), "<all service levels>");
+
+    //
+    // object_storage
+    //
+
+    BOOST_REQUIRE_EQUAL(format("{}", auth::root_object_storage_resource()), "<all object storage>");
 }
 
 BOOST_AUTO_TEST_CASE(expand) {

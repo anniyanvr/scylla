@@ -3,10 +3,10 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/thread.hh>
@@ -15,17 +15,17 @@
 #include "utils/managed_bytes.hh"
 #include "utils/logalloc.hh"
 #include "utils/UUID_gen.hh"
-#include "row_cache.hh"
+#include "db/row_cache.hh"
 #include "partition_slice_builder.hh"
-#include "schema_builder.hh"
-#include "memtable.hh"
+#include "schema/schema_builder.hh"
+#include "replica/memtable.hh"
 #include "test/lib/memtable_snapshot_source.hh"
 #include "test/perf/perf.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/simple_schema.hh"
-#include "querier.hh"
-#include "types.hh"
+#include "replica/querier.hh"
+#include "types/types.hh"
 #include "reader_concurrency_semaphore.hh"
 
 /// Tests read scenarios from cache.
@@ -54,7 +54,7 @@ static const auto MB = 1024 * 1024;
 void test_scans_with_dummy_entries() {
     std::cout << __FUNCTION__<< std::endl;
 
-    auto s = schema_builder("ks", "cf")
+    auto s = schema_builder(this_smp_shard_count(), "ks", "cf")
             .with_column("pk", uuid_type, column_kind::partition_key)
             .with_column("st", bytes_type, column_kind::static_column)
             .with_column("ck", reversed_type_impl::get_instance(uuid_type), column_kind::clustering_key)
@@ -112,17 +112,17 @@ void test_scans_with_dummy_entries() {
         scheduling_latency_measurer slm;
         slm.start();
         auto d = duration_in_seconds([&] {
-            rd.consume_pausable([](mutation_fragment) {
+            rd.consume_pausable([](mutation_fragment_v2) {
                 return stop_iteration(cancelled);
             }).get();
         });
         slm.stop();
 
-        std::cout << format("read: {:.6f} [ms], preemption: {}, cache: {:d}/{:d} [MB]\n",
-                            d.count() * 1000,
-                            slm,
-                            tracker.region().occupancy().used_space() / MB,
-                            tracker.region().occupancy().total_space() / MB);
+        fmt::print(std::cout, "read: {:.6f} [ms], preemption: {}, cache: {:d}/{:d} [MB]\n",
+                   d.count() * 1000,
+                   slm,
+                   tracker.region().occupancy().used_space() / MB,
+                   tracker.region().occupancy().total_space() / MB);
     };
 
     // The first scan populates the cache with continuity
@@ -176,10 +176,9 @@ void test_scan_with_range_delete_over_rows() {
             reader_permit permit,
             const dht::partition_range& range,
             const query::partition_slice& slice,
-            const io_priority_class& pc,
             tracing::trace_state_ptr trace,
             streamed_mutation::forwarding fwd) {
-        return cache.make_reader(s, permit, range, slice, pc, std::move(trace), std::move(fwd));
+        return cache.make_reader(s, permit, range, slice, std::move(trace), std::move(fwd));
     });
 
     std::cout << "Rows: " << ck_index << std::endl;
@@ -191,8 +190,7 @@ void test_scan_with_range_delete_over_rows() {
 
         auto d = duration_in_seconds([&] {
             auto slice = partition_slice_builder(*s).build();
-            auto q = query::querier<emit_only_live_rows::yes>(cache_ms, s, semaphore.make_permit(), pr, slice,
-                                                              default_priority_class(), nullptr);
+            auto q = replica::querier(cache_ms, s, semaphore.make_permit(), pr, slice, nullptr, tombstone_gc_state::for_tests());
             auto close_q = deferred_close(q);
             q.consume_page(noop_compacted_fragments_consumer(),
                            std::numeric_limits<uint32_t>::max(),
@@ -202,11 +200,11 @@ void test_scan_with_range_delete_over_rows() {
 
         slm.stop();
 
-        std::cout << format("read: {:.6f} [ms], preemption: {}, cache: {:d}/{:d} [MB]\n",
-                            d.count() * 1000,
-                            slm,
-                            tracker.region().occupancy().used_space() / MB,
-                            tracker.region().occupancy().total_space() / MB);
+        fmt::print(std::cout, "read: {:.6f} [ms], preemption: {}, cache: {:d}/{:d} [MB]\n",
+                   d.count() * 1000,
+                   slm,
+                   tracker.region().occupancy().used_space() / MB,
+                   tracker.region().occupancy().total_space() / MB);
     };
 
     // The first scan populates the cache with continuity
@@ -223,11 +221,10 @@ void test_scan_with_range_delete_over_rows() {
 
 int main(int argc, char** argv) {
     app_template app;
-    return app.run(argc, argv, [&app] {
+    return app.run(argc, argv, [] {
         return seastar::async([&] {
-            engine().at_exit([] {
+            auto stop_test = defer([] noexcept {
                 cancelled = true;
-                return make_ready_future();
             });
             logalloc::prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
             test_scans_with_dummy_entries();

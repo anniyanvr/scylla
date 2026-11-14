@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "bytes.hh"
+#include "bytes_fwd.hh"
 #include <memory>
 
 /// Implements <code>text LIKE pattern</code>.
@@ -38,7 +38,4 @@ public:
     ///
     /// \return true iff text matches constructor's pattern.
     bool operator()(bytes_view text) const;
-
-    /// Resets pattern if different from the current one.
-    void reset(bytes_view pattern);
 };

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -33,27 +33,27 @@
 // are read using O_DIRECT), nor uncompressed data. We intend to cache high-
 // level Cassandra rows, not disk blocks.
 
+#include "utils/assert.hh"
 #include <vector>
 #include <cstdint>
 #include <iterator>
+#include <deque>
 
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/fstream.hh>
 
-#include "types.hh"
+#include "types/types.hh"
 #include "sstables/types.hh"
 #include "checksum_utils.hh"
-#include "../compress.hh"
+
+class reader_permit;
 
 class compression_parameters;
 class compressor;
-using compressor_ptr = shared_ptr<compressor>;
 
 namespace sstables {
-
-struct compression;
 
 struct compression {
     // To reduce the memory footpring of compression-info, n offsets are grouped
@@ -70,7 +70,7 @@ struct compression {
     //
     // This is not a general purpose container. There are limitations:
     // * Can't be used before init() is called.
-    // * at() is best called incrementally, altough random lookups are
+    // * at() is best called incrementally, although random lookups are
     // perfectly valid as well.
     // * The iterator and at() can't provide references to the elements.
     // * No point insert is available.
@@ -145,7 +145,7 @@ struct compression {
         class const_iterator {
         public:
             using iterator_category = std::random_access_iterator_tag;
-            using value_type = const uint64_t;
+            using value_type = uint64_t;
             using difference_type = std::ptrdiff_t;
             using pointer = const uint64_t*;
             using reference = const uint64_t&;
@@ -170,7 +170,7 @@ struct compression {
             const_iterator(const const_iterator& other) = default;
 
             const_iterator& operator=(const const_iterator& other) {
-                assert(&_offsets == &other._offsets);
+                SCYLLA_ASSERT(&_offsets == &other._offsets);
                 _index = other._index;
                 return *this;
             }
@@ -228,10 +228,6 @@ struct compression {
 
             bool operator==(const const_iterator& other) const {
                 return _index == other._index;
-            }
-
-            bool operator!=(const const_iterator& other) const {
-                return !(*this == other);
             }
 
             bool operator<(const const_iterator& other) const {
@@ -293,17 +289,23 @@ struct compression {
 
     disk_string<uint16_t> name;
     disk_array<uint32_t, option> options;
-    uint32_t chunk_len = 0;
     uint64_t data_len = 0;
     segmented_offsets offsets;
 
 private:
     // Variables *not* found in the "Compression Info" file (added by update()):
     uint64_t _compressed_file_length = 0;
+    // chunk_len and _full_checksum are grouped here so the two uint32_t pack
+    // into a single 8-byte slot (avoids padding holes). chunk_len is only
+    // accessed via uncompressed_chunk_length()/set_uncompressed_chunk_length().
+    uint32_t chunk_len = 0;
     uint32_t _full_checksum = 0;
+    compressor_ptr _compressor;
 public:
     // Set the compressor algorithm, please check the definition of enum compressor.
     void set_compressor(compressor_ptr c);
+    compressor& get_compressor() const;
+    void discard_hidden_options();
     // After changing _compression, update() must be called to update
     // additional variables depending on it.    
     void update(uint64_t compressed_file_length);
@@ -361,25 +363,34 @@ public:
     friend class sstable;
 };
 
-// for API query only. Free function just to distinguish it from an accessor in compression
-compressor_ptr get_sstable_compressor(const compression&);
+using stream_creator_fn = std::function<future<input_stream<char>>(uint64_t, uint64_t, file_input_stream_options)>;
 
 // Note: compression_metadata is passed by reference; The caller is
 // responsible for keeping the compression_metadata alive as long as there
 // are open streams on it. This should happen naturally on a higher level -
 // as long as we have *sstables* work in progress, we need to keep the whole
 // sstable alive, and the compression metadata is only a part of it.
-input_stream<char> make_compressed_file_k_l_format_input_stream(file f,
+input_stream<char> make_compressed_file_k_l_format_input_stream(stream_creator_fn stream_creator,
                 sstables::compression* cm, uint64_t offset, size_t len,
-                class file_input_stream_options options);
+                class file_input_stream_options options, reader_permit permit,
+                std::optional<uint32_t> digest);
 
-input_stream<char> make_compressed_file_m_format_input_stream(file f,
+input_stream<char> make_compressed_file_m_format_input_stream(stream_creator_fn stream_creator,
                 sstables::compression* cm, uint64_t offset, size_t len,
-                class file_input_stream_options options);
+                class file_input_stream_options options, reader_permit permit,
+                std::optional<uint32_t> digest);
+
+// Raw compressed data stream function that return compressed chunks without decompression
+// while still calculating digests and verifying checksums. Compatible with SSTables version 3.x and later.
+input_stream<char> make_compressed_raw_file_input_stream(sstables::stream_creator_fn stream_creator, sstables::compression *cm,
+        file_input_stream_options options, reader_permit permit, std::optional<uint32_t> digest);
 
 output_stream<char> make_compressed_file_m_format_output_stream(output_stream<char> out,
                 sstables::compression* cm,
-                const compression_parameters& cp);
+                const compression_parameters& cp,
+                compressor_ptr);
+
+
+std::map<sstring, sstring> options_from_compression(const compression& c);
 
 }
-

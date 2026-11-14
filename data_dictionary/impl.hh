@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -17,13 +17,18 @@ namespace data_dictionary {
 class impl {
 public:
     virtual ~impl();
+    virtual const table_schema_version& get_version(database) const = 0;
     virtual std::optional<keyspace> try_find_keyspace(database db, std::string_view name) const = 0;
     virtual std::vector<keyspace> get_keyspaces(database db) const = 0;
+    virtual std::vector<sstring> get_user_keyspaces(database db) const = 0;
+    virtual std::vector<sstring> get_all_keyspaces(database db) const = 0;
     virtual std::vector<table> get_tables(database db) const = 0;
     virtual std::optional<table> try_find_table(database db, std::string_view ks, std::string_view tab) const = 0;
-    virtual std::optional<table> try_find_table(database db, utils::UUID id) const = 0;
+    virtual std::optional<table> try_find_table(database db, table_id id) const = 0;
     virtual const secondary_index::secondary_index_manager& get_index_manager(table t) const = 0;
     virtual schema_ptr get_table_schema(table t) const = 0;
+    virtual std::optional<keyspace> get_table_keyspace(table t) const = 0;
+    virtual db_clock::time_point get_truncation_time(table t) const = 0;
     virtual lw_shared_ptr<keyspace_metadata> get_keyspace_metadata(keyspace ks) const = 0;
     virtual bool is_internal(keyspace ks) const = 0;
     virtual const locator::abstract_replication_strategy& get_replication_strategy(keyspace ks) const = 0;
@@ -37,6 +42,7 @@ public:
     virtual const db::extensions& get_extensions(database db) const = 0;
     virtual const gms::feature_service& get_features(database db) const = 0;
     virtual replica::database& real_database(database db) const = 0;
+    virtual replica::database* real_database_ptr(database db) const = 0;
 protected:
     // Tools for type erasing an unerasing
     static database make_database(const impl* i, const void* db) {

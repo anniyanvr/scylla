@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -12,8 +12,14 @@
 #include "seastarx.hh"
 
 #include "db/timeout_clock.hh"
-#include "schema_fwd.hh"
-#include "query_class_config.hh"
+#include "schema/schema_fwd.hh"
+#include "tracing/tracing_fwd.hh"
+
+namespace query {
+
+struct max_result_size;
+
+}
 
 namespace seastar {
     class file;
@@ -30,10 +36,6 @@ struct reader_resources {
     reader_resources(int count, ssize_t memory)
         : count(count)
         , memory(memory) {
-    }
-
-    bool operator>=(const reader_resources& other) const {
-        return count >= other.count && memory >= other.memory;
     }
 
     reader_resources operator-(const reader_resources& other) const {
@@ -56,7 +58,7 @@ struct reader_resources {
         return *this;
     }
 
-    explicit operator bool() const {
+    bool non_zero() const {
         return count > 0 || memory > 0;
     }
 };
@@ -64,8 +66,6 @@ struct reader_resources {
 inline bool operator==(const reader_resources& a, const reader_resources& b) {
     return a.count == b.count && a.memory == b.memory;
 }
-
-std::ostream& operator<<(std::ostream& os, const reader_resources& r);
 
 class reader_concurrency_semaphore;
 
@@ -76,19 +76,23 @@ class reader_concurrency_semaphore;
 /// should be held onto while the respective resources are in use.
 class reader_permit {
     friend class reader_concurrency_semaphore;
+    friend class tracking_allocator_base;
 
 public:
     class resource_units;
-    class used_guard;
-    class blocked_guard;
+    class need_cpu_guard;
+    class awaits_guard;
 
     enum class state {
-        waiting, // waiting for admission
-        active_unused,
-        active_used,
-        active_blocked,
+        waiting_for_admission,
+        waiting_for_memory,
+        waiting_for_execution,
+        active,
+        active_need_cpu,
+        active_await,
         inactive,
         evicted,
+        preemptive_aborted,
     };
 
     class impl;
@@ -99,25 +103,29 @@ private:
 private:
     reader_permit() = default;
     reader_permit(shared_ptr<impl>);
-    explicit reader_permit(reader_concurrency_semaphore& semaphore, const schema* const schema, std::string_view op_name,
-            reader_resources base_resources, db::timeout_clock::time_point timeout);
-    explicit reader_permit(reader_concurrency_semaphore& semaphore, const schema* const schema, sstring&& op_name,
-            reader_resources base_resources, db::timeout_clock::time_point timeout);
+    explicit reader_permit(reader_concurrency_semaphore& semaphore, schema_ptr schema, std::string_view op_name,
+            reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
+    explicit reader_permit(reader_concurrency_semaphore& semaphore, schema_ptr schema, sstring&& op_name,
+            reader_resources base_resources, db::timeout_clock::time_point timeout, tracing::trace_state_ptr trace_ptr);
 
-    void on_waiting();
-    void on_admission();
+    reader_permit::impl& operator*() { return *_impl; }
+    reader_permit::impl* operator->() { return _impl.get(); }
 
-    void mark_used() noexcept;
+    void mark_need_cpu() noexcept;
 
-    void mark_unused() noexcept;
+    void mark_not_need_cpu() noexcept;
 
-    void mark_blocked() noexcept;
+    void mark_awaits() noexcept;
 
-    void mark_unblocked() noexcept;
+    void mark_not_awaits() noexcept;
 
     operator bool() const { return bool(_impl); }
 
     friend class optimized_optional<reader_permit>;
+
+    void consume(reader_resources res);
+
+    void signal(reader_resources res);
 
 public:
     ~reader_permit();
@@ -134,15 +142,20 @@ public:
 
     reader_concurrency_semaphore& semaphore();
 
-    future<> maybe_wait_readmission();
+    const schema_ptr& get_schema() const;
+    std::string_view get_op_name() const;
+    state get_state() const;
 
-    void consume(reader_resources res);
+    bool needs_readmission() const;
 
-    void signal(reader_resources res);
+    // Call only when needs_readmission() = true.
+    future<> wait_readmission();
 
     resource_units consume_memory(size_t memory = 0);
 
     resource_units consume_resources(reader_resources res);
+
+    future<resource_units> request_memory(size_t memory);
 
     reader_resources consumed_resources() const;
 
@@ -156,8 +169,20 @@ public:
 
     void set_timeout(db::timeout_clock::time_point timeout) noexcept;
 
+    const tracing::trace_state_ptr& trace_state() const noexcept;
+
+    void set_trace_state(tracing::trace_state_ptr trace_ptr) noexcept;
+
+    // If the permit is aborted, return the exception it was aborted with.
+    const std::exception_ptr& get_abort_exception() const noexcept;
+
     query::max_result_size max_result_size() const;
     void set_max_result_size(query::max_result_size);
+
+    void on_start_sstable_read() noexcept;
+    void on_finish_sstable_read() noexcept;
+
+    uintptr_t id() { return reinterpret_cast<uintptr_t>(_impl.get()); }
 };
 
 using reader_permit_opt = optimized_optional<reader_permit>;
@@ -169,7 +194,9 @@ class reader_permit::resource_units {
     friend class reader_permit;
     friend class reader_concurrency_semaphore;
 private:
-    resource_units(reader_permit permit, reader_resources res) noexcept;
+    class already_consumed_tag {};
+    resource_units(reader_permit permit, reader_resources res, already_consumed_tag);
+    resource_units(reader_permit permit, reader_resources res);
 public:
     resource_units(const resource_units&) = delete;
     resource_units(resource_units&&) noexcept;
@@ -177,91 +204,112 @@ public:
     resource_units& operator=(const resource_units&) = delete;
     resource_units& operator=(resource_units&&) noexcept;
     void add(resource_units&& o);
-    void reset(reader_resources res = {});
+    void reset_to(reader_resources res);
+    void reset_to_zero() noexcept;
     reader_permit permit() const { return _permit; }
     reader_resources resources() const { return _resources; }
 };
 
-/// Mark a permit as used.
+/// Mark a permit as needing CPU.
 ///
-/// Conceptually, a permit is considered used, when at least one reader
+/// Conceptually, a permit is considered as needing CPU, when at least one reader
 /// associated with it has an ongoing foreground operation initiated by
 /// its consumer. E.g. a pending `fill_buffer()` call.
-/// This class is an RAII used marker meant to be used by keeping it alive
-/// until the reader is used.
-class reader_permit::used_guard {
+/// This class is an RAII need_cpu marker meant to be used by keeping it alive
+/// while the reader is in need of CPU.
+class reader_permit::need_cpu_guard {
     reader_permit_opt _permit;
 public:
-    explicit used_guard(reader_permit permit) noexcept : _permit(std::move(permit)) {
-        _permit->mark_used();
+    explicit need_cpu_guard(reader_permit permit) noexcept : _permit(std::move(permit)) {
+        _permit->mark_need_cpu();
     }
-    used_guard(used_guard&&) noexcept = default;
-    used_guard(const used_guard&) = delete;
-    ~used_guard() {
+    need_cpu_guard(need_cpu_guard&&) noexcept = default;
+    need_cpu_guard(const need_cpu_guard&) = delete;
+    ~need_cpu_guard() {
         if (_permit) {
-            _permit->mark_unused();
+            _permit->mark_not_need_cpu();
         }
     }
-    used_guard& operator=(used_guard&&) = delete;
-    used_guard& operator=(const used_guard&) = delete;
+    need_cpu_guard& operator=(need_cpu_guard&&) = delete;
+    need_cpu_guard& operator=(const need_cpu_guard&) = delete;
 };
 
-/// Mark a permit as blocked.
+/// Mark a permit as awaiting I/O or an operation running on a remote shard.
 ///
-/// Conceptually, a permit is considered blocked, when at least one reader
+/// Conceptually, a permit is considered awaiting, when at least one reader
 /// associated with it is waiting on I/O or a remote shard as part of a
 /// foreground operation initiated by its consumer. E.g. an sstable reader
 /// waiting on a disk read as part of its `fill_buffer()` call.
-/// This class is an RAII block marker meant to be used by keeping it alive
-/// until said block resolves.
-class reader_permit::blocked_guard {
+/// This class is an RAII awaits marker meant to be used by keeping it alive
+/// until said awaited event completes.
+class reader_permit::awaits_guard {
     reader_permit_opt _permit;
 public:
-    explicit blocked_guard(reader_permit permit) noexcept : _permit(std::move(permit)) {
-        _permit->mark_blocked();
+    explicit awaits_guard(reader_permit permit) noexcept : _permit(std::move(permit)) {
+        _permit->mark_awaits();
     }
-    blocked_guard(blocked_guard&&) noexcept = default;
-    blocked_guard(const blocked_guard&) = delete;
-    ~blocked_guard() {
+    awaits_guard(awaits_guard&&) noexcept = default;
+    awaits_guard(const awaits_guard&) = delete;
+    ~awaits_guard() {
         if (_permit) {
-            _permit->mark_unblocked();
+            _permit->mark_not_awaits();
         }
     }
-    blocked_guard& operator=(blocked_guard&&) = delete;
-    blocked_guard& operator=(const blocked_guard&) = delete;
+    awaits_guard& operator=(awaits_guard&&) = delete;
+    awaits_guard& operator=(const awaits_guard&) = delete;
 };
 
 template <typename Char>
-temporary_buffer<Char> make_tracked_temporary_buffer(temporary_buffer<Char> buf, reader_permit& permit) {
-    return temporary_buffer<Char>(buf.get_write(), buf.size(),
-            make_deleter(buf.release(), [units = permit.consume_memory(buf.size())] () mutable { units.reset(); }));
+temporary_buffer<Char> make_tracked_temporary_buffer(temporary_buffer<Char> buf, reader_permit::resource_units units) {
+    return temporary_buffer<Char>(buf.get_write(), buf.size(), make_object_deleter(buf.release(), std::move(units)));
+}
+
+inline temporary_buffer<char> make_new_tracked_temporary_buffer(size_t size, reader_permit& permit) {
+    auto buf = temporary_buffer<char>(size);
+    return temporary_buffer<char>(buf.get_write(), buf.size(), make_object_deleter(buf.release(), permit.consume_memory(size)));
 }
 
 file make_tracked_file(file f, reader_permit p);
 
+class tracking_allocator_base {
+    reader_permit _permit;
+protected:
+    tracking_allocator_base(reader_permit permit) noexcept : _permit(std::move(permit)) { }
+    void consume(size_t memory) {
+        _permit.consume(reader_resources::with_memory(memory));
+    }
+    void signal(size_t memory) {
+        _permit.signal(reader_resources::with_memory(memory));
+    }
+};
+
 template <typename T>
-class tracking_allocator {
+class tracking_allocator : public tracking_allocator_base {
 public:
     using value_type = T;
     using propagate_on_container_move_assignment = std::true_type;
     using is_always_equal = std::false_type;
 
 private:
-    reader_permit _permit;
     std::allocator<T> _alloc;
 
 public:
-    tracking_allocator(reader_permit permit) noexcept : _permit(std::move(permit)) { }
+    tracking_allocator(reader_permit permit) noexcept : tracking_allocator_base(std::move(permit)) { }
 
     T* allocate(size_t n) {
         auto p = _alloc.allocate(n);
-        _permit.consume(reader_resources::with_memory(n * sizeof(T)));
+        try {
+            consume(n * sizeof(T));
+        } catch (...) {
+            _alloc.deallocate(p, n);
+            throw;
+        }
         return p;
     }
     void deallocate(T* p, size_t n) {
         _alloc.deallocate(p, n);
         if (n) {
-            _permit.signal(reader_resources::with_memory(n * sizeof(T)));
+            signal(n * sizeof(T));
         }
     }
 
@@ -273,3 +321,10 @@ template <typename T>
 bool operator==(const tracking_allocator<T>& a, const tracking_allocator<T>& b) {
     return a._semaphore == b._semaphore;
 }
+
+template <> struct fmt::formatter<reader_permit::state> : fmt::formatter<string_view> {
+    auto format(reader_permit::state, fmt::format_context& ctx) const -> decltype(ctx.out());
+};
+template <> struct fmt::formatter<reader_resources> : fmt::formatter<string_view> {
+    auto format(const reader_resources&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

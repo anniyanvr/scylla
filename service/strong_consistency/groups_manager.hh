@@ -1,0 +1,425 @@
+/*
+ * Copyright (C) 2025-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#pragma once
+
+#include "locator/abstract_replication_strategy.hh"
+#include "locator/tablets.hh"
+#include "locator/tablet_metadata_guard.hh"
+#include "message/messaging_service.hh"
+#include "service/raft/raft_group_registry.hh"
+#include "service/strong_consistency/table_metrics.hh"
+#include "service/topology_guard.hh"
+#include "cql3/query_processor.hh"
+#include "db/commitlog/raft_commitlog_replay_buffer.hh"
+#include "utils/hash.hh"
+
+#include <seastar/util/noncopyable_function.hh>
+
+#include <source_location>
+
+namespace db {
+class system_keyspace;
+class raft_commitlog_replay_buffer;
+}
+
+namespace gms {
+class gossiper;
+}
+
+namespace service {
+class migration_manager;
+}
+
+namespace service::strong_consistency {
+
+class raft_groups_storage;
+
+class raft_server;
+class raft_resize_tracker;
+
+/// A cache of leader locations for raft groups where this node is not a replica.
+/// Populated by the CQL transport layer after a redirect reveals the actual leader.
+///
+/// Uses a sweep-based eviction strategy tied to token_metadata updates:
+/// begin_sweep() before iterating tablets, mark_seen() for each existing group,
+/// end_sweep() to evict entries whose groups no longer exist.
+class tablet_group_leader_cache {
+    struct entry {
+        locator::host_id leader;
+        bool seen = false;
+    };
+    std::unordered_map<raft::group_id, entry> _entries;
+
+public:
+    void put(raft::group_id group, locator::host_id leader) {
+        auto [it, inserted] = _entries.try_emplace(group, entry{leader});
+        if (!inserted) {
+            it->second.leader = leader;
+        }
+    }
+
+    std::optional<locator::host_id> get(raft::group_id group) const {
+        auto it = _entries.find(group);
+        if (it != _entries.end()) {
+            return it->second.leader;
+        }
+        return std::nullopt;
+    }
+
+    void erase(raft::group_id group) {
+        _entries.erase(group);
+    }
+
+    void begin_sweep() {
+        for (auto& [_, e] : _entries) {
+            e.seen = false;
+        }
+    }
+
+    void mark_seen(raft::group_id group) {
+        auto it = _entries.find(group);
+        if (it != _entries.end()) {
+            it->second.seen = true;
+        }
+    }
+
+    void end_sweep() {
+        std::erase_if(_entries, [](const auto& p) { return !p.second.seen; });
+    }
+};
+
+// Whether `replica` still hosts the group's raft log at this stage. The running
+// group and commitlog replay both apply the rule: a replica that answers no has
+// had its raft server torn down and its segment references given up, so replay must
+// not recover a log for it.
+bool hosts_raft_group(const locator::tablet_info& tinfo,
+        const locator::tablet_transition_info* trinfo, const locator::tablet_replica& replica);
+
+/// A sharded service responsible for the lifecycle and access
+/// management of all Raft groups for strongly consistent tablets hosted on this node.
+///
+/// Listens for token_metadata updates to automatically start Raft servers for tablets newly
+/// assigned to this node and schedule the deletion of Raft servers for tablets that have moved away.
+///
+/// It serves as the entry point for read and write requests via acquire_server() method. It is guaranteed
+/// that the raft::server instance and its associated state managed by groups_manager cannot be
+/// stopped or destroyed while the returned raft_server object is alive.
+///
+/// Runs a background fiber (leader_info_updater) per group that monitors the raft::server state
+/// and computes the next write timestamp as soon as the server becomes leader.
+/// This allows write requests to proceed without waiting for read_barrier(),
+/// which would otherwise be needed to compute the timestamp.
+class groups_manager : public peering_sharded_service<groups_manager> {
+    class state_machine_impl;
+    class rpc_impl;
+
+    friend class raft_server;
+
+    struct leader_info {
+        // The Raft term this structure describes.
+        raft::term_t term;
+
+        // The last timestamp used for mutations in this term.
+        api::timestamp_type last_timestamp;
+    };
+
+    // A group can be deleted and started again while its entry exists (the
+    // tablet leaves the shard and returns before the deletion finishes), so
+    // the fields may describe different incarnations of the raft::server:
+    //  - `gate` is replaced by every start. A holder only defers the deletion
+    //    that closed that very gate, i.e. the destruction of that incarnation.
+    //  - `server` is the last started server until its deletion resets it.
+    //    Once a restart is queued behind a pending deletion, `gate` is already
+    //    the new incarnation's while `server` is still the old one's.
+    //  - `server_control_op` chains starts and deletions (chain_control_op()).
+    //    If it is available, the last operation was a start: a finished
+    //    deletion either erased the entry or has a start queued behind it.
+    // So `server` is the live server of the current `gate` iff
+    // `server_control_op` is available. Dereference it only via
+    // try_acquire_server(), acquire_server(), or from a control operation.
+    struct raft_group_state : public boost::intrusive::list_base_hook<boost::intrusive::link_mode<boost::intrusive::auto_unlink>> {
+        bool has_tablet = false;
+        lw_shared_ptr<gate> gate = nullptr;
+        raft::server* server = nullptr;
+        // Of the table of this tablet; expires when the table is dropped.
+        seastar::weak_ptr<table_metrics> metrics;
+        // Owned by the raft::server. Cleared before that server is destroyed,
+        // so the commitlog's flush handler never sees a dangling pointer.
+        raft_groups_storage* storage = nullptr;
+
+        shared_future<> server_control_op = make_ready_future<>();
+
+        // Populated only when this node thinks it's a tablet raft group leader.
+        std::optional<leader_info> leader_info = std::nullopt;
+        condition_variable leader_info_cond = condition_variable();
+        future<> leader_info_updater = make_ready_future<>();
+
+        // Aborts the migration RPC running on the group. The next one aborts it: the
+        // coordinator retries a failed attempt on every replica, and the retry supersedes
+        // the calls of the previous attempt that are still running.
+        lw_shared_ptr<abort_source> migration_rpc_as;
+    };
+
+    netw::messaging_service& _ms;
+    raft_group_registry& _raft_gr;
+    cql3::query_processor& _qp;
+    replica::database& _db;
+    service::migration_manager& _mm;
+    db::system_keyspace& _sys_ks;
+    gms::feature_service& _features;
+    gms::gossiper& _gossiper;
+    db::raft_commitlog_replay_buffer& _raft_replay_buffer;
+    raft_resize_tracker& _resize_tracker;
+    std::unordered_map<raft::group_id, raft_group_state> _raft_groups = {};
+    // Keyed by keyspace and table name, which is what the series are labelled
+    // with, so that two entries can never register colliding series.
+    using table_metrics_map = std::unordered_map<std::pair<sstring, sstring>, table_metrics, utils::tuple_hash>;
+    table_metrics_map _table_metrics;
+    boost::intrusive::list<raft_group_state, boost::intrusive::constant_time_size<false>> _starting_groups;
+    locator::token_metadata_ptr _pending_tm = nullptr;
+    bool _started = false;
+    // Requested on every shard by stop_all_shards() before it does anything else.
+    abort_source _as;
+
+    tablet_group_leader_cache _leader_cache;
+
+    // Keeps the flush handler registered. The handler forwards each round's
+    // position to every group; see raft_commitlog::closed_up_to().
+    std::optional<db::commitlog::flush_handler_anchor> _flush_handler;
+
+    // Ask table `id` to flush, in the background. `pos` only decides whether the
+    // table skips the request.
+    void request_flush(db::cf_id_type id, db::replay_position pos);
+
+    // Should be called on the shard that hosts the Raft group
+    future<> start_raft_group(locator::global_tablet_id tablet,
+        raft::group_id group_id,
+        locator::token_metadata_ptr tm,
+        lw_shared_ptr<raft::server_stats> server_stats,
+        lw_shared_ptr<raft_rpc::stats> rpc_stats,
+        lw_shared_ptr<state_machine_stats> apply_stats);
+
+    // Creates them if the table does not have any yet.
+    table_metrics& get_table_metrics(const schema& s);
+
+    // A table keeps its metrics until it is dropped, even once its last tablet
+    // has left this shard, or the sum over the shards would go backwards.
+    void drop_dropped_tables_metrics();
+
+    // Queues the start of the group's raft::server behind the previous control operation.
+    void schedule_raft_group_start(locator::global_tablet_id tablet, raft::group_id group_id,
+        raft_group_state& state, locator::token_metadata_ptr tm, table_metrics& metrics);
+
+    // Waits until a just started server knows a leader, so that it is ready to serve
+    // requests once wait_for_groups_to_start() reports it.
+    future<> wait_for_first_leader(locator::global_tablet_id tablet, raft::group_id group_id,
+        raft_group_state& state, gate& g);
+
+    // What becomes of a group's commitlog segment references when its server goes
+    // away: keep at shutdown so replay can recover the log, release for a group
+    // destroyed deliberately.
+    enum class log_disposition { keep, release };
+
+    // If `clean_up`, also does what cleanup_group() does for a migrated tablet, erasing the
+    // group's persisted raft state, for a group whose tablet has no cleanup stage: a resizing
+    // parent which the tablet map dropped. Only valid with log_disposition::release.
+    void schedule_raft_group_deletion(raft::group_id group_id, raft_group_state& group_state,
+        log_disposition disposition, bool clean_up = false);
+
+    void schedule_raft_groups_deletion(bool all, log_disposition disposition);
+
+    // Queues a start or deletion of the group's raft::server behind the
+    // previous one; at most one control operation runs per group. `op` is
+    // kept alive until it completes.
+    //
+    // Control operations must not fail; a failure aborts the node regardless
+    // of abort_on_internal_error, since the chain can't recover: a failed
+    // start can't be retried (the first attempt consumes the raft log entries
+    // replayed from the commitlog) and can't be left in place (every later
+    // operation would inherit the failure). Readers rely on this: an
+    // available `server_control_op` means "started".
+    static void chain_control_op(raft_group_state& state, raft::group_id id,
+            noncopyable_function<future<>()> op,
+            std::source_location loc = std::source_location::current());
+
+    // Handle to the group's server, or nullopt if the group is being deleted
+    // or (re)started. Unlike acquire_server(), doesn't wait for a start.
+    static std::optional<raft_server> try_acquire_server(raft_group_state& state);
+
+    // The shard hosting the raft group `expected_gid` of `tablet`,
+    // nullopt if this node holds no replica of the tablet or the table is gone.
+    std::optional<shard_id> find_shard_for_tablet(locator::global_tablet_id tablet, raft::group_id expected_gid) const;
+
+    // Appends a truncate of the group's tablet to the log of the group `gid` if this replica
+    // leads it, and tells whether the entry is committed. Runs on the shard hosting the group.
+    // Waits until the entry commits or the topology session of `frozen_guard` closes.
+    future<bool> truncate_tablet_group(raft::group_id gid, utils::UUID request_id,
+            service::frozen_topology_guard frozen_guard);
+
+    future<> leader_info_updater(raft_group_state& state, table_id table, raft::group_id gid,
+        dht::token_range range);
+
+    void init_messaging_service();
+
+    // Unregisters the RPC handlers, waiting for those that are running. Has to complete
+    // on every shard before stop_shard() runs on any: a handler that runs on one shard
+    // forwards to another, whose stop_shard() deletes the raft groups the handler uses.
+    future<> uninit_messaging_service();
+
+    // Deletes every raft::server of this shard and waits for that.
+    future<> stop_shard();
+
+    // Makes the pending replica of a tablet at sc_snapshot_transfer catch up with the
+    // group's leader, with a read barrier. Called through the wait_for_snapshot_transfer
+    // RPC, on the pending replica.
+    //
+    // This and sync_raft_group_config() run on behalf of handle_migration_rpc(), with the
+    // group's raft server, the guard of the tablet's metadata, and an abort source the
+    // guard and the coordinator's deadline trigger.
+    future<> wait_for_snapshot_transfer(locator::global_tablet_id tablet, raft::group_id group_id, const raft_server& server,
+            locator::tablet_metadata_guard& guard, abort_source& as);
+
+    // Drives the raft group of one tablet in transition to the configuration its
+    // current migration stage implies, and doesn't return until it got there.
+    //
+    // A failure is per tablet: the topology coordinator receives it as a failed
+    // background action of that one tablet, and the stage logic decides what to do
+    // about it - retry, exclude a replica, or roll back.
+    //
+    // Called through the sync_raft_group_config RPC, on the serving replicas of the stage
+    // the RPC was sent for: those that can be elected at the stage, and those whose
+    // configuration has to be checked. The leader proposes the change; a follower
+    // catches up. Returns once this replica has the configuration and, if the stage
+    // expects it to be a voter, names a leader that is a voter of it.
+    future<> sync_raft_group_config(locator::global_tablet_id tablet, raft::group_id group_id, const raft_server& server,
+            locator::tablet_metadata_guard& guard, abort_source& as);
+
+    using migration_rpc_method = future<> (groups_manager::*)(locator::global_tablet_id tablet,
+            raft::group_id group_id, const raft_server& server, locator::tablet_metadata_guard& guard, abort_source& as);
+
+    // Handles an RPC the topology coordinator sends about one tablet at one stage of its
+    // migration: checks the destination, the deadline and the shard, and catches up with
+    // group0. Then, on the target shard, fails unless the tablet is still at `stage` of
+    // the migration `session` identifies, and runs `method`. The call holds a
+    // tablet_metadata_guard, so it ends as soon as the stage moves on, and the barrier of
+    // a later stage waits for it.
+    future<> handle_migration_rpc(const char* verb, seastar::rpc::opt_time_point timeout, raft::server_id dst_id,
+            locator::global_tablet_id tablet, raft::group_id group_id, unsigned shard,
+            service::session_id session, sstring stage_name, migration_rpc_method method);
+
+public:
+    groups_manager(netw::messaging_service& ms, raft_group_registry& raft_gr,
+        cql3::query_processor& qp, replica::database& _db, service::migration_manager& mm, db::system_keyspace& sys_ks,
+        gms::feature_service& features, gms::gossiper& gossiper, db::raft_commitlog_replay_buffer& raft_replay_buffer,
+        sharded<raft_resize_tracker>& resize_tracker);
+
+    // Called whenever a new token_metadata is published on this shard.
+    // Starts raft::server instances for all strongly consistent tablets now
+    // residing on this shard, and schedules removal of servers for tablets
+    // that have moved away.
+    //
+    // Note that the method is synchronous: it only initiates these operations
+    // and does not wait for their completion.
+    void update(locator::token_metadata_ptr new_tm);
+
+    // The raft_server instance is used to submit write commands and perform read_barrier() before reads.
+    future<raft_server> acquire_server(table_id table_id, raft::group_id group_id, abort_source& as);
+
+    // Called during node boot. Starts all raft::server instances corresponding
+    // to the latest group0 state in the background.
+    void start();
+
+    // Stops the groups of every shard, from any shard: unregisters the RPC handlers
+    // on every shard, waiting for those still running, and then stops every shard.
+    // A call after an earlier call ended does nothing. Calls must not overlap.
+    // There is no stop(): sharded<>::stop() only destroys the instances.
+    future<> stop_all_shards();
+
+    // Hands Raft leadership over to another replica for every strongly consistent
+    // tablet group hosted on this shard which this node currently leads.
+    //
+    // Transferring leadership takes a round of Raft RPCs with the other replicas,
+    // so it must run while messaging_service is still up. In a normal shutdown,
+    // stop_all_shards() runs after storage_service::stop_transport() has shut the
+    // transport down, so we need a separate entry point to trigger stepdown().
+    future<> stepdown_leaders();
+
+    future<> wait_for_groups_to_start(lowres_clock::time_point timeout);
+
+    // Called by tablet cleanup, the point at which a replica has definitively left the
+    // group, before the tablet's storage is removed.
+    //
+    // Waits for the teardown of the group's raft server, which update() scheduled when
+    // the stage that ended this replica's hosting was published, and then deletes
+    // everything this shard persists about the group, so that a tablet migrated back
+    // here later rejoins the group with no history of its previous membership.
+    //
+    // Idempotent. A group whose raft server is running and not being deleted is an
+    // internal error: the caller has checked that the stage ended the hosting.
+    future<> cleanup_group(locator::global_tablet_id tablet, raft::group_id group_id);
+
+    // Sends an RPC to every host that holds a tablet replica of the given table, asking it to wait
+    // until the raft groups for those tablets are started and ready to serve queries.
+    // For the local node, waits directly without an RPC.
+    future<> wait_for_table_raft_groups_on_all_hosts(table_id table, lowres_clock::time_point timeout);
+
+    tablet_group_leader_cache& leader_cache() { return _leader_cache; }
+};
+
+/// A temporary, RAII-style handle to an active Raft group server instance,
+/// used to safely submit commands or perform consistency barriers.
+///
+/// Holds the gate of the server's incarnation: its deletion waits for the
+/// handle before destroying the raft::server. The server may still be aborted
+/// meanwhile; operations then fail with raft::stopped_error.
+///
+/// Obtain via groups_manager::acquire_server() or try_acquire_server().
+class raft_server {
+private:
+    groups_manager::raft_group_state& _state;
+    gate::holder _holder;
+
+    friend class groups_manager;
+
+public:
+    raft_server(groups_manager::raft_group_state& state, gate::holder holder);
+
+    raft::server& server() const {
+        return *_state.server;
+    }
+
+    // Can be null only after the table is dropped.
+    lw_shared_ptr<table_request_stats> table_stats() const {
+        return _state.metrics ? _state.metrics->request_stats() : nullptr;
+    }
+
+    // Possible results:
+    //   timestamp_with_term - timestamp to use for a new mutation request
+    //   raft::not_a_leader - this node is not a leader
+    //   need_wait_for_leader - the caller needs to wait on the specified future and then retry `begin_mutate`
+    struct timestamp_with_term {
+        api::timestamp_type timestamp;
+        raft::term_t term;
+    };
+    struct need_wait_for_leader {
+        future<> future;
+    };
+    using begin_mutate_result = std::variant<timestamp_with_term, raft::not_a_leader, need_wait_for_leader>;
+    begin_mutate_result begin_mutate(abort_source&);
+
+    // Possible results:
+    //   ok - this node is the leader, proceed with read_barrier() locally
+    //   raft::not_a_leader - this node is not a leader, redirect to the leader
+    //   need_wait_for_leader - the leader is unknown, the caller needs to wait and retry
+    struct ok {};
+    using begin_read_result = std::variant<ok, raft::not_a_leader, need_wait_for_leader>;
+    begin_read_result begin_read(abort_source&);
+};
+
+} // namespace service::strong_consistency

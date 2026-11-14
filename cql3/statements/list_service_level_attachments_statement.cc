@@ -3,20 +3,28 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "seastarx.hh"
 #include "cql3/statements/list_service_level_attachments_statement.hh"
-#include "cql3/column_identifier.hh"
-#include "service/qos/service_level_controller.hh"
 #include "transport/messages/result_message.hh"
 #include "service/client_state.hh"
 #include "service/query_state.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace cql3 {
 
 namespace statements {
+
+shared_ptr<const cql3::metadata> list_service_level_attachments_statement::get_result_metadata() const {
+    static thread_local const std::vector<lw_shared_ptr<column_specification>> metadata({
+        make_column_spec("QOS", "service_levels_attachments", "role", utf8_type),
+        make_column_spec("QOS", "service_levels_attachments", "service_level", utf8_type)
+    });
+
+    return ::make_shared<cql3::metadata>(metadata);
+}
 
 list_service_level_attachments_statement::list_service_level_attachments_statement(sstring role_name) :
     _role_name(role_name), _describe_all(false) {
@@ -28,11 +36,8 @@ list_service_level_attachments_statement::list_service_level_attachments_stateme
 
 std::unique_ptr<cql3::statements::prepared_statement>
 cql3::statements::list_service_level_attachments_statement::prepare(
-        data_dictionary::database db, cql_stats &stats) {
-    return std::make_unique<prepared_statement>(::make_shared<list_service_level_attachments_statement>(*this));
-}
-
-void list_service_level_attachments_statement::validate(query_processor &, const service::client_state &) const {
+        data_dictionary::database db, cql_stats &stats, const cql_config& cfg) {
+    return std::make_unique<prepared_statement>(audit_info(), ::make_shared<list_service_level_attachments_statement>(*this));
 }
 
 future<> list_service_level_attachments_statement::check_access(query_processor& qp, const service::client_state &state) const {
@@ -42,20 +47,9 @@ future<> list_service_level_attachments_statement::check_access(query_processor&
 future<::shared_ptr<cql_transport::messages::result_message>>
 list_service_level_attachments_statement::execute(query_processor& qp,
         service::query_state &state,
-        const query_options &) const {
-
-    static auto make_column = [] (sstring name, const shared_ptr<const abstract_type> type) {
-        return make_lw_shared<column_specification>(
-                "QOS",
-                "service_levels_attachments",
-                ::make_shared<column_identifier>(std::move(name), true),
-                type);
-    };
-
-    static thread_local const std::vector<lw_shared_ptr<column_specification>> metadata({
-        make_column("role", utf8_type), make_column("service_level", utf8_type)
-    });
-
+        const query_options &,
+        std::optional<service::group0_guard> guard) const {
+    auto metadata = ::make_shared<cql3::metadata>(*get_result_metadata());
 
     return make_ready_future().then([this, &state] () {
         if (_describe_all) {
@@ -70,7 +64,7 @@ list_service_level_attachments_statement::execute(query_processor& qp,
             });
 
         }
-    }).then([this, &state] (std::unordered_map<sstring, sstring> roles_to_att_val) {
+    }).then([metadata = std::move(metadata)] (std::unordered_map<sstring, sstring> roles_to_att_val) {
 
         auto rs = std::make_unique<result_set>(metadata);
         for (auto&& role_to_sl : roles_to_att_val) {

@@ -3,22 +3,20 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "test/lib/sstable_utils.hh"
 
 #include "replica/database.hh"
-#include "memtable-sstable.hh"
+#include "replica/memtable-sstable.hh"
 #include "dht/i_partitioner.hh"
 #include "dht/murmur3_partitioner.hh"
-#include <boost/range/irange.hpp>
-#include <boost/range/adaptor/map.hpp>
-#include <boost/range/adaptor/reversed.hpp>
-#include <boost/range/algorithm/sort.hpp>
 #include "sstables/version.hh"
-#include "test/lib/flat_mutation_reader_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
+#include "test/boost/sstable_test.hh"
+#include "test/lib/simple_schema.hh"
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/coroutine.hh>
@@ -26,185 +24,281 @@
 using namespace sstables;
 using namespace std::chrono_literals;
 
-std::vector<sstring> do_make_keys(unsigned n, const schema_ptr& s, size_t min_key_size, std::optional<shard_id> shard) {
-    std::vector<std::pair<sstring, dht::decorated_key>> p;
-    p.reserve(n);
+future<lw_shared_ptr<replica::memtable>> make_memtable(schema_ptr s, const utils::chunked_vector<mutation>& muts) {
+    auto mt = make_lw_shared<replica::memtable>(s);
 
-    auto key_id = 0U;
-    auto generated = 0U;
-    while (generated < n) {
-        auto raw_key = sstring(std::max(min_key_size, sizeof(key_id)), int8_t(0));
-        std::copy_n(reinterpret_cast<int8_t*>(&key_id), sizeof(key_id), raw_key.begin());
-        auto dk = dht::decorate_key(*s, partition_key::from_single_value(*s, to_bytes(raw_key)));
-        key_id++;
-        if (shard) {
-            if (*shard != shard_of(*s, dk.token())) {
-                continue;
-            }
-        }
-        generated++;
-        p.emplace_back(std::move(raw_key), std::move(dk));
-    }
-    boost::sort(p, [&] (auto& p1, auto& p2) {
-        return p1.second.less_compare(*s, p2.second);
-    });
-    return boost::copy_range<std::vector<sstring>>(p | boost::adaptors::map_keys);
-}
-
-std::vector<sstring> do_make_keys(unsigned n, const schema_ptr& s, size_t min_key_size, local_shard_only lso) {
-    return do_make_keys(n, s, min_key_size, lso ? std::optional(this_shard_id()) : std::nullopt);
-}
-
-sstables::shared_sstable make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, std::vector<mutation> muts) {
-    tests::reader_concurrency_semaphore_wrapper semaphore;
-
-    auto sst = sst_factory();
-    schema_ptr s = muts[0].schema();
-    auto mt = make_lw_shared<memtable>(s);
-
-    std::size_t i{0};
     for (auto&& m : muts) {
         mt->apply(m);
-        ++i;
-
         // Give the reactor some time to breathe
-        if(i == 10) {
-            seastar::thread::yield();
-            i = 0;
-        }
-    }
-    write_memtable_to_sstable_for_test(*mt, sst).get();
-    sst->open_data().get();
-
-    std::set<mutation, mutation_decorated_key_less_comparator> merged;
-    for (auto&& m : muts) {
-        auto result = merged.insert(m);
-        if (!result.second) {
-            auto old = *result.first;
-            merged.erase(result.first);
-            merged.insert(old + m);
-        }
+        co_await coroutine::maybe_yield();
     }
 
-    // validate the sstable
-    auto rd = assert_that(sst->as_mutation_source().make_reader(s, semaphore.make_permit()));
-    for (auto&& m : merged) {
-        rd.produces(m);
-    }
-    rd.produces_end_of_stream();
-
-    return sst;
+    co_return mt;
 }
 
-shared_sstable make_sstable(sstables::test_env& env, schema_ptr s, sstring dir, std::vector<mutation> mutations,
-        sstable_writer_config cfg, sstables::sstable::version_types version, gc_clock::time_point query_time) {
-    auto mt = make_lw_shared<memtable>(s);
-    fs::path dir_path(dir);
-
-    for (auto&& m : mutations) {
-        mt->apply(m);
-    }
-
-    return make_sstable_easy(env, dir_path, mt, cfg, 1, version, mutations.size(), query_time);
-}
-
-shared_sstable make_sstable_easy(test_env& env, const fs::path& path, flat_mutation_reader rd, sstable_writer_config cfg,
-        int64_t generation, const sstables::sstable::version_types version, int expected_partition) {
-    auto s = rd.schema();
-    auto sst = env.make_sstable(s, path.string(), generation, version, sstable_format_types::big);
-    sst->write_components(std::move(rd), expected_partition, s, cfg, encoding_stats{}).get();
-    sst->load().get();
-    return sst;
-}
-
-shared_sstable make_sstable_easy(test_env& env, const fs::path& path, lw_shared_ptr<memtable> mt, sstable_writer_config cfg,
-        unsigned long gen, const sstable::version_types v, int estimated_partitions, gc_clock::time_point query_time) {
-    schema_ptr s = mt->schema();
-    auto sst = env.make_sstable(s, path.string(), gen, v, sstable_format_types::big, default_sstable_buffer_size, query_time);
-    auto mr = mt->make_flat_reader(s, env.make_reader_permit());
-    sst->write_components(std::move(mr), estimated_partitions, s, cfg, mt->get_encoding_stats()).get();
-    sst->load().get();
-    return sst;
-}
-
-std::vector<std::pair<sstring, dht::token>>
-token_generation_for_shard(unsigned tokens_to_generate, unsigned shard,
-        unsigned ignore_msb, unsigned smp_count) {
-    unsigned tokens = 0;
-    unsigned key_id = 0;
-    std::vector<std::pair<sstring, dht::token>> key_and_token_pair;
-
-    key_and_token_pair.reserve(tokens_to_generate);
-    dht::murmur3_partitioner partitioner;
-    dht::sharder sharder(smp_count, ignore_msb);
-
-    while (tokens < tokens_to_generate) {
-        sstring key = to_sstring(key_id++);
-        dht::token token = create_token_from_key(partitioner, key);
-        if (shard != sharder.shard_of(token)) {
-            continue;
-        }
-        tokens++;
-        key_and_token_pair.emplace_back(key, token);
-    }
-    assert(key_and_token_pair.size() == tokens_to_generate);
-
-    std::sort(key_and_token_pair.begin(),key_and_token_pair.end(), [] (auto& i, auto& j) {
-        return i.second < j.second;
+std::vector<replica::memtable*> active_memtables(replica::table& t) {
+    std::vector<replica::memtable*> active_memtables;
+    t.for_each_active_memtable([&] (replica::memtable& mt) {
+        active_memtables.push_back(&mt);
     });
-
-    return key_and_token_pair;
+    return active_memtables;
 }
 
-future<compaction_result> compact_sstables(sstables::compaction_descriptor descriptor, replica::column_family& cf, std::function<shared_sstable()> creator, compaction_sstable_replacer_fn replacer) {
+future<sstables::shared_sstable> make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, lw_shared_ptr<replica::memtable> mt) {
+    return make_sstable_containing(sst_factory(), std::move(mt));
+}
+
+future<sstables::shared_sstable> make_sstable_containing(sstables::shared_sstable sst, lw_shared_ptr<replica::memtable> mt) {
+    co_await write_memtable_to_sstable(*mt, sst);
+    sstable_open_config cfg { .load_first_and_last_position_metadata = true };
+    co_await sst->open_data(cfg);
+    co_return sst;
+}
+
+future<sstables::shared_sstable> make_sstable_containing(sstables::shared_sstable sst, utils::chunked_vector<mutation> muts, validate do_validate) {
+    schema_ptr s = muts[0].schema();
+    co_await make_sstable_containing(sst, co_await make_memtable(s, muts));
+
+    if (do_validate) {
+        reader_concurrency_semaphore sem(
+            reader_concurrency_semaphore::no_limits{}, "make_sstable_containing", reader_concurrency_semaphore::register_metrics::no);
+
+        std::set<mutation, mutation_decorated_key_less_comparator> merged;
+        for (auto&& m : muts) {
+            auto it = merged.find(m);
+            if (it == merged.end()) {
+                merged.insert(std::move(m));
+            } else {
+                auto old = merged.extract(it);
+                old.value().apply(std::move(m));
+                merged.insert(std::move(old));
+            }
+            co_await coroutine::maybe_yield();
+        }
+
+        // validate the sstable
+        auto rd = sst->as_mutation_source().make_mutation_reader(s, sem.make_tracking_only_permit(nullptr, "test", db::no_timeout, {}));
+        for (auto&& m : merged) {
+            auto mo = co_await read_mutation_from_mutation_reader(rd);
+            BOOST_REQUIRE(mo);
+            assert_that(*mo).is_equal_to_compacted(m);
+            co_await coroutine::maybe_yield();
+        }
+        co_await rd.close();
+        co_await sem.stop();
+    }
+    co_return sst;
+}
+
+future<sstables::shared_sstable> make_sstable_containing(std::function<sstables::shared_sstable()> sst_factory, utils::chunked_vector<mutation> muts, validate do_validate) {
+    return make_sstable_containing(sst_factory(), std::move(muts), do_validate);
+}
+
+shared_sstable make_sstable_easy(test_env& env, mutation_reader rd, sstable_writer_config cfg,
+        sstables::generation_type gen, const sstables::sstable::version_types version, int expected_partition, db_clock::time_point query_time) {
+    auto s = rd.schema();
+    auto sst = env.make_sstable(s, gen, version, sstable_format_types::big, default_sstable_buffer_size, query_time);
+    sst->write_components(std::move(rd), expected_partition, s, cfg, encoding_stats{}).get();
+    sst->load(s->get_sharder()).get();
+    return sst;
+}
+
+shared_sstable make_sstable_easy(test_env& env, lw_shared_ptr<replica::memtable> mt, sstable_writer_config cfg,
+        sstables::generation_type gen, const sstable::version_types v, int estimated_partitions, db_clock::time_point query_time) {
+    return make_sstable_easy(env, mt->make_mutation_reader(mt->schema(), env.make_reader_permit()), std::move(cfg), gen, v, estimated_partitions, query_time);
+}
+
+future<compaction::compaction_result> compact_sstables(test_env& env, compaction::compaction_descriptor descriptor, table_for_tests t,
+                 std::function<shared_sstable()> creator, compaction::compaction_sstable_replacer_fn replacer, can_purge_tombstones can_purge) {
+    auto& table_s = t.as_compaction_group_view();
     descriptor.creator = [creator = std::move(creator)] (shard_id dummy) mutable {
         return creator();
     };
     descriptor.replacer = std::move(replacer);
-    auto& cm = cf.get_compaction_manager();
-    auto& cdata = compaction_manager_test(cm).register_compaction(descriptor.run_identifier, &cf);
-    return sstables::compact_sstables(std::move(descriptor), cdata, cf.as_table_state()).then([&cdata, &cm] (sstables::compaction_result res) {
-        return res;
-    }).finally([&cm, &cdata] {
-        compaction_manager_test(cm).deregister_compaction(cdata);
+    descriptor.gc_state = table_s.get_tombstone_gc_state();
+    if (can_purge) {
+        descriptor.enable_garbage_collection(*co_await table_s.main_sstable_set());
+    }
+    compaction::compaction_result ret;
+    co_await run_compaction_task(env, descriptor.run_identifier, table_s, [&] (compaction::compaction_data& cdata) {
+        return do_with(compaction::compaction_progress_monitor{}, [&] (compaction::compaction_progress_monitor& progress_monitor) {
+                return ::compaction::compact_sstables(std::move(descriptor), cdata, table_s, progress_monitor).then([&] (compaction::compaction_result res) {
+                ret = std::move(res);
+            });
+        });
     });
+    co_return ret;
 }
 
-std::vector<std::pair<sstring, dht::token>> token_generation_for_current_shard(unsigned tokens_to_generate) {
-    return token_generation_for_shard(tokens_to_generate, this_shard_id());
+class compaction_manager_test_task : public compaction::compaction_task_executor {
+    sstables::run_id _run_id;
+    noncopyable_function<future<> (compaction::compaction_data&)> _job;
+    gate::holder _hold;
+
+public:
+    compaction_manager_test_task(compaction::compaction_manager& cm, compaction::compaction_group_view& table_s, sstables::run_id run_id, noncopyable_function<future<> (compaction::compaction_data&)> job)
+        : compaction::compaction_task_executor(cm, compaction::throw_if_stopping::no, &table_s, compaction::compaction_type::Compaction, "Test compaction")
+        , _run_id(run_id)
+        , _job(std::move(job))
+        , _hold(hold_compaction_state_gate())
+    { }
+
+protected:
+    virtual future<compaction::compaction_manager::compaction_stats_opt> do_run() override {
+        setup_new_compaction(_run_id);
+        return _job(_compaction_data).then([] {
+            return make_ready_future<compaction::compaction_manager::compaction_stats_opt>(std::nullopt);
+        });
+    }
+};
+
+future<> run_compaction_task(test_env& env, sstables::run_id output_run_id, compaction::compaction_group_view& table_s, noncopyable_function<future<> (compaction::compaction_data&)> job) {
+    auto& tcm = env.test_compaction_manager();
+    auto task = make_shared<compaction_manager_test_task>(tcm.get_compaction_manager(), table_s, output_run_id, std::move(job));
+    co_await tcm.perform_compaction(std::move(task));
 }
 
-static sstring toc_filename(const sstring& dir, schema_ptr schema, unsigned int generation, sstable_version_types v) {
-    return sstable::filename(dir, schema->ks_name(), schema->cf_name(), v, generation,
-                             sstable_format_types::big, component_type::TOC);
+future<sstables::shared_sstable> verify_mutation(test_env& env, shared_sstable sst, lw_shared_ptr<replica::memtable> mt, bytes key, std::function<void(mutation_opt&)> verify) {
+    auto sstp = co_await make_sstable_containing(std::move(sst), mt);
+    co_return co_await verify_mutation(env, std::move(sstp), std::move(key), std::move(verify));
 }
 
-future<shared_sstable> test_env::reusable_sst(schema_ptr schema, sstring dir, unsigned long generation) {
-    for (auto v : boost::adaptors::reverse(all_sstable_versions)) {
-        if (co_await file_exists(toc_filename(dir, schema, generation, v))) {
-            co_return co_await reusable_sst(schema, dir, generation, v);
+future<sstables::shared_sstable> verify_mutation(test_env& env, shared_sstable sstp, bytes key, std::function<void(mutation_opt&)> verify) {
+    auto s = sstp->get_schema();
+    auto pr = dht::partition_range::make_singular(make_dkey(s, key));
+    auto rd = sstp->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+    auto mopt = co_await read_mutation_from_mutation_reader(rd);
+    verify(mopt);
+    co_await rd.close();
+    co_return sstp;
+}
+
+future<sstables::shared_sstable> verify_mutation(test_env& env, shared_sstable sst, lw_shared_ptr<replica::memtable> mt, dht::partition_range pr, std::function<stop_iteration(mutation_opt&)> verify) {
+    auto sstp = co_await make_sstable_containing(std::move(sst), mt);
+    co_return co_await verify_mutation(env, std::move(sstp), std::move(pr), std::move(verify));
+}
+
+future<sstables::shared_sstable> verify_mutation(test_env& env, shared_sstable sstp, dht::partition_range pr, std::function<stop_iteration(mutation_opt&)> verify) {
+    auto s = sstp->get_schema();
+    auto rd = sstp->make_reader(s, env.make_reader_permit(), std::move(pr), s->full_slice());
+    while (auto mopt = co_await read_mutation_from_mutation_reader(rd)) {
+        if (verify(mopt) == stop_iteration::yes) {
+            break;
         }
     }
-    throw sst_not_found(dir, generation);
+    co_await rd.close();
+    co_return sstp;
 }
 
-sstables::compaction_data& compaction_manager_test::register_compaction(utils::UUID output_run_id, replica::column_family* cf) {
-    auto task = make_lw_shared<compaction_manager::task>(cf, sstables::compaction_type::Compaction, _cm._compaction_state[cf]);
-    testlog.debug("compaction_manager_test: register_compaction: task {} cf={}", fmt::ptr(task.get()), fmt::ptr(cf));
-    task->compaction_running = true;
-    task->compaction_data = compaction_manager::create_compaction_data();
-    task->output_run_identifier = std::move(output_run_id);
-    _cm._tasks.push_back(task);
-    return task->compaction_data;
-}
+class corrupted_data_source_impl : public data_source_impl {
+    input_stream<char> _wrapped;
+    size_t _corrupted_byte;
+    size_t _read_bytes;
 
-void compaction_manager_test::deregister_compaction(const sstables::compaction_data& c) {
-    auto it = boost::find_if(_cm._tasks, [&c] (auto& task) { return task->compaction_data.compaction_uuid == c.compaction_uuid; });
-    if (it != _cm._tasks.end()) {
-        auto task = *it;
-        testlog.debug("compaction_manager_test: deregister_compaction uuid={}: task {} table={}", c.compaction_uuid, fmt::ptr(task.get()), fmt::ptr(task->compacting_table));
-        _cm._tasks.erase(it);
-    } else {
-        testlog.debug("compaction_manager_test: deregister_compaction uuid={}: task not found", c.compaction_uuid);
+    void maybe_corrupt(temporary_buffer<char>& buf) {
+        if (_read_bytes <= _corrupted_byte && _corrupted_byte < _read_bytes + buf.size()) {
+            buf.get_write()[_corrupted_byte - _read_bytes] ^= 1u;
+        }
     }
+public:
+    corrupted_data_source_impl(input_stream<char> wrapped, size_t corrupted_byte)
+        : _wrapped(std::move(wrapped))
+        , _corrupted_byte(corrupted_byte)
+        , _read_bytes(0)
+    {}
+
+    future<seastar::temporary_buffer<char>> get() override {
+        auto inner = co_await _wrapped.read();
+        maybe_corrupt(inner);
+        _read_bytes += inner.size();
+
+        co_return inner;
+    }
+
+    virtual future<temporary_buffer<char>> skip(uint64_t n) override {
+        co_await _wrapped.skip(n);
+        _read_bytes += n;
+
+        co_return temporary_buffer<char>();
+    }
+
+    future<> close() override {
+        return _wrapped.close();
+    }
+};
+
+class corrupted_data_source : public data_source {
+public:
+    corrupted_data_source(input_stream<char> wrapped, size_t corrupted_byte)
+        : data_source(std::make_unique<corrupted_data_source_impl>(std::move(wrapped), corrupted_byte))
+    {}
+};
+
+class corrupted_sstable_stream_source_impl : public sstable_stream_source {
+    std::unique_ptr<sstable_stream_source> _wrapped;
+    size_t _corrupted_byte;
+public:
+    corrupted_sstable_stream_source_impl(std::unique_ptr<sstable_stream_source> wrapped, sstables::shared_sstable sst, component_type type, size_t corrupted_byte)
+        : sstable_stream_source(std::move(sst), type)
+        , _wrapped(std::move(wrapped))
+        , _corrupted_byte(corrupted_byte)
+    {}
+
+    future<input_stream<char>> input(const file_input_stream_options& opts) const {
+        auto inner = co_await _wrapped->input(opts);
+        co_return input_stream<char>(corrupted_data_source(std::move(inner), _corrupted_byte));
+    }
+};
+
+std::unique_ptr<sstable_stream_source> make_corrupted_sstable_stream_source(std::unique_ptr<sstable_stream_source> wrapped, sstables::shared_sstable sst, component_type type, size_t corrupted_byte) {
+    return std::make_unique<corrupted_sstable_stream_source_impl>(std::move(wrapped), std::move(sst), type, corrupted_byte);
+}
+
+void slightly_corrupt_sstable(sstables::shared_sstable sst, component_type component) {
+    auto path = sstables::test(sst).filename(component).native();
+    auto size = seastar::file_size(path).get();
+    auto f = open_file_dma(path, open_flags::rw).get();
+    auto close_f = deferred_close(f);
+    const auto mem_align = f.memory_dma_alignment();
+    const auto dma_align = f.disk_write_dma_alignment();
+    auto block_offset = align_down(size - 1, dma_align);
+    auto buf = seastar::temporary_buffer<char>::aligned(mem_align, dma_align);
+    f.dma_read(block_offset, buf.get_write(), dma_align).get();
+    if (component == component_type::Scylla && sst->get_component_digest(component_type::Scylla)) {
+        // Modify the last bit of the data itself, not the digest.
+        buf.get_write()[size - 1 - sizeof(uint32_t) - block_offset] ^= 1u;
+    } else {
+        // Flip one bit in the last byte of the file to corrupt it minimally.
+        // Using a single-bit flip avoids creating values that overflow
+        // during parsing.
+        buf.get_write()[size - 1 - block_offset] += 1;
+    }
+    f.dma_write(block_offset, buf.get(), dma_align).get();
+    f.truncate(size).get();
+}
+
+void corrupt_sstable(sstables::shared_sstable sst, component_type type) {
+    auto f = sstables::test(sst).open_file(type, {}, {}).get();
+    auto close_f = deferred_close(f);
+    const auto wbuf_align = f.memory_dma_alignment();
+    const auto wbuf_len = f.size().get();
+    auto wbuf = seastar::temporary_buffer<char>::aligned(wbuf_align, wbuf_len);
+    std::fill(wbuf.get_write(), wbuf.get_write() + wbuf_len, 0xba);
+    auto os = output_stream<char>(sstables::test(sst).get_storage().make_component_sink(*sst, type, open_flags::wo, {}).get());
+    auto close_os = deferred_close(os);
+    os.write(std::move(wbuf)).get();
+}
+
+std::vector<shared_sstable> add_same_size_sstables(test_env& env, table_for_tests& cf, simple_schema& ss, sstable_version_types version,
+        uint32_t count) {
+    auto s = cf.schema();
+    std::vector<shared_sstable> ssts;
+    for (uint32_t i = 0; i < count; ++i) {
+        mutation m(s, ss.make_pkey(i));
+        ss.add_row(m, ss.make_ckey(0), "v");
+        auto sst = make_sstable_containing(env.make_sstable(s, version), {std::move(m)}).get();
+        column_family_test(cf).add_sstable(sst).get();
+        ssts.push_back(std::move(sst));
+    }
+    return ssts;
 }

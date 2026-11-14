@@ -3,30 +3,34 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include <seastar/core/coroutine.hh>
 #include "auth/common.hh"
 
+#include <optional>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sharded.hh>
 
+#include "mutation/canonical_mutation.hh"
+#include "mutation/timestamp.hh"
+#include "utils/exponential_backoff_retry.hh"
 #include "cql3/query_processor.hh"
-#include "cql3/statements/create_table_statement.hh"
-#include "replica/database.hh"
-#include "schema_builder.hh"
-#include "service/migration_manager.hh"
+#include "service/raft/group0_state_machine.hh"
 #include "timeout_config.hh"
+#include "db/config.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace auth {
 
 namespace meta {
 
-constinit const std::string_view AUTH_KS("system_auth");
-constinit const std::string_view USERS_CF("users");
+namespace legacy {
+    constinit const std::string_view AUTH_KS("system_auth");
+} // namespace legacy
 constinit const std::string_view AUTH_PACKAGE_NAME("org.apache.cassandra.auth.");
-
-}
+} // namespace meta
 
 static logging::logger auth_log("auth");
 
@@ -44,60 +48,6 @@ future<> do_after_system_ready(seastar::abort_source& as, seastar::noncopyable_f
     }).discard_result();
 }
 
-static future<> create_metadata_table_if_missing_impl(
-        std::string_view table_name,
-        cql3::query_processor& qp,
-        std::string_view cql,
-        ::service::migration_manager& mm) {
-    assert(this_shard_id() == 0); // once_among_shards makes sure a function is executed on shard 0 only
-
-    auto db = qp.db();
-    auto parsed_statement = cql3::query_processor::parse_statement(cql);
-    auto& parsed_cf_statement = static_cast<cql3::statements::raw::cf_statement&>(*parsed_statement);
-
-    parsed_cf_statement.prepare_keyspace(meta::AUTH_KS);
-
-    auto statement = static_pointer_cast<cql3::statements::create_table_statement>(
-            parsed_cf_statement.prepare(db, qp.get_cql_stats())->statement);
-
-    const auto schema = statement->get_cf_meta_data(qp.db());
-    const auto uuid = generate_legacy_id(schema->ks_name(), schema->cf_name());
-
-    schema_builder b(schema);
-    b.set_uuid(uuid);
-    schema_ptr table = b.build();
-
-    if (!db.has_schema(table->ks_name(), table->cf_name())) {
-        auto group0_guard = co_await mm.start_group0_operation();
-        auto ts = group0_guard.write_timestamp();
-        try {
-            co_return co_await mm.announce(co_await mm.prepare_new_column_family_announcement(table, ts), std::move(group0_guard));
-        } catch (exceptions::already_exists_exception&) {}
-    }
-}
-
-future<> create_metadata_table_if_missing(
-        std::string_view table_name,
-        cql3::query_processor& qp,
-        std::string_view cql,
-        ::service::migration_manager& mm) noexcept {
-    return futurize_invoke(create_metadata_table_if_missing_impl, table_name, qp, cql, mm);
-}
-
-future<> wait_for_schema_agreement(::service::migration_manager& mm, const replica::database& db, seastar::abort_source& as) {
-    static const auto pause = [] { return sleep(std::chrono::milliseconds(500)); };
-
-    return do_until([&db, &as] {
-        as.check();
-        return db.get_version() != replica::database::empty_version;
-    }, pause).then([&mm, &as] {
-        return do_until([&mm, &as] {
-            as.check();
-            return mm.have_schema_agreement();
-        }, pause);
-    });
-}
-
 ::service::query_state& internal_distributed_query_state() noexcept {
 #ifdef DEBUG
     // Give the much slower debug tests more headroom for completing auth queries.
@@ -109,6 +59,58 @@ future<> wait_for_schema_agreement(::service::migration_manager& mm, const repli
     static thread_local ::service::client_state cs(::service::client_state::internal_tag{}, tc);
     static thread_local ::service::query_state qs(cs, empty_service_permit());
     return qs;
+}
+
+::service::raft_timeout get_raft_timeout() noexcept {
+    auto dur = internal_distributed_query_state().get_client_state().get_timeout_config().other_timeout;
+    return ::service::raft_timeout{.value = lowres_clock::now() + dur};
+}
+
+static future<> announce_mutations_with_guard(
+        ::service::raft_group0_client& group0_client,
+        utils::chunked_vector<canonical_mutation> muts,
+        ::service::group0_guard group0_guard,
+        seastar::abort_source& as,
+        std::optional<::service::raft_timeout> timeout) {
+    auto group0_cmd = group0_client.prepare_command(
+        ::service::write_mutations{
+            .mutations{std::move(muts)},
+        },
+        group0_guard,
+        "auth: modify internal data"
+    );
+    return group0_client.add_entry(std::move(group0_cmd), std::move(group0_guard), as, timeout);
+}
+
+future<> announce_mutations(
+        cql3::query_processor& qp,
+        ::service::raft_group0_client& group0_client,
+        const sstring query_string,
+        std::vector<data_value_or_unset> values,
+        seastar::abort_source& as,
+        std::optional<::service::raft_timeout> timeout) {
+    auto group0_guard = co_await group0_client.start_operation(as, timeout);
+    auto timestamp = group0_guard.write_timestamp();
+    auto muts = co_await qp.get_mutations_internal(
+            query_string,
+            internal_distributed_query_state(),
+            timestamp,
+            std::move(values));
+    utils::chunked_vector<canonical_mutation> cmuts = {muts.begin(), muts.end()};
+    co_await announce_mutations_with_guard(group0_client, std::move(cmuts), std::move(group0_guard), as, timeout);
+}
+
+future<> collect_mutations(
+        cql3::query_processor& qp,
+        ::service::group0_batch& collector,
+        const sstring query_string,
+        std::vector<data_value_or_unset> values) {
+    auto muts = co_await qp.get_mutations_internal(
+            query_string,
+            internal_distributed_query_state(),
+            collector.write_timestamp(),
+            std::move(values));
+    collector.add_mutations(std::move(muts), format("auth internal statement: {}", query_string));
 }
 
 }

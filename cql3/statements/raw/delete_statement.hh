@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -31,17 +28,18 @@ namespace raw {
 class delete_statement : public modification_statement {
 private:
     std::vector<std::unique_ptr<operation::raw_deletion>> _deletions;
-    std::vector<::shared_ptr<relation>> _where_clause;
+    expr::expression _where_clause;
 public:
     delete_statement(cf_name name,
            std::unique_ptr<attributes::raw> attrs,
            std::vector<std::unique_ptr<operation::raw_deletion>> deletions,
-           std::vector<::shared_ptr<relation>> where_clause,
-           conditions_vector conditions,
+           expr::expression where_clause,
+           std::optional<expr::expression> conditions,
            bool if_exists);
 protected:
     virtual ::shared_ptr<cql3::statements::modification_statement> prepare_internal(data_dictionary::database db, schema_ptr schema,
-        prepare_context& ctx, std::unique_ptr<attributes> attrs, cql_stats& stats) const override;
+        prepare_context& ctx, std::unique_ptr<attributes> attrs, cql_stats& stats,
+        const modification_executor& executor) const override;
 };
 
 }

@@ -1,0 +1,500 @@
+# Testing
+
+## Introduction
+
+`test.py` is a regression testing harness shipped along with
+scylla.git, which runs C++, unit, CQL and python tests.
+
+This is a manual for `test.py`.
+
+
+## Installation
+
+To run `test.py`, Python 3.14 or higher is required.
+`./install-dependencies.sh` should install all the required Python
+modules. If `install-dependencies.sh` does not support your distribution,
+please manually install all Python modules it lists with `pip`.
+
+Additionally, `toolchain/dbuild` could be used to run `test.py`. In this
+case you don't need to run `./install-dependencies.sh`
+
+`test.py`'s own Python dependencies (scylla-driver and everything else it
+or pytest need to run) are declared in `test/pyproject.toml` and pinned
+in `test/uv.lock`, independent of the frozen toolchain image. On
+startup, `test.py` re-execs itself under `uv run --locked` against
+`test/pyproject.toml`, so the whole process runs inside a venv synced
+from that lockfile, reused across runs (keyed by the interpreter ABI)
+under `build/test-dependencies`. Bumping a version in
+`test/pyproject.toml` (and regenerating `test/uv.lock` with `uv lock
+--project test`) takes effect immediately without having to rebuild the
+toolchain. `--locked` makes `uv run` fail instead of silently
+re-resolving if the two files have drifted apart, so a forgotten `uv
+lock` is caught right away. Since the venv lives under `build/`,
+different checkouts never share packages, and `rm -rf build` removes it.
+Running `test.py` this way requires `uv` to be on `PATH` (it is included
+in the frozen toolchain image; `./install-dependencies.sh` installs it
+otherwise). Anything invoking pytest directly on `test/` rather than
+through `test.py` should likewise run it via
+`uv run --project test --locked -- pytest ...`, so it gets the same
+dependencies.
+
+Set `DISABLE_VENV=1` to skip the re-exec and run `test.py` directly under
+whatever Python/environment invoked it -- useful for running under a
+specific interpreter, a manually-managed venv, or a debugger, or when `uv`
+isn't available. Dependencies are then whatever's already importable;
+nothing installs or syncs them in that mode.
+
+By default `test.py` has `--gather-metrics` parameter, that is used to gather
+CPU/RAM usage during tests from the cgroup.
+This means that before execute `test.py` current terminal process should be located in
+the correct cgroup where the **current user** have RW access to the group.
+Some desktop environments (DE) handle this automatically by putting the process
+to the user-owned scope or slice.
+Some DE don't do this.
+To check if the terminal has the correct cgroup, do next:
+1. Check current cgroup
+    ```shell
+    $ cat /proc/self/cgroup
+    ```
+    The output will be a string with a cgroup something like this:
+    ```
+    0::/user.slice/user-1000.slice/user@1000.service/app.slice/
+    ```
+2. Check the permission of the cgroup. Get the path after `::` from the previous
+command and add at the beginning `/sys/fs/cgroup` and check the permissions:
+   ```shell
+   $ ls -la /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/
+   ```
+   All items should have the owner set to the current user
+
+If this requirement is satisfied you're good to go to run `test.py` with metrics.
+
+If the requirement isn't satisfied, here is how you can do to run `test.py`.
+1. Switch off the metric gathering.
+   1. Use toolchain to run `test.py`
+   2. Add `--no-gather-metrics` to the `test.py` during the run.
+      To make it persistent, it's possible to create an alias
+      ```shell
+      $ echo 'alias testpy="./test.py --no-gather-metrics"' > ~/.profile
+      $ source ~/.profile 
+      ```
+      Now it's possible to invoke `testpy` alias that will switch off 
+      gathering metrics.
+   3. Run the `test.py` with `systemd-run`
+      ```shell
+      $ systemd-run --user --scope ./test.py
+      ```
+      This can be created as an alias as well.
+   4. Create a cgroup manually and put the current terminal process to it
+      ```shell
+      $ mkdir /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/test_py.slice 
+      $ echo $! | sudo tee /sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/test_py.slice/cgroup.procs
+      ```
+      This solution requires `sudo` permissions, because, to change a process' cgroup 
+      user needs RW permissions to both cgroups: the old one and the new one.
+      ***NOTE:*** This operation needs to be executed each time the terminal is opened
+
+Some tests utilize (nested) docker images to provide mock/test services against which to 
+run scylla features. In general, these images will be pulled on first usage by the test.
+Some images used:
+    
+    * docker.io/fsouza/fake-gcs-server:1.54.0
+    * docker.io/versity/versitygw:v1.8.0
+    * (add as needed)
+
+## Usage
+
+In order to invoke `test.py`, you need to build first. `./test.py` will
+run all existing tests in all configured build modes:
+
+    $ ./test.py
+
+In order to invoke `test.py` with `toolchain/dbuild`, you need to run
+
+    $ ./tools/toolchain/dbuild ./test.py
+
+If you want to specify a specific build mode:
+
+    $ ./test.py --mode=dev
+
+If you want to run only tests in a specific directory:
+
+    $ ./test.py test/cqlpy/
+
+If you want to run a specific test file:
+
+    $ ./test.py test/cqlpy/test_null.py
+
+If you want to run a specific test case within a file:
+
+    $ ./test.py test/boost/aggregate_fcts_test.cc::test_aggregate_avg
+
+You can also use `-k` for expression-based filtering by test name:
+
+    $ ./test.py -k 'test_null or test_empty'
+
+This matches all test functions and classes whose name contains
+`test_null` or `test_empty`. Use `not` to exclude:
+
+    $ ./test.py -k 'not test_slow'
+
+To skip tests matching a pattern, use `--skip`:
+
+    $ ./test.py --skip test_slow
+
+Multiple paths and options can be combined freely.
+
+Build artefacts, such as test output and harness output is stored
+in `./testlog`. Scylla data files are stored in `/tmp`.
+
+Test directories under `./test/` may contain a `test_config.yaml` file
+that configures suite-specific behaviour such as extra Scylla
+command-line options and cluster topology. All test
+execution is delegated to pytest; `test.py` itself is a thin wrapper
+that builds the appropriate pytest arguments.
+
+## How it works
+
+`test.py` is a thin wrapper around `pytest`. On start it invokes `ninja`
+to find out configured build modes, builds a list of pytest arguments,
+and calls `pytest.main()`.
+
+`HOST_ID` is a short hash derived from the hostname and the current
+time (or set via the `SCYLLA_TEST_HOST_ID` environment variable).
+It is appended to log filenames, report paths, and the metrics database
+so that results from different CI builder nodes are not overwritten
+when Jenkins collects them into a single directory.
+
+Test discovery, collection and execution are handled entirely by pytest
+and its collectors (defined in `test/pylib/`). Each test directory
+contains a `test_config.yaml` that declares the suite type and options.
+Pytest collectors use these configs to locate test files — e.g. files
+ending with `_test.cc` or `_test.cql` for C++ and CQL suites,
+and `*_test.py` / `test_*.py` for Python suites.
+
+Test names or paths given on the command line are forwarded to pytest
+for selection. For example:
+
+    $ ./test.py test/cqlpy/test_null.py
+
+runs only `test/cqlpy/test_null.py`. You can also pass a substring via
+`-k` to filter by test name.
+
+The `./testlog` directory is created if it doesn't exist, otherwise it is
+cleared from the previous run artefacts.
+
+Tests are run concurrently via `pytest-xdist`, with the number of worker
+processes determined by available CPU cores, system memory, and build mode
+(see `ThreadsCalculator` in `test.py`). `test.py`
+continues until all tests are run even if any one of them fails.
+
+## CQL tests
+
+The main idea of CQL tests is that test writer specifies CQL
+statements run against Scylla, and (almost) everything else is done by
+`test.py`: statement output is recorded in a dedicated file, and
+later used to validate correctness of the test. The initial validation
+must be of course performed by the author of the test. This approach
+is sometimes called "approval testing" and discussion
+about pros and cons of this methodology is widely available online.
+
+To run CQL tests, `test.py` uses the custom pytest file collector implemented
+in `test/pylib/cql_repl.py` file.  More specifically, the test execution done
+in `CqlTest.runtest()` method: read CQL input file, evaluate it against a
+pre-started Scylla using CQL database connection, and print output in tabular
+format to a temporary output file in `testlog` directory.  A default keyspace
+is created automatically.  At the end, the test compares the output stored in
+the temporary file with a pre-recorded output stored in
+`test/suitename/testname_test.result`.
+
+The test is considered failed if executing any CQL statement produced an
+error (e.g.  because the server crashed during execution) or server output
+does not match one recorded in `testname.result`, or there is no
+`testname.result`. The latter is possible when it's the first invocation of
+the test ever.
+
+In the event of output mismatch file `test/suitename/testname_test.reject`
+is created, and first lines of the diff between the two files are output.
+To update `.result` file with new output, simply overwrite it with the
+reject file:
+
+    mv test/suitename/testname.re*
+
+*Note* Since the result file is effectively part of the test, developers
+must thoroughly examine the diff and understand the reasons for every
+change before overwriting `.result` files.
+
+### Debugging CQL tests
+
+To debug CQL tests, one can run CQL against a standalone
+Scylla (possibly started in debugger) using `cqlsh`.
+
+## Unit tests
+
+The same unit test can be run in different seastar configurations, i.e. with
+different command line arguments. The custom arguments can be set in
+`custom_args` key of the `test_config.yaml` file.
+
+Tests from boost suite are divided into test-cases. These are top-level
+functions wrapped by `BOOST_AUTO_TEST_CASE`, `SEASTAR_TEST_CASE` or alike.
+Boost tests support `path/to/file_name.cc::casename` selection described above.
+
+Unit tests are run by the executable they are built into, which has to be
+built beforehand. `--build` builds it as part of the run, so that a change
+can be tested with a single command:
+
+    $ ./tools/toolchain/dbuild uv run --project test --locked -- pytest test/boost/aggregate_fcts_test.cc --mode=dev --build
+
+Note that tests which have no executable of their own are built into
+`test/boost/combined_tests`, so `--build` can build a lot more than the test
+selected.
+
+### Debugging unit tests
+
+If a test fails, its log can be found in
+`testlog/{mode}/{suitename}.{testname}.{casename}_stdout.{run_id}.log`
+(e.g. `testlog/dev/boost.aggregate_fcts_test.test_aggregate_avg_stdout.1.log`).
+When a single test case is run, the path of its log is printed at the end of
+the run. The log of a test which passed is deleted, unless
+`--save-log-on-success` (`-s` for `test.py`) is passed.
+
+A single test case can be run under gdb with `--gdb`:
+
+    $ ./tools/toolchain/dbuild -i -- uv run --project test --locked -- pytest test/boost/aggregate_fcts_test.cc::test_aggregate_avg --mode=dev --gdb
+
+Note the `-i`: `dbuild` gives the container a terminal, but it does not pass
+input on to it unless asked to, and gdb sits at a prompt nothing can be typed
+into otherwise. It has to come before the `--` which ends dbuild's own flags.
+
+Since the debugging session takes over the terminal, exactly one test case
+has to be selected -- keep in mind that a test case is collected once per
+build mode, so `--mode` is needed as well -- and the tests cannot be run in
+parallel, which rules out `test.py`. The test case is reported as skipped
+afterwards: what the session exits with is gdb's verdict, not the test's.
+
+Note that the `dev` mode is compiled without debug info in both build systems,
+so a test can only be usefully debugged in another mode, `debug` and `release`
+among them:
+
+    $ ./tools/toolchain/dbuild -i -- uv run --project test --locked -- pytest test/boost/aggregate_fcts_test.cc::test_aggregate_avg --mode=debug --build --gdb
+
+The other half of the problem is that the tests are linked stripped by
+default, their debug info being huge and there being hundreds of them. The
+configure.py build emits an unstripped re-link of every test binary under a
+`_g` suffix, which `--build` builds when `--gdb` is given, so the command
+above needs nothing else. `--gdb` debugs the `_g` variant whenever it is
+present, so it can equally well be linked by hand beforehand:
+
+    $ ./tools/toolchain/dbuild ninja build/debug/test/boost/aggregate_fcts_test_g
+
+The cmake build has no `_g` target, so there the tests have to be linked
+unstripped to begin with, by configuring with `-DScylla_WITH_DEBUG_INFO=ON`.
+The configure.py build can do the same with `--tests-debuginfo 1`.
+
+`test.py` adds some command line arguments to unit tests.
+
+## Python tests
+
+`test.py` supports pytest standard of tests, for suites (directories)
+specifying `Python` test type in their test_config.yaml. For such tests,
+a standalone server instance is created, and a connection URI to the
+server is passed to the test. Thanks to convenience fixtures,
+test writers don't need to create or cleanup connections or keyspaces.
+`test.py` will also keep track of the used server(s) and will shut
+down the server when all tests  using it end.
+
+Note that some suites have a convenience helper script called `run`. Find
+more information about it in [test/cqlpy](../../test/cqlpy/README.md) and [test/alternator](../../test/alternator/README.md).
+
+All tests in pytest suites consist of test-cases -- top-level functions
+starting with test_ -- and thus support the `path/to/test_file.py::casename`
+selection described in the Usage section.
+
+## Sharing servers
+
+Since there can be many pytests in a single directory (e.g. cqlpy)
+`test.py` runs them in parallel in several `pytest-xdist` workers,
+each with its own servers. Within a worker, a cluster is created per
+test file and shared by all its test cases, to save on setup/teardown
+steps. While this speeds up execution, sharing servers complicates debugging
+if a test fails.
+
+Specifically, you should avoid leaving global artifacts in your test, even
+if it fails. Typically, you could use a built-in `keyspace()` fixture
+to create a randomly named keyspace.
+
+At start and end of each test, `test.py` performs a number of sanity checks
+of the used server:
+- it should be up and running,
+- it should not contain non-system keyspaces.
+
+### Debugging a pytest.
+
+To have a full picture for a failing pytest it is necessary to identify
+the server which was used to run it and the relevant fragment in the server
+log.
+
+Tests run in parallel via `pytest-xdist` workers (`gw0`, `gw1`, ...).
+Each worker writes its log to `testlog/pytest_log/pytest_gw{N}_{HOST_ID}.log`.
+This log contains cluster lifecycle messages and test pass/fail status.
+
+For example, imagine `cqlpy/test_null.py` fails. The relevant lines
+in the worker log will be:
+
+```
+INFO> installing Scylla server in .../testlog/dev/scylla-gw0-1...
+INFO> starting server at host 127.1.191.1 in scylla-gw0-1...
+INFO> started server at host 127.1.191.1 in scylla-gw0-1, pid 675
+INFO> Leasing Scylla cluster ... for test gw0.cqlpy.test_null.1
+INFO> Test gw0.cqlpy.test_null.1 failed
+```
+
+From these messages you can identify the server working directory
+(`testlog/dev/scylla-gw0-1/`) and the server log
+(`testlog/dev/scylla-gw0-1.log`).
+
+The server log contains special markers, written at test start and end:
+
+```
+------ Starting test gw0.cqlpy.test_null.1 ------
+...
+------ Ending test gw0.cqlpy.test_null.1 ------
+```
+
+The per-test failure output (pytest traceback) is captured in
+`testlog/pytest_tests_logs/`. For example:
+
+```
+testlog/pytest_tests_logs/cqlpy-test_null.py-test_insert_null_key.dev.1-call-c8a46.log
+```
+
+To extend logging, you can use the standard `logging` module API.
+
+When finished debugging, you don't have to worry about deleting the remains
+of a previous run, `test.py` will clean them up on the next execution
+automatically.
+
+### Server isolation implementation details
+
+When running multiple servers, we want to avoid host/port or
+temporary directory clashes. We also want to make sure that `test.py`
+doesn't leave any running servers around, even when it's interrupted
+by user or with an exception. This is why `test.py` has a special
+registry where it tracks all servers, in which each server gets a unique
+address in a subnet of network `127.*.*.*`. Unless killed with `SIGKILL`,
+`test.py` kills all servers it creates at shutdown.
+
+The servers created for tests use a pre-defined set of options
+to speed up boot. Some of these options are developer-only, such as
+`flush_schema_tables_after_modification: false`. If you wish to
+extend the options of a used server, you can do it by adding
+`extra_scylla_cmdline_options` or `extra_scylla_config_options`
+to your test_config.yaml.
+
+## Topology pytests
+
+Some pytest suites run against Scylla clusters
+and support topology operations. A standard `manager`
+fixture is available for these. Through this fixture,
+you can access individual nodes, start, stop
+and restart instances, add and remove instances from the cluster.
+The `manager` fixture drives the cluster through the cluster
+manager, an in-process Python object running on its own event
+loop; calls are bridged to that loop. This guarantees that the
+test framework is fully aware of all topology operations and can
+clean up resources, including added servers, when tests end.
+Every test gets its own cluster, created when the test starts and
+destroyed when it ends, so tests never share or reuse a cluster.
+
+## Test metrics
+
+The parameter `--gather-metrics` is used to gather CPU/RAM usage during tests from the cgroup and the amount of IO the
+tested Scylla servers issued.
+For that, SQLite database is used to store the metrics in `testlog/sqlite_{HOST_ID}.db`.
+`HOST_ID` is taken from `$SCYLLA_TEST_HOST_ID`, or derived from the hostname and the current time when that is unset, so
+every `test.py` invocation writes its own database file.
+The database is created in the `testlog` directory and contains the following tables:
+
+- `host_info` - one row describing the machine: CPU model, physical core count and total RAM. Referenced through
+  `host_id` by the tables that are not tied to a single test; for the others the host is reached through `tests`
+- `tests` - contains the list of tests that were executed with information about the test name, directory, architecture,
+  and mode
+- `test_metrics` - contains the metrics for each test: memory peak usage, CPU usage, duration, outcome, and the IO the
+  test's Scylla servers issued (`seastar_read_bytes`, `seastar_read_ops`, `seastar_write_bytes`, `seastar_write_ops`)
+- `system_resource_metrics` - contains system CPU utilization in percent and memory figures in bytes, sampled during the
+  whole run
+- `cgroup_memory_metrics` - contains cgroup memory usage in bytes during the test run
+- `resource_utilization` - contains one final record per run with the average, the median, the p95, the p99 and the
+  score of the system CPU and memory utilization, for the run's architecture and mode. The score is the percentage of
+  the run spent between 80% and 90% utilization, the band a test run should hold the machine at. Only what was sampled
+  between the start of the first test and the end of the last one is summarized, so the preparation and the cleanup
+  around the tests do not drag the figures down; a run too short for a sample to fall in that interval is summarized
+  from everything it sampled instead, and a session that ran no test at all gets no record
+
+`host_info`, `tests` and the timing/outcome columns of `test_metrics` are written even with `--no-gather-metrics`, so
+every test is recorded; the flag only controls the cgroup and Scylla IO measurements. `system_resource_metrics`, and the
+`resource_utilization` summary derived from it, are written either way as well: they come from `psutil` and need no
+cgroup access.
+
+The `seastar_*` columns are the reactor's AIO counters (`scylla_reactor_aio_{reads,writes}` and
+`scylla_reactor_aio_bytes_{read,write}`), summed over every shard of every server still running at the end of the test.
+They count the IO Scylla submitted to its IO queue, which is what has to be measured here: tests run with
+`--kernel-page-cache 1 --unsafe-bypass-fsync 1`, so most of that IO never reaches a disk and does not show up in the
+kernel's own counters. Only tests using the `manager` fixture (`test/cluster`) have them; elsewhere they are NULL.
+
+`test.py` itself reports nowhere: the summary stays in the database, which is part of the test artifacts a build keeps.
+CI collects the row from there, together with the test results it already publishes, and stores it with the identity of
+the build that produced it, so that the utilization of a build can be compared with the builds before it.
+
+## Automation, CI, and Jenkins
+
+If any of the tests fails, `test.py` returns a non-zero exit status.
+A consolidated JUNIT XML report is written to
+`testlog/report/pytest_cpp_{HOST_ID}.xml`. This file is used
+by Jenkins to produce formatted build reports.
+
+If that's not enough, a debugging journey, similar to a local one, is
+available in CI if you navigate to 'Build artifacts' at the Jenkins build
+page. This will bring you to a folder with all the test logs, preserved by
+Jenkins in event of test failure.
+
+## Stability
+
+Testing is hard. Testing ScyllaDB is even harder, but we strive to ensure our testing
+suite is as solid as possible. The first step is contributing a stable (read: non-flaky) test.
+To do so, when developing tests, please run them (1) in debug mode and (2) 100 times in a row (using `--repeat 100`),
+and see that they pass successfully.
+
+## Allure reporting
+
+To make analyzing of the test results more convenient, an allure reporting tool is introduced.
+Python module allure-pytest is included in the toolchain image and an additional parameter added to gather allure
+data for the test run.
+However, the allure binary is not a part of the toolchain image.
+So to have the full benefit of the new reporting tool allure binary should be installed locally.
+
+### Allure installation
+
+To install allure tool, please follow [official documentation](https://allurereport.org/docs/install-for-linux/)
+
+**Note:** rpm package requires dependency `default-jre-headless` but on Fedora 38,39 none of the packages provides it.
+So manual installation of allure is required.
+
+### Basic allure usage
+
+1. Open directory with the test results, e.g. testlog/report/
+2. Execute allure serve to show report
+```shell
+$ allure serve -h localhost .
+```
+This will open the default system browser with an interactive allure report.
+
+For more information please refer to `allure -h` or [official documentation](https://allurereport.org/docs/)
+
+
+## See also
+
+For command line help and available options, please see also:
+
+        $ ./test.py --help
+

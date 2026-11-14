@@ -3,12 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #define BOOST_TEST_MODULE core
 
-#include <boost/range/algorithm/for_each.hpp>
+#include "utils/assert.hh"
 
 #include <seastar/util/variant_utils.hh>
 
@@ -27,9 +27,9 @@ void append_sequence(bytes_ostream& buf, int count) {
 
 void assert_sequence(bytes_ostream& buf, int count) {
     auto in = ser::as_input_stream(buf.linearize());
-    assert(buf.size() == count * sizeof(int));
+    SCYLLA_ASSERT(buf.size() == count * sizeof(int));
     for (int i = 0; i < count; i++) {
-        auto val = ser::deserialize(in, boost::type<int>());
+        auto val = ser::deserialize(in, std::type_identity<int>());
         BOOST_REQUIRE_EQUAL(val, i);
     }
 }
@@ -124,7 +124,7 @@ BOOST_AUTO_TEST_CASE(test_view) {
     BOOST_REQUIRE(buf.is_linearized());
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(1, ser::deserialize(in, boost::type<int>()));
+    BOOST_REQUIRE_EQUAL(1, ser::deserialize(in, std::type_identity<int>()));
 }
 
 BOOST_AUTO_TEST_CASE(test_writing_blobs) {
@@ -163,7 +163,7 @@ BOOST_AUTO_TEST_CASE(test_fragment_iteration) {
 
     // If this fails, we will only have one fragment, and the test will be weak.
     // Bump up the 'count' if this is triggered.
-    assert(!buf2.is_linearized());
+    SCYLLA_ASSERT(!buf2.is_linearized());
 
     assert_sequence(buf2, count);
 }
@@ -204,8 +204,8 @@ BOOST_AUTO_TEST_CASE(test_retraction_to_the_same_chunk) {
     BOOST_REQUIRE(buf.size() == sizeof(int) * 2);
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 2);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 2);
     BOOST_REQUIRE(in.size() == 0);
 }
 
@@ -221,8 +221,8 @@ BOOST_AUTO_TEST_CASE(test_no_op_retraction) {
     BOOST_REQUIRE(buf.size() == sizeof(int) * 2);
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 2);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 2);
     BOOST_REQUIRE(in.size() == 0);
 }
 
@@ -238,7 +238,7 @@ BOOST_AUTO_TEST_CASE(test_retraction_discarding_chunks) {
     BOOST_REQUIRE(buf.size() == sizeof(int));
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
     BOOST_REQUIRE(in.size() == 0);
 }
 
@@ -251,8 +251,8 @@ BOOST_AUTO_TEST_CASE(test_writing_placeholders) {
     ser::serialize(ph_stream, 1);
 
     auto in = ser::as_input_stream(buf.view());
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 1);
-    BOOST_REQUIRE_EQUAL(ser::deserialize(in, boost::type<int>()), 2);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 1);
+    BOOST_REQUIRE_EQUAL(ser::deserialize(in, std::type_identity<int>()), 2);
     BOOST_REQUIRE(in.size() == 0);
 }
 
@@ -323,5 +323,334 @@ BOOST_AUTO_TEST_CASE(test_remove_suffix) {
         auto a = tests::random::get_int(128 * 1024);
         auto b = tests::random::get_int(128 * 1024);
         test(std::max(a, b), std::min(a, b));
+    }
+}
+
+// Verifies that the move constructor updates the first chunk's backref
+// to point to the new _begin field. Regression test for a bug introduced
+// in 53e0dc7530 ("bytes_ostream: base on managed_bytes") where the move
+// constructor failed to update backref, causing heap corruption when
+// bytes_ostream objects are relocated (e.g., by chunked_vector migration).
+BOOST_AUTO_TEST_CASE(test_move_constructor_updates_backref) {
+    // Create a multi-chunk bytes_ostream
+    bytes_ostream buf;
+    append_sequence(buf, 1024);
+
+    // Verify precondition: buf has chunks
+    auto* first_chunk = buf.begin().extract_implementation().current_chunk;
+    BOOST_REQUIRE(first_chunk != nullptr);
+    BOOST_REQUIRE(first_chunk->backref != nullptr);
+    BOOST_REQUIRE_EQUAL(first_chunk->backref->ptr, first_chunk);
+
+    // Move to a new location
+    bytes_ostream buf2(std::move(buf));
+
+    // The first chunk's backref must now point to buf2's _begin, not buf's
+    auto* chunk_after_move = buf2.begin().extract_implementation().current_chunk;
+    BOOST_REQUIRE(chunk_after_move != nullptr);
+    BOOST_REQUIRE(chunk_after_move->backref != nullptr);
+    // Without the fix, backref still points to buf._begin which was zeroed
+    // by std::exchange, so backref->ptr would be nullptr
+    BOOST_REQUIRE_EQUAL(chunk_after_move->backref->ptr, chunk_after_move);
+
+    // Verify data integrity
+    assert_sequence(buf2, 1024);
+}
+
+// Simulate what chunked_vector migration does: move bytes_ostream objects
+// to a new memory location and overwrite the old location.
+// Without the backref fix, this causes a dangling pointer.
+BOOST_AUTO_TEST_CASE(test_backref_survives_relocation) {
+    alignas(bytes_ostream) char old_storage[sizeof(bytes_ostream)];
+
+    // Construct in controlled memory
+    auto* old_buf = new (old_storage) bytes_ostream();
+    append_sequence(*old_buf, 1024);
+
+    // Move to a new location (simulates chunked_vector migration)
+    bytes_ostream new_buf(std::move(*old_buf));
+    old_buf->~bytes_ostream();
+
+    // Overwrite old memory (simulates allocator reusing the freed chunk)
+    memset(old_storage, 0xde, sizeof(old_storage));
+
+    // Verify backref invariant still holds
+    auto* first_chunk = new_buf.begin().extract_implementation().current_chunk;
+    BOOST_REQUIRE(first_chunk != nullptr);
+    BOOST_REQUIRE(first_chunk->backref != nullptr);
+    BOOST_REQUIRE_EQUAL(first_chunk->backref->ptr, first_chunk);
+
+    // Verify data is still intact
+    assert_sequence(new_buf, 1024);
+}
+
+BOOST_AUTO_TEST_CASE(test_conversion_to_managed_bytes) {
+    bytes_ostream buf;
+    append_sequence(buf, 1024);
+    auto mb = std::move(buf).to_managed_bytes();
+    bytes_ostream buf2;
+    buf2.write(to_bytes(mb));
+    assert_sequence(buf2, 1024);
+}
+
+BOOST_AUTO_TEST_CASE(test_write_managed_bytes_view) {
+    // Generate data for test
+    int count = 25000;
+    managed_bytes source_bytes(managed_bytes::initialized_later(), sizeof(long) * count);
+    managed_bytes_mutable_view source_bytes_mutable_view(source_bytes);
+    for (long num = 0; num < count; num++) {
+        write<long>(source_bytes_mutable_view, tests::random::get_int<long>());
+    }
+
+    // Verify writing managed_bytes_view into bytes_ostream works
+    bytes_ostream buf1;
+    managed_bytes_view source_bytes_view(source_bytes);
+    buf1.write(source_bytes_view);
+    BOOST_REQUIRE(std::move(buf1).to_managed_bytes() == source_bytes);
+
+    // Verify writing works when there is space left in the stream's current chunk
+    bytes_ostream buf2(1024);
+    // Partial write - this will create a chunk but it will not be full after write
+    size_t bytes_to_write = 10;
+    buf2.write(source_bytes_view.prefix(10));
+    source_bytes_view.remove_prefix(bytes_to_write);
+    // Verify write
+    BOOST_REQUIRE(buf2.size_bytes() == bytes_to_write);
+    // Now write the remaining bytes into buffer and verify the write
+    buf2.write(source_bytes_view);
+    BOOST_REQUIRE(std::move(buf2).to_managed_bytes() == source_bytes);
+}
+
+BOOST_AUTO_TEST_CASE(test_equality_empty) {
+    bytes_ostream empty1, empty2;
+    BOOST_REQUIRE(empty1 == empty2);
+
+    bytes_ostream full;
+    full.write(bytes("abc"));
+    BOOST_REQUIRE(!(empty1 == full));
+    BOOST_REQUIRE(!(full == empty1));
+
+    bytes_ostream cleared;
+    cleared.write(bytes("xyz"));
+    cleared.clear();
+    BOOST_REQUIRE(!(cleared == full));
+    BOOST_REQUIRE(!(full == cleared));
+    BOOST_REQUIRE(cleared == empty1);
+    BOOST_REQUIRE(empty1 == cleared);
+
+    // Same content, different fragment boundaries.
+    bytes_ostream a(4), b(16);
+    bytes data("0123456789abcdefghijklmnopqrstuvwxyz");
+    for (size_t i = 0; i < data.size(); i += 3) {
+        a.write(bytes_view(data).substr(i, 3));
+    }
+    for (size_t i = 0; i < data.size(); i += 10) {
+        b.write(bytes_view(data).substr(i, 10));
+    }
+    BOOST_REQUIRE(a == b);
+    BOOST_REQUIRE(b == a);
+
+    bytes_ostream c;
+    bytes other = data;
+    other[data.size() - 1] ^= 1;
+    c.write(other);
+    BOOST_REQUIRE(!(a == c));
+    BOOST_REQUIRE(!(c == a));
+}
+
+BOOST_AUTO_TEST_CASE(test_equality_leading_empty_chunk) {
+    bytes data(100, 'a');
+    bytes_ostream expected;
+    expected.write(data);
+
+    // clear() keeps a zero-length first chunk; the next write is chained after it.
+    bytes_ostream a(4);
+    a.write(bytes("abc"));
+    a.clear();
+    memcpy(a.write_place_holder(data.size()), data.data(), data.size());
+    BOOST_REQUIRE((*a.fragments().begin()).empty());
+    BOOST_REQUIRE(a == expected);
+    BOOST_REQUIRE(expected == a);
+
+    bytes other = data;
+    other.back() ^= 1;
+    bytes_ostream c;
+    c.write(other);
+    BOOST_REQUIRE(!(a == c));
+    BOOST_REQUIRE(!(c == a));
+}
+
+BOOST_AUTO_TEST_CASE(test_equality_after_retract_and_remove_suffix) {
+    bytes data("0123456789abcdefghijklmnopqrstuvwxyz");
+    bytes_view head = bytes_view(data).substr(0, 12);
+
+    bytes_ostream expected(16);
+    expected.write(head);
+
+    bytes_ostream a(4);
+    for (size_t i = 0; i < 12; i += 3) {
+        a.write(bytes_view(data).substr(i, 3));
+    }
+    auto pos = a.pos();
+    for (size_t i = 12; i < data.size(); i += 3) {
+        a.write(bytes_view(data).substr(i, 3));
+    }
+    a.retract(pos);
+    BOOST_REQUIRE(a == expected);
+    BOOST_REQUIRE(expected == a);
+    a.write(bytes("x"));
+    BOOST_REQUIRE(!(a == expected));
+    BOOST_REQUIRE(!(expected == a));
+
+    bytes_ostream b(8);
+    for (size_t i = 0; i < data.size(); i += 5) {
+        b.write(bytes_view(data).substr(i, 5));
+    }
+    b.remove_suffix(data.size() - head.size());
+    BOOST_REQUIRE(b == expected);
+    BOOST_REQUIRE(expected == b);
+    b.remove_suffix(head.size());
+    BOOST_REQUIRE(b == bytes_ostream());
+    BOOST_REQUIRE(bytes_ostream() == b);
+}
+
+static size_t count_fragments(const bytes_ostream& b) {
+    return std::ranges::distance(b.fragments());
+}
+
+static bytes write_in_pieces(bytes_ostream& buf, size_t n, size_t piece) {
+    auto data = tests::random::get_bytes(n);
+    for (size_t off = 0; off < n; off += piece) {
+        buf.write(bytes_view(data).substr(off, piece));
+    }
+    return data;
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_single_chunk) {
+    bytes_ostream buf;
+    buf.reserve(3000);
+    BOOST_REQUIRE(buf.empty());
+    auto data = write_in_pieces(buf, 3000, 7);
+    BOOST_REQUIRE(buf.is_linearized());
+    BOOST_REQUIRE_EQUAL(count_fragments(buf), 1);
+    BOOST_REQUIRE_EQUAL(bytes(buf.view()), data);
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_write_past_reservation) {
+    bytes_ostream buf;
+    buf.reserve(1000);
+    auto data = write_in_pieces(buf, 2500, 100);
+    BOOST_REQUIRE(!buf.is_linearized());
+    BOOST_REQUIRE_EQUAL(buf.size(), 2500);
+    BOOST_REQUIRE_EQUAL(bytes(buf.linearize()), data);
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_non_empty_is_noop) {
+    bytes_ostream buf;
+    auto data = write_in_pieces(buf, 10, 10);
+    buf.reserve(100000);
+    BOOST_REQUIRE_EQUAL(count_fragments(buf), 1);
+    BOOST_REQUIRE_EQUAL(buf.size(), 10);
+    BOOST_REQUIRE_EQUAL(bytes(buf.view()), data);
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_zero) {
+    bytes_ostream buf;
+    buf.reserve(0);
+    BOOST_REQUIRE(buf.empty());
+    BOOST_REQUIRE_EQUAL(count_fragments(buf), 0);
+    auto data = write_in_pieces(buf, 100, 100);
+    BOOST_REQUIRE_EQUAL(bytes(buf.view()), data);
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_capped_at_max_chunk_size) {
+    bytes_ostream buf;
+    size_t n = bytes_ostream::max_chunk_size() * 2 + 5;
+    buf.reserve(n);
+    auto data = write_in_pieces(buf, n, 1000);
+    BOOST_REQUIRE_EQUAL(count_fragments(buf), 3);
+    BOOST_REQUIRE_EQUAL(bytes(buf.linearize()), data);
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_exact_max_chunk_size) {
+    bytes_ostream buf;
+    buf.reserve(bytes_ostream::max_chunk_size());
+    auto data = write_in_pieces(buf, bytes_ostream::max_chunk_size(), 1000);
+    BOOST_REQUIRE_EQUAL(count_fragments(buf), 1);
+    BOOST_REQUIRE_EQUAL(bytes(buf.view()), data);
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_to_managed_bytes_partial) {
+    bytes_ostream buf;
+    buf.reserve(4096);
+    auto data = write_in_pieces(buf, 1234, 50);
+    BOOST_REQUIRE(std::move(buf).to_managed_bytes() == managed_bytes(data));
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_clear_retract_remove_suffix) {
+    bytes_ostream buf;
+    buf.reserve(1000);
+    auto data = write_in_pieces(buf, 600, 600);
+    auto pos = buf.pos();
+    write_in_pieces(buf, 300, 300);
+    buf.retract(pos);
+    BOOST_REQUIRE_EQUAL(bytes(buf.view()), data);
+    buf.remove_suffix(100);
+    BOOST_REQUIRE_EQUAL(bytes(buf.view()), bytes(bytes_view(data).substr(0, 500)));
+    buf.clear();
+    BOOST_REQUIRE(buf.empty());
+    auto data2 = write_in_pieces(buf, 1000, 1000);
+    BOOST_REQUIRE_EQUAL(count_fragments(buf), 1);
+    BOOST_REQUIRE_EQUAL(bytes(buf.view()), data2);
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_untouched_to_managed_bytes) {
+    bytes_ostream buf;
+    buf.reserve(100);
+    BOOST_REQUIRE(std::move(buf).to_managed_bytes().empty());
+}
+
+BOOST_AUTO_TEST_CASE(test_reserve_untouched_equality) {
+    bytes_ostream reserved;
+    reserved.reserve(100);
+    bytes_ostream full;
+    full.write(bytes("abc"));
+    BOOST_REQUIRE(!(reserved == full));
+    BOOST_REQUIRE(!(full == reserved));
+    BOOST_REQUIRE(reserved == bytes_ostream());
+    BOOST_REQUIRE(bytes_ostream() == reserved);
+}
+
+// Deserializing a bytes field into a bytes_ostream must yield one chunk.
+BOOST_AUTO_TEST_CASE(test_deserialize_bytes_ostream_single_chunk) {
+    for (size_t n : {size_t(600), size_t(5000), size_t(100000), size_t(300000)}) {
+        auto data = tests::random::get_bytes(n);
+        bool fits = n <= bytes_ostream::max_chunk_size();
+
+        bytes_ostream out;
+        ser::serialize(out, bytes_view(data));
+
+        // Simple input stream.
+        {
+            auto lin = bytes_ostream(out);
+            auto in = ser::as_input_stream(lin.linearize());
+            auto res = ser::deserialize(in, std::type_identity<bytes_ostream>());
+            BOOST_REQUIRE(!fits || res.is_linearized());
+            BOOST_REQUIRE_EQUAL(bytes(res.linearize()), data);
+        }
+
+        // Fragmented input stream: build a many-fragment source.
+        {
+            bytes_ostream frag(64);
+            bytes all(out.linearize());
+            for (size_t off = 0; off < all.size(); off += 64) {
+                frag.write(bytes_view(all).substr(off, 64));
+            }
+            BOOST_REQUIRE(!frag.is_linearized());
+            auto in = ser::as_input_stream(frag);
+            auto res = ser::deserialize(in, std::type_identity<bytes_ostream>());
+            BOOST_REQUIRE(!fits || res.is_linearized());
+            BOOST_REQUIRE_EQUAL(bytes(res.linearize()), data);
+        }
     }
 }

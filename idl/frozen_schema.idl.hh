@@ -3,8 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+
+#include "mutation/canonical_mutation.hh"
+#include "schema/schema_mutations.hh"
+#include "schema/frozen_schema.hh"
+
+#include "idl/uuid.idl.hh"
 
 class canonical_mutation final {
     bytes representation();
@@ -22,7 +28,7 @@ class schema_mutations {
 };
 
 class schema stub [[writable]] {
-    utils::UUID version;
+    table_schema_version version;
     schema_mutations mutations;
 };
 

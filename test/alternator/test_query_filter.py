@@ -1,15 +1,18 @@
 # Copyright 2020-present ScyllaDB
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 # Tests for the QueryFilter parameter of the Query operation.
 # QueryFilter is the older version of the newer FilterExpression syntax,
 # which is tested in test_filter_expression.py.
 
+import random
+
 import pytest
 from botocore.exceptions import ClientError
-import random
-from util import full_query, full_query_and_counts, random_string, random_bytes
+
+from test.alternator.util import full_query, full_query_and_counts, random_string, random_bytes
+
 
 # The test_table_sn_with_data fixture is the regular test_table_sn fixture
 # with a partition inserted with 20 items. The sort key 'c' of the items
@@ -80,7 +83,7 @@ def test_table_sn_with_data(test_table_sn):
 # must use KeyCondition or KeyConditionExpression instead.
 # In the first test we don't use a KeyCondition at all and get a generic
 # error message about Query always needing one. In the second test we do
-# have a KeyCondition plus a (redundent) QueryFilter on the key attribute,
+# have a KeyCondition plus a (redundant) QueryFilter on the key attribute,
 # and that isn't allowed either.
 def test_query_filter_partition_key_1(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
@@ -99,6 +102,18 @@ def test_query_filter_partition_key_2(test_table_sn_with_data):
 def test_query_filter_sort_key(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
     with pytest.raises(ClientError, match='ValidationException.* key '):
+        full_query(table,
+            KeyConditions={ 'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ' }},
+            QueryFilter={ 'c': { 'AttributeValueList': [3], 'ComparisonOperator': 'EQ' }})
+
+# The error for a filter on a key attribute names the parameter which carried
+# that filter. Both DynamoDB and Alternator name the legacy parameter
+# "QueryFilter" here, as opposed to "Filter expression" for a FilterExpression
+# (see test_filter_expression.py), so pin the name down - the two branches are
+# easy to confuse.
+def test_query_filter_key_attribute_names_the_parameter(test_table_sn_with_data):
+    table, p, items = test_table_sn_with_data
+    with pytest.raises(ClientError, match='ValidationException.*QueryFilter can only contain'):
         full_query(table,
             KeyConditions={ 'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ' }},
             QueryFilter={ 'c': { 'AttributeValueList': [3], 'ComparisonOperator': 'EQ' }})
@@ -400,7 +415,7 @@ def test_query_filter_null(test_table_sn_with_data):
 # Operator names are case sensitive. "EQ" is fine, "eq" is not.
 def test_query_filter_case_sensitive(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
-    with pytest.raises(ClientError, match='ValidationException.*eq'):
+    with pytest.raises(ClientError, match='ValidationException.*comparison'):
         full_query(table,
             KeyConditions={ 'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ' }},
             QueryFilter={ 'i': { 'AttributeValueList': [3], 'ComparisonOperator': 'eq' }})
@@ -408,7 +423,7 @@ def test_query_filter_case_sensitive(test_table_sn_with_data):
 # Obviously, an unknown operators is an error too.
 def test_query_filter_unknown_operator(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
-    with pytest.raises(ClientError, match='ValidationException.*DOG'):
+    with pytest.raises(ClientError, match='ValidationException.*comparison'):
         full_query(table,
             KeyConditions={ 'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ' }},
             QueryFilter={ 'i': { 'AttributeValueList': [3], 'ComparisonOperator': 'DOG' }})
@@ -461,7 +476,7 @@ def test_query_filter_or(test_table_sn_with_data):
 def test_query_filter_invalid_conditional_operator(test_table_sn_with_data):
     table, p, items = test_table_sn_with_data
     for conditional_operator in ['DOG', 'and']:
-        with pytest.raises(ClientError, match='ValidationException.*'+conditional_operator):
+        with pytest.raises(ClientError, match='ValidationException'):
             full_query(table,
                 KeyConditions={ 'p': { 'AttributeValueList': [p], 'ComparisonOperator': 'EQ' }},
                 QueryFilter={ 'i': { 'AttributeValueList': [1], 'ComparisonOperator': 'EQ' },
@@ -543,7 +558,7 @@ def test_query_filter_and_attributes_to_get(test_table):
     # Note that:
     # 1. Exactly one item matches the filter on x
     # 2. The returned record for that item will include *only* the attribute y
-    #    as requestd by AttributesToGet. It won't include x - it was just
+    #    as requested by AttributesToGet. It won't include x - it was just
     #    needed for the filter, but didn't appear in ProjectionExpression.
     expected_items = [{'y': 'horse'}]
     assert(got_items == expected_items)
@@ -551,7 +566,6 @@ def test_query_filter_and_attributes_to_get(test_table):
 # Test that a QueryFilter and Select=COUNT may be given together. Namely,
 # test that QueryFilter may inspect attributes which will not be returned
 # by the query, because the responses are just counted.
-@pytest.mark.xfail(reason="Select not supported yet - #5058")
 def test_query_filter_and_select_count(test_table):
     p = random_string()
     test_table.put_item(Item={'p': p, 'c': 'hi', 'x': 'dog', 'y': 'cat'})

@@ -3,14 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include <algorithm>
+#include <vector>
 #include <seastar/core/sharded.hh>
-#include "utils/UUID.hh"
+#include "dht/i_partitioner_fwd.hh"
+#include "dht/token.hh"
+#include "schema/schema_fwd.hh"
 #include "sstables/shared_sstable.hh"
+#include "tasks/task_manager.hh"
+#include "db/consistency_level_type.hh"
+#include "locator/tablets.hh"
+#include "service/topology_guard.hh"
+#include "utils/assert.hh"
 
 using namespace seastar;
 
@@ -18,23 +27,88 @@ namespace replica {
 class database;
 }
 
+struct minimal_sst_info;
+class download_progress;
+class tablet_restore_progress;
+struct restore_result {
+};
+
+namespace sstables { class storage_manager; }
+
 namespace netw { class messaging_service; }
 namespace db {
 class system_distributed_keyspace;
 namespace view {
-class view_update_generator;
+class view_builder;
+class view_building_worker;
 }
 }
+namespace service {
+class storage_service;
+}
+namespace locator {
+class effective_replication_map;
+class tablet_metadata_guard;
+}
+
+// A single backup location for tablet-aware restore: where in the object
+// storage the sstables of one datacenter's backup live, and the datacenter
+// of the restored cluster they are to be loaded into.
+struct tablet_restore_location {
+    sstring datacenter;
+    sstring endpoint;
+    sstring bucket;
+    sstring prefix;
+    utils::chunked_vector<sstring> manifests;
+};
+
+struct stream_progress {
+    float total = 0.;
+    float completed = 0.;
+
+    virtual ~stream_progress() = default;
+    stream_progress& operator+=(const stream_progress& p) {
+        total += p.total;
+        completed += p.completed;
+        return *this;
+    }
+    void start(float amount) {
+        SCYLLA_ASSERT(amount >= 0);
+        total = amount;
+    }
+    virtual void advance(float amount) {
+        // we should not move backward
+        SCYLLA_ASSERT(amount >= 0);
+        completed += amount;
+        // Clamp to total to absorb floating point rounding errors from
+        // fractional progress contributions (e.g. per-tablet progress
+        // computed as num_streamed / num_mapped).
+        completed = std::min(completed, total);
+    }
+};
 
 // The handler of the 'storage_service/load_new_ss_tables' endpoint which, in
 // turn, is the target of the 'nodetool refresh' command.
 // Gets sstables from the upload directory and makes them available in the
 // system. Built on top of the distributed_loader functionality.
 class sstables_loader : public seastar::peering_sharded_service<sstables_loader> {
+public:
+    enum class stream_scope { all, dc, rack, node };
+    class task_manager_module : public tasks::task_manager::module {
+        public:
+            task_manager_module(tasks::task_manager& tm) noexcept : tasks::task_manager::module(tm, "sstables_loader") {}
+    };
+
+private:
     sharded<replica::database>& _db;
-    sharded<db::system_distributed_keyspace>& _sys_dist_ks;
-    sharded<db::view::view_update_generator>& _view_update_generator;
+    sharded<service::storage_service>& _ss;
     netw::messaging_service& _messaging;
+    sharded<db::view::view_builder>& _view_builder;
+    sharded<db::view::view_building_worker>& _view_building_worker;
+    shared_ptr<task_manager_module> _task_manager_module;
+    sstables::storage_manager& _storage_manager;
+    db::system_distributed_keyspace& _sys_dist_ks;
+    seastar::scheduling_group _sched_group;
 
     // Note that this is obviously only valid for the current shard. Users of
     // this facility should elect a shard to be the coordinator based on any
@@ -45,20 +119,36 @@ class sstables_loader : public seastar::peering_sharded_service<sstables_loader>
     bool _loading_new_sstables = false;
 
     future<> load_and_stream(sstring ks_name, sstring cf_name,
-            utils::UUID table_id, std::vector<sstables::shared_sstable> sstables,
-            bool primary_replica_only);
+            table_id, std::vector<sstables::shared_sstable> sstables,
+            bool_class<struct primary_replica_only_tag> primary_replica_only, bool unlink_sstables, stream_scope scope,
+            shared_ptr<stream_progress> progress);
+
+    // Downloads the sstables from the object store and streams them with load_and_stream()
+    // on every shard, reporting through the progress. Called on the shard that owns the task.
+    future<> download_and_stream(download_progress& progress, const sstring& endpoint, const sstring& bucket, const sstring& ks, const sstring& cf,
+            const sstring& prefix, const std::vector<sstring>& sstable_names, stream_scope scope, bool_class<struct primary_replica_only_tag> primary_replica, abort_source& as);
+
+    // Pins the table at tablet_count tablets, restores them from the snapshot and alters the table back
+    // to its original hints. Called on the shard that owns the task.
+    future<> do_restore_tablets(tablet_restore_progress& progress, table_id, const sstring& snap_name, size_t tablet_count,
+            std::optional<size_t> original_min_tablet_count, std::optional<size_t> original_max_tablet_count);
+
+    future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
+    future<> download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard&);
+    future<sstables::shared_sstable> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
 
 public:
     sstables_loader(sharded<replica::database>& db,
-            sharded<db::system_distributed_keyspace>& sys_dist_ks,
-            sharded<db::view::view_update_generator>& view_update_generator,
-            netw::messaging_service& messaging)
-        : _db(db)
-        , _sys_dist_ks(sys_dist_ks)
-        , _view_update_generator(view_update_generator)
-        , _messaging(messaging)
-    {
-    }
+            sharded<service::storage_service>& ss,
+            netw::messaging_service& messaging,
+            sharded<db::view::view_builder>& vb,
+            sharded<db::view::view_building_worker>& vbw,
+            tasks::task_manager& tm,
+            sstables::storage_manager& sstm,
+            db::system_distributed_keyspace& sys_dist_ks,
+            seastar::scheduling_group sg);
+
+    future<> stop();
 
     /**
      * Load new SSTables not currently tracked by the system
@@ -70,8 +160,67 @@ public:
      *
      * @param ks_name the keyspace in which to search for new SSTables.
      * @param cf_name the column family in which to search for new SSTables.
+     * @param load_and_stream load SSTables that do not belong to this node and stream them to the appropriate nodes.
+     * @param primary_replica_only whether to stream only to the primary replica that owns the data.
+     * @param skip_cleanup whether to skip the cleanup step when loading SSTables.
+     * @param skip_reshape whether to skip the reshape step when loading SSTables.
      * @return a future<> when the operation finishes.
      */
     future<> load_new_sstables(sstring ks_name, sstring cf_name,
-            bool load_and_stream, bool primary_replica_only);
+            bool load_and_stream, bool primary_replica_only, bool skip_cleanup, bool skip_reshape, stream_scope scope);
+
+    /**
+     * Download new SSTables not currently tracked by the system from object store
+     */
+    future<tasks::task_id> download_new_sstables(sstring ks_name, sstring cf_name,
+            sstring prefix, std::vector<sstring> sstables,
+            sstring endpoint, sstring bucket, stream_scope scope, bool primary_replica);
+
+    // Takes one backup location per datacenter the keyspace replicates to.
+    future<tasks::task_id> restore_tablets(table_id, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations);
+
+    replica::database& local_db() {
+        return _db.local();
+    }
 };
+
+template <>
+struct fmt::formatter<sstables_loader::stream_scope> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const sstables_loader::stream_scope a, FormatContext& ctx) const {
+        using enum sstables_loader::stream_scope;
+        switch (a) {
+        case all:
+            return formatter<string_view>::format("all", ctx);
+        case dc:
+            return formatter<string_view>::format("dc", ctx);
+        case rack:
+            return formatter<string_view>::format("rack", ctx);
+        case node:
+            return formatter<string_view>::format("node", ctx);
+        }
+    }
+};
+
+struct tablet_sstable_collection {
+    dht::token_range tablet_range;
+    std::vector<sstables::shared_sstable> sstables_fully_contained;
+    std::vector<sstables::shared_sstable> sstables_partially_contained;
+};
+
+// This function is intended for test purposes only.
+// It assigns the given sstables to the given tablet ranges based on token containment.
+// It returns a vector of tablet_sstable_collection, each containing the tablet range
+// and the sstables that are fully or partially contained within that range.
+// The prerequisite is the tablet ranges are sorted by the range in ascending order and non-overlapping.
+// Another prerequisite is that the sstables' token ranges are sorted by its `start` in descending order.
+future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_tests(const std::vector<sstables::shared_sstable>& sstables,
+                                                                                  std::vector<dht::token_range>&& tablets_ranges);
+
+struct manifest_summary {
+    size_t tablet_count;
+    size_t nr_sstables;
+};
+
+// Manifests coming from a datacenter other than the expected one are rejected.
+future<manifest_summary> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring keyspace, sstring table, sstring endpoint, sstring bucket, sstring prefix, sstring expected_snapshot_name, sstring expected_datacenter, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl = db::consistency_level::QUORUM);

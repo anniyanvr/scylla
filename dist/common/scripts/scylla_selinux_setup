@@ -5,12 +5,11 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 import os
 import sys
-import subprocess
-from scylla_util import *
+from scylla_util import is_redhat_variant, out, sysconfig_parser
 from subprocess import run
 
 if __name__ == '__main__':
@@ -22,7 +21,7 @@ if __name__ == '__main__':
         print("scylla_selinux_setup only supports Red Hat variants")
         sys.exit(0)
 
-    res = run('sestatus', shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+    res = out('sestatus')
     if res.split(None)[2] != 'disabled':
         run('setenforce 0', shell=True, check=True)
         cfg = sysconfig_parser('/etc/sysconfig/selinux')

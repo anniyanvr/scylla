@@ -3,18 +3,15 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include <vector>
-#include <boost/dynamic_bitset.hpp>
-#include "schema_fwd.hh"
+#include <boost/dynamic_bitset.hpp>  // IWYU pragma: keep
+#include "cdc/log.hh"
 #include "replica/database_fwd.hh"
-#include "timestamp.hh"
-#include "bytes.hh"
-#include <seastar/util/noncopyable_function.hh>
+#include "mutation/timestamp.hh"
 
 class mutation;
 
@@ -71,7 +68,7 @@ public:
     virtual void end_record() = 0;
 };
 
-bool should_split(const mutation& base_mutation);
+bool should_split(const mutation& base_mutation, const per_request_options& options);
 void process_changes_with_splitting(const mutation& base_mutation, change_processor& processor,
         bool enable_preimage, bool enable_postimage);
 void process_changes_without_splitting(const mutation& base_mutation, change_processor& processor,

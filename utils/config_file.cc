@@ -4,17 +4,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <unordered_map>
-#include <regex>
 
 #include <yaml-cpp/yaml.h>
 
 #include <boost/program_options.hpp>
-#include <boost/any.hpp>
-#include <boost/range/adaptor/filtered.hpp>
 
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
@@ -22,11 +19,13 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/defer.hh>
 
 #include <seastar/json/json_elements.hh>
+
+#include <ranges>
 
 #include "config_file.hh"
 #include "config_file_impl.hh"
@@ -199,7 +198,13 @@ utils::config_type::to_json(const void* value) const {
 
 bool
 utils::config_file::config_src::matches(std::string_view name) const {
-    if (_name == name) {
+    // The below line provides support for option names in the "long_name,short_name" format,
+    // such as "workdir,W". We only want the long name ("workdir") to be used in the YAML.
+    // But since at some point (due to a bug) the YAML config parser expected the silly
+    // double form ("workdir,W") instead, we support both for backward compatibility.
+    std::string_view long_name = _name.substr(0, _name.find_first_of(','));
+
+    if (_name == name || long_name == name) {
         return true;
     }
     if (!_alias.empty() && _alias == name) {
@@ -220,7 +225,7 @@ sstring utils::hyphenate(const std::string_view& v) {
 }
 
 utils::config_file::config_file(std::initializer_list<cfg_ref> cfgs)
-    : _cfgs(cfgs)
+    : _cfgs(cfgs), _initialization_completed(false)
 {}
 
 void utils::config_file::add(cfg_ref cfg, std::unique_ptr<any_value> value) {
@@ -228,7 +233,7 @@ void utils::config_file::add(cfg_ref cfg, std::unique_ptr<any_value> value) {
         throw std::runtime_error("Can only add config_src to config_file during initialization");
     }
     _cfgs.emplace_back(cfg);
-    auto undo = defer([&] { _cfgs.pop_back(); });
+    auto undo = defer([&] noexcept { _cfgs.pop_back(); });
     cfg.get()._per_shard_values_offset = _per_shard_values[0].size();
     _per_shard_values[0].emplace_back(std::move(value));
     undo.cancel();
@@ -257,6 +262,17 @@ bpo::options_description_easy_init&
 utils::config_file::add_options(bpo::options_description_easy_init& init) {
     for (config_src& src : _cfgs) {
         if (src.status() == value_status::Used) {
+            src.add_command_line_option(init);
+        }
+    }
+    return init;
+}
+
+
+bpo::options_description_easy_init&
+utils::config_file::add_deprecated_options(bpo::options_description_easy_init& init) {
+    for (config_src& src : _cfgs) {
+        if (src.status() == value_status::Deprecated) {
             src.add_command_line_option(init);
         }
     }
@@ -299,6 +315,9 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
             continue;
         }
         switch (cfg.status()) {
+        case value_status::Deprecated:
+            h(label, "Option is deprecated", cfg.status());
+            continue;
         case value_status::Invalid:
             h(label, "Option is not applicable", cfg.status());
             continue;
@@ -311,7 +330,12 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
         }
         // Still, a syntax error is an error warning, not a fail
         try {
-            cfg.set_value(node.second);
+            cfg.set_value(node.second, this->_initialization_completed ? config_source::SettingsFile : config_source::None);
+        } catch (const retired_config_value_error&) {
+            // A retired/removed option value is a hard misconfiguration: let it
+            // propagate so startup fails with a readable error, instead of being
+            // downgraded to a warning like ordinary parse errors.
+            throw;
         } catch (std::exception& e) {
             h(label, e.what(), cfg.status());
         } catch (...) {
@@ -321,9 +345,9 @@ void utils::config_file::read_from_yaml(const char* yaml, error_handler h) {
 }
 
 utils::config_file::configs utils::config_file::set_values() const {
-    return boost::copy_range<configs>(_cfgs | boost::adaptors::filtered([] (const config_src& cfg) {
+    return _cfgs | std::views::filter([] (const config_src& cfg) {
         return cfg.status() > value_status::Used || cfg.source() > config_source::None;
-    }));
+    }) | std::ranges::to<configs>();
 }
 
 utils::config_file::configs utils::config_file::unset_values() const {
@@ -345,6 +369,11 @@ future<> utils::config_file::read_from_file(file f, error_handler h) {
         return do_with(make_file_input_stream(f), [this, s, h](input_stream<char>& in) {
             return in.read_exactly(s).then([this, h](temporary_buffer<char> buf) {
                read_from_yaml(sstring(buf.begin(), buf.end()), h);
+                if (!_initialization_completed) {
+                    // Boolean value set on only one shard, but broadcast_to_all_shards().get() called later
+                    // in main.cc will apply the required memory barriers anyway.
+                    _initialization_completed = true;
+                }
             });
         });
     });
@@ -358,8 +387,8 @@ future<> utils::config_file::read_from_file(const sstring& filename, error_handl
 
 future<> utils::config_file::broadcast_to_all_shards() {
     return async([this] {
-        if (_per_shard_values.size() != smp::count) {
-            _per_shard_values.resize(smp::count);
+        if (_per_shard_values.size() != this_smp_shard_count()) {
+            _per_shard_values.resize(this_smp_shard_count());
             smp::invoke_on_all([this] {
                 auto cpu = this_shard_id();
                 if (cpu != 0) {
@@ -403,9 +432,7 @@ future<> utils::config_file::broadcast_to_all_shards() {
     });
 }
 
-sstring utils::config_file::config_src::source_name() const noexcept {
-    auto src = source();
-
+sstring utils::config_source_name(utils::config_file::config_source src) noexcept {
     switch (src) {
     case utils::config_file::config_source::None:
         return "default";
@@ -417,7 +444,29 @@ sstring utils::config_file::config_src::source_name() const noexcept {
         return "internal";
     case utils::config_file::config_source::CQL:
         return "cql";
+    case utils::config_file::config_source::API:
+        return "api";
+    case utils::config_file::config_source::ClusterConfig:
+        return "cluster_config";
     }
 
+    __builtin_unreachable();
+}
+
+sstring utils::config_file::config_src::source_name() const noexcept {
+    return config_source_name(source());
+}
+
+std::string_view utils::config_file::config_src::status_name() const noexcept {
+    switch (status()) {
+    case utils::config_file::value_status::Used:
+        return "used";
+    case utils::config_file::value_status::Unused:
+        return "unused";
+    case utils::config_file::value_status::Invalid:
+        return "invalid";
+    case utils::config_file::value_status::Deprecated:
+        return "deprecated";
+    }
     __builtin_unreachable();
 }

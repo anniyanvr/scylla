@@ -3,13 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "mutation_reader.hh"
-#include "memtable.hh"
+#include "readers/combined.hh"
+#include "readers/mutation_reader.hh"
+#include "replica/memtable.hh"
 #include "utils/phased_barrier.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include <seastar/core/circular_buffer.hh>
@@ -21,7 +22,7 @@
 // Must be destroyed in a seastar thread.
 class memtable_snapshot_source {
     schema_ptr _s;
-    circular_buffer<lw_shared_ptr<memtable>> _memtables;
+    circular_buffer<lw_shared_ptr<replica::memtable>> _memtables;
     utils::phased_barrier _apply;
     bool _closed = false;
     seastar::condition_variable _should_compact;
@@ -30,10 +31,10 @@ private:
     bool should_compact() const {
         return !_closed && _memtables.size() >= 3;
     }
-    lw_shared_ptr<memtable> new_memtable() {
-        return make_lw_shared<memtable>(_s);
+    lw_shared_ptr<replica::memtable> new_memtable() {
+        return make_lw_shared<replica::memtable>(_s);
     }
-    lw_shared_ptr<memtable> pending() {
+    lw_shared_ptr<replica::memtable> pending() {
         if (_memtables.empty()) {
             _memtables.push_back(new_memtable());
             on_new_memtable();
@@ -51,22 +52,21 @@ private:
         }
         auto count = _memtables.size();
         auto op = _apply.start();
-        auto new_mt = make_lw_shared<memtable>(_s);
+        auto new_mt = make_lw_shared<replica::memtable>(_s);
         tests::reader_concurrency_semaphore_wrapper semaphore;
         auto permit = semaphore.make_permit();
-        std::vector<flat_mutation_reader_v2> readers;
+        std::vector<mutation_reader> readers;
         for (auto&& mt : _memtables) {
-            readers.push_back(upgrade_to_v2(mt->make_flat_reader(new_mt->schema(),
+            readers.push_back(mt->make_mutation_reader(new_mt->schema(),
                  permit,
                  query::full_partition_range,
                  new_mt->schema()->full_slice(),
-                 default_priority_class(),
                  nullptr,
                  streamed_mutation::forwarding::no,
-                 mutation_reader::forwarding::yes)));
+                 mutation_reader::forwarding::yes));
         }
         _memtables.push_back(new_memtable());
-        auto&& rd = downgrade_to_v1(make_combined_reader(new_mt->schema(), permit, std::move(readers)));
+        auto&& rd = make_combined_reader(new_mt->schema(), permit, std::move(readers));
         auto close_rd = deferred_close(rd);
         consume_partitions(rd, [&] (mutation&& m) {
             new_mt->apply(std::move(m));
@@ -78,11 +78,24 @@ private:
 public:
     memtable_snapshot_source(schema_ptr s)
         : _s(s)
+        , _apply("memtable_snapshot_source::apply")
         , _compactor(seastar::async([this] () noexcept {
             while (!_closed) {
-                // condition_variable::wait() also allocates memory
-                memory::scoped_critical_alloc_section dfg;
-                _should_compact.wait().get();
+                std::optional<future<>> f;
+                {
+                    memory::scoped_critical_alloc_section dfg;
+                    // condition_variable::wait() also allocates memory
+                    f = _should_compact.wait();
+                }
+
+                // Waiting on the future should not be covered by critical section.
+                f->get();
+
+                // compact() creates a reader_concurrency_semaphore_wrapper whose destructor
+                // calls stop().get(), which may yield. Holding scoped_critical_alloc_section
+                // across a yield point leaks the critical section counter to other fibers
+                // scheduled by the reactor, which corrupts with_allocation_failures() counting
+                // in test fibers. See: https://scylladb.atlassian.net/browse/SCYLLADB-1441
                 while (should_compact()) {
                     compact();
                 }
@@ -119,7 +132,7 @@ public:
         pending()->apply(mt);
     }
     // Must run in a seastar thread
-    void apply(memtable& mt) {
+    void apply(replica::memtable& mt) {
         auto op = _apply.start();
         auto new_mt = new_memtable();
         tests::reader_concurrency_semaphore_wrapper semaphore;
@@ -127,7 +140,7 @@ public:
         _memtables.push_back(new_mt);
     }
     // mt must not change from now on.
-    void apply(lw_shared_ptr<memtable> mt) {
+    void apply(lw_shared_ptr<replica::memtable> mt) {
         auto op = _apply.start();
         _memtables.push_back(std::move(mt));
         on_new_memtable();

@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 //
@@ -26,7 +26,7 @@
 //                       The purpose is to send small negative values as small unsigned values, so that we save bytes on the wire.
 //                       To encode a value n use "(n >> 31) ^ (n << 1)" for 32 bit values, and "(n >> 63) ^ (n << 1)"
 //                       for 64 bit values where "^" is the xor operation, "<<" is the left shift operation and ">>" is
-//                       the arithemtic right shift operation (highest-order bit is replicated).
+//                       the arithmetic right shift operation (highest-order bit is replicated).
 //                       Decode with "(n >> 1) ^ -(n & 1)".
 //
 
@@ -35,6 +35,7 @@
 #include "bytes.hh"
 
 #include <cstdint>
+#include <bit>
 
 using vint_size_type = bytes::size_type;
 
@@ -49,7 +50,9 @@ struct unsigned_vint final {
 
     static value_type deserialize(bytes_view v);
 
-    static vint_size_type serialized_size_from_first_byte(bytes::value_type first_byte);
+    static vint_size_type serialized_size_from_first_byte(bytes::value_type first_byte) {
+        return 1 + std::countl_zero(static_cast<uint8_t>(~first_byte));
+    }
 };
 
 struct signed_vint final {
@@ -61,5 +64,7 @@ struct signed_vint final {
 
     static value_type deserialize(bytes_view v);
 
-    static vint_size_type serialized_size_from_first_byte(bytes::value_type first_byte);
+    static vint_size_type serialized_size_from_first_byte(bytes::value_type first_byte) {
+        return unsigned_vint::serialized_size_from_first_byte(first_byte);
+    }
 };

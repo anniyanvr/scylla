@@ -1,15 +1,15 @@
 /*
- */
-/*
  * Copyright (C) 2019-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 #pragma once
+#include "cdc/log.hh"
+#include "utils/assert.hh"
 #include "service/paxos/cas_request.hh"
 #include "cql3/statements/modification_statement.hh"
 
@@ -25,8 +25,7 @@ using namespace std::chrono;
  */
 struct cas_row_update {
     modification_statement const& statement;
-    std::vector<query::clustering_range> ranges;
-    modification_statement::json_cache_opt json_cache;
+    modification_spec spec;
     // This statement query options. Different from cas_request::query_options,
     // which may stand for BATCH statement, not individual modification_statement,
     // in case of BATCH
@@ -40,22 +39,23 @@ class cas_request: public service::cas_request {
 private:
     std::vector<cas_row_update> _updates;
     schema_ptr _schema;
-    // A single partition key. Represented as a vector of partition ranges
-    // since this is the conventional format for storage_proxy.
-    std::vector<dht::partition_range> _key;
     update_parameters::prefetch_data _rows;
 
-public:
-    cas_request(schema_ptr schema_arg, std::vector<dht::partition_range> key_arg)
-          : _schema(schema_arg)
-          , _key(std::move(key_arg))
-          , _rows(schema_arg)
-    {
-        assert(_key.size() == 1 && query::is_single_partition(_key.front()));
+    // The single partition every row update addresses, as a vector of
+    // partition ranges since this is the conventional format for storage_proxy.
+    const std::vector<dht::partition_range>& partition() const {
+        throwing_assert(!_updates.empty());
+        return _updates.front().spec.keys;
     }
 
+public:
+    explicit cas_request(schema_ptr schema_arg)
+          : _schema(schema_arg)
+          , _rows(schema_arg)
+    { }
+
     dht::partition_range_vector key() const {
-        return dht::partition_range_vector(_key);
+        return dht::partition_range_vector(partition());
     }
 
     const update_parameters::prefetch_data& rows() const {
@@ -64,11 +64,11 @@ public:
 
     lw_shared_ptr<query::read_command> read_command(query_processor& qp) const;
 
-    void add_row_update(const modification_statement& stmt_arg, std::vector<query::clustering_range> ranges_arg,
-        modification_statement::json_cache_opt json_cache_arg, const query_options& options_arg);
+    void add_row_update(const modification_statement& stmt_arg, modification_spec spec_arg,
+        const query_options& options_arg);
 
     virtual std::optional<mutation> apply(foreign_ptr<lw_shared_ptr<query::result>> qr,
-            const query::partition_slice& slice, api::timestamp_type ts) override;
+            const query::partition_slice& slice, api::timestamp_type ts, cdc::per_request_options&) override;
 
     /// Build a result set with prefetched rows, but return only
     /// the columns required by CAS.
@@ -84,7 +84,11 @@ private:
     bool applies_to() const;
     std::optional<mutation> apply_updates(api::timestamp_type t) const;
     /// Find a row in prefetch_data which matches primary key identifying a given `cas_row_update`
-    const update_parameters::prefetch_data::row* find_old_row(const cas_row_update& op) const;
+    struct old_row {
+        const clustering_key* ckey;
+        const update_parameters::prefetch_data::row* row;
+    };
+    old_row find_old_row(const cas_row_update& op) const;
 };
 
 } // end of namespace "cql3::statements"

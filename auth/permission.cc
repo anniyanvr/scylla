@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "auth/permission.hh"
@@ -24,7 +21,8 @@ const auth::permission_set auth::permissions::ALL = auth::permission_set::of<
         auth::permission::SELECT,
         auth::permission::MODIFY,
         auth::permission::AUTHORIZE,
-        auth::permission::DESCRIBE>();
+        auth::permission::DESCRIBE,
+        auth::permission::EXECUTE>();
 
 const auth::permission_set auth::permissions::NONE;
 
@@ -37,7 +35,11 @@ static const std::unordered_map<sstring, auth::permission> permission_names({
         {"SELECT", auth::permission::SELECT},
         {"MODIFY", auth::permission::MODIFY},
         {"AUTHORIZE", auth::permission::AUTHORIZE},
-        {"DESCRIBE", auth::permission::DESCRIBE}});
+        {"DESCRIBE", auth::permission::DESCRIBE},
+        {"EXECUTE", auth::permission::EXECUTE},
+        {"VECTOR_SEARCH_INDEXING", auth::permission::VECTOR_SEARCH_INDEXING},
+        {"TEXT_SEARCH_INDEXING", auth::permission::TEXT_SEARCH_INDEXING},
+        {"PATTERN_SEARCH_INDEXING", auth::permission::PATTERN_SEARCH_INDEXING}});
 
 const sstring& auth::permissions::to_string(permission p) {
     for (auto& v : permission_names) {

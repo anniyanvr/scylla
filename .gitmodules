@@ -6,18 +6,18 @@
 	path = swagger-ui
 	url = ../scylla-swagger-ui
 	ignore = dirty
-[submodule "libdeflate"]
-	path = libdeflate
-	url = ../libdeflate
 [submodule "abseil"]
 	path = abseil
 	url = ../abseil-cpp
-[submodule "scylla-jmx"]
-	path = tools/jmx
-	url = ../scylla-jmx
-[submodule "scylla-tools"]
-	path = tools/java
-	url = ../scylla-tools-java
 [submodule "scylla-python3"]
 	path = tools/python3
 	url = ../scylla-python3
+[submodule "tools/cqlsh"]
+	path = tools/cqlsh
+	url = ../scylla-cqlsh
+[submodule "fmt"]
+	path = fmt
+	url = ../fmt
+[submodule "c-ares"]
+	path = c-ares
+	url = ../c-ares

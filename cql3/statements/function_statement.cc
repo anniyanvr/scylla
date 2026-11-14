@@ -3,13 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "cql3/statements/function_statement.hh"
 #include "cql3/functions/functions.hh"
 #include "cql3/functions/user_function.hh"
-#include "db/config.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "gms/feature_service.hh"
 #include "service/storage_proxy.hh"
@@ -19,6 +18,48 @@ namespace cql3 {
 namespace statements {
 
 future<> function_statement::check_access(query_processor& qp, const service::client_state& state) const { return make_ready_future<>(); }
+
+future<> create_function_statement_base::check_access(query_processor& qp, const service::client_state& state) const {
+    co_await state.has_functions_access(_name.keyspace, auth::permission::CREATE);
+    if (_or_replace) {
+        create_arg_types(qp);
+        sstring encoded_signature = auth::encode_signature(_name.name, _arg_types);
+
+        co_await state.has_function_access(_name.keyspace, encoded_signature, auth::permission::ALTER);
+    }
+}
+
+future<> drop_function_statement_base::check_access(query_processor& qp, const service::client_state& state) const
+{
+    create_arg_types(qp);
+    shared_ptr<functions::function> func;
+    if (_args_present) {
+        func = functions::instance().find(_name, _arg_types);
+        if (!func) {
+            return make_ready_future<>();
+        }
+    } else {
+        auto funcs = functions::instance().find(_name);
+        if (!funcs.empty()) {
+            auto b = funcs.begin();
+            auto i = b;
+            if (++i != funcs.end()) {
+                return make_ready_future<>();
+            }
+            func = b->second;
+        } else {
+            return make_ready_future<>();
+        }
+    }
+
+    sstring encoded_signature = auth::encode_signature(_name.name, func->arg_types());
+
+    try {
+        return state.has_function_access(_name.keyspace, encoded_signature, auth::permission::DROP);
+    } catch (exceptions::invalid_request_exception&) {
+        return make_ready_future();
+    }
+}
 
 function_statement::function_statement(
         functions::function_name name, std::vector<shared_ptr<cql3_type::raw>> raw_arg_types)
@@ -57,7 +98,7 @@ data_type function_statement::prepare_type(query_processor& qp, cql3_type::raw& 
 }
 
 void function_statement::create_arg_types(query_processor& qp) const {
-    if (!qp.proxy().features().cluster_supports_user_defined_functions()) {
+    if (!qp.proxy().features().user_defined_functions) {
         throw exceptions::invalid_request_exception("User defined functions are disabled. Set enable_user_defined_functions and experimental_features:udf to enable them");
     }
 
@@ -78,40 +119,43 @@ create_function_statement_base::create_function_statement_base(functions::functi
         std::vector<shared_ptr<cql3_type::raw>> raw_arg_types, bool or_replace, bool if_not_exists)
     : function_statement(std::move(name), std::move(raw_arg_types)), _or_replace(or_replace), _if_not_exists(if_not_exists) {}
 
-void create_function_statement_base::validate(query_processor& qp, const service::client_state& state) const {
-    // validation happens during execution
+void create_function_statement_base::validate_name(std::string_view what) const {
+    // A function's auth resource is named "functions/<keyspace>/<name>[<argument types>]",
+    // and parse_resource() splits it on '/', so a '/' in the name would break, e.g.,
+    // LIST PERMISSIONS. Unlike Cassandra, we do allow '[' and ']' in the name:
+    // decode_signature() finds the argument list by the last '[', and argument
+    // types never contain '[' or ']'.
+    if (_name.name.find('/') != sstring::npos) {
+        throw exceptions::invalid_request_exception(fmt::format("{} name '{}' is invalid: it may not contain '/'", what, _name.name));
+    }
 }
 
-shared_ptr<functions::function> create_function_statement_base::validate_while_executing(query_processor& qp) const {
+seastar::future<shared_ptr<functions::function>> create_function_statement_base::validate_while_executing(query_processor& qp) const {
     create_arg_types(qp);
-    auto old = functions::functions::find(_name, _arg_types);
+    auto old = functions::instance().find(_name, _arg_types);
     if (!old || _or_replace) {
-        return create(qp, old.get());
+        co_return co_await create(qp, old.get());
     }
     if (!_if_not_exists) {
         throw exceptions::invalid_request_exception(format("The function '{}' already exists", old));
     }
-    return nullptr;
+    co_return nullptr;
 }
 
 drop_function_statement_base::drop_function_statement_base(functions::function_name name,
         std::vector<shared_ptr<cql3_type::raw>> arg_types, bool args_present, bool if_exists)
     : function_statement(std::move(name), std::move(arg_types)), _args_present(args_present), _if_exists(if_exists) {}
 
-void drop_function_statement_base::validate(query_processor& qp, const service::client_state& state) const {
-    // validation happens during execution
-}
-
-shared_ptr<functions::function> drop_function_statement_base::validate_while_executing(query_processor& qp) const {
+seastar::future<shared_ptr<db::functions::function>> drop_function_statement_base::validate_while_executing(query_processor& qp) const {
     create_arg_types(qp);
     shared_ptr<functions::function> func;
     if (_args_present) {
-        func = functions::functions::find(_name, _arg_types);
+        func = functions::instance().find(_name, _arg_types);
         if (!func && !_if_exists) {
-            throw exceptions::invalid_request_exception(format("User function {}({}) doesn't exist", _name, _arg_types));
+            throw exceptions::invalid_request_exception(seastar::format("User function {}({}) doesn't exist", _name, _arg_types));
         }
     } else {
-        auto funcs = functions::functions::find(_name);
+        auto funcs = functions::instance().find(_name);
         if (!funcs.empty()) {
             auto b = funcs.begin();
             auto i = b;
@@ -126,7 +170,7 @@ shared_ptr<functions::function> drop_function_statement_base::validate_while_exe
         }
     }
 
-    return func;
+    co_return func;
 }
 }
 }

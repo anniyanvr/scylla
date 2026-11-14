@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -13,7 +13,6 @@
 #include <seastar/core/sstring.hh>
 #include "gms/inet_address.hh"
 #include "snitch_base.hh"
-#include "utils/fb_utilities.hh"
 
 namespace locator {
 
@@ -24,19 +23,23 @@ using inet_address = gms::inet_address;
  * in the 2nd and 3rd octets of the ip address, respectively.
  */
 struct rack_inferring_snitch : public snitch_base {
-    rack_inferring_snitch() {
-        _my_dc = get_datacenter(utils::fb_utilities::get_broadcast_address());
-        _my_rack = get_rack(utils::fb_utilities::get_broadcast_address());
+    rack_inferring_snitch(const snitch_config& cfg)
+        : snitch_base(cfg)
+    {
+        _my_dc = get_datacenter();
+        _my_rack = get_rack();
 
         // This snitch is ready on creation
         set_snitch_ready();
     }
 
-    virtual sstring get_rack(inet_address endpoint) override {
+    virtual sstring get_rack() const override {
+        auto& endpoint = _cfg.broadcast_address;
         return std::to_string(uint8_t(endpoint.bytes()[2]));
     }
 
-    virtual sstring get_datacenter(inet_address endpoint) override {
+    virtual sstring get_datacenter() const override {
+        auto& endpoint = _cfg.broadcast_address;
         return std::to_string(uint8_t(endpoint.bytes()[1]));
     }
 

@@ -5,7 +5,7 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "UUID_gen.hh"
@@ -15,8 +15,9 @@
 #include <net/if_arp.h>
 #endif // __linux__
 
+#include <atomic>
 #include <stdlib.h>
-#include "hashers.hh"
+#include "utils/hashers.hh"
 
 namespace utils {
 
@@ -59,7 +60,7 @@ static int64_t make_node() {
     static int64_t global_node = [] {
         int64_t node = 0;
 #ifdef __linux__
-        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
         if (fd >= 0) {
             // Get a hardware address for an interface, if there is more than one, use any
             struct ifreq ifr_list[32];
@@ -121,8 +122,8 @@ UUID UUID_gen::get_name_UUID(bytes_view b) {
     return get_name_UUID(reinterpret_cast<const unsigned char*>(b.begin()), b.size());
 }
 
-UUID UUID_gen::get_name_UUID(sstring_view s) {
-    static_assert(sizeof(char) == sizeof(sstring_view::value_type), "Assumed that str.size() counts in chars");
+UUID UUID_gen::get_name_UUID(std::string_view s) {
+    static_assert(sizeof(char) == sizeof(std::string_view::value_type), "Assumed that str.size() counts in chars");
     return get_name_UUID(reinterpret_cast<const unsigned char*>(s.begin()), s.size());
 }
 
@@ -160,7 +161,7 @@ UUID UUID_gen::negate(UUID o) {
 }
 
 const thread_local int64_t UUID_gen::spoof_node = make_thread_local_node(make_random_node());
-const thread_local int64_t UUID_gen::clock_seq_and_node = make_clock_seq_and_node();
+thread_local int64_t UUID_gen::clock_seq_and_node = make_clock_seq_and_node();
 thread_local UUID_gen UUID_gen::_instance;
 
 } // namespace utils

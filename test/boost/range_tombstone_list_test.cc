@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #define BOOST_TEST_MODULE core
@@ -11,15 +11,15 @@
 #include <boost/test/unit_test.hpp>
 #include <random>
 #include <iostream>
-#include "keys.hh"
-#include "schema_builder.hh"
-#include "range_tombstone_list.hh"
+#include "keys/keys.hh"
+#include "schema/schema_builder.hh"
+#include "mutation/range_tombstone_list.hh"
 #include "test/boost/range_tombstone_list_assertions.hh"
 #include "test/lib/log.hh"
 
 #include <seastar/util/defer.hh>
 
-static thread_local schema_ptr s = schema_builder("ks", "cf")
+static thread_local schema_ptr s = schema_builder(1, "ks", "cf")
         .with_column("pk", int32_type, column_kind::partition_key)
         .with_column("ck1", int32_type, column_kind::clustering_key)
         .with_column("ck2", int32_type, column_kind::clustering_key)
@@ -27,6 +27,11 @@ static thread_local schema_ptr s = schema_builder("ks", "cf")
         .build();
 
 static auto gc_now = gc_clock::now();
+
+static std::ostream& operator<<(std::ostream& out, const range_tombstone_entry& entry) {
+    fmt::print(out, "{}", entry);
+    return out;
+}
 
 static clustering_key_prefix key(std::vector<int32_t> components) {
     std::vector<bytes> exploded;
@@ -481,7 +486,7 @@ static std::vector<range_tombstone> make_random() {
              */
             start_b = bound_view(start_key, bound_kind::incl_start);
             if (less(end_b, start_b)) {
-                std::cout << "Unfixable slice " << start_b << " ... " << end_b << std::endl;
+                fmt::print("Unfixable slice {} ... {}\n", start_b, end_b);
                 std::abort();
             }
         }
@@ -500,8 +505,8 @@ static std::vector<range_tombstone> make_random() {
                     tombstone(dist(gen), gc_now));
         } else {
             rts.emplace_back(
-                    position_in_partition::after_key(key),
-                    position_in_partition::after_key(key),
+                    position_in_partition::after_key(*s, key),
+                    position_in_partition::after_key(*s, key),
                     tombstone(dist(gen), gc_now));
         }
     }
@@ -519,11 +524,11 @@ BOOST_AUTO_TEST_CASE(test_random_list_is_not_overlapped) {
         if (!assert_valid(l)) {
             std::cout << "For input:" << std::endl;
             for (auto&& rt : input) {
-                std::cout << rt << std::endl;
+                fmt::print(std::cout, "{}\n", rt);
             }
             std::cout << "Produced:" << std::endl;
             for (auto&& rt : l) {
-                std::cout << rt << std::endl;
+                fmt::print(std::cout, "{}\n", rt);
             }
             BOOST_REQUIRE(false);
         }
@@ -893,7 +898,8 @@ BOOST_AUTO_TEST_CASE(test_exception_safety) {
     // test apply_monotonically()
     memory::with_allocation_failures([&] () {
         auto list = original;
-        auto d = defer([&] {
+        auto d = defer([&] noexcept {
+            // May throw, aborting the test
             memory::scoped_critical_alloc_section dfg;
             assert_that(*s, list).has_no_less_information_than(original);
         });
@@ -904,7 +910,8 @@ BOOST_AUTO_TEST_CASE(test_exception_safety) {
     // test apply_reversibly()
     memory::with_allocation_failures([&] () {
         auto list = original;
-        auto d = defer([&] () {
+        auto d = defer([&] noexcept {
+            // May throw, aborting the test
             memory::scoped_critical_alloc_section dfg;
             assert_that(*s, list).is_equal_to_either(original, expected);
         });

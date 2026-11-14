@@ -3,25 +3,23 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include "counters.hh"
+#include "mutation/counters.hh"
 
+#include <algorithm>
 #include <random>
 
 #include <seastar/core/thread.hh>
+#include <seastar/testing/random.hh>
 
-#include <boost/range/algorithm/sort.hpp>
-#include <boost/range/algorithm/random_shuffle.hpp>
-
-#include <seastar/testing/test_case.hh>
-#include "test/lib/random_utils.hh"
-#include "schema_builder.hh"
-#include "keys.hh"
-#include "mutation.hh"
-#include "frozen_mutation.hh"
-#include "mutation_partition_view.hh"
+#include "test/lib/scylla_test_case.hh"
+#include "test/lib/test_utils.hh"
+#include "schema/schema_builder.hh"
+#include "keys/keys.hh"
+#include "mutation/mutation.hh"
+#include "mutation/frozen_mutation.hh"
 
 void verify_shard_order(counter_cell_view ccv) {
     if (ccv.shards().begin() == ccv.shards().end()) {
@@ -41,8 +39,8 @@ void verify_shard_order(counter_cell_view ccv) {
 
 std::vector<counter_id> generate_ids(unsigned count) {
     std::vector<counter_id> id;
-    std::generate_n(std::back_inserter(id), count, counter_id::generate_random);
-    boost::range::sort(id);
+    std::generate_n(std::back_inserter(id), count, counter_id::create_random_id);
+    std::ranges::sort(id);
     return id;
 }
 
@@ -148,7 +146,7 @@ SEASTAR_TEST_CASE(test_apply) {
 }
 
 schema_ptr get_schema() {
-    return schema_builder("ks", "cf")
+    return schema_builder(this_smp_shard_count(), "ks", "cf")
             .with_column("pk", int32_type, column_kind::partition_key)
             .with_column("ck", int32_type, column_kind::clustering_key)
             .with_column("s1", counter_type, column_kind::static_column)
@@ -254,13 +252,13 @@ SEASTAR_TEST_CASE(test_counter_mutations) {
         m = m1;
         m.apply(m4);
         m.partition().compact_for_query(*s, m.decorated_key(), gc_clock::now(), { query::clustering_range::make_singular(ck) },
-                                        false, false, query::max_rows);
+                                        false, query::max_rows);
         BOOST_REQUIRE_EQUAL(m.partition().clustered_rows().calculate_size(), 0);
         BOOST_REQUIRE(m.partition().static_row().empty());
 
         // Difference
 
-        m = mutation(s, m1.decorated_key(), m1.partition().difference(s, m2.partition()));
+        m = mutation(s, m1.decorated_key(), m1.partition().difference(*s, m2.partition()));
         ac = get_counter_cell(m);
         BOOST_REQUIRE(ac.is_live());
       {
@@ -277,7 +275,7 @@ SEASTAR_TEST_CASE(test_counter_mutations) {
         verify_shard_order(ccv);
       }
 
-        m = mutation(s, m1.decorated_key(), m2.partition().difference(s, m1.partition()));
+        m = mutation(s, m1.decorated_key(), m2.partition().difference(*s, m1.partition()));
         ac = get_counter_cell(m);
         BOOST_REQUIRE(ac.is_live());
       {
@@ -294,11 +292,11 @@ SEASTAR_TEST_CASE(test_counter_mutations) {
         verify_shard_order(ccv);
       }
 
-        m = mutation(s, m1.decorated_key(), m1.partition().difference(s, m3.partition()));
+        m = mutation(s, m1.decorated_key(), m1.partition().difference(*s, m3.partition()));
         BOOST_REQUIRE_EQUAL(m.partition().clustered_rows().calculate_size(), 0);
         BOOST_REQUIRE(m.partition().static_row().empty());
 
-        m = mutation(s, m1.decorated_key(), m3.partition().difference(s, m1.partition()));
+        m = mutation(s, m1.decorated_key(), m3.partition().difference(*s, m1.partition()));
         ac = get_counter_cell(m);
         BOOST_REQUIRE(!ac.is_live());
 
@@ -393,6 +391,7 @@ SEASTAR_TEST_CASE(test_counter_update_mutations) {
 SEASTAR_TEST_CASE(test_transfer_updates_to_shards) {
     return seastar::async([] {
         auto s = get_schema();
+        counter_id default_counter_id(locator::host_id::create_null_id().uuid());
 
         auto pk = partition_key::from_single_value(*s, int32_type->decompose(0));
         auto ck = clustering_key::from_single_value(*s, int32_type->decompose(0));
@@ -417,11 +416,11 @@ SEASTAR_TEST_CASE(test_transfer_updates_to_shards) {
         m3.set_static_cell(scol, std::move(c3));
 
         auto m0 = m1;
-        transform_counter_updates_to_shards(m0, nullptr, 0, utils::UUID{});
+        transform_counter_updates_to_shards(m0, nullptr, 0, default_counter_id);
 
         auto empty = mutation(s, pk);
         auto m = m1;
-        transform_counter_updates_to_shards(m, &empty, 0, utils::UUID{});
+        transform_counter_updates_to_shards(m, &empty, 0, default_counter_id);
         BOOST_REQUIRE_EQUAL(m, m0);
 
         auto ac = get_counter_cell(m);
@@ -441,7 +440,7 @@ SEASTAR_TEST_CASE(test_transfer_updates_to_shards) {
       }
 
         m = m2;
-        transform_counter_updates_to_shards(m, &m0, 0, utils::UUID{});
+        transform_counter_updates_to_shards(m, &m0, 0, default_counter_id);
 
         ac = get_counter_cell(m);
         BOOST_REQUIRE(ac.is_live());
@@ -460,7 +459,7 @@ SEASTAR_TEST_CASE(test_transfer_updates_to_shards) {
       }
 
         m = m3;
-        transform_counter_updates_to_shards(m, &m0, 0, utils::UUID{});
+        transform_counter_updates_to_shards(m, &m0, 0, default_counter_id);
         ac = get_counter_cell(m);
         BOOST_REQUIRE(!ac.is_live());
         ac = get_static_counter_cell(m);
@@ -495,7 +494,7 @@ SEASTAR_TEST_CASE(test_sanitize_corrupted_cells) {
             auto c1 = atomic_cell_or_collection(b1.build(0));
 
             // Corrupt it by changing shard order and adding duplicates
-            boost::range::random_shuffle(shards);
+            std::ranges::shuffle(shards, gen);
 
             std::uniform_int_distribution<unsigned> duplicate_count_dist(1, shard_count / 2);
             auto duplicate_count = duplicate_count_dist(gen);
@@ -504,7 +503,7 @@ SEASTAR_TEST_CASE(test_sanitize_corrupted_cells) {
                 shards.emplace_back(cs);
             }
 
-            boost::range::random_shuffle(shards);
+            std::ranges::shuffle(shards, gen);
 
             // Sanitize
             counter_cell_builder b2;
@@ -545,11 +544,9 @@ SEASTAR_TEST_CASE(test_counter_id_ordering) {
                 "ffeeddcc-aa99-8878-6655-443322110000",
         };
 
-        auto counter_ids = boost::copy_range<std::vector<counter_id>>(
-            ids | boost::adaptors::transformed([] (auto id) {
+        auto counter_ids = ids | std::views::transform([] (auto id) {
                 return counter_id(utils::UUID(id));
-            })
-        );
+            }) | std::ranges::to<std::vector<counter_id>>();
 
         for (auto it = counter_ids.begin(); it != counter_ids.end(); ++it) {
             BOOST_REQUIRE_EQUAL(*it, *it);

@@ -1,24 +1,20 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include <vector>
+#include "cql3/statements/prepared_statement.hh"
 #include "utils/chunked_vector.hh"
 #include "enum_set.hh"
 #include "service/pager/paging_state.hh"
-
-#include "query-result-reader.hh"
 
 #include "result_generator.hh"
 
@@ -31,12 +27,14 @@ public:
         GLOBAL_TABLES_SPEC = 0,
         HAS_MORE_PAGES = 1,
         NO_METADATA = 2,
+        METADATA_CHANGED = 3,
     };
 
     using flag_enum = super_enum<flag,
         flag::GLOBAL_TABLES_SPEC,
         flag::HAS_MORE_PAGES,
-        flag::NO_METADATA>;
+        flag::NO_METADATA,
+        flag::METADATA_CHANGED>;
 
     using flag_enum_set = enum_set<flag_enum>;
 
@@ -75,9 +73,7 @@ public:
     uint32_t value_count() const;
 
     void add_non_serialized_column(lw_shared_ptr<column_specification> name);
-
-private:
-    bool all_in_same_cf() const;
+    void hide_last_column();
 
 public:
     void set_paging_state(lw_shared_ptr<const service::pager::paging_state> paging_state);
@@ -94,6 +90,8 @@ public:
     const std::vector<lw_shared_ptr<column_specification>>& get_names() const {
         return _column_info->_names;
     }
+
+    cql3::cql_metadata_id_type calculate_metadata_id() const;
 };
 
 ::shared_ptr<const cql3::metadata> make_empty_metadata();
@@ -132,15 +130,19 @@ public:
 };
 
 template<typename Visitor>
-concept ResultVisitor = requires(Visitor& visitor) {
+concept ResultVisitor = requires(Visitor& visitor, managed_bytes_view_opt val) {
     visitor.start_row();
-    visitor.accept_value(std::optional<query::result_bytes_view>());
+    visitor.accept_value(std::move(val));
     visitor.end_row();
 };
 
 class result_set {
+    using col_type = managed_bytes_opt;
+    using row_type = std::vector<col_type>;
+    using rows_type = utils::chunked_vector<row_type>;
+
     ::shared_ptr<metadata> _metadata;
-    utils::chunked_vector<std::vector<bytes_opt>> _rows;
+    rows_type _rows;
 
     friend class result;
 public:
@@ -155,8 +157,10 @@ public:
 
     bool empty() const;
 
+    void add_row(row_type row);
     void add_row(std::vector<bytes_opt> row);
 
+    void add_column_value(col_type value);
     void add_column_value(bytes_opt value);
 
     void reverse();
@@ -164,8 +168,11 @@ public:
     void trim(size_t limit);
 
     template<typename RowComparator>
+    requires requires (RowComparator cmp, const row_type& row) {
+        { cmp(row, row) } -> std::same_as<bool>;
+    }
     void sort(const RowComparator& cmp) {
-        std::sort(_rows.begin(), _rows.end(), std::ref(cmp));
+        std::sort(_rows.begin(), _rows.end(), cmp);
     }
 
     metadata& get_metadata();
@@ -173,7 +180,7 @@ public:
     const metadata& get_metadata() const;
 
     // Returns a range of rows. A row is a range of bytes_opt.
-    const utils::chunked_vector<std::vector<bytes_opt>>& rows() const;
+    const rows_type& rows() const;
 
     template<typename Visitor>
     requires ResultVisitor<Visitor>
@@ -183,29 +190,46 @@ public:
             visitor.start_row();
             for (auto i = 0u; i < column_count; i++) {
                 auto& cell = row[i];
-                visitor.accept_value(cell ? std::optional<query::result_bytes_view>(*cell) : std::optional<query::result_bytes_view>());
+                visitor.accept_value(cell ? managed_bytes_view_opt(*cell) : managed_bytes_view_opt());
             }
             visitor.end_row();
         }
     }
+
+    // visit_gently() is like visit(), except it may yield between rows and
+    // returns a future that will resolve when it's done. We only yield
+    // between rows, not between individual cells, which is a good compromise
+    // if we assume that individual rows are not too large.
+    future<> visit_gently(ResultVisitor auto& visitor) const {
+        auto column_count = get_metadata().column_count();
+        return do_for_each(_rows, [&visitor, column_count] (auto& row) {
+            visitor.start_row();
+            for (auto i = 0u; i < column_count; i++) {
+                auto& cell = row[i];
+                visitor.accept_value(cell ? managed_bytes_view_opt(*cell) : managed_bytes_view_opt());
+            }
+            visitor.end_row();
+        });
+    }
+
 
     class builder;
 };
 
 class result_set::builder {
     result_set _result;
-    std::vector<bytes_opt> _current_row;
+    row_type _current_row;
 public:
     explicit builder(shared_ptr<metadata> mtd)
         : _result(std::move(mtd)) { }
 
     void start_row() { }
-    void accept_value(std::optional<query::result_bytes_view> value) {
+    void accept_value(managed_bytes_view_opt value) {
         if (!value) {
             _current_row.emplace_back();
             return;
         }
-        _current_row.emplace_back(value->linearize());
+        _current_row.emplace_back(value);
     }
     void end_row() {
         _result.add_row(std::exchange(_current_row, { }));

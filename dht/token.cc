@@ -3,62 +3,32 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <limits>
 #include <ostream>
-#include <utility>
+#include <random>
+#include <ranges>
+#include <boost/lexical_cast.hpp>
 
 #include "dht/token.hh"
 #include "dht/token-sharding.hh"
-#include "dht/i_partitioner.hh"
+#include "utils/assert.hh"
 
 namespace dht {
 
 using uint128_t = unsigned __int128;
 
 inline int64_t long_token(const token& t) {
-    if (t.is_minimum() || t.is_maximum()) {
-        return std::numeric_limits<int64_t>::min();
-    }
-
     return t._data;
 }
 
-static const token min_token{ token::kind::before_all_keys, 0 };
-static const token max_token{ token::kind::after_all_keys, 0 };
-
-const token&
-minimum_token() noexcept {
-    return min_token;
-}
-
-const token&
-maximum_token() noexcept {
-    return max_token;
-}
-
-std::strong_ordering tri_compare(const token& t1, const token& t2) {
-    if (t1._kind < t2._kind) {
-            return std::strong_ordering::less;
-    } else if (t1._kind > t2._kind) {
-            return std::strong_ordering::greater;
-    } else if (t1._kind == token_kind::key) {
-        return tri_compare_raw(long_token(t1), long_token(t2));
-    }
-    return std::strong_ordering::equal;
-}
-
 std::ostream& operator<<(std::ostream& out, const token& t) {
-    if (t._kind == token::kind::after_all_keys) {
-        out << "maximum token";
-    } else if (t._kind == token::kind::before_all_keys) {
-        out << "minimum token";
-    } else {
-        out << t.to_sstring();
-    }
+    fmt::print(out, "{}", t);
     return out;
 }
 
@@ -83,7 +53,17 @@ token token::get_random_token() {
 }
 
 token token::from_sstring(const sstring& t) {
-    auto lp = boost::lexical_cast<long>(t);
+    const char* first = t.data();
+    const char* last = first + t.size();
+    if (last - first > 1 && first[0] == '+' && std::isdigit(static_cast<unsigned char>(first[1]))) {
+        // from_chars rejects a leading '+'; skip one that a digit follows.
+        ++first;
+    }
+    long lp;
+    auto [ptr, ec] = std::from_chars(first, last, lp);
+    if (ec != std::errc{} || ptr != last) {
+        throw boost::bad_lexical_cast(typeid(sstring), typeid(long));
+    }
     if (lp == std::numeric_limits<long>::min()) {
         return minimum_token();
     } else {
@@ -111,7 +91,7 @@ static float ratio_helper(int64_t a, int64_t b) {
 }
 
 std::map<token, float>
-token::describe_ownership(const std::vector<token>& sorted_tokens) {
+token::describe_ownership(const utils::chunked_vector<token>& sorted_tokens) {
     std::map<token, float> ownerships;
     auto i = sorted_tokens.begin();
 
@@ -147,14 +127,6 @@ token::get_token_validator() {
     return long_type;
 }
 
-static uint64_t unbias(const token& t) {
-    return uint64_t(long_token(t)) + uint64_t(std::numeric_limits<int64_t>::min());
-}
-
-static token bias(uint64_t n) {
-    return token(token::kind::key, n - uint64_t(std::numeric_limits<int64_t>::min()));
-}
-
 inline
 unsigned
 zero_based_shard_of(uint64_t token, unsigned shards, unsigned sharding_ignore_msb_bits) {
@@ -173,7 +145,7 @@ init_zero_based_shard_start(unsigned shards, unsigned sharding_ignore_msb_bits) 
         return std::vector<uint64_t>(1, uint64_t(0));
     }
     auto ret = std::vector<uint64_t>(shards);
-    for (auto s : boost::irange<unsigned>(0, shards)) {
+    for (auto s : std::views::iota(0u, shards)) {
         uint64_t token = (uint128_t(s) << 64) / shards;
         token >>= sharding_ignore_msb_bits;   // leftmost bits are ignored by zero_based_shard_of
         // token is the start of the next shard, and can be slightly before due to rounding errors; adjust
@@ -241,7 +213,7 @@ dht::token token::from_int64(int64_t i) {
 }
 
 static
-dht::token find_first_token_for_shard_in_not_wrap_around_range(const dht::sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
+dht::token find_first_token_for_shard_in_not_wrap_around_range(const dht::static_sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
     // Invariant start < end
     // It is guaranteed that start is not MAX_INT64 because end is greater
     auto t = dht::token::from_int64(dht::token::to_int64(start) + 1);
@@ -252,7 +224,7 @@ dht::token find_first_token_for_shard_in_not_wrap_around_range(const dht::sharde
 }
 
 dht::token find_first_token_for_shard(
-        const dht::sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
+        const dht::static_sharder& sharder, dht::token start, dht::token end, size_t shard_idx) {
     if (start < end) { // Not a wrap around token range
         return find_first_token_for_shard_in_not_wrap_around_range(sharder, start, end, shard_idx);
     } else { // A wrap around token range
@@ -269,6 +241,55 @@ dht::token find_first_token_for_shard(
         return find_first_token_for_shard_in_not_wrap_around_range(
                 sharder, dht::minimum_token(), end, shard_idx);
     }
+}
+
+size_t
+compaction_group_of(unsigned most_significant_bits, dht::raw_token t) {
+    if (!most_significant_bits) {
+        return 0;
+    }
+    uint64_t adjusted = unbias(t);
+    return adjusted >> (64 - most_significant_bits);
+}
+
+size_t
+compaction_group_of(unsigned most_significant_bits, const token& t) {
+    if (!most_significant_bits) {
+        return 0;
+    }
+    switch (t._kind) {
+        case token::kind::before_all_keys:
+            return 0;
+        case token::kind::after_all_keys:
+            return (1 << most_significant_bits) - 1;
+        case token::kind::key:
+            uint64_t adjusted = unbias(t);
+            return adjusted >> (64 - most_significant_bits);
+    }
+    __builtin_unreachable();
+}
+
+token last_token_of_compaction_group(unsigned most_significant_bits, size_t group) {
+    uint64_t n;
+    if (group == ((1ul << most_significant_bits) - 1)) {
+        n = std::numeric_limits<uint64_t>::max();
+    } else {
+        n = ((uint64_t(group) + 1) << (64 - most_significant_bits)) - 1;
+    }
+    return bias(n);
+}
+
+utils::chunked_vector<dht::raw_token> get_uniform_tokens(size_t count) {
+    utils::chunked_vector<dht::raw_token> tokens;
+    tokens.reserve(count);
+
+    for (size_t i = 1; i <= count; ++i) {
+        uint64_t n = (uint128_t(i) * std::numeric_limits<uint64_t>::max()) / count;
+        tokens.push_back(raw_token{bias(n)});
+        SCYLLA_ASSERT(tokens.back().value != std::numeric_limits<int64_t>::min()); // See token::normalize()
+    }
+
+    return tokens;
 }
 
 } // namespace dht

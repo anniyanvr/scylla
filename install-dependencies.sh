@@ -17,6 +17,8 @@
 # under the License.
 #
 
+trap 'echo "error $? in $0 line $LINENO"' ERR
+
 # os-release may be missing in container environment by default.
 if [ -f "/etc/os-release" ]; then
     . /etc/os-release
@@ -29,50 +31,66 @@ fi
 
 debian_base_packages=(
     clang
+    clang-tools
     gdb
+    cargo
+    wabt
     liblua5.3-dev
     python3-pyparsing
-    python3-colorama
+    python3-dev
+    python3-tabulate
+    python3-pip
     libsnappy-dev
     libjsoncpp-dev
     rapidjson-dev
-    scylla-libthrift010-dev
     scylla-antlr35-c++-dev
-    thrift-compiler
     git
     pigz
     libunistring-dev
     libzstd-dev
+    libdeflate-dev
+    librapidxml-dev
+    libcrypto++-dev
+    libxxhash-dev
+    zlib1g-dev
+    slapd
+    ldap-utils
+    libcpp-jwt-dev
+    elfutils
+    curl
+    jq
+    git-lfs
+    e2fsprogs
+    fuse3
+    libev-dev # for python driver
 )
 
 fedora_packages=(
     clang
+    clang-tools-extra
+    compiler-rt
+    libasan
+    libubsan
     gdb
     lua-devel
     yaml-cpp-devel
-    thrift-devel
-    antlr3-tool
-    antlr3-C++-devel
     jsoncpp-devel
     rapidjson-devel
     snappy-devel
+    libdeflate-devel
     systemd-devel
+    cryptopp-devel
     git
+    git-lfs
     python
     sudo
-    java-1.8.0-openjdk-headless
-    java-1.8.0-openjdk-devel
-    ant
-    ant-junit
-    maven
     patchelf
     python3
+    python3-devel
     python3-pip
-    python3-magic
-    python3-colorama
-    python3-boto3
-    python3-pytest
-    python3-redis
+    python3-file-magic
+    python3-tabulate
+    python3-jinja2
     dnf-utils
     pigz
     net-tools
@@ -86,6 +104,8 @@ fedora_packages=(
     xxhash-devel
     makeself
     libzstd-static libzstd-devel
+    lz4-static lz4-devel
+    zlib-ng-compat-devel
     rpm-build
     devscripts
     debhelper
@@ -93,36 +113,85 @@ fedora_packages=(
     file
     dpkg-dev
     curl
-)
+    rust
+    cargo
+    rapidxml-devel
+    rust-std-static-wasm32-wasip1
+    wabt
+    binaryen
+    lcov
+    e2fsprogs
+    fuse3
 
-# lld is not available on s390x, see
-# https://src.fedoraproject.org/rpms/lld/c/aa6e69df60747496f8f22121ae8cc605c9d3498a?branch=rawhide
-if [ "$(uname -m)" != "s390x" ]; then
-    fedora_packages+=(lld)
-fi
+    lld
+    llvm-bolt
+    moreutils
+    iproute
+    llvm
+    openldap-servers
+    openldap-devel
+    cyrus-sasl
+    fipscheck
+    cpp-jwt-devel
+
+    podman
+    buildah
+    passt
+
+    # for cassandra-stress
+    java-openjdk-headless
+    snappy
+
+    elfutils
+    jq
+
+    libev-devel # for python driver
+
+    # test.py re-execs itself under `uv run --locked` against
+    # test/pyproject.toml (see _ensure_running_under_uv() in test.py)
+    uv
+)
 
 fedora_python3_packages=(
     python3-pyyaml
     python3-urwid
     python3-pyparsing
     python3-requests
-    python3-pyudev
     python3-setuptools
     python3-psutil
     python3-distro
     python3-click
     python3-six
+    python3-pyudev
+    python3-tabulate
 )
 
-pip_packages=(
-    scylla-driver
-    geomet
+# an associative array from packages to constrains
+#
+# These are packages also needed outside of test.py (e.g. by cqlsh, or by the
+# shipped python3 relocatable package / dist/common/scripts). test.py's own
+# dependencies (scylla-driver and everything else it or pytest needs to run)
+# live in test/pyproject.toml / test/uv.lock instead: test.py re-execs itself
+# under `uv run --locked` on startup (see _ensure_running_under_uv() in
+# test.py), so their versions stay decoupled from this frozen toolchain
+# image, and any invocation that needs them directly (e.g. bare pytest) is
+# expected to also go through `uv run --project test --locked` rather than
+# relying on this image.
+declare -A pip_packages=(
+    [conan]=""
+    [scylla-driver]="==$(cat tools/cqlsh/requirements.txt | grep scylla-driver | cut -d= -f3)"
+    [geomet]=""
+    [traceback-with-variables]=""
+    [scylla-api-client]=""
+)
+
+pip_symlinks=(
+    scylla-api-client
 )
 
 centos_packages=(
     gdb
     yaml-cpp-devel
-    thrift-devel
     scylla-antlr35-tool
     scylla-antlr35-C++-devel
     jsoncpp-devel snappy-devel
@@ -131,6 +200,10 @@ centos_packages=(
     scylla-python34-pyparsing20
     systemd-devel
     pigz
+    openldap-servers
+    openldap-devel
+    cpp-jwt-devel
+    python3-pip
 )
 
 # 1) glibc 2.30-3 has sys/sdt.h (systemtap include)
@@ -150,63 +223,20 @@ arch_packages=(
     glibc
     jsoncpp
     lua
+    python-pip
     python-pyparsing
     python3
     rapidjson
     snappy
-    thrift
+    uv
 )
 
-NODE_EXPORTER_VERSION=1.0.1
-declare -A NODE_EXPORTER_CHECKSUM=(
-    ["x86_64"]=3369b76cd2b0ba678b6d618deab320e565c3d93ccb5c2a0d5db51a53857768ae
-    ["aarch64"]=017514906922fcc4b7d727655690787faed0562bc7a17aa9f72b0651cb1b47fb
-    ["s390x"]=2f22d1ce18969017fb32dbd285a264adf3da6252eec05f03f105cf638ec0bb06
-)
-declare -A NODE_EXPORTER_ARCH=(
-    ["x86_64"]=amd64
-    ["aarch64"]=arm64
-    ["s390x"]=s390x
-)
-NODE_EXPORTER_DIR=/opt/scylladb/dependencies
-
-node_exporter_filename() {
-    echo "node_exporter-$NODE_EXPORTER_VERSION.linux-${NODE_EXPORTER_ARCH["$(arch)"]}.tar.gz"
-}
-
-node_exporter_fullpath() {
-    echo "$NODE_EXPORTER_DIR/$(node_exporter_filename)"
-}
-
-node_exporter_checksum() {
-    sha256sum "$(node_exporter_fullpath)" | while read -r sum _; do [[ "$sum" == "${NODE_EXPORTER_CHECKSUM["$(arch)"]}" ]]; done
-}
-
-node_exporter_url() {
-    echo "https://github.com/prometheus/node_exporter/releases/download/v$NODE_EXPORTER_VERSION/$(node_exporter_filename)"
-}
-
-WASMTIME_VERSION=0.29.0
-WASMTIME_DIR=/opt/scylladb/dependencies
-declare -A WASMTIME_CHECKSUM=(
-    ["x86_64"]=e94a9a768270e86e7f7eac1a68575bb1f287702822e83b14c3b04bf7e865a84c
-    ["aarch64"]=36a257aef36f5a0cabc8ce414e31ccede9c16ca996d6b07cb440a32aaa263164
-)
-
-wasmtime_filename() {
-    echo "wasmtime-v$WASMTIME_VERSION-$(arch)-linux-c-api.tar.xz"
-}
-
-wasmtime_fullpath() {
-    echo "$WASMTIME_DIR/$(wasmtime_filename)"
-}
-
-wasmtime_checksum() {
-    sha256sum "$(wasmtime_fullpath)" | while read -r sum _; do [[ "$sum" == "${WASMTIME_CHECKSUM["$(arch)"]}" ]]; done
-}
-
-wasmtime_url() {
-    echo "https://github.com/bytecodealliance/wasmtime/releases/download/v$WASMTIME_VERSION/$(wasmtime_filename)"
+go_arch() {
+    local -A GO_ARCH=(
+        ["x86_64"]=amd64
+        ["aarch64"]=arm64
+    )
+    echo ${GO_ARCH["$(arch)"]}
 }
 
 print_usage() {
@@ -214,13 +244,15 @@ print_usage() {
     echo ""
     echo "  --print-python3-runtime-packages Print required python3 packages for Scylla"
     echo "  --print-pip-runtime-packages Print required pip packages for Scylla"
-    echo "  --print-node-exporter-filename Print node_exporter filename"
+    echo "  --print-pip-symlinks Print list of pip provided commands which need to install to /usr/bin"
+    echo "  --future Install dependencies for future toolchain (Fedora rawhide based)"
     exit 1
 }
 
 PRINT_PYTHON3=false
 PRINT_PIP=false
-PRINT_NODE_EXPORTER=false
+PRINT_PIP_SYMLINK=false
+FUTURE=false
 while [ $# -gt 0 ]; do
     case "$1" in
         "--print-python3-runtime-packages")
@@ -231,8 +263,12 @@ while [ $# -gt 0 ]; do
             PRINT_PIP=true
             shift 1
             ;;
-        "--print-node-exporter-filename")
-            PRINT_NODE_EXPORTER=true
+        "--print-pip-symlinks")
+            PRINT_PIP_SYMLINK=true
+            shift 1
+            ;;
+        "--future")
+            FUTURE=true
             shift 1
             ;;
          *)
@@ -251,18 +287,24 @@ if $PRINT_PYTHON3; then
 fi
 
 if $PRINT_PIP; then
-    echo "${pip_packages[@]}"
+    echo "${!pip_packages[@]}"
     exit 0
 fi
 
-if $PRINT_NODE_EXPORTER; then
-    node_exporter_fullpath
+if $PRINT_PIP_SYMLINK; then
+    echo "${pip_symlinks[@]}"
     exit 0
 fi
+
+if ! $FUTURE; then
+    fedora_packages+=(
+        python3-pytest-sugar
+    )
+fi
+
+umask 0022
 
 ./seastar/install-dependencies.sh
-./tools/jmx/install-dependencies.sh
-./tools/java/install-dependencies.sh
 
 if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     apt-get -y install "${debian_base_packages[@]}"
@@ -275,8 +317,11 @@ if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
     else
         apt-get -y install libsystemd-dev antlr3 libyaml-cpp-dev
     fi
-    echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-thrift --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
+    apt-get -y install libssl-dev
+
+    echo -e "Configure example:\n\t./configure.py --enable-dpdk --mode=release --static-boost --static-yaml-cpp --compiler=/opt/scylladb/bin/g++-7 --cflags=\"-I/opt/scylladb/include -L/opt/scylladb/lib/x86-linux-gnu/\" --ldflags=\"-Wl,-rpath=/opt/scylladb/lib\""
 elif [ "$ID" = "fedora" ]; then
+    fedora_packages+=(openssl-devel)
     if rpm -q --quiet yum-utils; then
         echo
         echo "This script will install dnf-utils package, witch will conflict with currently installed package: yum-utils"
@@ -284,38 +329,22 @@ elif [ "$ID" = "fedora" ]; then
         exit 1
     fi
     dnf install -y "${fedora_packages[@]}" "${fedora_python3_packages[@]}"
-    pip3 install "geomet<0.3,>=0.1"
-    # Disable C extensions
-    pip3 install scylla-driver --install-option="--no-murmur3" --install-option="--no-libev" --install-option="--no-cython"
 
-    if [ -f "$(node_exporter_fullpath)" ] && node_exporter_checksum; then
-        echo "$(node_exporter_filename) already exists, skipping download"
-    else
-        mkdir -p "$NODE_EXPORTER_DIR"
-        curl -fSL -o "$(node_exporter_fullpath)" "$(node_exporter_url)"
-        if ! node_exporter_checksum; then
-            echo "$(node_exporter_filename) download failed"
-            exit 1
-        fi
-    fi
-    if [ -f "$(wasmtime_fullpath)" ] && wasmtime_checksum; then
-        echo "$(wasmtime_filename) already exists, skipping download"
-    else
-        mkdir -p "$WASMTIME_DIR"
-        if curl --retry 5 -fSL -o "$(wasmtime_fullpath)" "$(wasmtime_url)"; then
-            if ! wasmtime_checksum; then
-                echo "$(wasmtime_filename) download failed, skipping"
-            else
-                ( cd $WASMTIME_DIR; tar xvf $(wasmtime_filename) )
-                wasmtime_unpacked=$(basename $(wasmtime_filename) .tar.xz)
-                cp $WASMTIME_DIR/$wasmtime_unpacked/lib/libwasmtime.a /usr/lib64/
-                cp -r $WASMTIME_DIR/$wasmtime_unpacked/include/was{m.h,i.h,mtime,mtime.h} /usr/local/include/
-            fi
-        else
-            echo "$(wasmtime_url) is unreachable, skipping"
-        fi
-    fi
+    ./scripts/install-antlr3.sh
+
+    # Fedora 45 tightened key checks, and cassandra-stress is not signed yet.
+    dnf install --no-gpgchecks -y https://github.com/scylladb/cassandra-stress/releases/download/v3.18.1/cassandra-stress-java21-3.18.1-1.noarch.rpm
+
+    PIP_DEFAULT_ARGS="--only-binary=:all: -v"
+    pip_constrained_packages=""
+    for package in "${!pip_packages[@]}"
+    do
+        pip_constrained_packages="${pip_constrained_packages} ${package}${pip_packages[$package]}"
+    done
+    pip3 install --upgrade --no-cache-dir "$PIP_DEFAULT_ARGS" $pip_constrained_packages
+
 elif [ "$ID" = "centos" ]; then
+    centos_packages+=(openssl-devel)
     dnf install -y "${centos_packages[@]}"
     echo -e "Configure example:\n\tpython3.4 ./configure.py --enable-dpdk --mode=release --static-boost --compiler=/opt/scylladb/bin/g++-7.3 --python python3.4 --ldflag=-Wl,-rpath=/opt/scylladb/lib64 --cflags=-I/opt/scylladb/include --with-antlr3=/opt/scylladb/bin/antlr3"
 elif [ "$ID" == "arch" ]; then
@@ -355,3 +384,41 @@ elif [ "$ID" == "arch" ]; then
     fi
     echo -e "Configure example:\n\t./configure.py\n\tninja release"
 fi
+
+# test.py re-execs itself under `uv run --locked` against test/pyproject.toml
+# (see _ensure_running_under_uv() in test.py), so uv is required on PATH.
+# Fedora and Arch get it from the distro package manager above. Debian, Ubuntu
+# and CentOS have no official uv package, so install Astral's standalone,
+# self-contained binary into /usr/local/bin rather than pip-installing it into
+# the system Python, which could clash with distro-managed packages on a
+# developer workstation. The release tarball is verified against a pinned
+# checksum instead of piping Astral's install.sh into a shell.
+UV_VERSION="0.12.0"
+declare -A UV_SHA256=(
+    ["x86_64"]=eaf842262aa1c418d8ecc5605f02ee1ebfd369124fa48548e85f9481a47831a9
+    ["aarch64"]=2c5d6e3092cc5223b10ff403880cc75121bf64e84644e7a0c69f643b0d89ac95
+)
+if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ] || [ "$ID" = "centos" ]; then
+    if ! command -v uv > /dev/null; then
+        uv_tmpdir=$(mktemp -d)
+        uv_target="uv-$(arch)-unknown-linux-gnu"
+        curl -fSL -o "${uv_tmpdir}/${uv_target}.tar.gz" "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_target}.tar.gz"
+        echo "${UV_SHA256["$(arch)"]}  ${uv_tmpdir}/${uv_target}.tar.gz" | sha256sum --check
+        tar -xzf "${uv_tmpdir}/${uv_target}.tar.gz" -C "${uv_tmpdir}"
+        install -m 755 "${uv_tmpdir}/${uv_target}/uv" "${uv_tmpdir}/${uv_target}/uvx" /usr/local/bin/
+        rm -rf "${uv_tmpdir}"
+    fi
+fi
+
+# Keep this version in lockstep with the `cxx` crate pinned in rust/inc/Cargo.toml
+# and rust/wasmtime_bindings/Cargo.toml: the cxxbridge CLI generates the C++ side
+# of the FFI and the cxx crate generates the Rust side, so a version mismatch
+# breaks linking (unresolved cxxbridge symbols). Bumping one requires bumping the
+# other (and rebuilding the toolchain image).
+cargo --config net.git-fetch-with-cli=true install cxxbridge-cmd --version 1.0.83 --root /usr/local
+
+toxyproxy_version="v2.12.0"
+for bin in toxiproxy-cli toxiproxy-server; do
+    curl -fSL -o "/usr/local/bin/${bin}" "https://github.com/Shopify/toxiproxy/releases/download/${toxyproxy_version}/${bin}-linux-$(go_arch)"
+    chmod +x "/usr/local/bin/${bin}"
+done

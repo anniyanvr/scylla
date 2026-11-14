@@ -3,38 +3,37 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
-#include "abstract_function.hh"
 #include "scalar_function.hh"
-#include "aggregate_function.hh"
+#include "cql3/description.hh"
+#include "cql3/functions/function_name.hh"
+#include "db/functions/aggregate_function.hh"
 
 namespace cql3 {
 namespace functions {
 
-class user_aggregate : public abstract_function, public aggregate_function{
-    bytes_opt _initcond;
-    ::shared_ptr<scalar_function> _sfunc;
-    ::shared_ptr<scalar_function> _finalfunc;
+class user_aggregate : public db::functions::aggregate_function {
 public:
-    user_aggregate(function_name fname, bytes_opt initcond, ::shared_ptr<scalar_function> sfunc, ::shared_ptr<scalar_function> finalfunc);
-    virtual std::unique_ptr<aggregate_function::aggregate> new_aggregate() override;
-    virtual bool is_pure() const override;
-    virtual bool is_native() const override;
-    virtual bool is_aggregate() const override;
-    virtual bool requires_thread() const override;
+    user_aggregate(function_name fname, managed_bytes_opt initcond, ::shared_ptr<scalar_function> sfunc, ::shared_ptr<scalar_function> reducefunc, ::shared_ptr<scalar_function> finalfunc);
+    bool has_finalfunc() const;
 
-    const scalar_function& sfunc() const {
-        return *_sfunc;
+    description describe(with_create_statement) const;
+
+    seastar::shared_ptr<scalar_function> sfunc() const {
+        return _agg.aggregation_function;
     }
-    const scalar_function& finalfunc() const {
-        return *_finalfunc;
+    seastar::shared_ptr<scalar_function> reducefunc() const {
+        return _agg.state_reduction_function;
     }
-    const bytes_opt& initcond() const {
-        return _initcond;
+    seastar::shared_ptr<scalar_function> finalfunc() const {
+        return _agg.state_to_result_function;
+    }
+    const managed_bytes_opt& initcond() const {
+        return _agg.initial_state;
     }
 };
 

@@ -4,7 +4,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <seastar/core/seastar.hh>
@@ -12,19 +12,20 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/util/closeable.hh>
 
+#include "init.hh"
+#include "db/config.hh"
 #include "db/system_distributed_keyspace.hh"
-#include "message/messaging_service.hh"
-#include "gms/failure_detector.hh"
 #include "gms/feature_service.hh"
+#include "message/messaging_service.hh"
 #include "gms/gossiper.hh"
 #include "gms/application_state.hh"
-#include "utils/fb_utilities.hh"
-#include "locator/snitch_base.hh"
-#include "log.hh"
+#include "service/qos/service_level_controller.hh"
+#include "service/topology_state_machine.hh"
+#include "utils/log.hh"
 #include <seastar/core/thread.hh>
 #include <chrono>
-#include "db/config.hh"
 #include "db/schema_tables.hh"
+
 
 namespace bpo = boost::program_options;
 
@@ -48,35 +49,55 @@ namespace bpo = boost::program_options;
 // DEBUG [shard 0] gossip - ep=127.0.0.2, eps=HeartBeatState = { generation = 1446454380, version = 27 }, AppStateMap = { LOAD : Value(0.5005,26) }
 
 int main(int ac, char ** av) {
-    distributed<replica::database> db;
+    sharded<replica::database> db;
     app_template app;
     app.add_options()
         ("seed", bpo::value<std::vector<std::string>>(), "IP address of seed node")
         ("listen-address", bpo::value<std::string>()->default_value("0.0.0.0"), "IP address to listen");
-    return app.run_deprecated(ac, av, [&db, &app] {
-        return async([&db, &app] {
+    return app.run_deprecated(ac, av, [&app] {
+        return async([&app] {
             auto config = app.configuration();
             logging::logger_registry().set_logger_level("gossip", logging::log_level::trace);
             const gms::inet_address listen = gms::inet_address(config["listen-address"].as<std::string>());
-            utils::fb_utilities::set_broadcast_address(listen);
-            utils::fb_utilities::set_broadcast_rpc_address(listen);
-            auto cfg = std::make_unique<db::config>();
-            locator::i_endpoint_snitch::create_snitch("SimpleSnitch").get();
-
-            sharded<gms::feature_service> feature_service;
-            feature_service.start(gms::feature_config_from_db_config(*cfg)).get();
-            auto stop_feature_service = deferred_stop(feature_service);
 
             sharded<abort_source> abort_sources;
             sharded<locator::shared_token_metadata> token_metadata;
+            sharded<netw::walltime_compressor_tracker> compressor_tracker;
+            sharded<gms::feature_service> feature_service;
+            sharded<gms::gossip_address_map> gossip_address_map;
             sharded<netw::messaging_service> messaging;
+            sharded<auth::service> auth_service;
+            sharded<service::topology_state_machine> topo_sm;
+            topo_sm.start().get();
 
             abort_sources.start().get();
-            auto stop_abort_source = defer([&] { abort_sources.stop().get(); });
-            token_metadata.start([] () noexcept { return db::schema_tables::hold_merge_lock(); }).get();
-            auto stop_token_mgr = defer([&] { token_metadata.stop().get(); });
+            auto stop_abort_source = defer([&] noexcept { abort_sources.stop().get(); });
 
-            messaging.start(listen).get();
+            locator::token_metadata::config tm_cfg;
+            auto my_address = gms::inet_address("localhost");
+            tm_cfg.topo_cfg.this_endpoint = my_address;
+            tm_cfg.topo_cfg.this_cql_address = my_address;
+            token_metadata.start([] () noexcept { return db::schema_tables::hold_merge_lock(); }, tm_cfg).get();
+            auto stop_token_mgr = defer([&] noexcept { token_metadata.stop().get(); });
+            locator::shared_token_metadata tm({}, {});
+            sharded<qos::service_level_controller> sl_controller;
+            scheduling_group default_scheduling_group = create_scheduling_group("sl_default_sg", 1.0).get();
+            sharded<abort_source> as;
+            as.start().get();
+            auto stop_as = defer([&as] noexcept { as.stop().get(); });
+            sl_controller.start(std::ref(auth_service), std::ref(tm), std::ref(as), qos::service_level_options{.shares = 1000}, scheduling_supergroup(), default_scheduling_group).get();
+            compressor_tracker.start([] { return netw::walltime_compressor_tracker::config{}; }).get();
+            auto stop_compressor_tracker = deferred_stop(compressor_tracker);
+
+            gms::feature_config cfg;
+            cfg.disabled_features = get_disabled_features_from_db_config(db::config());
+            feature_service.start(cfg).get();
+
+            gossip_address_map.start().get();
+
+            messaging.start(locator::host_id{}, listen, 7000, std::ref(feature_service),
+                            std::ref(gossip_address_map), gms::generation_type{}, std::ref(compressor_tracker),
+                            std::ref(sl_controller)).get();
             auto stop_messaging = deferred_stop(messaging);
 
             gms::gossip_config gcfg;
@@ -84,7 +105,8 @@ int main(int ac, char ** av) {
             for (auto s : config["seed"].as<std::vector<std::string>>()) {
                 gcfg.seeds.emplace(std::move(s));
             }
-            gms::get_gossiper().start(std::ref(abort_sources), std::ref(feature_service), std::ref(token_metadata), std::ref(messaging), std::ref(*cfg), std::move(gcfg)).get();
+            sharded<gms::gossiper> gossiper;
+            gossiper.start(std::ref(abort_sources), std::ref(token_metadata), std::ref(messaging), std::move(gcfg), std::ref(gossip_address_map), std::ref(topo_sm)).get();
 
             auto& server = messaging.local();
             auto port = server.port();
@@ -92,21 +114,20 @@ int main(int ac, char ** av) {
             fmt::print("Messaging server listening on ip {} port {:d} ...\n", msg_listen, port);
 
             std::cout << "Start gossiper service ...\n";
-            auto& gossiper = gms::get_local_gossiper();
 
-            std::map<gms::application_state, gms::versioned_value> app_states = {
+            gms::application_state_map app_states = {
                 { gms::application_state::LOAD, gms::versioned_value::load(0.5) },
             };
 
             using namespace std::chrono;
             auto now = high_resolution_clock::now().time_since_epoch();
-            int generation_number = duration_cast<seconds>(now).count();
-            gossiper.start_gossiping(generation_number, app_states).get();
+            auto generation_number = gms::generation_type(duration_cast<seconds>(now).count());
+            gossiper.local().start_gossiping(generation_number, app_states).get();
             static double load = 0.5;
             for (;;) {
                 auto value = gms::versioned_value::load(load);
                 load += 0.0001;
-                gms::get_local_gossiper().add_local_application_state(gms::application_state::LOAD, value).get();
+                gossiper.local().add_local_application_state(gms::application_state::LOAD, value).get();
                 sleep(std::chrono::seconds(1)).get();
            }
         });

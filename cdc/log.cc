@@ -3,14 +3,13 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include <utility>
 #include <algorithm>
-
+#include <unordered_set>
 #include <boost/range/irange.hpp>
-#include <boost/algorithm/string/predicate.hpp>
 #include <seastar/core/thread.hh>
 #include <seastar/core/metrics.hh>
 
@@ -20,29 +19,35 @@
 #include "cdc/cdc_options.hh"
 #include "cdc/change_visitor.hh"
 #include "cdc/metadata.hh"
+#include "cdc/cdc_partitioner.hh"
 #include "bytes.hh"
+#include "index/external_index.hh"
+#include "locator/abstract_replication_strategy.hh"
+#include "locator/topology.hh"
 #include "replica/database.hh"
+#include "db/config.hh"
 #include "db/schema_tables.hh"
-#include "partition_slice_builder.hh"
-#include "schema.hh"
-#include "schema_builder.hh"
+#include "gms/feature_service.hh"
+#include "schema/schema.hh"
+#include "schema/schema_builder.hh"
 #include "service/migration_listener.hh"
 #include "service/storage_proxy.hh"
+#include "tombstone_gc_extension.hh"
 #include "types/tuple.hh"
 #include "cql3/statements/select_statement.hh"
-#include "cql3/multi_column_relation.hh"
 #include "cql3/untyped_result_set.hh"
 #include "log.hh"
+#include "utils/assert.hh"
 #include "utils/rjson.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/managed_bytes.hh"
-#include "utils/fragment_range.hh"
-#include "types.hh"
-#include "concrete_types.hh"
+#include "types/types.hh"
+#include "types/concrete_types.hh"
 #include "types/listlike_partial_deserializing_iterator.hh"
 #include "tracing/trace_state.hh"
 #include "stats.hh"
-#include "compaction/compaction_strategy.hh"
+#include "utils/labels.hh"
+#include "alternator/executor.hh"
 
 namespace std {
 
@@ -58,8 +63,23 @@ using namespace std::chrono_literals;
 
 logging::logger cdc_log("cdc");
 
+namespace {
+
+shared_ptr<locator::abstract_replication_strategy> generate_replication_strategy(const keyspace_metadata& ksm, const locator::topology& topo) {
+    locator::replication_strategy_params params(ksm.strategy_options(), ksm.initial_tablets(), ksm.consistency_option());
+    return locator::abstract_replication_strategy::create_replication_strategy(ksm.strategy_name(), params, topo);
+}
+
+// When dropping a column from a CDC log table, we set the drop timestamp
+// `column_drop_leeway` seconds into the future to ensure that for writes concurrent
+// with column drop, the write timestamp is before the column drop timestamp.
+constexpr auto column_drop_leeway = std::chrono::seconds(5);
+
+} // anonymous namespace
+
 namespace cdc {
-static schema_ptr create_log_schema(const schema&, std::optional<utils::UUID> = {});
+static schema_ptr create_log_schema(const schema&, const replica::database&, const keyspace_metadata&, api::timestamp_type,
+        std::optional<table_id> = {}, schema_ptr = nullptr);
 }
 
 static constexpr auto cdc_group_name = "cdc";
@@ -68,9 +88,9 @@ void cdc::stats::parts_touched_stats::register_metrics(seastar::metrics::metric_
     namespace sm = seastar::metrics;
     auto register_part = [&] (part_type part, sstring part_name) {
         metrics.add_group(cdc_group_name, {
-                sm::make_total_operations(format("operations_on_{}_performed_{}", part_name, suffix), count[(size_t)part],
-                        sm::description(format("number of {} CDC operations that processed a {}", suffix, part_name)),
-                        {})
+                sm::make_total_operations(seastar::format("operations_on_{}_performed_{}", part_name, suffix), count[(size_t)part],
+                        sm::description(seastar::format("number of {} CDC operations that processed a {}", suffix, part_name)),
+                        {cdc_label}).set_skip_when_empty()
             });
     };
 
@@ -93,23 +113,23 @@ cdc::stats::stats() {
         _metrics.add_group(cdc_group_name, {
                 sm::make_total_operations("operations_" + kind, counters.unsplit_count,
                         sm::description(format("number of {} CDC operations", kind)),
-                        {split_label(false)}),
+                        {split_label(false), basic_level, cdc_label}).set_skip_when_empty(),
 
                 sm::make_total_operations("operations_" + kind, counters.split_count,
                         sm::description(format("number of {} CDC operations", kind)),
-                        {split_label(true)}),
+                        {split_label(true), basic_level, cdc_label}).set_skip_when_empty(),
 
                 sm::make_total_operations("preimage_selects_" + kind, counters.preimage_selects,
                         sm::description(format("number of {} preimage queries performed", kind)),
-                        {}),
+                        {cdc_label}).set_skip_when_empty(),
 
                 sm::make_total_operations("operations_with_preimage_" + kind, counters.with_preimage_count,
                         sm::description(format("number of {} operations that included preimage", kind)),
-                        {}),
+                        {cdc_label}).set_skip_when_empty(),
 
                 sm::make_total_operations("operations_with_postimage_" + kind, counters.with_postimage_count,
                         sm::description(format("number of {} operations that included postimage", kind)),
-                        {})
+                        {cdc_label}).set_skip_when_empty()
             });
 
         counters.touches.register_metrics(_metrics, kind);
@@ -151,7 +171,7 @@ public:
         _ctxt._migration_notifier.register_listener(this);
     }
     ~impl() {
-        assert(_stopped);
+        SCYLLA_ASSERT(_stopped);
     }
 
     future<> stop() {
@@ -160,85 +180,150 @@ public:
         });
     }
 
-    void on_before_create_column_family(const schema& schema, std::vector<mutation>& mutations, api::timestamp_type timestamp) override {
-        if (schema.cdc_options().enabled()) {
+    virtual void on_before_allocate_tablet_map(const locator::tablet_map& map, const schema& s, utils::chunked_vector<mutation>& muts, api::timestamp_type ts) override {
+        if (!is_log_schema(s)) {
+            return;
+        }
+
+        auto stream_ts = db_clock::now() - duration_cast<std::chrono::milliseconds>(get_generation_leeway());
+        auto mut = create_table_streams_mutation(s.id(), stream_ts, map, ts).get();
+        muts.emplace_back(std::move(mut));
+    }
+
+    void on_pre_create_column_families(const keyspace_metadata& ksm, std::vector<schema_ptr>& cfms, api::timestamp_type ts) override {
+        std::vector<schema_ptr> new_cfms;
+
+        for (auto sp : cfms) {
+            const auto& schema = *sp;
+
+            if (!cdc_enabled(schema)) {
+                continue;
+            }
+
             auto& db = _ctxt._proxy.get_db().local();
             auto logname = log_name(schema.cf_name());
             check_that_cdc_log_table_does_not_exist(db, schema, logname);
             ensure_that_table_has_no_counter_columns(schema);
+            ensure_that_keyspace_is_not_strongly_consistent(ksm, schema);
+            if (!db.features().cdc_with_tablets) {
+                ensure_that_table_uses_vnodes(ksm, schema, db.get_token_metadata().get_topology());
+            }
 
             // in seastar thread
-            auto log_schema = create_log_schema(schema);
-            auto& keyspace = db.find_keyspace(schema.ks_name());
-
-            auto log_mut = db::schema_tables::make_create_table_mutations(keyspace.metadata(), log_schema, timestamp);
-
-            mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
+            auto log_schema = create_log_schema(schema, db, ksm, ts);
+            new_cfms.push_back(std::move(log_schema));
         }
+
+        cfms.insert(cfms.end(), std::make_move_iterator(new_cfms.begin()), std::make_move_iterator(new_cfms.end()));
     }
 
-    void on_before_update_column_family(const schema& new_schema, const schema& old_schema, std::vector<mutation>& mutations, api::timestamp_type timestamp) override {
-        bool is_cdc = new_schema.cdc_options().enabled();
-        bool was_cdc = old_schema.cdc_options().enabled();
+    void on_before_update_column_family(const schema& new_schema, const schema& old_schema, utils::chunked_vector<mutation>& mutations, api::timestamp_type timestamp) override {
+        // If we have a vector (VS) or fulltext (FTS) index, we need to ensure that the CDC log
+        // is created satisfying the minimal requirements of Vector Store.
+        secondary_index::external_index::check_cdc_options_if_present(new_schema);
 
-        // we need to create or modify the log & stream schemas iff either we changed cdc status (was != is)
-        // or if cdc is on now unconditionally, since then any actual base schema changes will affect the column 
-        // etc.
-        if (was_cdc || is_cdc) {
+        bool is_cdc = cdc_enabled(new_schema);
+        bool was_cdc = cdc_enabled(old_schema);
+
+        // if we are turning off cdc we can skip this, since even if columns change etc,
+        // any writer should see cdc -> off together with any actual schema changes to
+        // base table, so should never try to write to non-existent log column etc.
+        // note that if user has set ttl=0 in cdc options, he is still responsible
+        // for emptying the log. 
+        if (is_cdc) {
             auto& db = _ctxt._proxy.get_db().local();
-
-            if (!was_cdc) {
-                check_that_cdc_log_table_does_not_exist(db, new_schema, log_name(new_schema.cf_name()));
-            }
-            if (is_cdc) {
-                check_for_attempt_to_create_nested_cdc_log(db, new_schema);
-                ensure_that_table_has_no_counter_columns(new_schema);
-            }
-
             auto logname = log_name(old_schema.cf_name());
             auto& keyspace = db.find_keyspace(old_schema.ks_name());
-            auto log_schema = was_cdc ? db.find_column_family(old_schema.ks_name(), logname).schema() : nullptr;
+            auto has_cdc_log = db.has_schema(old_schema.ks_name(), logname);
+            auto log_schema = has_cdc_log ? db.find_schema(old_schema.ks_name(), logname) : nullptr;
 
-            if (!is_cdc) {
-                auto log_mut = db::schema_tables::make_drop_table_mutations(keyspace.metadata(), log_schema, timestamp);
-
-                mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
-                return;
+            if (!was_cdc && has_cdc_log) {
+                // make sure the apparent log table really is a cdc log (not user table)
+                // we just check the partitioner - since user tables should _not_ be able
+                // set/use this.
+                if (!is_log_schema(*log_schema)) {
+                    // will throw
+                    check_that_cdc_log_table_does_not_exist(db, old_schema, logname);
+                }
             }
 
-            auto new_log_schema = create_log_schema(new_schema, log_schema ? std::make_optional(log_schema->id()) : std::nullopt);
+            check_for_attempt_to_create_nested_cdc_log(db, new_schema);
+            ensure_that_table_has_no_counter_columns(new_schema);
+            ensure_that_keyspace_is_not_strongly_consistent(*keyspace.metadata(), new_schema);
+            if (!db.features().cdc_with_tablets) {
+                ensure_that_table_uses_vnodes(*keyspace.metadata(), new_schema, db.get_token_metadata().get_topology());
+            }
+
+            std::optional<table_id> maybe_id = log_schema ? std::make_optional(log_schema->id()) : std::nullopt;
+            auto new_log_schema = create_log_schema(new_schema, db, *keyspace.metadata(), timestamp, std::move(maybe_id), log_schema);
 
             auto log_mut = log_schema 
-                ? db::schema_tables::make_update_table_mutations(db, keyspace.metadata(), log_schema, new_log_schema, timestamp, false)
-                : db::schema_tables::make_create_table_mutations(keyspace.metadata(), new_log_schema, timestamp)
+                ? db::schema_tables::make_update_table_mutations(_ctxt._proxy, keyspace.metadata(), log_schema, new_log_schema, timestamp)
+                : db::schema_tables::make_create_table_mutations(new_log_schema, timestamp)
                 ;
 
             mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
+
+            if (!log_schema) {
+                db.get_notifier().before_create_column_family_in_notification(*keyspace.metadata(), *new_log_schema, mutations, timestamp);
+            }
         }
     }
 
-    void on_before_drop_column_family(const schema& schema, std::vector<mutation>& mutations, api::timestamp_type timestamp) override {
-        if (schema.cdc_options().enabled()) {
-            auto logname = log_name(schema.cf_name());
-            auto& db = _ctxt._proxy.get_db().local();
+    void on_before_drop_column_family(const schema& schema, utils::chunked_vector<mutation>& mutations, api::timestamp_type timestamp) override {
+        auto logname = log_name(schema.cf_name());
+        auto& db = _ctxt._proxy.get_db().local();
+        auto has_cdc_log = db.has_schema(schema.ks_name(), logname);
+        if (has_cdc_log) {
+            auto log_schema = db.find_schema(schema.ks_name(), logname);
+            if (is_log_schema(*log_schema)) {
+                auto& keyspace = db.find_keyspace(schema.ks_name());
+                auto log_mut = db::schema_tables::make_drop_table_mutations(keyspace.metadata(), log_schema, timestamp);
+                mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
+
+                db.get_notifier().before_drop_column_family_in_notification(*log_schema, mutations, timestamp);
+            }
+        }
+
+        if (is_log_schema(schema)) {
             auto& keyspace = db.find_keyspace(schema.ks_name());
-            auto log_schema = db.find_column_family(schema.ks_name(), logname).schema();
-
-            auto log_mut = db::schema_tables::make_drop_table_mutations(keyspace.metadata(), log_schema, timestamp);
-
-            mutations.insert(mutations.end(), std::make_move_iterator(log_mut.begin()), std::make_move_iterator(log_mut.end()));
+            if (keyspace.uses_tablets()) {
+                // drop cdc streams of this table
+                auto drop_stream_mut = make_drop_table_streams_mutations(schema.id(), timestamp);
+                mutations.insert(mutations.end(), std::make_move_iterator(drop_stream_mut.begin()), std::make_move_iterator(drop_stream_mut.end()));
+            }
         }
     }
 
-    future<std::tuple<std::vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>> augment_mutation_call(
+    void on_before_drop_keyspace(const sstring& keyspace_name, utils::chunked_vector<mutation>& mutations, api::timestamp_type ts) override {
+        auto& db = _ctxt._proxy.get_db().local();
+        auto& ks = db.find_keyspace(keyspace_name);
+
+        if (ks.uses_tablets()) {
+            // drop cdc streams for all CDC tables in this keyspace
+            for (auto&& [name, s] : ks.metadata()->cf_meta_data()) {
+                seastar::thread::maybe_yield();
+
+                if (!is_log_schema(*s)) {
+                    continue;
+                }
+
+                auto drop_stream_mut = make_drop_table_streams_mutations(s->id(), ts);
+                mutations.insert(mutations.end(), std::make_move_iterator(drop_stream_mut.begin()), std::make_move_iterator(drop_stream_mut.end()));
+            }
+        }
+    }
+
+    future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>> augment_mutation_call(
         lowres_clock::time_point timeout,
-        std::vector<mutation>&& mutations,
+        utils::chunked_vector<mutation>&& mutations,
         tracing::trace_state_ptr tr_state,
-        db::consistency_level write_cl
+        db::consistency_level write_cl,
+        per_request_options options
     );
 
     template<typename Iter>
-    future<> append_mutations(Iter i, Iter e, schema_ptr s, lowres_clock::time_point, std::vector<mutation>&);
+    future<> append_mutations(Iter i, Iter e, schema_ptr s, lowres_clock::time_point, utils::chunked_vector<mutation>&);
 
 private:
     static void check_for_attempt_to_create_nested_cdc_log(replica::database& db, const schema& schema) {
@@ -264,6 +349,25 @@ private:
                     schema.ks_name(), schema.cf_name()));
         }
     }
+
+    static void ensure_that_keyspace_is_not_strongly_consistent(const keyspace_metadata& ksm, const schema& schema) {
+        using data_dictionary::consistency_config_option;
+        if (ksm.consistency_option().value_or(consistency_config_option::eventual) != consistency_config_option::eventual) {
+            throw exceptions::invalid_request_exception(format("Cannot create CDC log for table {}.{}: CDC is not supported in strongly consistent keyspaces",
+                    schema.ks_name(), schema.cf_name()));
+        }
+    }
+
+    // Until we support CDC with tablets (issue #16317), we can't allow this
+    // to be attempted - in particular the log table we try to create will not
+    // have tablets, and will cause a failure.
+    static void ensure_that_table_uses_vnodes(const keyspace_metadata& ksm, const schema& schema, const locator::topology& topo) {
+        auto rs = generate_replication_strategy(ksm, topo);
+        if (rs->uses_tablets()) {
+            throw exceptions::invalid_request_exception(format("Cannot create CDC log for a table {}.{}, because the keyspace uses tablets, and not all nodes support the CDC with tablets feature.",
+                schema.ks_name(), schema.cf_name()));
+        }
+    }
 };
 
 cdc::cdc_service::cdc_service(service::storage_proxy& proxy, cdc::metadata& cdc_metadata, service::migration_notifier& notifier)
@@ -284,36 +388,38 @@ future<> cdc::cdc_service::stop() {
 cdc::cdc_service::~cdc_service() = default;
 
 namespace {
-static const sstring delta_mode_string_keys = "keys";
-static const sstring delta_mode_string_full = "full";
+static constexpr std::string_view delta_mode_string_keys = "keys";
+static constexpr std::string_view delta_mode_string_full = "full";
 
-static const std::string_view image_mode_string_full = delta_mode_string_full;
+static constexpr std::string_view image_mode_string_full = delta_mode_string_full;
 
-sstring to_string(cdc::delta_mode dm) {
-    switch (dm) {
-        case cdc::delta_mode::keys : return delta_mode_string_keys;
-        case cdc::delta_mode::full : return delta_mode_string_full;
+} // anon. namespace
+
+auto fmt::formatter<cdc::delta_mode>::format(cdc::delta_mode m, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    using enum cdc::delta_mode;
+    switch (m) {
+        case keys:
+            return fmt::format_to(ctx.out(), delta_mode_string_keys);
+        case full:
+            return fmt::format_to(ctx.out(), delta_mode_string_full);
     }
     throw std::logic_error("Impossible value of cdc::delta_mode");
 }
 
-sstring to_string(cdc::image_mode m) {
+auto fmt::formatter<cdc::image_mode>::format(cdc::image_mode m, fmt::format_context& ctx) const
+        -> decltype(ctx.out()) {
+    using enum cdc::image_mode;
     switch (m) {
-        case cdc::image_mode::off : return "false";
-        case cdc::image_mode::on : return "true";
-        case cdc::image_mode::full : return sstring(image_mode_string_full);
+        case off:
+            return fmt::format_to(ctx.out(), "false");
+        case on:
+            return fmt::format_to(ctx.out(), "true");
+            break;
+        case full:
+            return fmt::format_to(ctx.out(), image_mode_string_full);
     }
     throw std::logic_error("Impossible value of cdc::image_mode");
-}
-
-} // anon. namespace
-
-std::ostream& cdc::operator<<(std::ostream& os, delta_mode m) {
-    return os << to_string(m);
-}
-
-std::ostream& cdc::operator<<(std::ostream& os, image_mode m) {
-    return os << to_string(m);
 }
 
 cdc::options::options(const std::map<sstring, sstring>& map) {
@@ -366,6 +472,18 @@ cdc::options::options(const std::map<sstring, sstring>& map) {
             if (_ttl < 0) {
                 throw exceptions::configuration_exception("Invalid CDC option: ttl must be >= 0");
             }
+        } else if (key == "enable_requested") {
+            if (is_true || is_false) {
+                _enable_requested = is_true;
+            } else {
+                throw exceptions::configuration_exception("Invalid value for CDC option \"enable_requested\": " + p.second);
+            }
+        } else if (key == "tablet_merge_blocked") {
+            if (is_true || is_false) {
+                _tablet_merge_blocked = is_true;
+            } else {
+                throw exceptions::configuration_exception("Invalid value for CDC option \"tablet_merge_blocked\": " + p.second);
+            }
         } else {
             throw exceptions::configuration_exception("Invalid CDC option: " + p.first);
         }
@@ -373,17 +491,28 @@ cdc::options::options(const std::map<sstring, sstring>& map) {
 }
 
 std::map<sstring, sstring> cdc::options::to_map() const {
-    if (!is_enabled_set()) {
+    if (!is_enabled_set() && !_enable_requested) {
         return {};
     }
 
-    return {
+    std::map<sstring, sstring> ret = {
         { "enabled", enabled() ? "true" : "false" },
-        { "preimage", to_string(_preimage) },
+        { "preimage", fmt::format("{}", _preimage) },
         { "postimage", _postimage ? "true" : "false" },
-        { "delta", to_string(_delta_mode) },
+        { "delta", fmt::format("{}", _delta_mode) },
         { "ttl", std::to_string(_ttl) },
     };
+    // enable_requested and tablet_merge_blocked are set to true only by feature-gated code.
+    // This feature is CDC_BLOCK_TABLET_MERGES_FOR_ALTERNATOR_STREAMS.
+    // Since absence decodes as false and older nodes throw on unknown CDC option names
+    // regardless of their values, we keep false values absent from the serialized map.
+    if (enable_requested()) {
+        ret.emplace("enable_requested", "true");
+    }
+    if (_tablet_merge_blocked) {
+        ret.emplace("tablet_merge_blocked", "true");
+    }
+    return ret;
 }
 
 sstring cdc::options::to_sstring() const {
@@ -391,11 +520,10 @@ sstring cdc::options::to_sstring() const {
 }
 
 bool cdc::options::operator==(const options& o) const {
-    return enabled() == o.enabled() && _preimage == o._preimage && _postimage == o._postimage && _ttl == o._ttl
+    return enabled() == o.enabled() && enable_requested() == o.enable_requested()
+            && _tablet_merge_blocked == o._tablet_merge_blocked
+            && _preimage == o._preimage && _postimage == o._postimage && _ttl == o._ttl
             && _delta_mode == o._delta_mode;
-}
-bool cdc::options::operator!=(const options& o) const {
-    return !(*this == o);
 }
 
 namespace cdc {
@@ -407,8 +535,16 @@ static const sstring cdc_meta_column_prefix = "cdc$";
 static const sstring cdc_deleted_column_prefix = cdc_meta_column_prefix + "deleted_";
 static const sstring cdc_deleted_elements_column_prefix = cdc_meta_column_prefix + "deleted_elements_";
 
-static bool is_log_name(const std::string_view& table_name) {
-    return boost::ends_with(table_name, cdc_log_suffix);
+bool cdc_enabled(const schema& s) {
+    return s.cdc_options().enabled() || secondary_index::external_index::has_index(s);
+}
+
+bool is_log_name(const std::string_view& table_name) {
+    return table_name.ends_with(cdc_log_suffix);
+}
+
+bool is_log_schema(const schema& s) {
+    return s.get_partitioner().name() == cdc::cdc_partitioner::classname;
 }
 
 bool is_cdc_metacolumn_name(const sstring& name) {
@@ -420,14 +556,14 @@ bool is_log_for_some_table(const replica::database& db, const sstring& ks_name, 
     if (!base_schema) {
         return false;
     }
-    return base_schema->cdc_options().enabled();
+    return cdc_enabled(*base_schema);
 }
 
 schema_ptr get_base_table(const replica::database& db, const schema& s) {
     return get_base_table(db, s.ks_name(), s.cf_name());
 }
 
-schema_ptr get_base_table(const replica::database& db, sstring_view ks_name,std::string_view table_name) {
+schema_ptr get_base_table(const replica::database& db, std::string_view ks_name, std::string_view table_name) {
     if (!is_log_name(table_name)) {
         return nullptr;
     }
@@ -444,7 +580,7 @@ schema_ptr get_base_table(const replica::database& db, sstring_view ks_name,std:
 }
 
 seastar::sstring base_name(std::string_view log_name) {
-    assert(is_log_name(log_name));
+    SCYLLA_ASSERT(is_log_name(log_name));
     return sstring(log_name.data(), log_name.size() - cdc_log_suffix.size());
 }
 
@@ -484,10 +620,10 @@ bytes log_data_column_deleted_elements_name_bytes(const bytes& column_name) {
     return to_bytes(cdc_deleted_elements_column_prefix) + column_name;
 }
 
-static schema_ptr create_log_schema(const schema& s, std::optional<utils::UUID> uuid) {
-    schema_builder b(s.ks_name(), log_name(s.cf_name()));
-    b.with_partitioner("com.scylladb.dht.CDCPartitioner");
-    b.set_compaction_strategy(sstables::compaction_strategy_type::time_window);
+static void set_default_properties_log_table(schema_builder& b, const schema& s,
+        const replica::database& db, const keyspace_metadata& ksm)
+{
+    b.set_compaction_strategy(compaction::compaction_strategy_type::time_window);
     b.set_comment(fmt::format("CDC log for {}.{}", s.ks_name(), s.cf_name()));
     auto ttl_seconds = s.cdc_options().ttl();
     if (ttl_seconds > 0) {
@@ -512,13 +648,44 @@ static schema_ptr create_log_schema(const schema& s, std::optional<utils::UUID> 
                         std::to_string(std::max(1, window_seconds / 2))},
         });
     }
+    b.set_caching_options(caching_options::get_disabled_caching_options());
+
+    auto rs = generate_replication_strategy(ksm, db.get_token_metadata().get_topology());
+    auto tombstone_gc_ext = seastar::make_shared<tombstone_gc_extension>(get_default_tombstone_gc_mode(*rs, false));
+    b.add_extension(tombstone_gc_extension::NAME, std::move(tombstone_gc_ext));
+}
+
+static void add_columns_to_cdc_log(schema_builder& b, const schema& s,
+        const api::timestamp_type timestamp, const schema_ptr old)
+{
     b.with_column(log_meta_column_name_bytes("stream_id"), bytes_type, column_kind::partition_key);
     b.with_column(log_meta_column_name_bytes("time"), timeuuid_type, column_kind::clustering_key);
     b.with_column(log_meta_column_name_bytes("batch_seq_no"), int32_type, column_kind::clustering_key);
     b.with_column(log_meta_column_name_bytes("operation"), data_type_for<operation_native_type>());
     b.with_column(log_meta_column_name_bytes("ttl"), long_type);
     b.with_column(log_meta_column_name_bytes("end_of_batch"), boolean_type);
-    b.set_caching_options(caching_options::get_disabled_caching_options());
+
+    auto validate_new_column = [&] (const sstring& name) {
+        // When dropping a column from a CDC log table, we set the drop timestamp to be
+        // `column_drop_leeway` seconds into the future (see `create_log_schema`).
+        // Therefore, when recreating a column with the same name, we need to validate
+        // that it's not recreated too soon and that the drop timestamp has passed.
+        if (old && old->dropped_columns().contains(name)) {
+            const auto& drop_info = old->dropped_columns().at(name);
+            auto create_time = api::timestamp_clock::time_point(api::timestamp_clock::duration(timestamp));
+            auto drop_time = api::timestamp_clock::time_point(api::timestamp_clock::duration(drop_info.timestamp));
+            if (drop_time > create_time) {
+                throw exceptions::invalid_request_exception(format("Cannot add column {} because a column with the same name was dropped too recently. Please retry after {} seconds",
+                        name, std::chrono::duration_cast<std::chrono::seconds>(drop_time - create_time).count() + 1));
+            }
+        }
+    };
+
+    auto add_column = [&] (sstring name, data_type type) {
+        validate_new_column(name);
+        b.with_column(to_bytes(name), type);
+    };
+
     auto add_columns = [&] (const schema::const_iterator_range_type& columns, bool is_data_col = false) {
         for (const auto& column : columns) {
             auto type = column.type;
@@ -540,9 +707,9 @@ static schema_ptr create_log_schema(const schema& s, std::optional<utils::UUID> 
                     }
                 ));
             }
-            b.with_column(log_data_column_name_bytes(column.name()), type);
+            add_column(log_data_column_name(column.name_as_text()), type);
             if (is_data_col) {
-                b.with_column(log_data_column_deleted_name_bytes(column.name()), boolean_type);
+                add_column(log_data_column_deleted_name(column.name_as_text()), boolean_type);
             }
             if (column.type->is_multi_cell()) {
                 auto dtype = visit(*type, make_visitor(
@@ -558,7 +725,7 @@ static schema_ptr create_log_schema(const schema& s, std::optional<utils::UUID> 
                         throw std::invalid_argument("Should not reach");
                     }
                 ));
-                b.with_column(log_data_column_deleted_elements_name_bytes(column.name()), dtype);
+                add_column(log_data_column_deleted_elements_name(column.name_as_text()), dtype);
             }
         }
     };
@@ -566,9 +733,41 @@ static schema_ptr create_log_schema(const schema& s, std::optional<utils::UUID> 
     add_columns(s.clustering_key_columns());
     add_columns(s.static_columns(), true);
     add_columns(s.regular_columns(), true);
+}
+
+static schema_ptr create_log_schema(const schema& s, const replica::database& db,
+        const keyspace_metadata& ksm, api::timestamp_type timestamp, std::optional<table_id> uuid, schema_ptr old)
+{
+    schema_builder b(this_smp_shard_count(), s.ks_name(), log_name(s.cf_name()));
+
+    b.with_partitioner(cdc::cdc_partitioner::classname);
+
+    if (old) {
+        // If the user reattaches the log table, do not change its properties.
+        b.set_properties(old->get_properties());
+    } else {
+        set_default_properties_log_table(b, s, db, ksm);
+    }
+
+    add_columns_to_cdc_log(b, s, timestamp, old);
 
     if (uuid) {
         b.set_uuid(*uuid);
+    }
+
+    /**
+     * #10473 - if we are redefining the log table, we need to ensure any dropped
+     * columns are registered in "dropped_columns" table, otherwise clients will not
+     * be able to read data older than now.
+     */
+    if (old) {
+        // not super efficient, but we don't do this often.
+        for (auto& col : old->all_columns()) {
+            if (!b.has_column({col.name(), col.name_as_text() })) {
+                auto drop_ts = api::timestamp_clock::now() + column_drop_leeway;
+                b.without_column(col.name_as_text(), col.type, drop_ts.time_since_epoch().count());
+            }
+        }
     }
 
     return b.build();
@@ -590,7 +789,7 @@ private:
 public:
     collection_iterator(managed_bytes_view_opt v = {})
         : _v(v.value_or(managed_bytes_view{}))
-        , _rem(_v.empty() ? 0 : read_collection_size(_v, cql_serialization_format::internal()))
+        , _rem(_v.empty() ? 0 : read_collection_size(_v))
     {
         if (_rem != 0) {
             parse();
@@ -620,9 +819,6 @@ public:
     bool operator==(const collection_iterator& x) const {
         return _v == x._v;
     }
-    bool operator!=(const collection_iterator& x) const {
-        return !(*this == x);
-    }
 private:
     void next() {
         --_rem;
@@ -633,18 +829,26 @@ private:
 
 template<>
 void collection_iterator<std::pair<managed_bytes_view, managed_bytes_view>>::parse() {
-    assert(_rem > 0);
+    SCYLLA_ASSERT(_rem > 0);
     _next = _v;
-    auto k = read_collection_value(_next, cql_serialization_format::internal());
-    auto v = read_collection_value(_next, cql_serialization_format::internal());
+    auto k = read_collection_key(_next);
+    auto v = read_collection_value_nonnull(_next);
     _current = std::make_pair(k, v);
 }
 
 template<>
 void collection_iterator<managed_bytes_view>::parse() {
-    assert(_rem > 0);
+    SCYLLA_ASSERT(_rem > 0);
     _next = _v;
-    auto k = read_collection_value(_next, cql_serialization_format::internal());
+    auto k = read_collection_key(_next);
+    _current = k;
+}
+
+template<>
+void collection_iterator<managed_bytes_view_opt>::parse() {
+    SCYLLA_ASSERT(_rem > 0);
+    _next = _v;
+    auto k = read_collection_value_nonnull(_next);
     _current = k;
 }
 
@@ -705,6 +909,14 @@ std::strong_ordering maybe_back_insert_iterator<std::vector<managed_bytes_view>,
     return _type.compare(t, v);
 }
 
+template<>
+std::strong_ordering maybe_back_insert_iterator<std::vector<managed_bytes_view_opt>, managed_bytes_view_opt>::compare(const managed_bytes_view_opt& t, const value_type& v) {
+    if (!t.has_value() || !v.has_value()) {
+        return unsigned(t.has_value()) <=> unsigned(v.has_value());
+    }
+    return _type.compare(*t, *v);
+}
+
 template<typename Container, typename T>
 auto make_maybe_back_inserter(Container& c, const abstract_type& type, collection_iterator<T> s) {
     return maybe_back_insert_iterator<Container, T>(c, type, s);
@@ -713,7 +925,7 @@ auto make_maybe_back_inserter(Container& c, const abstract_type& type, collectio
 static size_t collection_size(const managed_bytes_opt& bo) {
     if (bo) {
         managed_bytes_view mbv(*bo);
-        return read_collection_size(mbv, cql_serialization_format::internal());
+        return read_collection_size(mbv);
     }
     return 0;
 }
@@ -735,25 +947,28 @@ static managed_bytes merge(const collection_type_impl& ctype, const managed_byte
     // note order: set_union, when finding doubles, use value from first1 (j here). So
     // since this is next, it has prio
     std::set_union(j, e, i, e, make_maybe_back_inserter(res, *type, collection_iterator<managed_bytes_view>(deleted)), cmp);
-    return map_type_impl::serialize_partially_deserialized_form_fragmented(res, cql_serialization_format::internal());
+    return map_type_impl::serialize_partially_deserialized_form_fragmented(res);
 }
 static managed_bytes merge(const set_type_impl& ctype, const managed_bytes_opt& prev, const managed_bytes_opt& next, const managed_bytes_opt& deleted) {
-    std::vector<managed_bytes_view> res;
+    std::vector<managed_bytes_view_opt> res;
     res.reserve(collection_size(prev) + collection_size(next));
     auto type = ctype.name_comparator();
-    auto cmp = [&type = *type](managed_bytes_view k1, managed_bytes_view k2) {
-        return type.compare(k1, k2) < 0;
+    auto cmp = [&type = *type](managed_bytes_view_opt k1, managed_bytes_view_opt k2) {
+        if (!k1.has_value() || !k2.has_value()) {
+            return unsigned(k1.has_value()) < unsigned(k2.has_value());
+        }
+        return type.compare(*k1, *k2) < 0;
     };
-    collection_iterator<managed_bytes_view> e, i(prev), j(next), d(deleted);
+    collection_iterator<managed_bytes_view_opt> e, i(prev), j(next), d(deleted);
     std::set_union(j, e, i, e, make_maybe_back_inserter(res, *type, d), cmp);
-    return set_type_impl::serialize_partially_deserialized_form_fragmented(res, cql_serialization_format::internal());
+    return set_type_impl::serialize_partially_deserialized_form_fragmented(res);
 }
 static managed_bytes merge(const user_type_impl& type, const managed_bytes_opt& prev, const managed_bytes_opt& next, const managed_bytes_opt& deleted) {
     std::vector<managed_bytes_view_opt> res(type.size());
-    udt_for_each(prev, [&res, i = res.begin()](managed_bytes_view_opt k) mutable {
+    udt_for_each(prev, [i = res.begin()](managed_bytes_view_opt k) mutable {
         *i++ = k;
     });
-    udt_for_each(next, [&res, i = res.begin()](managed_bytes_view_opt k) mutable {
+    udt_for_each(next, [i = res.begin()](managed_bytes_view_opt k) mutable {
         if (k) {
             *i = k;
         }
@@ -770,9 +985,6 @@ static managed_bytes merge(const abstract_type& type, const managed_bytes_opt& p
     throw std::runtime_error(format("cdc merge: unknown type {}", type.name()));
 }
 
-using cell_map = std::unordered_map<const column_definition*, managed_bytes_opt>;
-using row_states_map = std::unordered_map<clustering_key, cell_map, clustering_key::hashing, clustering_key::equality>;
-
 static managed_bytes_opt get_col_from_row_state(const cell_map* state, const column_definition& cdef) {
     if (state) {
         if (auto it = state->find(&cdef); it != state->end()) {
@@ -782,7 +994,12 @@ static managed_bytes_opt get_col_from_row_state(const cell_map* state, const col
     return std::nullopt;
 }
 
-static cell_map* get_row_state(row_states_map& row_states, const clustering_key& ck) {
+cell_map* get_row_state(row_states_map& row_states, const clustering_key& ck) {
+    auto it = row_states.find(ck);
+    return it == row_states.end() ? nullptr : &it->second;
+}
+
+const cell_map* get_row_state(const row_states_map& row_states, const clustering_key& ck) {
     auto it = row_states.find(ck);
     return it == row_states.end() ? nullptr : &it->second;
 }
@@ -797,15 +1014,14 @@ static managed_bytes_opt get_preimage_col_value(const column_definition& cdef, c
             // flatten set
             [&] (const set_type_impl& type) {
                 auto v = pirow->get_view(cdef.name_as_text());
-                auto f = cql_serialization_format::internal();
-                auto n = read_collection_size(v, f);
+                auto n = read_collection_size(v);
                 std::vector<managed_bytes> tmp;
                 tmp.reserve(n);
                 while (n--) {
-                    tmp.emplace_back(read_collection_value(v, f)); // key
-                    read_collection_value(v, f); // value. ignore.
+                    tmp.emplace_back(read_collection_key(v)); // key
+                    read_collection_value_nonnull(v); // value. ignore.
                 }
-                return set_type_impl::serialize_partially_deserialized_form_fragmented({tmp.begin(), tmp.end()}, f);
+                return set_type_impl::serialize_partially_deserialized_form_fragmented({tmp.begin(), tmp.end()});
             },
             [&] (const abstract_type& o) -> managed_bytes {
                 return pirow->get_blob_fragmented(cdef.name_as_text());
@@ -885,6 +1101,14 @@ public:
         return create_ck(_batch_no - 1);
     }
 
+    api::timestamp_type get_timestamp() const {
+        return _ts;
+    }
+
+    ttl_opt get_ttl() const {
+        return _ttl;
+    }
+
     // A common pattern is to allocate a row and then immediately set its `cdc$operation` column.
     clustering_key allocate_new_log_row(operation op) {
         auto log_ck = allocate_new_log_row();
@@ -919,8 +1143,12 @@ public:
     // Given a reference to such a column from the base schema, this function sets the corresponding column
     // in the log to the given value for the given row.
     void set_value(const clustering_key& log_ck, const column_definition& base_cdef, const managed_bytes_view& value) {
-        auto& log_cdef = *_log_schema.get_column_definition(log_data_column_name_bytes(base_cdef.name()));
-        _log_mut.set_cell(log_ck, log_cdef, atomic_cell::make_live(*base_cdef.type, _ts, value, _ttl));
+        auto log_cdef_ptr = _log_schema.get_column_definition(log_data_column_name_bytes(base_cdef.name()));
+        if (!log_cdef_ptr) {
+            throw exceptions::invalid_request_exception(format("CDC log schema for {}.{} does not have base column {}",
+                _log_schema.ks_name(), _log_schema.cf_name(), base_cdef.name_as_text()));
+        }
+        _log_mut.set_cell(log_ck, *log_cdef_ptr, atomic_cell::make_live(*base_cdef.type, _ts, value, _ttl));
     }
 
     // Each regular and static column in the base schema has a corresponding column in the log schema
@@ -928,7 +1156,13 @@ public:
     // Given a reference to such a column from the base schema, this function sets the corresponding column
     // in the log to `true` for the given row. If not called, the column will be `null`.
     void set_deleted(const clustering_key& log_ck, const column_definition& base_cdef) {
-        _log_mut.set_cell(log_ck, log_data_column_deleted_name_bytes(base_cdef.name()), data_value(true), _ts, _ttl);
+        auto log_cdef_ptr = _log_schema.get_column_definition(log_data_column_deleted_name_bytes(base_cdef.name()));
+        if (!log_cdef_ptr) {
+            throw exceptions::invalid_request_exception(format("CDC log schema for {}.{} does not have base column {}",
+                _log_schema.ks_name(), _log_schema.cf_name(), base_cdef.name_as_text()));
+        }
+        auto& log_cdef = *log_cdef_ptr;
+        _log_mut.set_cell(log_ck, *log_cdef_ptr, atomic_cell::make_live(*log_cdef.type, _ts, log_cdef.type->decompose(true), _ttl));
     }
 
     // Each regular and static non-atomic column in the base schema has a corresponding column in the log schema
@@ -937,7 +1171,12 @@ public:
     // Given a reference to such a column from the base schema, this function sets the corresponding column
     // in the log to the given set of keys for the given row.
     void set_deleted_elements(const clustering_key& log_ck, const column_definition& base_cdef, const managed_bytes& deleted_elements) {
-        auto& log_cdef = *_log_schema.get_column_definition(log_data_column_deleted_elements_name_bytes(base_cdef.name()));
+        auto log_cdef_ptr = _log_schema.get_column_definition(log_data_column_deleted_elements_name_bytes(base_cdef.name()));
+        if (!log_cdef_ptr) {
+            throw exceptions::invalid_request_exception(format("CDC log schema for {}.{} does not have base column {}",
+                _log_schema.ks_name(), _log_schema.cf_name(), base_cdef.name_as_text()));
+        }
+        auto& log_cdef = *log_cdef_ptr;
         _log_mut.set_cell(log_ck, log_cdef, atomic_cell::make_live(*log_cdef.type, _ts, deleted_elements, _ttl));
     }
 
@@ -1011,25 +1250,45 @@ struct process_row_visitor {
     row_states_map& _clustering_row_states;
 
     const bool _generate_delta_values = true; 
+    
+    // true if we are processing changes that were produced by Alternator
+    const bool _alternator;
 
+    // will be set to true, if any kind of change in row will be detected. Used only, when processing Alternator's changes.
+    bool _alternator_any_value_changed = false;
+
+    // will be set to true, if Alternator's collection column (:attrs) will be modified only by removing elements
+    // Used only, when processing Alternator's changes.
+    bool _alternator_only_deletes = false;
+    
     process_row_visitor(
             const clustering_key& log_ck, stats::part_type_set& touched_parts, log_mutation_builder& builder,
             bool enable_updating_state, const clustering_key* base_ck, cell_map* row_state,
-            row_states_map& clustering_row_states, bool generate_delta_values)
+            row_states_map& clustering_row_states, bool generate_delta_values, bool alternator = false)
         : _log_ck(log_ck), _touched_parts(touched_parts), _builder(builder),
           _enable_updating_state(enable_updating_state), _base_ck(base_ck), _row_state(row_state),
           _clustering_row_states(clustering_row_states),
-          _generate_delta_values(generate_delta_values)
+          _generate_delta_values(generate_delta_values), _alternator(alternator)
     {}
 
     void update_row_state(const column_definition& cdef, managed_bytes_opt value) {
         if (!_row_state) {
             // static row always has a valid state, so this must be a clustering row missing
-            assert(_base_ck);
+            SCYLLA_ASSERT(_base_ck);
             auto [it, _] = _clustering_row_states.try_emplace(*_base_ck);
             _row_state = &it->second;
         }
-        (*_row_state)[&cdef] = std::move(value);
+        auto [ it, inserted ] = _row_state->insert({ &cdef, std::nullopt });
+
+        // we ignore `_alternator_any_value_changed` for non-alternator changes.
+        // we don't filter if `_enable_updating_state` is false, as on top of needing pre image
+        // we also need cdc to build post image for us
+        // we add check for `_alternator` here for performance reasons - no point in byte compare objects
+        // if the return value will be ignored
+        if (_alternator && _enable_updating_state) {
+            _alternator_any_value_changed = _alternator_any_value_changed || it->second != value;
+        }
+        it->second = std::move(value);
     }
 
     void live_atomic_cell(const column_definition& cdef, const atomic_cell_view& cell) {
@@ -1069,7 +1328,7 @@ struct process_row_visitor {
         // See `set_visitor`, `udt_visitior`, and `map_or_list_visitor` below.
         struct collection_visitor {
             bool _is_column_delete = false;
-            std::vector<managed_bytes_view> _deleted_keys;
+            std::vector<managed_bytes_view_opt> _deleted_keys;
 
             ttl_opt& _ttl_column;
 
@@ -1079,7 +1338,7 @@ struct process_row_visitor {
                 _is_column_delete = true;
             }
 
-            void dead_collection_cell(bytes_view key, const atomic_cell_view&) {
+            void dead_collection_cell(managed_bytes_view key, const atomic_cell_view&) {
                 _deleted_keys.push_back(key);
             }
 
@@ -1088,17 +1347,17 @@ struct process_row_visitor {
 
 
         // cdc$deleted_col, cdc$deleted_elements_col, col
-        using result_t = std::tuple<bool, std::vector<managed_bytes_view>, managed_bytes_opt>;
+        using result_t = std::tuple<bool, std::vector<managed_bytes_view_opt>, managed_bytes_opt>;
         auto result = visit(*cdef.type, make_visitor(
             [&] (const set_type_impl&) -> result_t {
                 _touched_parts.set<stats::part_type::SET>();
 
                 struct set_visitor : public collection_visitor {
-                    std::vector<managed_bytes_view> _added_keys;
+                    std::vector<managed_bytes_view_opt> _added_keys;
 
                     set_visitor(ttl_opt& ttl_column) : collection_visitor(ttl_column) {}
 
-                    void live_collection_cell(bytes_view key, const atomic_cell_view& cell) {
+                    void live_collection_cell(managed_bytes_view key, const atomic_cell_view& cell) {
                         this->_ttl_column = get_ttl(cell);
                         _added_keys.emplace_back(key);
                     }
@@ -1107,7 +1366,7 @@ struct process_row_visitor {
                 visit_collection(v);
 
                 managed_bytes_opt added_keys = v._added_keys.empty() ? std::nullopt :
-                    std::optional{set_type_impl::serialize_partially_deserialized_form_fragmented(v._added_keys, cql_serialization_format::internal())};
+                    std::optional{set_type_impl::serialize_partially_deserialized_form_fragmented(v._added_keys)};
 
                 return {
                     v._is_column_delete,
@@ -1124,7 +1383,7 @@ struct process_row_visitor {
                     udt_visitor(ttl_opt& ttl_column, size_t num_keys)
                         : collection_visitor(ttl_column), _added_cells(num_keys) {}
 
-                    void live_collection_cell(bytes_view key, const atomic_cell_view& cell) {
+                    void live_collection_cell(managed_bytes_view key, const atomic_cell_view& cell) {
                         this->_ttl_column = get_ttl(cell);
                         _added_cells[deserialize_field_index(key)].emplace(cell.value());
                     }
@@ -1152,7 +1411,7 @@ struct process_row_visitor {
                     map_or_list_visitor(ttl_opt& ttl_column)
                         : collection_visitor(ttl_column) {}
 
-                    void live_collection_cell(bytes_view key, const atomic_cell_view& cell) {
+                    void live_collection_cell(managed_bytes_view key, const atomic_cell_view& cell) {
                         this->_ttl_column = get_ttl(cell);
                         _added_cells.emplace_back(key, cell.value());
                     }
@@ -1163,7 +1422,7 @@ struct process_row_visitor {
                 visit_collection(v);
 
                 managed_bytes_opt added_cells = v._added_cells.empty() ? std::nullopt :
-                    std::optional{map_type_impl::serialize_partially_deserialized_form_fragmented(v._added_cells, cql_serialization_format::internal())};
+                    std::optional{map_type_impl::serialize_partially_deserialized_form_fragmented(v._added_cells)};
 
                 return {
                     v._is_column_delete,
@@ -1179,11 +1438,13 @@ struct process_row_visitor {
         auto&& deleted_keys = std::get<1>(result);
         auto&& added_cells = std::get<2>(result);
 
+        _alternator_only_deletes = cdef.name_as_text() == alternator::executor::ATTRS_COLUMN_NAME && !deleted_keys.empty() && !added_cells.has_value();
+
         // FIXME: we're doing redundant work: first we serialize the set of deleted keys into a blob,
         // then we deserialize again when merging images below
         managed_bytes_opt deleted_elements = std::nullopt;
         if (!deleted_keys.empty()) {
-            deleted_elements = set_type_impl::serialize_partially_deserialized_form_fragmented(deleted_keys, cql_serialization_format::internal());
+            deleted_elements = set_type_impl::serialize_partially_deserialized_form_fragmented(deleted_keys);
         }
 
         // delta
@@ -1221,6 +1482,13 @@ struct process_row_visitor {
 };
 
 struct process_change_visitor {
+    const per_request_options& _request_options;
+    // The types of the operations used for row / partition deletes. Introduced
+    // to differentiate service operations (e.g. operation::service_row_delete
+    // vs operation::row_delete).
+    const operation _row_delete_op = operation::row_delete;
+    const operation _partition_delete_op = operation::partition_delete;
+
     stats::part_type_set& _touched_parts;
 
     log_mutation_builder& _builder;
@@ -1229,9 +1497,30 @@ struct process_change_visitor {
     const bool _enable_updating_state = false;
 
     row_states_map& _clustering_row_states;
+
+    // clustering keys' as bytes of rows that should be ignored, when writing cdc log changes
+    // filtering will be done in `clean_up_noop_rows` function. Used only, when processing Alternator's changes.
+    // Since Alternator clustering key is always at most single column, we store unpacked clustering key.
+    // If Alternator table is without clustering key, that means partition has at most one row, any value present
+    // in _alternator_clustering_keys_to_ignore will make us ignore that single row -
+    // we will use an empty bytes object.
+    std::unordered_set<bytes>& _alternator_clustering_keys_to_ignore;
+
     cell_map& _static_row_state;
 
+    const bool _alternator_schema_has_no_clustering_key = false;
+
+    const bool _is_update = false;
+
     const bool _generate_delta_values = true;
+
+    // only called, when processing Alternator's change
+    void alternator_add_ckey_to_rows_to_ignore(const clustering_key& ckey) {
+        throwing_assert(_request_options.alternator);
+        auto res = ckey.explode();
+        auto ckey_exploded = !res.empty() ? res[0] : bytes{};
+        _alternator_clustering_keys_to_ignore.insert(ckey_exploded);
+    }
 
     void static_row_cells(auto&& visit_row_cells) {
         _touched_parts.set<stats::part_type::STATIC_ROW>();
@@ -1254,22 +1543,39 @@ struct process_change_visitor {
 
         struct clustering_row_cells_visitor : public process_row_visitor {
             operation _cdc_op = operation::update;
+            operation _marker_op = operation::insert;
 
             using process_row_visitor::process_row_visitor;
 
             void marker(const row_marker& rm) {
                 _ttl_column = get_ttl(rm);
-                _cdc_op = operation::insert;
+                _cdc_op = _marker_op;
             }
         };
 
+        auto row_state = get_row_state(_clustering_row_states, ckey);
         clustering_row_cells_visitor v(
                 log_ck, _touched_parts, _builder,
-                _enable_updating_state, &ckey, get_row_state(_clustering_row_states, ckey),
-                _clustering_row_states, _generate_delta_values);
+                _enable_updating_state, &ckey, row_state,
+                _clustering_row_states, _generate_delta_values, _request_options.alternator);
+        if (_is_update && _request_options.alternator) {
+            v._marker_op = row_state ? operation::update : operation::insert;
+        }
         visit_row_cells(v);
 
         if (_enable_updating_state) {
+            if (_request_options.alternator && !v._alternator_any_value_changed) {
+                // we need additional checks here:
+                // - without `row_state != nullptr` inserting new key without additional fields (so only partition / clustering key) would be
+                //   treated as no-change, because without additional fields given by the user `v` visitor won't visit any cells
+                //   and _alternator_any_value_changed will be false (thus item will be skipped),
+                // - without `row_state == nullptr && v._alternator_only_deletes` check we won't properly ignore
+                //   column deletes for existing items, but without the column we want to delete -
+                //   item exists (so row_state != nullptr), but we delete non-existing column, so no-op
+                if (row_state != nullptr || (row_state == nullptr && v._alternator_only_deletes)) {
+                    alternator_add_ckey_to_rows_to_ignore(ckey);
+                }
+            }
             // #7716: if there are no regular columns, our visitor would not have visited any cells,
             // hence it would not have created a row_state for this row. In effect, postimage wouldn't be produced.
             // Ensure that the row state exists.
@@ -1283,11 +1589,15 @@ struct process_change_visitor {
     void clustered_row_delete(const clustering_key& ckey, const tombstone&) {
         _touched_parts.set<stats::part_type::ROW_DELETE>();
 
-        auto log_ck = _builder.allocate_new_log_row(operation::row_delete);
+        auto log_ck = _builder.allocate_new_log_row(_row_delete_op);
         _builder.set_clustering_columns(log_ck, ckey);
 
-        if (_enable_updating_state && get_row_state(_clustering_row_states, ckey)) {
-            _clustering_row_states.erase(ckey);
+        if (_enable_updating_state) {
+            if (get_row_state(_clustering_row_states, ckey)) {
+                _clustering_row_states.erase(ckey);
+            } else if (_request_options.alternator) {
+                alternator_add_ckey_to_rows_to_ignore(ckey);
+            }
         }
     }
 
@@ -1327,8 +1637,24 @@ struct process_change_visitor {
 
     void partition_delete(const tombstone&) {
         _touched_parts.set<stats::part_type::PARTITION_DELETE>();
-        auto log_ck = _builder.allocate_new_log_row(operation::partition_delete);
+        auto log_ck = _builder.allocate_new_log_row(_partition_delete_op);
         if (_enable_updating_state) {
+            if (_request_options.alternator && _alternator_schema_has_no_clustering_key && _clustering_row_states.empty()) {
+                // Alternator's table can be with or without clustering key. If the clustering key exists,
+                // delete request will be `clustered_row_delete` and will be handled there.
+                // If the clustering key doesn't exist, delete request will be `partition_delete` and will be handled here.
+                // The no-clustering-key case is slightly tricky, because insert of such item is handled by `clustered_row_cells`
+                // and has some value as clustering_key (the value currently seems to be empty bytes object).
+                // We don't want to rely on knowing the value exactly, instead we rely on the fact that
+                // there will be at most one item in a partition. So if `_clustering_row_states` is empty,
+                // we know the delete is for a non-existing item and we should ignore it.
+                // If `_clustering_row_states` is not empty, then we know the delete is for an existing item
+                // we should log it and clear `_clustering_row_states`.
+                // The same logic applies to `alternator_add_ckey_to_rows_to_ignore` call in `clustered_row_delete`
+                // we need to insert "anything" for no-clustering-key case, so further logic will check
+                // if map is empty or not and will know if it should ignore the single partition item and keep it.
+                alternator_add_ckey_to_rows_to_ignore({});
+            }
             _clustering_row_states.clear();
         }
     }
@@ -1342,6 +1668,7 @@ private:
     schema_ptr _schema;
     dht::decorated_key _dk;
     schema_ptr _log_schema;
+    const per_request_options& _options;
 
     /**
      * #6070, #6084
@@ -1419,8 +1746,15 @@ private:
 
     row_states_map _clustering_row_states;
     cell_map _static_row_state;
+    // True if the mutated row existed before applying the mutation. In other
+    // words, if the preimage is enabled and it isn't empty (otherwise, we
+    // assume that the row is non-existent). Used for Alternator Streams (see
+    // #6918).
+    bool _is_update = false;
 
-    std::vector<mutation> _result_mutations;
+    const bool _uses_tablets;
+
+    utils::chunked_vector<mutation> _result_mutations;
     std::optional<log_mutation_builder> _builder;
 
     // When enabled, process_change will update _clustering_row_states and _static_row_state
@@ -1428,26 +1762,85 @@ private:
 
     stats::part_type_set _touched_parts;
 
+    std::unordered_set<bytes> _alternator_clustering_keys_to_ignore;
+    const column_definition* _alternator_clustering_key_column = nullptr;
+
+    // the function will process mutations and remove rows that are in _alternator_clustering_keys_to_ignore
+    // we need to take care and reindex clustering keys (cdc$batch_seq_no)
+    // this is used for Alternator's changes only
+    // NOTE: `_alternator_clustering_keys_to_ignore` must be not empty.
+    mutation clean_up_noop_rows(mutation mut) {
+        throwing_assert(!_alternator_clustering_keys_to_ignore.empty());
+        auto after_mut = mutation(_log_schema, mut.key());
+        if (!_alternator_clustering_key_column) {
+            // no clustering key - only single row per partition
+            // since _alternator_clustering_keys_to_ignore is not empty we need to drop that single row
+            // so we just return empty mutation instead
+            return after_mut;
+        }
+        int batch_seq = 0;
+        for (rows_entry &row : mut.partition().mutable_non_dummy_rows()) {
+            auto cell = row.row().cells().find_cell(_alternator_clustering_key_column->id);
+            if (cell) {
+                auto val = cell->as_atomic_cell(*_alternator_clustering_key_column).value().linearize();
+
+                if (_alternator_clustering_keys_to_ignore.contains(val)) {
+                    continue;
+                }
+            }
+            auto new_key = _builder->create_ck(batch_seq++);
+            after_mut.partition().clustered_row(*_log_schema, std::move(new_key)) = std::move(row.row());
+        }
+
+        if (batch_seq > 0) {
+            // update end_of_batch marker
+            // we don't need to clear previous one, as we only removed rows
+            // we need to set it on the last row, because original last row might have been deleted
+            // batch_seq == 0 -> no rows, after_mut is empty, all entries were dropped and there's nothing to write to cdc log
+            auto last_key = _builder->create_ck(batch_seq - 1);
+            after_mut.set_cell(last_key, log_meta_column_name_bytes("end_of_batch"), data_value(true), _builder->get_timestamp(), _builder->get_ttl());
+        }
+
+        return after_mut;
+    }
 public:
-    transformer(db_context ctx, schema_ptr s, dht::decorated_key dk)
+    transformer(db_context ctx, schema_ptr s, dht::decorated_key dk, const per_request_options& options)
         : _ctx(ctx)
         , _schema(std::move(s))
         , _dk(std::move(dk))
-        , _log_schema(ctx._proxy.get_db().local().find_schema(_schema->ks_name(), log_name(_schema->cf_name())))
+        , _log_schema(_schema->cdc_schema() ? _schema->cdc_schema() : ctx._proxy.get_db().local().find_schema(_schema->ks_name(), log_name(_schema->cf_name())))
+        , _options(options)
         , _clustering_row_states(0, clustering_key::hashing(*_schema), clustering_key::equality(*_schema))
+        , _uses_tablets(ctx._proxy.get_db().local().find_keyspace(_schema->ks_name()).uses_tablets())
+        , _alternator_clustering_keys_to_ignore()
     {
+        if (_options.alternator) {
+            auto cks = _schema->clustering_key_columns();
+            const column_definition *ck_def = nullptr;
+            if (!cks.empty()) {
+                auto it = _log_schema->columns_by_name().find(cks.front().name());
+                if (it == _log_schema->columns_by_name().end()) {
+                    on_internal_error(cdc_log, fmt::format("failed to find clustering key `{}` in cdc log table `{}`", cks.front().name(), _log_schema->id()));
+                }
+                ck_def = it->second;
+            }
+            _alternator_clustering_key_column = ck_def;
+        }
     }
 
     // DON'T move the transformer after this
     void begin_timestamp(api::timestamp_type ts, bool is_last) override {
-        const auto stream_id = _ctx._cdc_metadata.get_stream(ts, _dk.token());
+        const auto stream_id = _uses_tablets ? _ctx._cdc_metadata.get_tablet_stream(_log_schema->id(), ts, _dk.token()) : _ctx._cdc_metadata.get_vnode_stream(ts, _dk.token());
         _result_mutations.emplace_back(_log_schema, stream_id.to_partition_key(*_log_schema));
         _builder.emplace(_result_mutations.back(), ts, _dk.key(), *_schema);
-        _enable_updating_state = _schema->cdc_options().postimage() || (!is_last && _schema->cdc_options().preimage());
+        // alternator_streams_increased_compatibility set to true reads preimage, but we need to set
+        // _enable_updating_state to true to keep track of changes and produce correct pre/post images even
+        // if upper layer didn't request them explicitly.
+        _enable_updating_state = _schema->cdc_options().postimage() || (!is_last && _schema->cdc_options().preimage()) || (_options.alternator && _options.alternator_streams_increased_compatibility);
     }
 
     void produce_preimage(const clustering_key* ck, const one_kind_column_set& columns_to_include) override {
-        // iff we want full preimage, just ignore the affected columns and include everything. 
+        // if we want full preimage, just ignore the affected columns and include everything. 
         generate_image(operation::pre_image, ck, _schema->cdc_options().full_preimage() ? nullptr : &columns_to_include);
     };
 
@@ -1456,12 +1849,12 @@ public:
     }
 
     void generate_image(operation op, const clustering_key* ck, const one_kind_column_set* affected_columns) {
-        assert(op == operation::pre_image || op == operation::post_image);
+        SCYLLA_ASSERT(op == operation::pre_image || op == operation::post_image);
 
-        // assert that post_image is always full
-        assert(!(op == operation::post_image && affected_columns));
+        // SCYLLA_ASSERT that post_image is always full
+        SCYLLA_ASSERT(!(op == operation::post_image && affected_columns));
 
-        assert(_builder);
+        SCYLLA_ASSERT(_builder);
 
         const auto kind = ck ? column_kind::regular_column : column_kind::static_column;
 
@@ -1531,27 +1924,46 @@ public:
     // TODO: is pre-image data based on query enough. We only have actual column data. Do we need
     // more details like tombstones/ttl? Probably not but keep in mind.
     void process_change(const mutation& m) override {
-        assert(_builder);
+        SCYLLA_ASSERT(_builder);
         process_change_visitor v {
+            ._request_options = _options,
+            ._row_delete_op = _options.is_system_originated ? operation::service_row_delete : operation::row_delete,
+            ._partition_delete_op = _options.is_system_originated ? operation::service_partition_delete : operation::partition_delete,
             ._touched_parts = _touched_parts,
             ._builder = *_builder,
             ._enable_updating_state = _enable_updating_state,
             ._clustering_row_states = _clustering_row_states,
+            ._alternator_clustering_keys_to_ignore = _alternator_clustering_keys_to_ignore,
             ._static_row_state = _static_row_state,
+            ._alternator_schema_has_no_clustering_key = (_alternator_clustering_key_column == nullptr),
+            ._is_update = _is_update,
             ._generate_delta_values = generate_delta_values(_builder->base_schema())
         };
         cdc::inspect_mutation(m, v);
     }
 
     void end_record() override {
-        assert(_builder);
+        SCYLLA_ASSERT(_builder);
         _builder->end_record();
+
+        if (_options.alternator && !_alternator_clustering_keys_to_ignore.empty()) {
+            // we filter mutations for Alternator's changes here.
+            // We do it per mutation object (user might submit a batch of those in one go
+            // and some might be split because of different timestamps),
+            // ignore key set is cleared afterwards.
+            // If single mutation object contains two separate changes to the same row
+            // and at least one of them is ignored, all of them will be ignored.
+            // This is not possible in Alternator - Alternator spec forbids reusing 
+            // primary key in single batch.
+            _result_mutations.back() = clean_up_noop_rows(std::move(_result_mutations.back()));
+            _alternator_clustering_keys_to_ignore.clear();
+        }
     }
 
     // Takes and returns generated cdc log mutations and associated statistics about parts touched during transformer's lifetime.
     // The `transformer` object on which this method was called on should not be used anymore.
-    std::tuple<std::vector<mutation>, stats::part_type_set> finish() && {
-        return std::make_pair<std::vector<mutation>, stats::part_type_set>(std::move(_result_mutations), std::move(_touched_parts));
+    std::tuple<utils::chunked_vector<mutation>, stats::part_type_set> finish() && {
+        return std::make_pair<utils::chunked_vector<mutation>, stats::part_type_set>(std::move(_result_mutations), std::move(_touched_parts));
     }
 
     static db::timeout_clock::time_point default_timeout() {
@@ -1564,7 +1976,8 @@ public:
             const mutation& m)
     {
         auto& p = m.partition();
-        if (p.clustered_rows().empty() && p.static_row().empty()) {
+        const bool no_ck_schema_partition_deletion = m.schema()->clustering_key_size() == 0 && bool(p.partition_tombstone());
+        if (p.clustered_rows().empty() && p.static_row().empty() && !no_ck_schema_partition_deletion) {
             return make_ready_future<lw_shared_ptr<cql3::untyped_result_set>>();
         }
 
@@ -1613,12 +2026,12 @@ public:
                 });
             }
         }
-        if (!p.clustered_rows().empty()) {
+        if (!p.clustered_rows().empty() || no_ck_schema_partition_deletion) {
             const bool has_row_delete = std::any_of(p.clustered_rows().begin(), p.clustered_rows().end(), [] (const rows_entry& re) {
                 return re.row().deleted_at();
             });
             // for postimage we need everything...
-            if (has_row_delete || _schema->cdc_options().postimage() || _schema->cdc_options().full_preimage()) {
+            if (has_row_delete || _schema->cdc_options().postimage() || _schema->cdc_options().full_preimage() || no_ck_schema_partition_deletion) {
                 for (const column_definition& c: _schema->regular_columns()) {
                     regular_columns.emplace_back(c.id);
                     columns.emplace_back(&c);
@@ -1640,7 +2053,8 @@ public:
 
         auto partition_slice = query::partition_slice(std::move(bounds), std::move(static_columns), std::move(regular_columns), std::move(opts));
         const auto max_result_size = _ctx._proxy.get_max_result_size(partition_slice);
-        auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(), partition_slice, query::max_result_size(max_result_size), query::row_limit(row_limit));
+        const auto tombstone_limit = query::tombstone_limit(_ctx._proxy.get_tombstone_limit());
+        auto command = ::make_lw_shared<query::read_command>(_schema->id(), _schema->version(), partition_slice, query::max_result_size(max_result_size), tombstone_limit, query::row_limit(row_limit));
 
         const auto select_cl = adjust_cl(write_cl);
 
@@ -1669,6 +2083,7 @@ public:
                     _static_row_state[&c] = std::move(*maybe_cell_view);
                 }
             }
+            _is_update = true;
         }
 
         if (static_only) {
@@ -1721,8 +2136,8 @@ public:
 };
 
 template <typename Func>
-future<std::vector<mutation>>
-transform_mutations(std::vector<mutation>& muts, decltype(muts.size()) batch_size, Func&& f) {
+future<utils::chunked_vector<mutation>>
+transform_mutations(utils::chunked_vector<mutation>& muts, decltype(muts.size()) batch_size, Func&& f) {
     return parallel_for_each(
             boost::irange(static_cast<decltype(muts.size())>(0), muts.size(), batch_size),
             std::forward<Func>(f))
@@ -1731,37 +2146,42 @@ transform_mutations(std::vector<mutation>& muts, decltype(muts.size()) batch_siz
 
 } // namespace cdc
 
-future<std::tuple<std::vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>
-cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, std::vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl) {
+future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>
+cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, utils::chunked_vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl, per_request_options options) {
     // we do all this because in the case of batches, we can have mixed schemas.
     auto e = mutations.end();
     auto i = std::find_if(mutations.begin(), e, [](const mutation& m) {
-        return m.schema()->cdc_options().enabled();
+        return cdc_enabled(*m.schema());
     });
 
     if (i == e) {
-        return make_ready_future<std::tuple<std::vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>(std::make_tuple(std::move(mutations), lw_shared_ptr<cdc::operation_result_tracker>()));
+        return make_ready_future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>(std::make_tuple(std::move(mutations), lw_shared_ptr<cdc::operation_result_tracker>()));
     }
 
     tracing::trace(tr_state, "CDC: Started generating mutations for log rows");
     mutations.reserve(2 * mutations.size());
 
-    return do_with(std::move(mutations), service::query_state(service::client_state::for_internal_calls(), empty_service_permit()), operation_details{},
-            [this, timeout, i, tr_state = std::move(tr_state), write_cl] (std::vector<mutation>& mutations, service::query_state& qs, operation_details& details) {
-        return transform_mutations(mutations, 1, [this, &mutations, timeout, &qs, tr_state = tr_state, &details, write_cl] (int idx) mutable {
+    return do_with(std::move(mutations), service::query_state(service::client_state::for_internal_calls(), empty_service_permit()), operation_details{}, std::move(options),
+            [this, tr_state = std::move(tr_state), write_cl] (utils::chunked_vector<mutation>& mutations, service::query_state& qs, operation_details& details, per_request_options& options) {
+        return transform_mutations(mutations, 1, [this, &mutations, &qs, tr_state = tr_state, &details, write_cl, &options] (int idx) mutable {
             auto& m = mutations[idx];
             auto s = m.schema();
 
-            if (!s->cdc_options().enabled()) {
+            if (!cdc_enabled(*s)) {
                 return make_ready_future<>();
             }
 
-            transformer trans(_ctxt, s, m.decorated_key());
+            const bool alternator_increased_compatibility = options.alternator && options.alternator_streams_increased_compatibility;
+            transformer trans(_ctxt, s, m.decorated_key(), options);
 
             auto f = make_ready_future<lw_shared_ptr<cql3::untyped_result_set>>(nullptr);
-            if (s->cdc_options().preimage() || s->cdc_options().postimage()) {
+            if (options.preimage && !options.preimage->empty()) {
+                // Preimage has been fetched by upper layers.
+                tracing::trace(tr_state, "CDC: Using a prefetched preimage");
+                f = make_ready_future<lw_shared_ptr<cql3::untyped_result_set>>(options.preimage);
+            } else if (s->cdc_options().preimage() || s->cdc_options().postimage() || alternator_increased_compatibility) {
                 // Note: further improvement here would be to coalesce the pre-image selects into one
-                // iff a batch contains several modifications to the same table. Otoh, batch is rare(?)
+                // if a batch contains several modifications to the same table. Otoh, batch is rare(?)
                 // so this is premature.
                 tracing::trace(tr_state, "CDC: Selecting preimage for {}", m.decorated_key());
                 f = trans.pre_image_select(qs.get_client_state(), write_cl, m).then_wrapped([this] (future<lw_shared_ptr<cql3::untyped_result_set>> f) {
@@ -1776,7 +2196,7 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
                 tracing::trace(tr_state, "CDC: Preimage not enabled for the table, not querying current value of {}", m.decorated_key());
             }
 
-            return f.then([trans = std::move(trans), &mutations, idx, tr_state, &details] (lw_shared_ptr<cql3::untyped_result_set> rs) mutable {
+            return f.then([trans = std::move(trans), &mutations, idx, tr_state, &details, &options] (lw_shared_ptr<cql3::untyped_result_set> rs) mutable {
                 auto& m = mutations[idx];
                 auto& s = m.schema();
 
@@ -1791,7 +2211,7 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
                 details.had_preimage |= preimage;
                 details.had_postimage |= postimage;
                 tracing::trace(tr_state, "CDC: Generating log mutations for {}", m.decorated_key());
-                if (should_split(m)) {
+                if (should_split(m, options)) {
                     tracing::trace(tr_state, "CDC: Splitting {}", m.decorated_key());
                     details.was_split = true;
                     process_changes_with_splitting(m, trans, preimage, postimage);
@@ -1807,21 +2227,26 @@ cdc::cdc_service::impl::augment_mutation_call(lowres_clock::time_point timeout, 
                 tracing::trace(tr_state, "CDC: Generated {} log mutations from {}", generated_count, mutations[idx].decorated_key());
                 details.touched_parts.add(touched_parts);
             });
-        }).then([this, tr_state, &details](std::vector<mutation> mutations) {
+        }).then([this, tr_state, &details](utils::chunked_vector<mutation> mutations) {
             tracing::trace(tr_state, "CDC: Finished generating all log mutations");
             auto tracker = make_lw_shared<cdc::operation_result_tracker>(_ctxt._proxy.get_cdc_stats(), details);
-            return make_ready_future<std::tuple<std::vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>(std::make_tuple(std::move(mutations), std::move(tracker)));
+            return make_ready_future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>(std::make_tuple(std::move(mutations), std::move(tracker)));
         });
     });
 }
 
-bool cdc::cdc_service::needs_cdc_augmentation(const std::vector<mutation>& mutations) const {
+bool cdc::cdc_service::needs_cdc_augmentation(const utils::chunked_vector<mutation>& mutations) const {
     return std::any_of(mutations.begin(), mutations.end(), [](const mutation& m) {
-        return m.schema()->cdc_options().enabled();
+        return cdc_enabled(*m.schema());
     });
 }
 
-future<std::tuple<std::vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>
-cdc::cdc_service::augment_mutation_call(lowres_clock::time_point timeout, std::vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl) {
-    return _impl->augment_mutation_call(timeout, std::move(mutations), std::move(tr_state), write_cl);
+future<std::tuple<utils::chunked_vector<mutation>, lw_shared_ptr<cdc::operation_result_tracker>>>
+cdc::cdc_service::augment_mutation_call(lowres_clock::time_point timeout, utils::chunked_vector<mutation>&& mutations, tracing::trace_state_ptr tr_state, db::consistency_level write_cl, per_request_options options) {
+    if (utils::get_local_injector().enter("sleep_before_cdc_augmentation")) {
+        return seastar::sleep(std::chrono::milliseconds(100)).then([this, timeout, mutations = std::move(mutations), tr_state = std::move(tr_state), write_cl, options = std::move(options)] () mutable {
+            return _impl->augment_mutation_call(timeout, std::move(mutations), std::move(tr_state), write_cl, std::move(options));
+        });
+    }
+    return _impl->augment_mutation_call(timeout, std::move(mutations), std::move(tr_state), write_cl, std::move(options));
 }

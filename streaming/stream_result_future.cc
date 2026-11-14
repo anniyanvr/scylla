@@ -4,20 +4,21 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include "streaming/stream_result_future.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_exception.hh"
-#include "log.hh"
+#include "utils/log.hh"
 #include <cfloat>
+#include <fmt/ranges.h>
 
 namespace streaming {
 
 extern logging::logger sslog;
 
-future<stream_state> stream_result_future::init_sending_side(stream_manager& mgr, UUID plan_id_, sstring description_,
+future<stream_state> stream_result_future::init_sending_side(stream_manager& mgr, streaming::plan_id plan_id_, sstring description_,
         std::vector<stream_event_handler*> listeners_, shared_ptr<stream_coordinator> coordinator_) {
     auto sr = ::make_shared<stream_result_future>(mgr, plan_id_, description_, coordinator_);
     mgr.register_sending(sr);
@@ -37,12 +38,12 @@ future<stream_state> stream_result_future::init_sending_side(stream_manager& mgr
     return sr->_done.get_future();
 }
 
-shared_ptr<stream_result_future> stream_result_future::init_receiving_side(stream_manager& mgr, UUID plan_id, sstring description, inet_address from) {
+shared_ptr<stream_result_future> stream_result_future::init_receiving_side(stream_manager& mgr, streaming::plan_id plan_id, sstring description, locator::host_id from) {
     auto sr = mgr.get_receiving_stream(plan_id);
     if (sr) {
         auto err = fmt::format("[Stream #{}] GOT PREPARE_MESSAGE from {}, description={},"
                           "stream_plan exists, duplicated message received?", plan_id, description, from);
-        sslog.warn(err.c_str());
+        sslog.warn("{}", err);
         throw std::runtime_error(err);
     }
     sslog.info("[Stream #{}] Executing streaming plan for {} with peers={}, slave", plan_id, description, from);
@@ -77,7 +78,7 @@ template <typename Event>
 void stream_result_future::fire_stream_event(Event event) {
     // delegate to listener
     for (auto listener : _event_listeners) {
-        listener->handle_stream_event(std::move(event));
+        listener->handle_stream_event(event);
     }
 }
 
@@ -92,7 +93,7 @@ void stream_result_future::maybe_complete() {
         auto duration = std::chrono::duration_cast<std::chrono::duration<float>>(lowres_clock::now() - _start_time).count();
         auto stats = make_lw_shared<sstring>("");
         //FIXME: discarded future.
-        (void)_mgr.get_progress_on_all_shards(plan_id).then([plan_id, duration, stats] (auto sbytes) {
+        (void)_mgr.get_progress_on_all_shards(plan_id).then([duration, stats] (auto sbytes) {
             auto tx_bw = sstring("0");
             auto rx_bw = sstring("0");
             if (std::fabs(duration) > FLT_EPSILON) {

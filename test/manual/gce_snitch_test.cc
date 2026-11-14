@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 /// \brief Tests the GoogleCloudSnitch.
@@ -21,7 +21,6 @@
 
 #include <boost/test/unit_test.hpp>
 #include "locator/gce_snitch.hh"
-#include "utils/fb_utilities.hh"
 #include <seastar/testing/test_case.hh>
 #include <seastar/http/httpd.hh>
 #include <seastar/net/inet_address.hh>
@@ -34,16 +33,16 @@ static constexpr const char* DUMMY_META_SERVER_IP = "DUMMY_META_SERVER_IP";
 static constexpr const char* USE_GCE_META_SERVER = "USE_GCE_META_SERVER";
 
 class gce_meta_get_handler : public seastar::httpd::handler_base {
-    virtual future<std::unique_ptr<seastar::httpd::reply>> handle(const sstring& path, std::unique_ptr<seastar::httpd::request> req, std::unique_ptr<seastar::httpd::reply> rep) override {
+    virtual future<std::unique_ptr<seastar::http::reply>> handle(const sstring& path, std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep) override {
         using namespace seastar::httpd;
 
         if (path == locator::gce_snitch::ZONE_NAME_QUERY_REQ) {
             rep->write_body(sstring("txt"), sstring("projects/431729375847/zones/us-central1-a"));
         } else {
-            rep->set_status(reply::status_type::bad_request);
+            rep->set_status(http::reply::status_type::bad_request);
         }
 
-        return make_ready_future<std::unique_ptr<reply>>(std::move(rep));
+        return make_ready_future<std::unique_ptr<http::reply>>(std::move(rep));
     }
 };
 
@@ -54,8 +53,7 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
         fs::path fname(test_files_subdir);
         fname /= fs::path(property_fname);
 
-        utils::fb_utilities::set_broadcast_address(gms::inet_address("localhost"));
-        utils::fb_utilities::set_broadcast_rpc_address(gms::inet_address("localhost"));
+        auto my_address = gms::inet_address("localhost");
 
         char* meta_url_env = std::getenv(DUMMY_META_SERVER_IP);
         char* use_gce_server = std::getenv(USE_GCE_META_SERVER);
@@ -74,16 +72,24 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
         try {
             if (use_dummy_server) {
                 http_server.start("dummy_GCE_meta_server").get();
-                http_server.set_routes([] (routes& r) {
+                http_server.set_routes([] (httpd::routes& r) {
                     r.put(seastar::httpd::operation_type::GET, locator::gce_snitch::ZONE_NAME_QUERY_REQ, new gce_meta_get_handler());
                 }).get();
                 http_server.listen(ipv4_addr(meta_url.c_str(), 80)).get();
             }
 
-            i_endpoint_snitch::create_snitch<const sstring&, const unsigned&, const sstring&>("GoogleCloudSnitch", sstring(fname.string()), 0, meta_url).get();
+            snitch_config cfg;
+            cfg.name = "GoogleCloudSnitch";
+            cfg.properties_file_name = fname.string();
+            cfg.gce_meta_server_url = meta_url;
+            cfg.listen_address = my_address;
+            cfg.broadcast_address = my_address;
+            sharded<snitch_ptr> snitch;
+            snitch.start(cfg).get();
+            snitch.invoke_on_all(&snitch_ptr::start).get();
             if (!exp_result) {
                 BOOST_ERROR("Failed to catch an error in a malformed configuration file");
-                i_endpoint_snitch::stop_snitch().get();
+                snitch.stop().get();
                 if (use_dummy_server) {
                     http_server.stop().get();
                 }
@@ -92,16 +98,15 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
             auto cpu0_dc = make_lw_shared<sstring>();
             auto cpu0_rack = make_lw_shared<sstring>();
             auto res = make_lw_shared<bool>(true);
-            auto my_address = utils::fb_utilities::get_broadcast_address();
 
-            i_endpoint_snitch::snitch_instance().invoke_on(0, [cpu0_dc, cpu0_rack, res, my_address] (snitch_ptr& inst) {
-                *cpu0_dc =inst->get_datacenter(my_address);
-                *cpu0_rack = inst->get_rack(my_address);
+            snitch.invoke_on(0, [cpu0_dc, cpu0_rack, res] (snitch_ptr& inst) {
+                *cpu0_dc =inst->get_datacenter();
+                *cpu0_rack = inst->get_rack();
             }).get();
 
-            i_endpoint_snitch::snitch_instance().invoke_on_all([cpu0_dc, cpu0_rack, res, my_address] (snitch_ptr& inst) {
-                if (*cpu0_dc != inst->get_datacenter(my_address) ||
-                    *cpu0_rack != inst->get_rack(my_address)) {
+            snitch.invoke_on_all([cpu0_dc, cpu0_rack, res] (snitch_ptr& inst) {
+                if (*cpu0_dc != inst->get_datacenter() ||
+                    *cpu0_rack != inst->get_rack()) {
                     *res = false;
                 }
             }).get();
@@ -111,7 +116,7 @@ future<> one_test(const std::string& property_fname, bool exp_result) {
             } else {
                 BOOST_CHECK(true);
             }
-            i_endpoint_snitch::stop_snitch().get();
+            snitch.stop().get();
         } catch (std::exception& e) {
             BOOST_CHECK(!exp_result);
         }

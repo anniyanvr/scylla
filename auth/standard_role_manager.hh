@@ -3,21 +3,25 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include "auth/common.hh"
 #include "auth/role_manager.hh"
+#include "auth/cache.hh"
 
 #include <string_view>
-#include <unordered_set>
 
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/sstring.hh>
 
+#include "cql3/description.hh"
 #include "seastarx.hh"
+#include "service/raft/raft_group0_client.hh"
 
 namespace cql3 {
 class query_processor;
@@ -29,18 +33,20 @@ class migration_manager;
 
 namespace auth {
 
+struct config;
+
 class standard_role_manager final : public role_manager {
     cql3::query_processor& _qp;
+    ::service::raft_group0_client& _group0_client;
     ::service::migration_manager& _migration_manager;
+    cache& _cache;
+    std::string _superuser_name;
     future<> _stopped;
-    seastar::abort_source _as;
+    abort_source _as;
+    shared_promise<> _superuser_created_promise;
 
 public:
-    standard_role_manager(cql3::query_processor& qp, ::service::migration_manager& mm)
-            : _qp(qp)
-            , _migration_manager(mm)
-            , _stopped(make_ready_future<>()) {
-    }
+    standard_role_manager(cql3::query_processor&, ::service::raft_group0_client&, ::service::migration_manager&, cache&, const config&);
 
     virtual std::string_view qualified_java_name() const noexcept override;
 
@@ -50,19 +56,23 @@ public:
 
     virtual future<> stop() override;
 
-    virtual future<> create(std::string_view role_name, const role_config&) override;
+    virtual future<> ensure_superuser_is_created() override;
 
-    virtual future<> drop(std::string_view role_name) override;
+    virtual future<> create(std::string_view role_name, const role_config&, ::service::group0_batch&) override;
 
-    virtual future<> alter(std::string_view role_name, const role_config_update&) override;
+    virtual future<> drop(std::string_view role_name, ::service::group0_batch& mc) override;
 
-    virtual future<> grant(std::string_view grantee_name, std::string_view role_name) override;
+    virtual future<> alter(std::string_view role_name, const role_config_update&, ::service::group0_batch&) override;
 
-    virtual future<> revoke(std::string_view revokee_name, std::string_view role_name) override;
+    virtual future<> grant(std::string_view grantee_name, std::string_view role_name, ::service::group0_batch& mc) override;
+
+    virtual future<> revoke(std::string_view revokee_name, std::string_view role_name, ::service::group0_batch& mc) override;
 
     virtual future<role_set> query_granted(std::string_view grantee_name, recursive_role_query) override;
 
-    virtual future<role_set> query_all() override;
+    virtual future<role_to_directly_granted_map> query_all_directly_granted(::service::query_state&) override;
+
+    virtual future<role_set> query_all(::service::query_state&) override;
 
     virtual future<bool> exists(std::string_view role_name) override;
 
@@ -70,28 +80,38 @@ public:
 
     virtual future<bool> can_login(std::string_view role_name) override;
 
-    virtual future<std::optional<sstring>> get_attribute(std::string_view role_name, std::string_view attribute_name) override;
+    virtual future<std::optional<sstring>> get_attribute(std::string_view role_name, std::string_view attribute_name, ::service::query_state&) override;
 
-    virtual future<role_manager::attribute_vals> query_attribute_for_all(std::string_view attribute_name) override;
+    virtual future<role_manager::attribute_vals> query_attribute_for_all(std::string_view attribute_name, ::service::query_state&) override;
 
-    virtual future<> set_attribute(std::string_view role_name, std::string_view attribute_name, std::string_view attribute_value) override;
+    virtual future<> set_attribute(std::string_view role_name, std::string_view attribute_name, std::string_view attribute_value, ::service::group0_batch& mc) override;
 
-    virtual future<> remove_attribute(std::string_view role_name, std::string_view attribute_name) override;
+    virtual future<> remove_attribute(std::string_view role_name, std::string_view attribute_name, ::service::group0_batch& mc) override;
+
+    virtual future<std::vector<cql3::description>> describe_role_grants() override;
 
 private:
     enum class membership_change { add, remove };
+    struct record final {
+        sstring name;
+        bool is_superuser;
+        bool can_login;
+        role_set member_of;
+    };
 
-    future<> create_metadata_tables_if_missing() const;
+    future<> maybe_create_default_role();
+    future<> maybe_create_default_role_with_retries();
 
-    bool legacy_metadata_exists();
+    future<> create_or_replace(std::string_view role_name, const role_config&, ::service::group0_batch&);
 
-    future<> migrate_legacy_metadata() const;
+    future<> modify_membership(std::string_view role_name, std::string_view grantee_name, membership_change, ::service::group0_batch& mc);
 
-    future<> create_default_role_if_missing() const;
-
-    future<> create_or_replace(std::string_view role_name, const role_config&) const;
-
-    future<> modify_membership(std::string_view role_name, std::string_view grantee_name, membership_change) const;
+    future<std::optional<record>> find_record(std::string_view role_name);
+    future<record> require_record(std::string_view role_name);
+    future<> collect_roles(
+            std::string_view grantee_name,
+            bool recurse,
+            role_set& roles);
 };
 
-}
+} // namespace auth

@@ -5,42 +5,85 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 import os
 import sys
 import glob
 import platform
 import distro
+import re
+import traceback
 
-from scylla_util import *
+from scylla_util import sysconfig_parser, out, get_set_nic_and_disks_config_value, check_sysfs_numa_topology_is_valid, sysconfdir_p, scylla_excepthook, perftune_base_command
 from subprocess import run
-
-def get_mode_cpuset(nic, mode):
-    mode_cpu_mask = run('/opt/scylladb/scripts/perftune.py --tune net --nic {} --mode {} --get-cpu-mask-quiet'.format(nic, mode), shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
-    return hex2list(mode_cpu_mask)
 
 def get_cur_cpuset():
     cfg = sysconfig_parser('/etc/scylla.d/cpuset.conf')
     cpuset = cfg.get('CPUSET')
     return re.sub(r'^--cpuset (.+)$', r'\1', cpuset).strip()
 
-def get_tune_mode(nic):
+def cpu_mask_is_zero(cpu_mask):
+    """
+    The cpu_mask is a comma-separated list of 32-bit hex values with possibly omitted zero components,
+            e.g. 0xffff,,0xffff
+    We want to estimate if the whole mask is all-zeros.
+    :param cpu_mask: hwloc-calc generated CPU mask
+    :return: True if mask is zero, False otherwise
+    """
+    for cur_cpu_mask in cpu_mask.split(','):
+        if cur_cpu_mask and int(cur_cpu_mask, 16) != 0:
+            return False
+
+    return True
+
+def get_irq_cpu_mask():
+    """
+    Return an irq_cpu_mask corresponding to a value written in cpuset.conf
+
+    Let's use the "CPU masks invariant": irq_cpu_mask | compute_cpu_mask == cpu_mask.
+
+    This function is called when  we are generating a perftune.yaml meaning that there are no restrictions on
+    cpu_mask defined.
+
+    And this means that in the context of this function call cpu_mask is "all CPUs", or in hwloc-cal lingo - 'all'.
+
+    (For any "special" value of a cpu_mask a user needs to write his/her own perftune.yaml)
+
+    Mentioned above means that in order to calculate an irq_cpu_mask that corresponds to a compute_cpu_mask defined
+    using --cpuset in cpuset.conf and cpu_mask == 'all' we need to invert bits from the compute_cpu_mask in the 'all'
+    mask.
+
+    This can be achieved by running the following hwloc-calc command:
+
+    hwloc-calc --pi all ~PU:X ~PU:Y ~PU:Z ...
+
+    where X,Y,Z,... are either a single CPU index or a CPU range.
+
+    For example, if we have the following cpuset:
+
+    0,2-7,17-24,35
+
+    to get irq_cpu_mask we want to run the following command:
+
+    hwloc-calc --pi all ~PU:0 ~PU:2-7 ~PU:17-24 ~PU:35
+    """
+
     if not os.path.exists('/etc/scylla.d/cpuset.conf'):
         raise Exception('/etc/scylla.d/cpuset.conf not found')
     cur_cpuset = get_cur_cpuset()
-    mq_cpuset = get_mode_cpuset(nic, 'mq')
-    sq_cpuset = get_mode_cpuset(nic, 'sq')
-    sq_split_cpuset = get_mode_cpuset(nic, 'sq_split')
 
-    if cur_cpuset == mq_cpuset:
-        return 'mq'
-    elif cur_cpuset == sq_cpuset:
-        return 'sq'
-    elif cur_cpuset == sq_split_cpuset:
-        return 'sq_split'
-    else:
-        raise Exception('tune mode not found')
+    hwloc_cmd = "/opt/scylladb/bin/hwloc-calc --pi all {}".\
+        format(" ".join(['~PU:{}'.format(c) for c in cur_cpuset.split(",")]))
+
+    irq_cpu_mask = out(hwloc_cmd).strip()
+
+    # If the generated mask turns out to be all-zeros then it means that all present CPUs are used in cpuset.conf.
+    # In such a case irq_cpu_mask has to be all-CPUs too, a.k.a. MQ mode.
+    if cpu_mask_is_zero(irq_cpu_mask):
+        irq_cpu_mask = out("/opt/scylladb/bin/hwloc-calc all").strip()
+
+    return irq_cpu_mask
 
 def create_perftune_conf(cfg):
     """
@@ -52,10 +95,17 @@ def create_perftune_conf(cfg):
     """
     params = ''
     if get_set_nic_and_disks_config_value(cfg) == 'yes':
+        if not check_sysfs_numa_topology_is_valid():
+            print('WARNING: NUMA topology information is corrupted, skip running perftune')
+            return False
+
         nic = cfg.get('IFNAME')
         if not nic:
             nic = 'eth0'
-        params += '--tune net --nic "{nic}"'.format(nic=nic)
+        irq_cpu_mask = get_irq_cpu_mask()
+        # Note that 'irq_cpu_mask' is a coma separated list of 32-bits wide masks.
+        # Therefore, we need to put it in quotes.
+        params += '--tune net --nic "{nic}" --irq-cpu-mask "{irq_cpu_mask}"'.format(nic=nic, irq_cpu_mask=irq_cpu_mask)
 
     if cfg.has_option('SET_CLOCKSOURCE') and cfg.get('SET_CLOCKSOURCE') == 'yes':
         params += ' --tune system --tune-clock'
@@ -64,12 +114,15 @@ def create_perftune_conf(cfg):
         params += ' --write-back-cache=false'
 
     if len(params) > 0:
+        if not check_sysfs_numa_topology_is_valid():
+            print('WARNING: NUMA topology information is corrupted, skip running perftune')
+            return False
+
         if os.path.exists('/etc/scylla.d/perftune.yaml'):
             return True
 
-        mode = get_tune_mode(nic)
-        params += ' --mode {mode} --dump-options-file'.format(mode=mode)
-        yaml = run('/opt/scylladb/scripts/perftune.py ' + params, shell=True, check=True, capture_output=True, encoding='utf-8').stdout.strip()
+        params += ' --dump-options-file'
+        yaml = out('/opt/scylladb/scripts/perftune.py ' + params)
         with open('/etc/scylla.d/perftune.yaml', 'w') as f:
             f.write(yaml)
         os.chmod('/etc/scylla.d/perftune.yaml', 0o644)
@@ -79,7 +132,8 @@ def create_perftune_conf(cfg):
 
 def verify_cpu():
     if platform.machine() == 'x86_64':
-        needed_flags = set(['sse4_2', 'pclmulqdq'])
+        # x86-64-v3 (configure.py's default_target_arch()) plus PCLMUL; abm is LZCNT.
+        needed_flags = set(['sse4_2', 'pclmulqdq', 'avx', 'avx2', 'bmi1', 'bmi2', 'f16c', 'fma', 'abm', 'movbe', 'xsave'])
         for line in open('/proc/cpuinfo'):
             if line.startswith('flags'):
                 actual_flags = set(line.split()[2:])
@@ -96,12 +150,7 @@ if __name__ == '__main__':
         print('Requires root permission.')
         sys.exit(1)
     cfg = sysconfig_parser(sysconfdir_p() / 'scylla-server')
-    ami = cfg.get('AMI')
     mode = cfg.get('NETWORK_MODE')
-
-    if ami == 'yes' and os.path.exists('/etc/scylla/ami_disabled'):
-        os.remove('/etc/scylla/ami_disabled')
-        sys.exit(1)
 
     if mode == 'virtio':
         tap = cfg.get('TAP')
@@ -126,9 +175,17 @@ if __name__ == '__main__':
             run('hugeadm --create-mounts', shell=True, check=True)
     else:
         try:
-            if create_perftune_conf(cfg):
+            res = create_perftune_conf(cfg)
+        except Exception as e:
+            print(f'Exception occurred while creating perftune.yaml:\n')
+            scylla_excepthook(*sys.exc_info())
+            print('\nTo fix the error, please re-run scylla_setup.')
+            sys.exit(1)
+        try:
+            if res:
                 run("{} --options-file /etc/scylla.d/perftune.yaml".format(perftune_base_command()), shell=True, check=True)
         except Exception as e:
-            print(f'Exception occurred while creating perftune.yaml: {e}')
-            print('To fix the error, please re-run scylla_setup.')
+            print(f'Exception occurred while tuning system using perftune.yaml:\n')
+            traceback.print_exc()
+            print('\nTo fix the error, please re-run scylla_setup.')
             sys.exit(1)

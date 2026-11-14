@@ -3,16 +3,14 @@
  */
 
 /*
- * This file is part of Scylla.
- *
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #include "sstables/checksum_utils.hh"
 #include "test/lib/make_random_string.hh"
 #include "utils/gz/crc_combine.hh"
 
-#include "seastar/include/seastar/testing/perf_tests.hh"
+#include <seastar/testing/perf_tests.hh>
 
 struct crc_test {
     const sstring data = make_random_string(64*1024);

@@ -3,37 +3,44 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
+#include "db_clock.hh"
 #include "disk_types.hh"
 #include <seastar/core/enum.hh>
+#include <seastar/core/weak_ptr.hh>
 #include "bytes.hh"
 #include "gc_clock.hh"
-#include "tombstone.hh"
+#include "locator/host_id.hh"
+#include "mutation/tombstone.hh"
 #include "utils/streaming_histogram.hh"
 #include "utils/estimated_histogram.hh"
+#include <boost/intrusive/set.hpp>
 #include "sstables/key.hh"
+#include "sstables/file_writer.hh"
 #include "db/commitlog/replay_position.hh"
-#include "version.hh"
 #include <vector>
 #include <unordered_map>
 #include <type_traits>
 #include <concepts>
 #include "version.hh"
 #include "encoding_stats.hh"
-#include "utils/UUID.hh"
+#include "types_fwd.hh"
+#include "schema/schema_fwd.hh"
 
 // While the sstable code works with char, bytes_view works with int8_t
 // (signed char). Rather than change all the code, let's do a cast.
-static inline bytes_view to_bytes_view(const temporary_buffer<char>& b) {
+inline bytes_view to_bytes_view(const temporary_buffer<char>& b) {
     using byte = bytes_view::value_type;
     return bytes_view(reinterpret_cast<const byte*>(b.get()), b.size());
 }
 
 namespace sstables {
+
+using use_caching = bool_class<struct use_caching_tag>;
 
 template<typename T>
 concept Writer =
@@ -69,17 +76,14 @@ struct deletion_time {
                (marked_for_delete_at == std::numeric_limits<int64_t>::min());
     }
 
-    bool operator==(const deletion_time& d) {
-        return local_deletion_time == d.local_deletion_time &&
-               marked_for_delete_at == d.marked_for_delete_at;
-    }
-    bool operator!=(const deletion_time& d) {
-        return !(*this == d);
-    }
-    explicit operator tombstone() {
+    bool operator==(const deletion_time& d) const = default;
+    explicit operator tombstone() const {
         return !live() ? tombstone(marked_for_delete_at, gc_clock::time_point(gc_clock::duration(local_deletion_time))) : tombstone();
     }
-    friend std::ostream& operator<<(std::ostream&, const deletion_time&);
+
+    static deletion_time make_live() {
+        return {std::numeric_limits<int32_t>::max(), std::numeric_limits<int64_t>::min()};
+    }
 };
 
 struct option {
@@ -117,23 +121,32 @@ enum class indexable_element {
     cell
 };
 
-inline std::ostream& operator<<(std::ostream& o, indexable_element e) {
-    o << static_cast<std::underlying_type_t<indexable_element>>(e);
-    return o;
+inline auto format_as(indexable_element e) {
+    return fmt::underlying(e);
 }
 
 class summary_entry {
 public:
-    dht::token token;
+    int64_t raw_token;
     bytes_view key;
     uint64_t position;
+
+    explicit summary_entry(dht::token token, bytes_view key, uint64_t position)
+            : raw_token(dht::token::to_int64(token))
+            , key(key)
+            , position(position) {
+    }
 
     key_view get_key() const {
         return key_view{key};
     }
 
+    dht::token get_token() const {
+        return dht::token::from_int64(raw_token);
+    }
+
     decorated_key_view get_decorated_key() const {
-        return decorated_key_view(token, get_key());
+        return decorated_key_view(get_token(), get_key());
     }
 
     bool operator==(const summary_entry& x) const {
@@ -232,12 +245,11 @@ private:
 };
 using summary = summary_ka;
 
-class file_writer;
-
 struct metadata {
     virtual ~metadata() {}
     virtual uint64_t serialized_size(sstable_version_types v) const = 0;
     virtual void write(sstable_version_types v, file_writer& write) const = 0;
+    virtual std::unique_ptr<metadata> clone() const = 0;
 };
 
 template <typename T>
@@ -256,6 +268,9 @@ public:
     }
     virtual void write(sstable_version_types v, file_writer& writer) const override {
         return sstables::write(v, writer, static_cast<const Component&>(*this));
+    }
+    virtual std::unique_ptr<metadata> clone() const final {
+        return std::make_unique<Component>(static_cast<const Component&>(*this));
     }
 };
 
@@ -276,6 +291,9 @@ struct compaction_metadata : public metadata_base<compaction_metadata> {
         switch (v) {
         case sstable_version_types::mc:
         case sstable_version_types::md:
+        case sstable_version_types::me:
+        case sstable_version_types::ms:
+        case sstable_version_types::mt:
             return f(
                 cardinality
             );
@@ -292,30 +310,65 @@ struct compaction_metadata : public metadata_base<compaction_metadata> {
 };
 
 struct stats_metadata : public metadata_base<stats_metadata> {
+    // NOTE: on-disk serialization order is defined by describe_type() below and
+    // is independent of this declaration order. Fields are grouped here to pack
+    // the sub-8-byte scalars together and avoid padding holes.
     utils::estimated_histogram estimated_partition_size;
     utils::estimated_histogram estimated_cells_count;
+    utils::streaming_histogram estimated_tombstone_drop_time;
     db::replay_position position;
+    db::replay_position commitlog_lower_bound; // 3_x only
     int64_t min_timestamp;
     int64_t max_timestamp;
+    double compression_ratio;
+    // There is not meaningful value to put in this field, since we have no
+    // incremental repair. Before we have it, let's set it to 0.
+    // According to architecture/sstable/sstable3/sstables-3-statistics.rst,
+    // the repaired_at is a int64_t value.
+    int64_t repaired_at = 0;
+    int64_t columns_count; // 3_x only
+    int64_t rows_count; // 3_x only
+    // Sub-8-byte scalars grouped together to avoid padding holes.
     int32_t min_local_deletion_time; // 3_x only
     int32_t max_local_deletion_time;
     int32_t min_ttl; // 3_x only
     int32_t max_ttl; // 3_x only
-    double compression_ratio;
-    utils::streaming_histogram estimated_tombstone_drop_time;
     uint32_t sstable_level;
-    uint64_t repaired_at;
+    bool has_legacy_counter_shards;
     disk_array<uint32_t, disk_string<uint16_t>> min_column_names;
     disk_array<uint32_t, disk_string<uint16_t>> max_column_names;
-    bool has_legacy_counter_shards;
-    int64_t columns_count; // 3_x only
-    int64_t rows_count; // 3_x only
-    db::replay_position commitlog_lower_bound; // 3_x only
     disk_array<uint32_t, commitlog_interval> commitlog_intervals; // 3_x only
+    std::optional<locator::host_id> originating_host_id; // 3_11_11 and later (me format)
 
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) {
         switch (v) {
+        case sstable_version_types::mt:
+        case sstable_version_types::ms:
+        case sstable_version_types::me:
+            return f(
+                estimated_partition_size,
+                estimated_cells_count,
+                position,
+                min_timestamp,
+                max_timestamp,
+                min_local_deletion_time,
+                max_local_deletion_time,
+                min_ttl,
+                max_ttl,
+                compression_ratio,
+                estimated_tombstone_drop_time,
+                sstable_level,
+                repaired_at,
+                min_column_names,
+                max_column_names,
+                has_legacy_counter_shards,
+                columns_count,
+                rows_count,
+                commitlog_lower_bound,
+                commitlog_intervals,
+                originating_host_id
+            );
         case sstable_version_types::mc:
         case sstable_version_types::md:
             return f(
@@ -389,6 +442,9 @@ struct serialization_header : public metadata_base<serialization_header> {
         switch (v) {
         case sstable_version_types::mc:
         case sstable_version_types::md:
+        case sstable_version_types::me:
+        case sstable_version_types::ms:
+        case sstable_version_types::mt:
             return f(
                 min_timestamp_base,
                 min_local_deletion_time_base,
@@ -457,7 +513,8 @@ enum sstable_feature : uint8_t {
     CorrectStaticCompact = 3, // See #4139
     CorrectEmptyCounters = 4, // See #4363
     CorrectUDTsInCollections = 5, // See #6130
-    End = 6,
+    CorrectLastPiBlockWidth = 6,
+    End = 7,
 };
 
 // Scylla-specific features enabled for a particular sstable.
@@ -498,15 +555,38 @@ enum class scylla_metadata_type : uint32_t {
     RunIdentifier = 4,
     LargeDataStats = 5,
     SSTableOrigin = 6,
+    ScyllaBuildId = 7,
+    ScyllaVersion = 8,
+    ExtTimestampStats = 9,
+    SSTableIdentifier = 10,
+    Schema = 11,
+    ComponentsDigests = 12,
+    LargeDataRecords = 13,
+    ScrubTime = 14,
 };
 
+// UUID is used for uniqueness across nodes, such that an imported sstable
+// will not have its run identifier conflicted with the one of a local sstable.
 struct run_identifier {
     // UUID is used for uniqueness across nodes, such that an imported sstable
     // will not have its run identifier conflicted with the one of a local sstable.
-    utils::UUID id;
+    run_id id;
 
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) { return f(id); }
+};
+
+using sstable_id = utils::tagged_uuid<struct sstable_id_tag>;
+
+// UUID is used for uniqueness across nodes, such that an imported sstable
+// will not have its identifier conflicted with the one of a local sstable.
+// The identifier is initialized using the sstable UUID generation, if available,
+// or a time-UUID otherwise.
+struct sstable_identifier_type {
+    sstable_id value;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(value); }
 };
 
 // Types of large data statistics.
@@ -518,6 +598,7 @@ enum class large_data_type : uint32_t {
     row_size = 2,           // row size, in bytes
     cell_size = 3,          // cell size, in bytes
     rows_in_partition = 4,  // number of rows in a partition
+    elements_in_collection = 5,// number of elements in a collection
 };
 
 struct large_data_stats_entry {
@@ -529,10 +610,95 @@ struct large_data_stats_entry {
     auto describe_type(sstable_version_types v, Describer f) { return f(max_value, threshold, above_threshold); }
 };
 
+// A single top-N large data record stored in the SSTable's scylla metadata.
+// Records are written by the sstable writer and survive tablet/shard migration
+// because they live in the SSTable file itself rather than in a CQL system table.
+struct large_data_record {
+    large_data_type type;
+    disk_string<uint32_t> partition_key;    // binary serialized partition key (sstables::key::get_bytes())
+    disk_string<uint32_t> clustering_key;   // binary serialized CK (clustering_key_prefix::representation()), empty if N/A
+    disk_string<uint32_t> column_name;      // column name as text, empty for partition/row entries
+    uint64_t value;                         // size in bytes (partition, row, or cell size depending on type)
+    // Type-dependent element count:
+    //   partition_size, rows_in_partition: number of rows in the partition
+    //   cell_size, elements_in_collection: number of elements in the collection (0 for non-collection cells)
+    //   row_size: 0
+    uint64_t elements_count;
+    // Partition-level auxiliary fields (meaningful only for partition_size records, 0 otherwise):
+    uint64_t range_tombstones;              // number of range tombstones in the partition
+    uint64_t dead_rows;                     // number of dead rows in the partition
+
+    // Runtime hook for large_data_record_index.  Not serialized.
+    using index_hook_type = boost::intrusive::set_member_hook<
+        boost::intrusive::link_mode<boost::intrusive::auto_unlink>>;
+    index_hook_type _index_hook;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) {
+        return f(type, partition_key, clustering_key, column_name, value,
+                 elements_count, range_tombstones, dead_rows);
+    }
+};
+
+// Types of extended timestamp statistics.
+//
+// Note: For extensibility, never reuse an identifier,
+// only add new ones, since these are stored on stable storage.
+enum class ext_timestamp_stats_type : uint32_t {
+    min_live_timestamp = 1,
+    min_live_row_marker_timestamp = 2,
+};
+
+// Mirrors column_kind from schema.hh
+// Not reusing said enum because this enum is ABI, it must have a defined
+// integer storage type and defined values for each member. This kind of
+// restrictions are hard to enforce on an enum in a seemingly unrelated part
+// of the code.
+enum class sstable_column_kind : uint8_t {
+    partition_key = 1,
+    clustering_key = 2,
+    static_column = 3,
+    regular_column = 4,
+};
+
+struct sstable_column_description {
+    sstable_column_kind kind;
+    disk_string<uint32_t> name;
+    disk_string<uint32_t> type;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(kind, name, type); }
+};
+
+struct sstable_schema_type {
+    table_id id;
+    table_schema_version version;
+    disk_string<uint32_t> keyspace_name;
+    disk_string<uint32_t> table_name;
+    disk_array<uint32_t, sstable_column_description> columns;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(id, version, keyspace_name, table_name, columns); }
+};
+
+struct scrub_time_type {
+    int64_t timestamp;
+
+    template <typename Describer>
+    auto describe_type(sstable_version_types v, Describer f) { return f(timestamp); }
+};
+
 struct scylla_metadata {
     using extension_attributes = disk_hash<uint32_t, disk_string<uint32_t>, disk_string<uint32_t>>;
     using large_data_stats = disk_hash<uint32_t, large_data_type, large_data_stats_entry>;
+    using large_data_records = disk_array<uint32_t, large_data_record>;
     using sstable_origin = disk_string<uint32_t>;
+    using scylla_build_id = disk_string<uint32_t>;
+    using scylla_version = disk_string<uint32_t>;
+    using ext_timestamp_stats = disk_hash<uint32_t, ext_timestamp_stats_type, int64_t>;
+    using sstable_identifier = sstable_identifier_type;
+    using sstable_schema = sstable_schema_type;
+    using components_digests = disk_hash<uint32_t, component_type, uint32_t>;
 
     disk_set_of_tagged_union<scylla_metadata_type,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Sharding, sharding_metadata>,
@@ -540,8 +706,17 @@ struct scylla_metadata {
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ExtensionAttributes, extension_attributes>,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::RunIdentifier, run_identifier>,
             disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::LargeDataStats, large_data_stats>,
-            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::SSTableOrigin, sstable_origin>
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::SSTableOrigin, sstable_origin>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ScyllaBuildId, scylla_build_id>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ScyllaVersion, scylla_version>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ExtTimestampStats, ext_timestamp_stats>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::SSTableIdentifier, sstable_identifier>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::Schema, sstable_schema>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ComponentsDigests, components_digests>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::LargeDataRecords, large_data_records>,
+            disk_tagged_union_member<scylla_metadata_type, scylla_metadata_type::ScrubTime, scrub_time_type>
             > data;
+    std::optional<uint32_t> digest;
 
     sstable_enabled_features get_features() const {
         auto features = data.get<scylla_metadata_type::Features, sstable_enabled_features>();
@@ -550,11 +725,11 @@ struct scylla_metadata {
         }
         return *features;
     }
-    bool has_feature(sstable_feature f) const {
-        return get_features().is_enabled(f);
-    }
     const extension_attributes* get_extension_attributes() const {
         return data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
+    }
+    void remove_extension_attributes() {
+        data.data.erase(scylla_metadata_type::ExtensionAttributes);
     }
     extension_attributes& get_or_create_extension_attributes() {
         auto* ext = data.get<scylla_metadata_type::ExtensionAttributes, extension_attributes>();
@@ -564,21 +739,60 @@ struct scylla_metadata {
         }
         return *ext;
     }
-    std::optional<utils::UUID> get_optional_run_identifier() const {
+    std::optional<run_id> get_optional_run_identifier() const {
         auto* m = data.get<scylla_metadata_type::RunIdentifier, run_identifier>();
         return m ? std::make_optional(m->id) : std::nullopt;
     }
-
-    template <typename Describer>
-    auto describe_type(sstable_version_types v, Describer f) { return f(data); }
+    const ext_timestamp_stats* get_ext_timestamp_stats() const {
+        return data.get<scylla_metadata_type::ExtTimestampStats, ext_timestamp_stats>();
+    }
+    sstable_id get_optional_sstable_identifier() const {
+        auto* sid = data.get<scylla_metadata_type::SSTableIdentifier, scylla_metadata::sstable_identifier>();
+        return sid ? sid->value : sstable_id::create_null_id();
+    }
+    void set_sstable_identifier(sstable_id sid) {
+        data.set<scylla_metadata_type::SSTableIdentifier>(scylla_metadata::sstable_identifier{sid});
+    }
+    components_digests& get_or_create_components_digests() {
+        auto* cd = data.get<scylla_metadata_type::ComponentsDigests, components_digests>();
+        if (!cd) {
+            data.set<scylla_metadata_type::ComponentsDigests>(components_digests{});
+            cd = data.get<scylla_metadata_type::ComponentsDigests, components_digests>();
+        }
+        return *cd;
+    }
+    const components_digests* get_components_digests() const {
+        return data.get<scylla_metadata_type::ComponentsDigests, components_digests>();
+    }
+    std::optional<db_clock::time_point> get_scrub_time() const {
+        auto* ts = data.get<scylla_metadata_type::ScrubTime, scrub_time_type>();
+        if (!ts) {
+            return std::nullopt;
+        }
+        return db_clock::time_point(std::chrono::milliseconds(ts->timestamp));
+    }
+    void set_scrub_time(db_clock::time_point timestamp) {
+        std::chrono::milliseconds since_epoch = std::chrono::duration_cast<std::chrono::milliseconds>(timestamp.time_since_epoch());
+        data.set<scylla_metadata_type::ScrubTime>(scrub_time_type(since_epoch.count()));
+    }
 };
 
 static constexpr int DEFAULT_CHUNK_SIZE = 65536;
 
 // checksums are generated using adler32 algorithm.
-struct checksum {
+struct checksum : public weakly_referencable<checksum>, enable_lw_shared_from_this<checksum> {
     uint32_t chunk_size;
     utils::chunked_vector<uint32_t> checksums;
+
+    checksum()
+            : chunk_size(0)
+            , checksums()
+    {}
+
+    explicit checksum(uint32_t chunk_size, utils::chunked_vector<uint32_t> checksums)
+            : chunk_size(chunk_size)
+            , checksums(std::move(checksums))
+    {}
 
     template <typename Describer>
     auto describe_type(sstable_version_types v, Describer f) { return f(chunk_size, checksums); }
@@ -625,6 +839,27 @@ inline int32_t adjusted_local_deletion_time(gc_clock::time_point local_deletion_
 struct statistics {
     disk_array<uint32_t, std::pair<metadata_type, uint32_t>> offsets; // ordered by metadata_type
     std::unordered_map<metadata_type, std::unique_ptr<metadata>> contents;
+private:
+    std::unordered_map<metadata_type, std::unique_ptr<metadata>> clone_contents() const {
+        std::unordered_map<metadata_type, std::unique_ptr<metadata>> result;
+        for (const auto& [type, md] : contents) {
+            result[type] = md->clone();
+        }
+        return result;
+    }
+public:
+    statistics() = default;
+    ~statistics() = default;
+    statistics(statistics&&) = default;
+    statistics(const statistics& other)
+        : offsets{other.offsets}
+        , contents{other.clone_contents()} {}
+    statistics& operator=(statistics&&) = default;
+    statistics& operator=(const statistics& other) {
+        offsets = other.offsets;
+        contents = other.clone_contents();
+        return *this;
+    }
 };
 
 enum class column_mask : uint8_t {
@@ -741,3 +976,33 @@ public:
 };
 }
 
+template <>
+struct fmt::formatter<sstables::deletion_time> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const sstables::deletion_time& dt, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(),
+                              "{{timestamp={}, deletion_time={}}}",
+                              dt.marked_for_delete_at, dt.local_deletion_time);
+    }
+};
+
+template <>
+struct fmt::formatter<sstables::large_data_type> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(sstables::large_data_type type, FormatContext& ctx) const {
+        using enum sstables::large_data_type;
+        switch (type) {
+        case partition_size:
+            return formatter<string_view>::format("partition_size", ctx);
+        case row_size:
+            return formatter<string_view>::format("row_size", ctx);
+        case cell_size:
+            return formatter<string_view>::format("cell_size", ctx);
+        case rows_in_partition:
+            return formatter<string_view>::format("rows_in_partition", ctx);
+        case elements_in_collection:
+            return formatter<string_view>::format("elements_in_collection", ctx);
+        }
+        return formatter<string_view>::format("unknown", ctx);
+    }
+};

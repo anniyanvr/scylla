@@ -1,0 +1,4054 @@
+/*
+ * Copyright (C) 2026-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+#include <boost/test/unit_test.hpp>
+#include <algorithm>
+#include <chrono>
+#include <array>
+#include <cmath>
+#include <deque>
+#include <functional>
+#include <stdexcept>
+#include <map>
+#include <ranges>
+#include <span>
+#include <vector>
+#include <fmt/format.h>
+#include <seastar/core/memory.hh>
+#include <seastar/util/closeable.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/format.hh>
+#include <seastar/core/temporary_buffer.hh>
+#include <seastar/util/memory-data-source.hh>
+#include <seastar/util/defer.hh>
+
+#include "mutation/canonical_mutation.hh"
+#include "replica/exceptions.hh"
+#include "replica/logstor/index.hh"
+#include "replica/logstor/logstor.hh"
+#include "replica/logstor/ondisk.hh"
+#include "replica/logstor/record_value.hh"
+#include "replica/logstor/single_row_partition.hh"
+#include "replica/logstor/write_buffer.hh"
+#include <seastar/testing/thread_test_case.hh>
+
+#include "replica/logstor/segment_io.hh"
+#include "replica/database.hh"
+#include "schema/schema_builder.hh"
+#include "schema/schema_registry.hh"
+#include "data_dictionary/user_types_metadata.hh"
+#include "db/config.hh"
+#include "db/schema_tables.hh"
+#include "gms/feature_service.hh"
+#include "init.hh"
+#include <seastar/core/simple-stream.hh>
+#include "partition_slice_builder.hh"
+#include "test/lib/logstor_test_utils.hh"
+#include "test/lib/mutation_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
+#include "test/lib/reader_concurrency_semaphore.hh"
+#include "test/lib/tmpdir.hh"
+#include "utils/disk-error-handler.hh"
+#include "utils/error_injection.hh"
+#include "utils/exceptions.hh"
+
+using namespace replica::logstor;
+using namespace tests::logstor;
+
+namespace {
+
+schema_ptr make_kv_schema() {
+    return schema_builder(1, "ks", "cf")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .build();
+}
+
+primary_index_key make_index_key(const schema&, const dht::decorated_key& dk) {
+    return primary_index_key{dk};
+}
+
+mutation make_kv_mutation(schema_ptr schema, sstring pk, sstring value, api::timestamp_type ts = api::min_timestamp) {
+    auto key = partition_key::from_single_value(*schema, serialized(pk));
+    auto dk = dht::decorate_key(*schema, key);
+    mutation m(schema, dk);
+    auto& row = m.partition().clustered_row(*schema, clustering_key::make_empty());
+    row.apply(row_marker(ts));
+    const auto& v_def = *schema->get_column_definition("v");
+    row.cells().apply(v_def, atomic_cell::make_live(*v_def.type, ts, serialized(value)));
+    return m;
+}
+
+log_record make_log_record(schema_ptr schema, sstring pk, sstring value, api::timestamp_type ts = api::min_timestamp) {
+    auto m = make_kv_mutation(schema, std::move(pk), std::move(value), ts);
+    return log_record {
+        .header = {
+            .key = m.decorated_key(),
+            .timestamp = ts,
+            .table = schema->id(),
+        },
+        .value = encode_record_value(m),
+    };
+}
+
+// The mutation that a record value decodes to, for the tests that compare mutations: the decoder
+// gives a single_row_partition.
+mutation decode_to_mutation(const record_value& v, schema_ptr s, const record_header& h) {
+    auto partition = decode_record_value(v, *s, h);
+    return to_mutation(std::move(s), h.key, std::move(partition));
+}
+
+// The mutation that a whole record holds.
+mutation to_mutation(const log_record& r, schema_ptr s) {
+    return decode_to_mutation(r.value, std::move(s), r.header);
+}
+
+temporary_buffer<char> copy_chunk(bytes_view chunk) {
+    return temporary_buffer<char>(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+}
+
+temporary_buffer<char> concat_chunks(std::initializer_list<const temporary_buffer<char>*> bufs) {
+    size_t total_size = 0;
+    for (const auto* buf : bufs) {
+        total_size += buf->size();
+    }
+
+    temporary_buffer<char> out(total_size);
+    size_t offset = 0;
+    for (const auto* buf : bufs) {
+        std::copy_n(buf->get(), buf->size(), out.get_write() + offset);
+        offset += buf->size();
+    }
+    return out;
+}
+
+log_record read_record_at_location(const temporary_buffer<char>& segment, record_location loc) {
+    BOOST_REQUIRE_EQUAL(loc.offset + loc.size <= segment.size(), true);
+
+    temporary_buffer<char> buf(loc.size);
+    std::copy_n(segment.get() + loc.offset, loc.size, buf.get_write());
+    auto frame = simple_memory_input_stream(buf.begin(), buf.size());
+    return ondisk::read_record_frame(frame);
+}
+
+void flip_byte(temporary_buffer<char>& buf, size_t offset) {
+    buf.get_write()[offset] ^= char(0x1);
+}
+
+std::optional<segment_info> read_chunk_info_from_bytes(const temporary_buffer<char>& buf) {
+    temporary_buffer<char> copy(buf.size());
+    std::copy_n(buf.get(), buf.size(), copy.get_write());
+    auto in = seastar::util::as_input_stream(std::move(copy));
+    auto header = read_chunk_info(in).get();
+    in.close().get();
+    return header;
+}
+
+temporary_buffer<char> slice_buffer(const temporary_buffer<char>& buf, size_t offset, size_t size) {
+    temporary_buffer<char> out(size);
+    std::copy_n(buf.get() + offset, size, out.get_write());
+    return out;
+}
+
+ondisk::chunk_header read_chunk_header(const temporary_buffer<char>& buf) {
+    seastar::simple_memory_input_stream in(buf.get(), buf.size());
+    return ser::deserialize(in, std::type_identity<ondisk::chunk_header>{});
+}
+
+// The segment header that follows the chunk header in a full segment.
+ondisk::segment_header read_segment_header(const temporary_buffer<char>& buf) {
+    seastar::simple_memory_input_stream in(buf.get() + ondisk::chunk_header_size, buf.size() - ondisk::chunk_header_size);
+    return ser::deserialize(in, std::type_identity<ondisk::segment_header>{});
+}
+
+// Recomputes the chunk header's CRCs over the bytes as they are now, for a test that corrupts the
+// records on purpose and wants the scan to get past the body CRC to what it is testing.
+void reseal_chunk_crcs(temporary_buffer<char>& buf) {
+    auto ch = read_chunk_header(buf);
+    std::optional<ondisk::segment_header> sh;
+    if (ch.kind == segment_kind::full) {
+        sh = read_segment_header(buf);
+    }
+    ch.body_crc = ondisk::calculate_body_crc(std::span(buf.get() + raw_write_buffer::chunk_headers_size(ch.kind), ch.records_size));
+    ch.crc = ch.calculate_crc(sh);
+    seastar::simple_memory_output_stream out(buf.get_write(), ondisk::chunk_header_size);
+    ser::serialize<ondisk::chunk_header>(out, ch);
+}
+
+struct rewritten_stream_result {
+    temporary_buffer<char> data;
+    size_t write_count{0};
+};
+
+rewritten_stream_result rewrite_streamed_segment(log_segment_id segment_id, segment_sequence seq_num, std::span<temporary_buffer<char>> pieces) {
+    std::vector<char> written;
+    size_t write_count = 0;
+
+    streamed_segment_rewriter rewriter(segment_id, seq_num, [&written, &write_count] (bytes_view data) {
+        auto* ptr = reinterpret_cast<const char*>(data.data());
+        written.insert(written.end(), ptr, ptr + data.size());
+        ++write_count;
+        return make_ready_future<>();
+    });
+
+    rewriter.put(pieces).get();
+    rewriter.close().get();
+
+    temporary_buffer<char> out(written.size());
+    std::copy(written.begin(), written.end(), out.get_write());
+    return rewritten_stream_result{.data = std::move(out), .write_count = write_count};
+}
+
+struct scanned_record {
+    record_location location;
+    log_record record;
+};
+
+std::vector<scanned_record> scan_buffer_records(const temporary_buffer<char>& buf, log_segment_id segment_id) {
+    temporary_buffer<char> copy(buf.size());
+    std::copy_n(buf.get(), buf.size(), copy.get_write());
+    auto in = seastar::util::as_input_stream(std::move(copy));
+    std::vector<scanned_record> records;
+
+    segment_scanner scanner(in, segment_id, buf.size());
+    while (auto* chunk = scanner.next_chunk().get()) {
+        for (const auto& record : chunk->records()) {
+            records.push_back(scanned_record{.location = record.location, .record = record.to_log_record()});
+        }
+    }
+    in.close().get();
+
+    return records;
+}
+
+void assert_log_record_matches(schema_ptr schema, const log_record& actual, const log_record& expected) {
+    BOOST_REQUIRE_EQUAL(actual.header.timestamp, expected.header.timestamp);
+    BOOST_REQUIRE_EQUAL(actual.header.table, expected.header.table);
+    assert_that(to_mutation(actual, schema)).is_equal_to(to_mutation(expected, schema));
+}
+
+db::timeout_clock::time_point test_timeout() {
+    return db::timeout_clock::now() + std::chrono::minutes(1);
+}
+
+buffered_writer_config make_buffered_writer_config(size_t buffer_size, size_t ring_size, size_t max_queued_write_bytes = 0, std::chrono::milliseconds sync_period = std::chrono::milliseconds(0)) {
+    return buffered_writer_config{
+        .buffer_size = buffer_size,
+        .ring_size = ring_size,
+        .flush_sg = seastar::default_scheduling_group(),
+        .max_queued_write_bytes = max_queued_write_bytes,
+        .sync_period = sync_period,
+    };
+}
+
+sstring make_single_buffer_value(schema_ptr schema, size_t buffer_size) {
+    sstring value;
+    while (true) {
+        auto next_value = value;
+        next_value += sstring("x");
+        auto next_record = make_log_record(schema, "pk0000", next_value, api::timestamp_type(17));
+        auto next_writer = log_record_writer(next_record);
+        raw_write_buffer wb(buffer_size, segment_kind::mixed);
+
+        BOOST_REQUIRE(wb.can_fit(next_writer));
+        wb.append(next_writer);
+        if (!wb.can_fit(next_writer)) {
+            return next_value;
+        }
+
+        value = std::move(next_value);
+    }
+}
+
+log_record make_buffered_writer_record(schema_ptr schema, size_t idx, const sstring& value, api::timestamp_type ts) {
+    return make_log_record(schema, sstring(fmt::format("pk{:04}", idx)), value, ts);
+}
+
+record_location wait_for_persisted(future<record_location_with_holder>& fut) {
+    auto [loc, op] = fut.get();
+    return loc;
+}
+
+struct test_flush_controller {
+    struct flushed_buffer {
+        temporary_buffer<char> data;
+        segment_position base_position;
+        size_t record_count;
+    };
+
+    bool pause_flushes{false};
+    std::optional<size_t> fail_flush_index;
+    seastar::semaphore flush_started{0};
+    seastar::semaphore flush_release{0};
+    std::vector<flushed_buffer> flushed_buffers;
+    size_t started_count{0};
+    uint32_t next_segment_id{100};
+    uint64_t next_sequence{1};
+
+    future<> operator()(write_buffer& wb) {
+        const auto flush_idx = started_count++;
+        flush_started.signal(1);
+
+        if (pause_flushes) {
+            co_await flush_release.wait(1);
+        }
+
+        if (fail_flush_index && *fail_flush_index == flush_idx) {
+            throw std::runtime_error("injected flush failure");
+        }
+
+        wb.seal(segment_sequence{next_sequence++}, std::nullopt, ondisk::block_alignment);
+        auto base_position = segment_position{
+            .segment = log_segment_id{next_segment_id++},
+            .offset = 0,
+        };
+        flushed_buffers.push_back(flushed_buffer{
+            .data = copy_chunk(wb.chunk()),
+            .base_position = base_position,
+            .record_count = wb.record_count(),
+        });
+        co_await wb.complete_writes(base_position);
+    }
+
+    void wait_for_flush_starts(size_t target_count) {
+        while (started_count < target_count) {
+            flush_started.wait().get();
+        }
+    }
+
+    void release_one_flush() {
+        flush_release.signal(1);
+    }
+
+    const temporary_buffer<char>& buffer_for_segment(log_segment_id segment_id) const {
+        for (const auto& flushed : flushed_buffers) {
+            if (flushed.base_position.segment == segment_id) {
+                return flushed.data;
+            }
+        }
+        throw std::runtime_error(fmt::format("Missing flushed segment {}", segment_id));
+    }
+
+    std::vector<scanned_record> all_records() const {
+        std::vector<scanned_record> records;
+        for (const auto& flushed : flushed_buffers) {
+            auto buffer_records = scan_buffer_records(flushed.data, flushed.base_position.segment);
+            records.insert(records.end(), std::make_move_iterator(buffer_records.begin()), std::make_move_iterator(buffer_records.end()));
+        }
+        return records;
+    }
+};
+
+void assert_records_in_order(schema_ptr schema, const std::vector<scanned_record>& actual, const std::vector<log_record>& expected) {
+    BOOST_REQUIRE_EQUAL(actual.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        assert_log_record_matches(schema, actual[i].record, expected[i]);
+    }
+}
+
+std::set<log_segment_id> snapshot_segment_ids(const utils::chunked_vector<segment_snapshot>& snapshot) {
+    std::set<log_segment_id> ids;
+    for (const auto& seg : snapshot) {
+        ids.insert(seg.segment_id);
+    }
+    return ids;
+}
+
+// Writes all the mutations and flushes the group's separator once, so that they all end up in a
+// single segment of the group.
+void write_and_flush_segment(logstor& ls, test_logstor_group& cg, std::span<const mutation> ms) {
+    for (const auto& m : ms) {
+        ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    }
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+}
+
+void write_and_flush_segment(logstor& ls, test_logstor_group& cg, const mutation& m) {
+    write_and_flush_segment(ls, cg, std::span(&m, 1));
+}
+
+// Which side of a split a key falls on is decided by its token, so a split test needs its keys in
+// token order. Returns `count` distinct keys, sorted by token.
+std::vector<sstring> make_token_ordered_keys(schema_ptr schema, size_t count) {
+    auto token_of = [&] (const sstring& pk) {
+        return dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(pk))).token();
+    };
+    std::vector<sstring> keys;
+    for (size_t i = 0; i < count; ++i) {
+        keys.push_back(seastar::format("pk{}", i));
+    }
+    std::ranges::sort(keys, std::less<>{}, token_of);
+    return keys;
+}
+
+// Scans every segment of the snapshot and counts the records it holds by their timestamp, which is
+// what the tests give each record version to tell them apart.
+std::map<api::timestamp_type, size_t> count_records_by_timestamp(logstor& ls, utils::chunked_vector<segment_snapshot>& snapshot) {
+    std::map<api::timestamp_type, size_t> counts;
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    for (auto& snap : snapshot) {
+        auto in = snap.source(seastar::file_input_stream_options{
+            .buffer_size = std::min<size_t>(segment_size, 128 * 1024),
+            .read_ahead = 1,
+        }).get();
+        segment_scanner scanner(in, snap.segment_id, segment_size);
+        while (auto* chunk = scanner.next_chunk().get()) {
+            for (const auto& record : chunk->records()) {
+                counts[record.header.timestamp]++;
+            }
+        }
+        in.close().get();
+    }
+    return counts;
+}
+
+write_buffer_pool::config make_test_write_buffer_pool_config(size_t capacity, size_t max_cached, size_t preallocate = 0) {
+    return write_buffer_pool::config{
+        .capacity = capacity,
+        .buffer_size = 4 * 1024,
+        .kind = segment_kind::full,
+        .preallocate = preallocate,
+        .max_cached = max_cached,
+    };
+}
+
+// A pooled buffer has to be closed before it can go back to the pool, which happens when the
+// handle is destroyed - here, when this returns.
+void close_and_return(owned_write_buffer buf) {
+    buf->close().get();
+}
+
+size_t record_size_with_value(schema_ptr schema, const sstring& pk, size_t value_size) {
+    return log_record_writer(make_log_record(schema, pk, sstring(value_size, 'x'))).record_size();
+}
+
+// Builds a mutation whose log record serializes to exactly `record_size` bytes, by sizing its value
+// to whatever is left over. The serialized size grows by a byte per value byte, apart from the
+// value's length prefix, so this converges in a step or two.
+mutation make_kv_mutation_of_record_size(schema_ptr schema, const sstring& pk, size_t record_size) {
+    const auto target = static_cast<ssize_t>(record_size);
+    auto size_with_value = [&] (ssize_t value_size) {
+        return static_cast<ssize_t>(record_size_with_value(schema, pk, std::max<ssize_t>(value_size, 0)));
+    };
+
+    ssize_t value_size = target - size_with_value(0);
+    for (int i = 0; i < 4 && size_with_value(value_size) != target; ++i) {
+        value_size += target - size_with_value(value_size);
+    }
+
+    BOOST_REQUIRE_EQUAL(size_with_value(value_size), target);
+    return make_kv_mutation(schema, pk, sstring(value_size, 'x'));
+}
+
+// Verifies that the fixed serialized size declared by a serializer is the number of bytes
+// that write(), read() and skip() actually cover.
+template <typename T>
+void check_serialized_size(const char* name, const T& value) {
+    constexpr size_t expected = ser::serializer<T>::serialized_size;
+
+    BOOST_TEST_CONTEXT(name) {
+        seastar::measuring_output_stream ms;
+        ser::serialize(ms, value);
+        BOOST_REQUIRE_EQUAL(ms.size(), expected);
+
+        std::vector<char> buf(expected);
+        seastar::simple_memory_output_stream out(buf.data(), buf.size());
+        ser::serialize(out, value);
+
+        seastar::simple_memory_input_stream in(buf.data(), buf.size());
+        auto read_back = ser::deserialize(in, std::type_identity<T>{});
+        BOOST_REQUIRE_EQUAL(buf.size() - in.size(), expected);
+        BOOST_REQUIRE(read_back == value);
+
+        seastar::simple_memory_input_stream skip_in(buf.data(), buf.size());
+        ser::serializer<T>::skip(skip_in);
+        BOOST_REQUIRE_EQUAL(buf.size() - skip_in.size(), expected);
+    }
+}
+
+}
+
+// Checks that the on-disk size constants match what the serializers actually write, read and skip.
+// These sizes drive the substream sizing in write_buffer and segment_io, where a mismatch would
+// silently truncate or pad records rather than fail, so they are verified against the real encoding.
+SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_serialized_sizes) {
+    auto table = table_id(utils::UUID(int64_t(0x1122334455667788), int64_t(0x99aabbccddeeff00)));
+
+    check_serialized_size("chunk_header", ondisk::chunk_header {
+        .magic = ondisk::chunk_header_magic,
+        .kind = segment_kind::full,
+        .version = ondisk::current_version,
+        .reserved = 0x1234,
+        .segment_seq = segment_sequence{0x0102030405060708},
+        .records_size = 0xdeadbeef,
+        .body_crc = 0x0badf00d,
+        .reserved2 = 0x5eed1e55,
+        .crc = 0xfeedface,
+    });
+
+    check_serialized_size("segment_header", ondisk::segment_header {
+        .table = table,
+        .first_token = dht::token::from_int64(-0x0123456789abcdef),
+        .last_token = dht::token::from_int64(0x7fffffffffffffff),
+    });
+
+    check_serialized_size("record_frame_header", ondisk::record_frame_header {
+        .key_size = 0x0a0b0c0d,
+        .value_size = 0xcafebabe,
+    });
+}
+
+// Serializes a record frame and returns its bytes, checking that the frame took exactly the size
+// ondisk::record_frame_size() predicts.
+std::vector<char> serialize_record_frame(const log_record& record) {
+    const auto expected_size = ondisk::record_frame_size(record);
+
+    seastar::measuring_output_stream ms;
+    ondisk::write_record_frame(ms, record.header, record.value);
+    BOOST_REQUIRE_EQUAL(ms.size(), expected_size);
+
+    std::vector<char> buf(expected_size);
+    seastar::simple_memory_output_stream out(buf.data(), buf.size());
+    ondisk::write_record_frame(out, record.header, record.value);
+    BOOST_REQUIRE_EQUAL(out.size(), 0u);
+    return buf;
+}
+
+// Checks that ondisk::write_record_frame() and ondisk::read_record_frame() are inverses: the frame
+// the write path puts in a buffer is exactly what the read path takes out, and writing the record
+// that came back produces the same bytes. Also checks that the two write overloads agree, since
+// compaction and the separator rewrite a record through the bytes one.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_frame_round_trip) {
+    auto schema = make_kv_schema();
+
+    // A key longer than the inline size of managed_bytes, so the fragmented paths are exercised,
+    // and an empty key, which is the smallest frame a scan has to accept.
+    for (const auto& pk : {sstring("pk0"), sstring(100, 'k'), sstring("")}) {
+        auto record = make_log_record(schema, pk, "a-value-of-some-length", api::timestamp_type(0x0f0e0d0c0b0a0908));
+        const auto header_size = ondisk::record_header_size(record.header);
+        const auto value_size = record.value.size();
+
+        auto frame = serialize_record_frame(record);
+
+        // Read it back and compare.
+        seastar::simple_memory_input_stream in(frame.data(), frame.size());
+        auto read_back = ondisk::read_record_frame(in);
+        BOOST_REQUIRE_EQUAL(in.size(), 0u);
+        BOOST_REQUIRE(read_back.header == record.header);
+        BOOST_REQUIRE(read_back.header.key.equal(*schema, record.header.key));
+        BOOST_REQUIRE(read_back.value == record.value);
+
+        // Writing what came back gives the same bytes.
+        BOOST_REQUIRE(serialize_record_frame(read_back) == frame);
+
+        // The bytes overload, given the header and value slices of the frame as a scan hands them
+        // out, writes the same frame.
+        const auto* frame_bytes = reinterpret_cast<const int8_t*>(frame.data());
+        log_record_bytes_view record_view {
+            .header = bytes_view(frame_bytes + ondisk::record_frame_header_size, header_size),
+            .value = bytes_view(frame_bytes + ondisk::record_frame_header_size + header_size, value_size),
+        };
+        std::vector<char> from_bytes(frame.size());
+        seastar::simple_memory_output_stream bytes_out(from_bytes.data(), from_bytes.size());
+        ondisk::write_record_frame(bytes_out, record_view);
+        BOOST_REQUIRE_EQUAL(bytes_out.size(), 0u);
+        BOOST_REQUIRE(from_bytes == frame);
+    }
+}
+
+// Checks that ondisk::read_record_frame() rejects a frame header that does not match the frame
+// it is read from, rather than cutting the key and the value in the wrong places. A size one short
+// of the frame is the case that would otherwise go unnoticed, since the reads it sizes all fit.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_frame_invalid_header) {
+    auto schema = make_kv_schema();
+    auto record = make_log_record(schema, "pk0", "a-value-of-some-length", api::timestamp_type(1));
+    const auto frame = serialize_record_frame(record);
+    const ondisk::record_frame_header good {
+        .key_size = uint32_t(record.header.key.key().representation().size()),
+        .value_size = uint32_t(record.value.size()),
+    };
+
+    auto read_with_header = [&] (ondisk::record_frame_header h) {
+        auto corrupt = frame;
+        seastar::simple_memory_output_stream out(corrupt.data(), ondisk::record_frame_header_size);
+        ser::serializer<ondisk::record_frame_header>::write(out, h);
+        seastar::simple_memory_input_stream in(corrupt.data(), corrupt.size());
+        return ondisk::read_record_frame(in);
+    };
+
+    BOOST_REQUIRE(read_with_header(good).value == record.value);
+
+    auto h = good;
+    h.value_size = 0;
+    BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
+
+    h = good;
+    h.key_size = ondisk::max_key_size + 1;
+    BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
+
+    for (int delta : {-1, 1}) {
+        h = good;
+        h.key_size += delta;
+        BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
+
+        h = good;
+        h.value_size += delta;
+        BOOST_REQUIRE_THROW(read_with_header(h), std::runtime_error);
+    }
+}
+
+// Checks that the record header encoding round-trips, including a key longer than the inline size of
+// managed_bytes, and that its size is the fixed part plus the key.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_header_round_trip) {
+    auto schema = make_kv_schema();
+    auto m = make_kv_mutation(schema, sstring(100, 'k'), "v");
+    record_header header {
+        .key = m.decorated_key(),
+        .timestamp = api::timestamp_type(0x0f0e0d0c0b0a0908),
+        .table = table_id(utils::UUID(int64_t(0x1122334455667788), int64_t(0x99aabbccddeeff00))),
+    };
+    // The representation is the key bytes plus their length prefix.
+    const auto key_size = header.key.key().representation().size();
+    BOOST_REQUIRE_GE(key_size, 100u);
+
+    const auto expected_size = ondisk::record_header_fixed_size + key_size;
+    BOOST_REQUIRE_EQUAL(ondisk::record_header_size(header), expected_size);
+
+    seastar::measuring_output_stream ms;
+    ondisk::write_record_header(ms, header);
+    BOOST_REQUIRE_EQUAL(ms.size(), expected_size);
+
+    std::vector<char> buf(expected_size);
+    seastar::simple_memory_output_stream out(buf.data(), buf.size());
+    ondisk::write_record_header(out, header);
+    BOOST_REQUIRE_EQUAL(out.size(), 0u);
+
+    seastar::simple_memory_input_stream in(buf.data(), buf.size());
+    auto read_back = ondisk::read_record_header(in, key_size);
+    BOOST_REQUIRE_EQUAL(in.size(), 0u);
+    BOOST_REQUIRE(read_back == header);
+    BOOST_REQUIRE(read_back.key.equal(*schema, header.key));
+    BOOST_REQUIRE(read_back.index_key() == header.index_key());
+}
+
+// Checks that the index key hashes the internal representation of the partition key and keeps its token.
+SEASTAR_THREAD_TEST_CASE(test_logstor_index_key_hashes_key_representation) {
+    auto schema = make_kv_schema();
+    auto dk0 = make_kv_mutation(schema, "pk0", "v0").decorated_key();
+    auto dk1 = make_kv_mutation(schema, "pk1", "v1").decorated_key();
+
+    auto key0 = primary_index_key(dk0);
+    BOOST_REQUIRE_EQUAL(key0.token(), dk0.token());
+    BOOST_REQUIRE(key0.hash() == compute_key_hash(dk0.key().representation()));
+    BOOST_REQUIRE(key0 == primary_index_key(dk0));
+
+    auto key1 = primary_index_key(dk1);
+    BOOST_REQUIRE(key1.hash() != key0.hash());
+    BOOST_REQUIRE(key1 != key0);
+}
+
+// Checks that sealing a full raw write buffer writes the expected header fields.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serialization) {
+    auto schema = make_kv_schema();
+    auto expected = make_log_record(schema, "pk0", "v0", api::timestamp_type(7));
+
+    raw_write_buffer wb(32 * 1024, segment_kind::full);
+    auto writer = log_record_writer(expected);
+    auto expected_records_size = size_t(ondisk::record_frame_header_size) + writer.record_size();
+    expected_records_size = ((expected_records_size + ondisk::record_alignment - 1) / ondisk::record_alignment) * ondisk::record_alignment;
+    wb.append(std::move(writer));
+    wb.seal(segment_sequence{17}, schema->id(), ondisk::block_alignment);
+
+    const auto chunk = wb.chunk();
+    BOOST_REQUIRE_EQUAL(chunk.size() % ondisk::block_alignment, 0u);
+
+    seastar::simple_memory_input_stream in(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+    auto ch = ser::deserialize(in, std::type_identity<ondisk::chunk_header>{});
+    auto sh = ser::deserialize(in, std::type_identity<ondisk::segment_header>{});
+    BOOST_REQUIRE(ondisk::validate_chunk_headers(ch, sh));
+    BOOST_REQUIRE(ch.kind == segment_kind::full);
+    BOOST_REQUIRE_EQUAL(ch.segment_seq.value, 17u);
+    BOOST_REQUIRE_EQUAL(ch.records_size, expected_records_size);
+
+    BOOST_REQUIRE_EQUAL(sh.table, schema->id());
+    BOOST_REQUIRE_EQUAL(sh.first_token, expected.header.key.token());
+    BOOST_REQUIRE_EQUAL(sh.last_token, expected.header.key.token());
+}
+
+namespace {
+
+schema_ptr make_multi_column_schema() {
+    return schema_builder(1, "ks", "cf_multi")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .with_column("w", int32_type)
+            .with_column("x", bytes_type)
+            .build();
+}
+
+// A partition with a live cell, an expiring cell and a dead cell, and a row marker.
+mutation make_multi_column_mutation(schema_ptr schema, sstring pk, api::timestamp_type ts) {
+    auto key = partition_key::from_single_value(*schema, serialized(pk));
+    mutation m(schema, dht::decorate_key(*schema, key));
+    auto& row = m.partition().clustered_row(*schema, clustering_key::make_empty());
+    row.apply(row_marker(ts));
+    const auto& v_def = *schema->get_column_definition("v");
+    const auto& w_def = *schema->get_column_definition("w");
+    const auto& x_def = *schema->get_column_definition("x");
+    row.cells().apply(v_def, atomic_cell::make_live(*v_def.type, ts, serialized(sstring("value"))));
+    row.cells().apply(w_def, atomic_cell::make_live(*w_def.type, ts, serialized(int32_t(42)),
+            gc_clock::now() + std::chrono::hours(1), std::chrono::hours(1)));
+    row.cells().apply(x_def, atomic_cell::make_dead(ts, gc_clock::now()));
+    return m;
+}
+
+record_header make_header(const mutation& m, api::timestamp_type ts) {
+    return record_header{
+        .key = m.decorated_key(),
+        .timestamp = ts,
+        .table = m.schema()->id(),
+    };
+}
+
+} // anonymous namespace
+
+// Checks that a record value decodes back to the partition it was encoded from, and that it is
+// smaller than the canonical_mutation it is stripped from.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_round_trip) {
+    auto schema = make_multi_column_schema();
+    const auto ts = api::timestamp_type(11);
+
+    auto m = make_multi_column_mutation(schema, "pk0", ts);
+    auto value = encode_record_value(m);
+    assert_that(decode_to_mutation(value, schema, make_header(m, ts))).is_equal_to(m);
+    BOOST_REQUIRE_LT(value.size(), canonical_mutation(m).representation().size());
+
+    // The value starts with the schema version, most significant half first. That is what a
+    // read under the same schema compares against, and a decoder that got the halves in the
+    // wrong order would still decode correctly, only through the converting path.
+    auto in = ser::as_input_stream(value.representation());
+    BOOST_REQUIRE_EQUAL(ser::serializer<int64_t>::read(in), schema->version().uuid().get_most_significant_bits());
+    BOOST_REQUIRE_EQUAL(ser::serializer<int64_t>::read(in), schema->version().uuid().get_least_significant_bits());
+
+    // A partition tombstone alone, with no row.
+    mutation deleted(schema, m.decorated_key());
+    deleted.partition().apply(tombstone(ts, gc_clock::now()));
+    auto deleted_value = encode_record_value(deleted);
+    assert_that(decode_to_mutation(deleted_value, schema, make_header(deleted, ts))).is_equal_to(deleted);
+}
+
+// Checks that a record written under one schema version reads under another the way a
+// canonical_mutation does: a column the record has and the schema does not is dropped, a column
+// the schema has and the record does not is absent.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_decodes_under_another_schema_version) {
+    auto schema = make_multi_column_schema();
+    const auto ts = api::timestamp_type(21);
+
+    auto m = make_multi_column_mutation(schema, "pk0", ts);
+    auto value = encode_record_value(m);
+    auto header = make_header(m, ts);
+    auto oracle = canonical_mutation(m);
+
+    auto with_added = schema_builder(schema).with_column("y", long_type).build();
+    BOOST_REQUIRE(with_added->version() != schema->version());
+    assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(oracle.to_mutation(with_added));
+    assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(m);
+
+    auto with_dropped = schema_builder(schema).without_column("w", ts + 1).build();
+    BOOST_REQUIRE(with_dropped->version() != schema->version());
+    auto decoded = decode_to_mutation(value, with_dropped, header);
+    assert_that(decoded).is_equal_to(oracle.to_mutation(with_dropped));
+    // Of the three cells written, the one of the dropped column is gone.
+    const auto& cells = decoded.partition().clustered_row(*with_dropped, clustering_key::make_empty()).cells();
+    BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("v")->id) != nullptr);
+    BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("x")->id) != nullptr);
+    BOOST_REQUIRE_EQUAL(cells.size(), 2u);
+}
+
+// Checks that a value is not decoded with the schema of another table: the table id comes from the
+// header, and the check that used to be inside the canonical_mutation has to hold there.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_rejects_the_schema_of_another_table) {
+    auto schema = make_multi_column_schema();
+    auto other = make_kv_schema();
+    const auto ts = api::timestamp_type(31);
+
+    auto m = make_multi_column_mutation(schema, "pk0", ts);
+    auto value = encode_record_value(m);
+    auto header = make_header(m, ts);
+
+    BOOST_REQUIRE(other->id() != schema->id());
+    BOOST_REQUIRE_THROW(decode_to_mutation(value, other, header), std::runtime_error);
+    assert_that(decode_to_mutation(value, schema, header)).is_equal_to(m);
+}
+
+// Checks that the frozen and the unfrozen forms of a mutation give the same record value and the
+// same timestamp.
+SEASTAR_THREAD_TEST_CASE(test_logstor_frozen_record_value_matches_the_unfrozen_one) {
+    auto schema = make_multi_column_schema();
+    const auto ts = api::timestamp_type(41);
+
+    // One mutation per kind of row marker and per source of the record timestamp. Each has its own
+    // partition key, and the record timestamp of each is ts.
+    std::vector<mutation> ms;
+    const auto add = [&] (const sstring& pk) -> mutation& {
+        auto key = partition_key::from_single_value(*schema, serialized(pk));
+        return ms.emplace_back(schema, dht::decorate_key(*schema, key));
+    };
+    const auto row = [&] (mutation& m) -> deletable_row& {
+        return m.partition().clustered_row(*schema, clustering_key::make_empty());
+    };
+
+    // A live marker and cells that are live, expiring and dead.
+    ms.push_back(make_multi_column_mutation(schema, "pk0", ts));
+
+    // A row with an expiring marker.
+    row(add("pk1")).apply(row_marker(ts, std::chrono::hours(1), gc_clock::now() + std::chrono::hours(1)));
+
+    // A row with a dead marker. The timestamp comes from the tombstone of the marker.
+    row(add("pk2")).apply(row_marker(tombstone(ts, gc_clock::now())));
+
+    // A partition tombstone and no rows. The timestamp comes from the partition tombstone.
+    add("pk3").partition().apply(tombstone(ts, gc_clock::now()));
+
+    // A row with cells and no marker, and a partition tombstone.
+    {
+        auto& m = add("pk4");
+        const auto& v_def = *schema->get_column_definition("v");
+        row(m).cells().apply(v_def, atomic_cell::make_live(*v_def.type, ts, serialized(sstring("value"))));
+        m.partition().apply(tombstone(ts, gc_clock::now()));
+    }
+
+    for (const auto& m : ms) {
+        const auto frozen = freeze(m);
+        BOOST_REQUIRE(encode_record_value(frozen, *schema) == encode_record_value(m));
+        BOOST_REQUIRE_EQUAL(record_timestamp(m), ts);
+        BOOST_REQUIRE_EQUAL(record_timestamp(frozen), ts);
+
+        // The value decodes to the original mutation.
+        assert_that(decode_to_mutation(encode_record_value(frozen, *schema), schema, make_header(m, ts))).is_equal_to(m);
+    }
+}
+
+// Checks that record_timestamp() throws for both forms of a mutation that has no row marker and
+// no partition tombstone.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_timestamp_requires_a_marker_or_a_tombstone) {
+    auto schema = make_multi_column_schema();
+    auto key = partition_key::from_single_value(*schema, serialized(sstring("pk0")));
+
+    mutation empty(schema, dht::decorate_key(*schema, key));
+    BOOST_REQUIRE_THROW(record_timestamp(empty), std::runtime_error);
+    BOOST_REQUIRE_THROW(record_timestamp(freeze(empty)), std::runtime_error);
+
+    // A row with cells and no marker.
+    mutation cells_only(schema, dht::decorate_key(*schema, key));
+    {
+        auto& row = cells_only.partition().clustered_row(*schema, clustering_key::make_empty());
+        const auto& v_def = *schema->get_column_definition("v");
+        row.cells().apply(v_def, atomic_cell::make_live(*v_def.type, api::timestamp_type(51), serialized(sstring("v"))));
+    }
+    BOOST_REQUIRE_THROW(record_timestamp(cells_only), std::runtime_error);
+    BOOST_REQUIRE_THROW(record_timestamp(freeze(cells_only)), std::runtime_error);
+}
+
+// Checks that a frozen mutation written through logstor::write() reads back as the original
+// mutation, and that write() rejects a different schema version.
+SEASTAR_THREAD_TEST_CASE(test_logstor_writes_a_frozen_mutation) {
+    auto schema = make_multi_column_schema();
+    const auto ts = api::timestamp_type(61);
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    // A row with a live marker and cells, a row with a dead marker, and a partition tombstone.
+    std::vector<mutation> mutations;
+    mutations.push_back(make_multi_column_mutation(schema, "pk0", ts));
+    {
+        auto key = partition_key::from_single_value(*schema, serialized(sstring("pk1")));
+        auto& m = mutations.emplace_back(schema, dht::decorate_key(*schema, key));
+        m.partition().clustered_row(*schema, clustering_key::make_empty()).apply(row_marker(tombstone(ts, gc_clock::now())));
+    }
+    {
+        auto key = partition_key::from_single_value(*schema, serialized(sstring("pk2")));
+        auto& m = mutations.emplace_back(schema, dht::decorate_key(*schema, key));
+        m.partition().apply(tombstone(ts, gc_clock::now()));
+    }
+
+    for (const auto& expected : mutations) {
+        ls.write(freeze(expected), *schema, write_target(&cg, {}), db::no_timeout).get();
+        ls.flush_to_separator().get();
+        cg.flush_separator().get();
+
+        auto actual = read_mutation(ls, schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(expected);
+    }
+
+    auto altered = schema_builder(schema).with_column("z", long_type).build();
+    BOOST_REQUIRE(altered->version() != schema->version());
+    BOOST_REQUIRE_THROW(ls.write(freeze(mutations.front()), *altered, write_target(&cg, {}), db::no_timeout).get(),
+            schema_mismatch_error);
+}
+
+// Checks that a raw write buffer can hold and seal a record whose serialized size is exactly max_record_size().
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_size) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(ondisk::block_alignment, segment_kind::mixed);
+    auto max_size = wb.max_record_size();
+
+    sstring value;
+    auto record = make_log_record(schema, "pk", "", api::timestamp_type(27));
+    log_record_writer writer(record);
+
+    while (writer.record_size() < max_size) {
+        value += "x";
+        record = make_log_record(schema, "pk", value, api::timestamp_type(27));
+        writer = log_record_writer(record);
+    }
+
+    BOOST_REQUIRE_EQUAL(writer.record_size(), max_size);
+    BOOST_REQUIRE(wb.can_fit(writer));
+
+    wb.append(writer);
+    wb.seal(segment_sequence{29}, std::nullopt, ondisk::block_alignment);
+
+    BOOST_REQUIRE_EQUAL(wb.chunk().size(), ondisk::block_alignment);
+}
+
+// A record written to a mixed segment is rewritten by the separator into a full segment of its
+// compaction group, so it has to fit a buffer of either kind, which do not have the same room for
+// records. The write path used to bound a record by the mixed buffer alone, so a record that only
+// fits that one was accepted and could then never be separated, spinning in write_to_separator.
+SEASTAR_THREAD_TEST_CASE(test_logstor_largest_accepted_record_can_be_separated) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size);
+
+    auto expected = make_kv_mutation_of_record_size(schema, "pk0", max_size);
+    auto key = expected.decorated_key();
+
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+// A read of a stopped logstor fails with the closed gate, which the read of the segment takes.
+SEASTAR_THREAD_TEST_CASE(test_logstor_read_after_stop_fails_the_future) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+
+    test_logstor_group cg(schema, ls);
+    auto m = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    ls.stop().get();
+
+    BOOST_REQUIRE_THROW(read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get(), gate_closed_exception);
+}
+
+// Checks that a record that does not fit a segment of either kind is rejected by the write path,
+// rather than accepted into a mixed segment that the separator would then not be able to split.
+SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_record_that_does_not_fit_a_segment_of_either_kind) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size);
+
+    auto too_big = make_kv_mutation_of_record_size(schema, "pk0", max_size + 1);
+    BOOST_REQUIRE_THROW(ls.write(too_big, write_target(&cg, {}), db::no_timeout).get(), std::runtime_error);
+
+    BOOST_REQUIRE(!cg.separator_has_data());
+}
+
+// Checks that a buffer holding records that were never flushed can still be closed and reused
+// after aborting its writes. A pending write is resolved only by the flush and holds the buffer's
+// write gate until then, so close() alone never completes. The compaction buffer pool relies on
+// abort_writes() to reclaim a buffer left behind by a compaction that failed before flushing.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_abort_writes_reclaims_unflushed_buffer) {
+    auto schema = make_kv_schema();
+
+    write_buffer wb(32 * 1024, segment_kind::full);
+    auto written = wb.write(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+    BOOST_REQUIRE(!written.available());
+
+    auto closed = wb.close();
+    seastar::thread::yield();
+    BOOST_REQUIRE(!closed.available());
+
+    wb.abort_writes(std::make_exception_ptr(std::runtime_error("buffer was not flushed"))).get();
+    BOOST_REQUIRE_THROW(written.get(), std::runtime_error);
+    closed.get();
+    BOOST_REQUIRE(wb.is_closed());
+
+    wb.reset();
+    BOOST_REQUIRE(!wb.is_closed());
+    BOOST_REQUIRE(!wb.has_data());
+}
+
+// Checks that a pool builds its buffers at the point of use and keeps only max_cached of them once
+// they are returned, so that a pool whose capacity is rarely reached does not hold the memory for it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_builds_buffers_on_demand) {
+    abort_source as;
+    write_buffer_pool pool(make_test_write_buffer_pool_config(4, 1));
+    auto stop_pool = seastar::defer([&pool] noexcept { pool.stop().get(); });
+
+    BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 0u);
+
+    auto b0 = pool.allocate(as).get();
+    auto b1 = pool.allocate(as).get();
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 2u);
+    BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 2u);
+    BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 2u);
+    BOOST_REQUIRE_EQUAL(b0->buffer_size(), 4u * 1024);
+
+    close_and_return(std::move(b0));
+    close_and_return(std::move(b1));
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0u);
+    BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 1u);
+
+    // The kept buffer is handed out again, the one that was let go is built anew.
+    auto b2 = pool.allocate(as).get();
+    BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 2u);
+    auto b3 = pool.allocate(as).get();
+    BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 3u);
+
+    close_and_return(std::move(b2));
+    close_and_return(std::move(b3));
+}
+
+// Checks that a pool configured to build its buffers up front never builds one at the point of use,
+// which is what the compaction buffer pool relies on.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_preallocates_its_buffers) {
+    abort_source as;
+    write_buffer_pool pool(make_test_write_buffer_pool_config(2, 2, 2));
+    auto stop_pool = seastar::defer([&pool] noexcept { pool.stop().get(); });
+
+    BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 2u);
+    BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 2u);
+
+    auto bufs = pool.allocate_many(2, as).get();
+    BOOST_REQUIRE_EQUAL(bufs.size(), 2u);
+    BOOST_REQUIRE(bufs[0].get() != bufs[1].get());
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 2u);
+    BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 2u);
+
+    for (auto& buf : bufs) {
+        close_and_return(std::move(buf));
+    }
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0u);
+    BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 2u);
+}
+
+// Checks that the capacity bounds how many buffers are out at once, and that raising it lets a
+// waiting allocation through.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_capacity_bounds_allocations) {
+    abort_source as;
+    write_buffer_pool pool(make_test_write_buffer_pool_config(1, 1));
+    auto stop_pool = seastar::defer([&pool] noexcept { pool.stop().get(); });
+
+    auto b0 = pool.allocate(as).get();
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 1u);
+
+    auto waiting = pool.allocate(as);
+    seastar::thread::yield();
+    BOOST_REQUIRE(!waiting.available());
+    BOOST_REQUIRE_EQUAL(pool.get_stats().allocation_waits, 1u);
+
+    pool.set_capacity(2);
+    auto b1 = waiting.get();
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 2u);
+
+    close_and_return(std::move(b0));
+    close_and_return(std::move(b1));
+}
+
+// Checks that lowering the capacity while buffers are out takes effect as they come back: the first
+// return covers the capacity that was taken away and its buffer is freed rather than kept.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_capacity_shrinks_while_buffers_are_out) {
+    abort_source as;
+    write_buffer_pool pool(make_test_write_buffer_pool_config(2, 2));
+    auto stop_pool = seastar::defer([&pool] noexcept { pool.stop().get(); });
+
+    auto b0 = pool.allocate(as).get();
+    auto b1 = pool.allocate(as).get();
+
+    pool.set_capacity(1);
+    BOOST_REQUIRE_EQUAL(pool.capacity(), 1u);
+
+    close_and_return(std::move(b0));
+    BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 1u);
+
+    auto waiting = pool.allocate(as);
+    seastar::thread::yield();
+    BOOST_REQUIRE(!waiting.available());
+
+    close_and_return(std::move(b1));
+    auto b2 = waiting.get();
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 1u);
+    BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 1u);
+
+    close_and_return(std::move(b2));
+}
+
+// Checks that a compaction that fails after rewriting records into its buffer returns the buffer to
+// the pool, so that later compactions - and shutdown, which waits for the pool to drain - are not
+// blocked by it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_failed_compaction_returns_its_buffer_to_the_pool) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    auto pk1_v0 = make_kv_mutation(schema, "pk1", "v1", api::timestamp_type(2));
+    auto pk0_v1 = make_kv_mutation(schema, "pk0", "v0-new", api::timestamp_type(3));
+
+    write_and_flush_segment(ls, cg, pk0_v0);
+    write_and_flush_segment(ls, cg, pk1_v0);
+    write_and_flush_segment(ls, cg, pk0_v1);
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 3u);
+
+    const auto pk0 = make_index_key(*schema, pk0_v1.decorated_key());
+    const auto pk1 = make_index_key(*schema, pk1_v0.decorated_key());
+
+    auto pk0_before = cg.logstor_index().get(pk0);
+    auto pk1_before = cg.logstor_index().get(pk1);
+    BOOST_REQUIRE(pk0_before);
+    BOOST_REQUIRE(pk1_before);
+
+    // The first compaction fails right after rewriting a record, leaving records in its buffer that
+    // will never be flushed.
+    utils::get_local_injector().enable("logstor_compaction_fail_after_rewrite", true /* one shot */);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    setup_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // Nothing was flushed, so the group and the index are unchanged.
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 3u);
+    BOOST_REQUIRE(cg.logstor_index().get(pk0)->location == pk0_before->location);
+    BOOST_REQUIRE(cg.logstor_index().get(pk1)->location == pk1_before->location);
+
+    // The buffer of the failed compaction is back in the pool, so this one runs to completion.
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    auto pk0_after = cg.logstor_index().get(pk0);
+    auto pk1_after = cg.logstor_index().get(pk1);
+    BOOST_REQUIRE(pk0_after);
+    BOOST_REQUIRE(pk1_after);
+    BOOST_REQUIRE(pk0_after->location != pk0_before->location);
+    BOOST_REQUIRE(pk1_after->location != pk1_before->location);
+
+    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get()).is_equal_to(pk0_v1);
+    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk1_v0.decorated_key(), schema->full_slice()).get()).is_equal_to(pk1_v0);
+}
+
+// Checks that a compaction whose index updates fail returns its buffer to the pool. This failure
+// surfaces only after the output segment was written, so it lands after flush() handed the pending
+// updates to when_all_succeed() - which moves them out of the vector. That is the path where a
+// teardown still walking that vector would operate on moved-from futures.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_failing_index_update_returns_its_buffer_to_the_pool) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    auto pk1_v0 = make_kv_mutation(schema, "pk1", "v1", api::timestamp_type(2));
+    auto pk0_v1 = make_kv_mutation(schema, "pk0", "v0-new", api::timestamp_type(3));
+
+    write_and_flush_segment(ls, cg, pk0_v0);
+    write_and_flush_segment(ls, cg, pk1_v0);
+    write_and_flush_segment(ls, cg, pk0_v1);
+
+    utils::get_local_injector().enable("logstor_compaction_fail_index_update", true /* one shot */);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    setup_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // The records are readable whichever location the index kept for them.
+    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get()).is_equal_to(pk0_v1);
+    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk1_v0.decorated_key(), schema->full_slice()).get()).is_equal_to(pk1_v0);
+
+    // The buffer of the failed compaction is back in the pool, so compaction still runs.
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get()).is_equal_to(pk0_v1);
+    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk1_v0.decorated_key(), schema->full_slice()).get()).is_equal_to(pk1_v0);
+}
+
+// Checks that primary_index accounting callbacks track live bytes across
+// inserts, overwrites, relocations, erases, range erases, and clear().
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_space_accounting) {
+    auto schema = make_kv_schema();
+    struct accounting_subscriber : space_accounting_subscriber {
+        ssize_t live_bytes = 0;
+        size_t add_calls = 0;
+        size_t free_calls = 0;
+        std::vector<record_location> added_locations;
+        std::vector<record_location> freed_locations;
+
+        bool is_live(record_location loc) const {
+            return std::count(added_locations.begin(), added_locations.end(), loc)
+                 > std::count(freed_locations.begin(), freed_locations.end(), loc);
+        }
+
+        size_t live_location_count() const {
+            return std::count_if(added_locations.begin(), added_locations.end(), [&] (record_location loc) {
+                return is_live(loc);
+            });
+        }
+
+        void on_add_record(record_location loc) noexcept override {
+            live_bytes += loc.size;
+            ++add_calls;
+            added_locations.push_back(loc);
+        }
+
+        void on_free_record(record_location loc) noexcept override {
+            live_bytes -= loc.size;
+            ++free_calls;
+            BOOST_REQUIRE(is_live(loc));
+            freed_locations.push_back(loc);
+        }
+    } accounting;
+
+    primary_index index(accounting, nullptr, false);
+
+    // The index counts the bytes of the records it points at for the table it belongs to, which is
+    // the same number the subscriber accumulates, so the two must agree after every operation.
+    auto check_live_bytes = [&] (ssize_t expected) {
+        BOOST_REQUIRE_EQUAL(accounting.live_bytes, expected);
+        BOOST_REQUIRE_EQUAL(index.get_live_record_bytes(), uint64_t(expected));
+    };
+
+    const auto pk0 = make_index_key(*schema, make_kv_mutation(schema, "pk0", "v0").decorated_key());
+    const auto pk1 = make_index_key(*schema, make_kv_mutation(schema, "pk1", "v1").decorated_key());
+    const auto pk2 = make_index_key(*schema, make_kv_mutation(schema, "pk2", "v2").decorated_key());
+
+    const record_location loc0{.segment = log_segment_id{1}, .offset = 0, .size = 11};
+    const record_location loc0_old{.segment = log_segment_id{1}, .offset = 16, .size = 7};
+    const record_location loc1{.segment = log_segment_id{2}, .offset = 0, .size = 17};
+    const record_location loc2{.segment = log_segment_id{3}, .offset = 0, .size = 13};
+    const record_location loc3{.segment = log_segment_id{4}, .offset = 0, .size = 19};
+    const record_location loc4{.segment = log_segment_id{5}, .offset = 0, .size = 23};
+    const record_location loc5{.segment = log_segment_id{6}, .offset = 0, .size = 29};
+
+    // insert(pk0, loc0): new entry, succeeds, no previous entry to free  →  {pk0: loc0}
+    auto outcome0 = index.insert(pk0, index_entry{.location = loc0, .timestamp = api::timestamp_type(10)});
+    BOOST_REQUIRE(outcome0.inserted());
+    BOOST_REQUIRE(!outcome0.previous_entry);
+    check_live_bytes(ssize_t(loc0.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 1u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 0u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 1);
+    BOOST_REQUIRE(accounting.is_live(loc0));
+
+    // insert(pk0, loc0_old): older timestamp, rejected, no accounting change  →  {pk0: loc0}
+    auto outcome_old = index.insert(pk0, index_entry{.location = loc0_old, .timestamp = api::timestamp_type(9)});
+    BOOST_REQUIRE(outcome_old.result == primary_index::insert_result::superseded);
+    BOOST_REQUIRE(outcome_old.previous_entry);
+    BOOST_REQUIRE(outcome_old.previous_entry->location == loc0);
+    BOOST_REQUIRE_EQUAL(outcome_old.previous_entry->timestamp, api::timestamp_type(10));
+    check_live_bytes(ssize_t(loc0.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 1u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 0u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 1);
+    BOOST_REQUIRE(accounting.is_live(loc0));
+
+    // insert(pk0, loc1): newer timestamp, replaces loc0, old location freed via accounting  →  {pk0: loc1}
+    auto outcome1 = index.insert(pk0, index_entry{.location = loc1, .timestamp = api::timestamp_type(11)});
+    BOOST_REQUIRE(outcome1.inserted());
+    BOOST_REQUIRE(outcome1.previous_entry);
+    BOOST_REQUIRE(outcome1.previous_entry->location == loc0);
+    BOOST_REQUIRE_EQUAL(outcome1.previous_entry->timestamp, api::timestamp_type(10));
+    check_live_bytes(ssize_t(loc1.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 2u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 1u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 1);
+    BOOST_REQUIRE(accounting.is_live(loc1));
+    BOOST_REQUIRE(!accounting.is_live(loc0));
+    BOOST_REQUIRE(accounting.added_locations.back() == loc1);
+    BOOST_REQUIRE(accounting.freed_locations.back() == loc0);
+
+    // insert(pk1, loc2): new key, succeeds, adds to live bytes  →  {pk0: loc1, pk1: loc2}
+    auto outcome2 = index.insert(pk1, index_entry{.location = loc2, .timestamp = api::timestamp_type(7)});
+    BOOST_REQUIRE(outcome2.inserted());
+    BOOST_REQUIRE(!outcome2.previous_entry);
+    check_live_bytes(ssize_t(loc1.size + loc2.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 3u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 1u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 2);
+    BOOST_REQUIRE(accounting.is_live(loc1));
+    BOOST_REQUIRE(accounting.is_live(loc2));
+
+    // erase(pk1, loc1): location mismatch, returns false, no accounting change  →  {pk0: loc1, pk1: loc2}
+    BOOST_REQUIRE(!index.erase(pk1, loc1));
+    check_live_bytes(ssize_t(loc1.size + loc2.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 3u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 1u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 2);
+
+    // update_record_location(pk0, loc1 -> loc3): old location matches, succeeds, frees loc1 adds loc3  →  {pk0: loc3, pk1: loc2}
+    BOOST_REQUIRE(index.update_record_location(pk0, loc1, loc3));
+    check_live_bytes(ssize_t(loc2.size + loc3.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 4u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 2u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 2);
+    BOOST_REQUIRE(accounting.is_live(loc2));
+    BOOST_REQUIRE(accounting.is_live(loc3));
+    BOOST_REQUIRE(!accounting.is_live(loc1));
+    BOOST_REQUIRE(accounting.added_locations.back() == loc3);
+    BOOST_REQUIRE(accounting.freed_locations.back() == loc1);
+
+    // update_record_location(pk0, loc1 -> loc4): old location no longer current, fails, no accounting change  →  {pk0: loc3, pk1: loc2}
+    BOOST_REQUIRE(!index.update_record_location(pk0, loc1, loc4));
+    check_live_bytes(ssize_t(loc2.size + loc3.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 4u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 2u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 2);
+
+    // erase(pk1, loc2): location matches, succeeds, frees loc2  →  {pk0: loc3}
+    BOOST_REQUIRE(index.erase(pk1, loc2));
+    check_live_bytes(ssize_t(loc3.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 4u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 3u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 1);
+    BOOST_REQUIRE(accounting.is_live(loc3));
+    BOOST_REQUIRE(!accounting.is_live(loc2));
+    BOOST_REQUIRE(accounting.freed_locations.back() == loc2);
+
+    // insert(pk1, loc4): new entry for pk1 (previously erased), succeeds  →  {pk0: loc3, pk1: loc4}
+    auto outcome4 = index.insert(pk1, index_entry{.location = loc4, .timestamp = api::timestamp_type(12)});
+    BOOST_REQUIRE(outcome4.inserted());
+    BOOST_REQUIRE(!outcome4.previous_entry);
+    // insert(pk2, loc5): new key, succeeds  →  {pk0: loc3, pk1: loc4, pk2: loc5}
+    auto outcome5 = index.insert(pk2, index_entry{.location = loc5, .timestamp = api::timestamp_type(13)});
+    BOOST_REQUIRE(outcome5.inserted());
+    BOOST_REQUIRE(!outcome5.previous_entry);
+    check_live_bytes(ssize_t(loc3.size + loc4.size + loc5.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 6u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 3u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 3);
+
+    // range erase pk1: removes pk1 entry (loc4), frees via accounting  →  {pk0: loc3, pk2: loc5}
+    dht::token_range pk1_range(
+            std::optional(interval_bound(pk1.token(), true)),
+            std::optional(interval_bound(pk1.token(), true)));
+    index.erase(pk1_range).get();
+    check_live_bytes(ssize_t(loc3.size + loc5.size));
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 6u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 4u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 2);
+    BOOST_REQUIRE(!accounting.is_live(loc4));
+    BOOST_REQUIRE(accounting.is_live(loc3));
+    BOOST_REQUIRE(accounting.is_live(loc5));
+    BOOST_REQUIRE(accounting.freed_locations.back() == loc4);
+
+    // clear(): removes all remaining entries (pk0->loc3, pk2->loc5), all freed  →  {}
+    index.clear().get();
+    BOOST_REQUIRE(index.empty());
+    check_live_bytes(0);
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 6u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 6u);
+    BOOST_REQUIRE_EQUAL(accounting.live_location_count(), 0);
+    BOOST_REQUIRE_EQUAL(accounting.freed_locations.size(), 6u);
+}
+
+// Checks that range erase and clear() account for freed log locations correctly.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_accounting) {
+    auto schema = make_kv_schema();
+    struct accounting_subscriber : space_accounting_subscriber {
+        ssize_t live_bytes = 0;
+        size_t add_calls = 0;
+        size_t free_calls = 0;
+        std::vector<record_location> freed_locations;
+
+        void on_add_record(record_location loc) noexcept override {
+            live_bytes += loc.size;
+            ++add_calls;
+        }
+
+        void on_free_record(record_location loc) noexcept override {
+            live_bytes -= loc.size;
+            ++free_calls;
+            freed_locations.push_back(loc);
+        }
+    } accounting;
+
+    primary_index index(accounting, nullptr, false);
+
+    auto check_live_bytes = [&] (ssize_t expected) {
+        BOOST_REQUIRE_EQUAL(accounting.live_bytes, expected);
+        BOOST_REQUIRE_EQUAL(index.get_live_record_bytes(), uint64_t(expected));
+    };
+
+    struct entry {
+        primary_index_key key;
+        record_location loc;
+    };
+
+    std::vector<entry> entries = {
+        { make_index_key(*schema, make_kv_mutation(schema, "pk0", "v0").decorated_key()), {.segment = log_segment_id{11}, .offset = 0, .size = 5} },
+        { make_index_key(*schema, make_kv_mutation(schema, "pk1", "v1").decorated_key()), {.segment = log_segment_id{12}, .offset = 0, .size = 7} },
+        { make_index_key(*schema, make_kv_mutation(schema, "pk2", "v2").decorated_key()), {.segment = log_segment_id{13}, .offset = 0, .size = 11} },
+        { make_index_key(*schema, make_kv_mutation(schema, "pk3", "v3").decorated_key()), {.segment = log_segment_id{14}, .offset = 0, .size = 13} },
+        { make_index_key(*schema, make_kv_mutation(schema, "pk4", "v4").decorated_key()), {.segment = log_segment_id{15}, .offset = 0, .size = 17} },
+    };
+
+    std::sort(entries.begin(), entries.end(), [&] (const entry& a, const entry& b) {
+        return a.key.token() < b.key.token();
+    });
+
+    auto insert = [&] (const entry& e, api::timestamp_type ts) {
+        auto outcome = index.insert(e.key, index_entry{.location = e.loc, .timestamp = ts});
+        BOOST_REQUIRE(outcome.inserted());
+        BOOST_REQUIRE(!outcome.previous_entry);
+    };
+
+    insert(entries[0], api::timestamp_type(10));
+    insert(entries[1], api::timestamp_type(11));
+    insert(entries[2], api::timestamp_type(12));
+    insert(entries[3], api::timestamp_type(13));
+    insert(entries[4], api::timestamp_type(14));
+
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 5u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 0u);
+    check_live_bytes(ssize_t(entries[0].loc.size + entries[1].loc.size + entries[2].loc.size + entries[3].loc.size + entries[4].loc.size));
+
+    dht::token_range range(
+            std::optional(interval_bound(entries[1].key.token(), true)),
+            std::optional(interval_bound(entries[3].key.token(), true)));
+    index.erase(range).get();
+
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 5u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 3u);
+    check_live_bytes(ssize_t(entries[0].loc.size + entries[4].loc.size));
+    BOOST_REQUIRE(index.get(entries[0].key).has_value());
+    BOOST_REQUIRE(!index.get(entries[1].key).has_value());
+    BOOST_REQUIRE(!index.get(entries[2].key).has_value());
+    BOOST_REQUIRE(!index.get(entries[3].key).has_value());
+    BOOST_REQUIRE(index.get(entries[4].key).has_value());
+    BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[1].loc), 1);
+    BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[2].loc), 1);
+    BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[3].loc), 1);
+
+    index.clear().get();
+
+    BOOST_REQUIRE(index.empty());
+    BOOST_REQUIRE_EQUAL(accounting.add_calls, 5u);
+    BOOST_REQUIRE_EQUAL(accounting.free_calls, 5u);
+    check_live_bytes(0);
+    BOOST_REQUIRE_EQUAL(accounting.freed_locations.size(), 5u);
+    BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[0].loc), 1);
+    BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[4].loc), 1);
+}
+
+// Checks that the segment scan returns mixed-segment record locations that can be used to read back the expected records.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_chunks_report_readable_record_locations) {
+    auto schema = make_kv_schema();
+    // A key well past the inline size of managed_bytes, so the variable part of the record header is exercised.
+    const sstring long_pk(100, 'k');
+
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+
+    auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(11));
+    auto expected1 = make_kv_mutation(schema, "pk1", "value1-longer", api::timestamp_type(12));
+    auto expected2 = make_kv_mutation(schema, "pk2", "v2", api::timestamp_type(13));
+    auto expected3 = make_kv_mutation(schema, long_pk, "value-three-is-even-longer-than-before", api::timestamp_type(14));
+
+    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(11))));
+    wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1-longer", api::timestamp_type(12))));
+    wb1.append(log_record_writer(make_log_record(schema, "pk2", "v2", api::timestamp_type(13))));
+    wb1.append(log_record_writer(make_log_record(schema, long_pk, "value-three-is-even-longer-than-before", api::timestamp_type(14))));
+
+    wb0.seal(segment_sequence{23}, std::nullopt, ondisk::block_alignment);
+    wb1.seal(segment_sequence{23}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized0 = copy_chunk(wb0.chunk());
+    auto serialized1 = copy_chunk(wb1.chunk());
+    auto segment = concat_chunks({&serialized0, &serialized1});
+    const auto segment_size = segment.size();
+    const auto* segment_data = segment.get();
+    auto in = seastar::util::as_input_stream(std::move(segment));
+
+    std::vector<segment_info> seen_segment_infos;
+    std::vector<record_header> seen_headers;
+    std::vector<record_location> seen_locations;
+
+    segment_scanner scanner(in, log_segment_id{3}, segment_size);
+    while (auto* chunk = scanner.next_chunk().get()) {
+        seen_segment_infos.push_back(chunk->info());
+        for (const auto& record : chunk->records()) {
+            seen_headers.push_back(record.header);
+            seen_locations.push_back(record.location);
+        }
+    }
+    in.close().get();
+
+    temporary_buffer<char> segment_copy(segment_size);
+    std::copy_n(segment_data, segment_size, segment_copy.get_write());
+
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.size(), 2u);
+    for (const auto& sh : seen_segment_infos) {
+        BOOST_REQUIRE(sh.kind == segment_kind::mixed);
+        BOOST_REQUIRE_EQUAL(sh.segment_seq.value, 23u);
+    }
+
+    BOOST_REQUIRE_EQUAL(seen_headers.size(), 4u);
+    BOOST_REQUIRE_EQUAL(seen_headers[0].timestamp, api::timestamp_type(11));
+    BOOST_REQUIRE_EQUAL(seen_headers[1].timestamp, api::timestamp_type(12));
+    BOOST_REQUIRE_EQUAL(seen_headers[2].timestamp, api::timestamp_type(13));
+    BOOST_REQUIRE_EQUAL(seen_headers[3].timestamp, api::timestamp_type(14));
+    BOOST_REQUIRE_EQUAL(seen_headers[0].table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_headers[1].table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_headers[2].table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_headers[3].table, schema->id());
+    BOOST_REQUIRE(seen_headers[0].key.equal(*schema, expected0.decorated_key()));
+    BOOST_REQUIRE(seen_headers[3].key.equal(*schema, expected3.decorated_key()));
+
+    BOOST_REQUIRE_EQUAL(seen_locations.size(), 4u);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[0]), schema)).is_equal_to(expected0);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[1]), schema)).is_equal_to(expected1);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[2]), schema)).is_equal_to(expected2);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[3]), schema)).is_equal_to(expected3);
+
+    auto maybe_header = read_chunk_info_from_bytes(segment_copy);
+    BOOST_REQUIRE(maybe_header);
+    BOOST_REQUIRE(maybe_header->kind == segment_kind::mixed);
+    BOOST_REQUIRE_EQUAL(maybe_header->segment_seq.value, 23u);
+    BOOST_REQUIRE(std::holds_alternative<segment_info::mixed>(maybe_header->v));
+}
+
+// Checks that the segment scan stops at a record whose key_size is corrupt instead of trusting it, and
+// resumes with the next chunk of a mixed segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_key_size) {
+    auto schema = make_kv_schema();
+
+    auto scan_with_corrupt_key_size = [&] (uint32_t key_size) {
+        raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+        raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+        wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(31))));
+        wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(32))));
+        wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(33))));
+        wb0.seal(segment_sequence{29}, std::nullopt, ondisk::block_alignment);
+        wb1.seal(segment_sequence{29}, std::nullopt, ondisk::block_alignment);
+
+        auto serialized0 = copy_chunk(wb0.chunk());
+        auto serialized1 = copy_chunk(wb1.chunk());
+        // The first record_frame_header of the first chunk follows the chunk header; key_size is its first field.
+        seastar::simple_memory_output_stream out(serialized0.get_write() + ondisk::chunk_header_size, sizeof(uint32_t));
+        ser::serialize(out, key_size);
+        // The corruption is in the records, which is what the body CRC would catch first.
+        reseal_chunk_crcs(serialized0);
+
+        auto segment = concat_chunks({&serialized0, &serialized1});
+        const auto segment_size = segment.size();
+        auto in = seastar::util::as_input_stream(std::move(segment));
+
+        std::vector<api::timestamp_type> seen;
+        segment_scanner scanner(in, log_segment_id{5}, segment_size);
+        while (auto* chunk = scanner.next_chunk().get()) {
+            for (const auto& record : chunk->records()) {
+                seen.push_back(record.header.timestamp);
+            }
+        }
+        in.close().get();
+        return seen;
+    };
+
+    // Above the partition key size cap: rejected by validate_record_frame_header().
+    auto seen = scan_with_corrupt_key_size(ondisk::max_key_size + 1);
+    BOOST_REQUIRE_EQUAL(seen.size(), 1u);
+    BOOST_REQUIRE_EQUAL(seen[0], api::timestamp_type(33));
+
+    // Within the cap but past the end of the chunk: rejected by the size check.
+    seen = scan_with_corrupt_key_size(ondisk::max_key_size);
+    BOOST_REQUIRE_EQUAL(seen.size(), 1u);
+    BOOST_REQUIRE_EQUAL(seen[0], api::timestamp_type(33));
+}
+
+// Checks that the segment scan reads all records from the chunk of a full segment with varying serialized sizes.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_reads_full_chunk_records_with_varying_lengths) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::full);
+    auto expected0 = make_kv_mutation(schema, "pk-full-0", "x", api::timestamp_type(31));
+    auto expected1 = make_kv_mutation(schema, "pk-full-1-with-longer-key", "medium-value", api::timestamp_type(32));
+    auto expected2 = make_kv_mutation(schema, "pk-full-2", "value-with-a-significantly-longer-payload-to-exercise-varying-record-sizes", api::timestamp_type(33));
+    wb.append(log_record_writer(make_log_record(schema, "pk-full-0", "x", api::timestamp_type(31))));
+    wb.append(log_record_writer(make_log_record(schema, "pk-full-1-with-longer-key", "medium-value", api::timestamp_type(32))));
+    wb.append(log_record_writer(make_log_record(schema, "pk-full-2", "value-with-a-significantly-longer-payload-to-exercise-varying-record-sizes", api::timestamp_type(33))));
+    wb.seal(segment_sequence{41}, schema->id(), ondisk::block_alignment);
+
+    auto serialized = copy_chunk(wb.chunk());
+    auto maybe_header = read_chunk_info_from_bytes(serialized);
+    auto in = seastar::util::as_input_stream(std::move(serialized));
+
+    std::vector<segment_info> seen_segment_infos;
+    std::vector<log_record> seen_records;
+
+    segment_scanner scanner(in, log_segment_id{7}, wb.chunk().size());
+    while (auto* chunk = scanner.next_chunk().get()) {
+        seen_segment_infos.push_back(chunk->info());
+        for (const auto& record : chunk->records()) {
+            seen_records.push_back(record.to_log_record());
+        }
+    }
+    in.close().get();
+
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.size(), 1u);
+    BOOST_REQUIRE(seen_segment_infos.front().kind == segment_kind::full);
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.front().segment_seq.value, 41u);
+    BOOST_REQUIRE(std::holds_alternative<segment_info::full>(seen_segment_infos.front().v));
+    BOOST_REQUIRE_EQUAL(seen_records.size(), 3u);
+    BOOST_REQUIRE_EQUAL(seen_records[0].header.table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_records[1].header.table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_records[2].header.table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_records[0].header.timestamp, api::timestamp_type(31));
+    BOOST_REQUIRE_EQUAL(seen_records[1].header.timestamp, api::timestamp_type(32));
+    BOOST_REQUIRE_EQUAL(seen_records[2].header.timestamp, api::timestamp_type(33));
+    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
+    assert_that(to_mutation(seen_records[2], schema)).is_equal_to(expected2);
+
+    BOOST_REQUIRE(maybe_header);
+    BOOST_REQUIRE(maybe_header->kind == segment_kind::full);
+    BOOST_REQUIRE_EQUAL(maybe_header->segment_seq.value, 41u);
+    BOOST_REQUIRE(std::holds_alternative<segment_info::full>(maybe_header->v));
+    auto& full = std::get<segment_info::full>(maybe_header->v);
+    auto expected_first_token = std::min({
+        seen_records[0].header.key.token(),
+        seen_records[1].header.key.token(),
+        seen_records[2].header.key.token(),
+    });
+    auto expected_last_token = std::max({
+        seen_records[0].header.key.token(),
+        seen_records[1].header.key.token(),
+        seen_records[2].header.key.token(),
+    });
+    BOOST_REQUIRE_EQUAL(full.table, schema->id());
+    BOOST_REQUIRE_EQUAL(full.first_token, expected_first_token);
+    BOOST_REQUIRE_EQUAL(full.last_token, expected_last_token);
+}
+
+// Checks that the segment scan stops before a later mixed chunk whose sequence number is lower.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_mixed_chunk_lower_sequence_number) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+
+    auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(51));
+    auto expected1 = make_kv_mutation(schema, "pk1", "value1", api::timestamp_type(52));
+    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(51))));
+    wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(52))));
+    wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(53))));
+    wb1.append(log_record_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(54))));
+
+    wb0.seal(segment_sequence{61}, std::nullopt, ondisk::block_alignment);
+    wb1.seal(segment_sequence{60}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized0 = copy_chunk(wb0.chunk());
+    auto serialized1 = copy_chunk(wb1.chunk());
+    auto segment = concat_chunks({&serialized0, &serialized1});
+    const auto segment_size = segment.size();
+    auto in = seastar::util::as_input_stream(std::move(segment));
+
+    std::vector<segment_info> seen_segment_infos;
+    std::vector<record_header> seen_headers;
+    std::vector<log_record> seen_records;
+
+    segment_scanner scanner(in, log_segment_id{5}, segment_size);
+    while (auto* chunk = scanner.next_chunk().get()) {
+        seen_segment_infos.push_back(chunk->info());
+        for (const auto& record : chunk->records()) {
+            seen_headers.push_back(record.header);
+            seen_records.push_back(record.to_log_record());
+        }
+    }
+    in.close().get();
+
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.size(), 1u);
+    BOOST_REQUIRE(seen_segment_infos.front().kind == segment_kind::mixed);
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.front().segment_seq.value, 61u);
+
+    BOOST_REQUIRE_EQUAL(seen_headers.size(), 2u);
+    BOOST_REQUIRE_EQUAL(seen_headers[0].timestamp, api::timestamp_type(51));
+    BOOST_REQUIRE_EQUAL(seen_headers[1].timestamp, api::timestamp_type(52));
+
+    BOOST_REQUIRE_EQUAL(seen_records.size(), 2u);
+    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
+}
+
+// Checks that the segment scan stops after a later mixed chunk with a corrupted header crc.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_corrupted_later_mixed_chunk_header) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+
+    auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(91));
+    auto expected1 = make_kv_mutation(schema, "pk1", "value1", api::timestamp_type(92));
+
+    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(91))));
+    wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(92))));
+    wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(93))));
+    wb1.append(log_record_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(94))));
+
+    wb0.seal(segment_sequence{101}, std::nullopt, ondisk::block_alignment);
+    wb1.seal(segment_sequence{101}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized0 = copy_chunk(wb0.chunk());
+    auto serialized1 = copy_chunk(wb1.chunk());
+    flip_byte(serialized1, ondisk::chunk_header_size - sizeof(uint32_t));
+
+    auto segment = concat_chunks({&serialized0, &serialized1});
+    const auto segment_size = segment.size();
+    auto in = seastar::util::as_input_stream(std::move(segment));
+
+    std::vector<segment_info> seen_segment_infos;
+    std::vector<record_header> seen_headers;
+    std::vector<log_record> seen_records;
+
+    segment_scanner scanner(in, log_segment_id{6}, segment_size);
+    while (auto* chunk = scanner.next_chunk().get()) {
+        seen_segment_infos.push_back(chunk->info());
+        for (const auto& record : chunk->records()) {
+            seen_headers.push_back(record.header);
+            seen_records.push_back(record.to_log_record());
+        }
+    }
+    in.close().get();
+
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.size(), 1u);
+    BOOST_REQUIRE_EQUAL(seen_headers.size(), 2u);
+    BOOST_REQUIRE_EQUAL(seen_records.size(), 2u);
+    BOOST_REQUIRE_EQUAL(seen_headers[0].timestamp, api::timestamp_type(91));
+    BOOST_REQUIRE_EQUAL(seen_headers[1].timestamp, api::timestamp_type(92));
+    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
+}
+
+// Checks that the chunk header's CRC covers the segment header: a full segment whose segment header
+// is corrupt has no segment info, gives no records, and is not taken in by the streamed rewriter.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_segment_header) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::full);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(111))));
+    wb.seal(segment_sequence{121}, schema->id(), ondisk::block_alignment);
+
+    auto serialized = copy_chunk(wb.chunk());
+    BOOST_REQUIRE(read_chunk_info_from_bytes(serialized));
+    // A byte of last_token, the last field of the segment header.
+    flip_byte(serialized, ondisk::chunk_header_size + ondisk::segment_header_size - 1);
+
+    BOOST_REQUIRE(!read_chunk_info_from_bytes(serialized));
+    BOOST_REQUIRE_THROW(rewrite_streamed_segment(log_segment_id{13}, segment_sequence{131}, std::span(&serialized, 1)), std::runtime_error);
+
+    const auto segment_size = serialized.size();
+    auto in = seastar::util::as_input_stream(std::move(serialized));
+    size_t seen_segment_infos = 0;
+    size_t seen_headers = 0;
+
+    segment_scanner scanner(in, log_segment_id{13}, segment_size);
+    while (auto* chunk = scanner.next_chunk().get()) {
+        ++seen_segment_infos;
+        seen_headers += std::ranges::distance(chunk->records());
+    }
+    in.close().get();
+
+    BOOST_REQUIRE_EQUAL(seen_segment_infos, 0u);
+    BOOST_REQUIRE_EQUAL(seen_headers, 0u);
+}
+
+// A crash while a chunk is being written over a reused segment can leave the headers on disk and
+// only part of the body, with the previous incarnation's bytes in the rest. Where the old and the
+// new records' boundaries line up - here, as they do under a uniform record size - the old records
+// parse cleanly under the new header, so the scan has to check the chunk's body CRC before it
+// delivers anything of the chunk. It still reports the segment info of the chunk, as recovery
+// takes the highest segment_seq on disk from it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_torn_chunk) {
+    auto schema = make_kv_schema();
+    constexpr size_t record_size = 1024;
+    constexpr size_t record_count = 4;
+
+    auto make_chunk = [&] (const char* key_prefix, api::timestamp_type first_ts, segment_sequence seq) {
+        raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+        for (size_t i = 0; i < record_count; ++i) {
+            auto m = make_kv_mutation_of_record_size(schema, fmt::format("{}{}", key_prefix, i), record_size);
+            wb.append(log_record_writer(log_record {
+                .header = {
+                    .key = m.decorated_key(),
+                    .timestamp = api::timestamp_type(first_ts + i),
+                    .table = schema->id(),
+                },
+                .value = encode_record_value(m),
+            }));
+        }
+        wb.seal(seq, std::nullopt, ondisk::block_alignment);
+        return copy_chunk(wb.chunk());
+    };
+    auto old_incarnation = make_chunk("old", api::timestamp_type(1), segment_sequence{10});
+    auto new_incarnation = make_chunk("new", api::timestamp_type(11), segment_sequence{11});
+    BOOST_REQUIRE_EQUAL(old_incarnation.size(), new_incarnation.size());
+
+    // The header and the first two record frames of the new incarnation made it to disk, the rest
+    // is still the old one's.
+    const size_t torn_at = ondisk::chunk_header_size + 2 * align_up(ondisk::record_frame_header_size + record_size, ondisk::record_alignment);
+    auto torn = slice_buffer(new_incarnation, 0, new_incarnation.size());
+    std::copy_n(old_incarnation.get() + torn_at, old_incarnation.size() - torn_at, torn.get_write() + torn_at);
+
+    struct scan_result {
+        std::vector<segment_sequence> segment_seqs;
+        std::vector<bool> body_valid;
+        std::vector<api::timestamp_type> timestamps;
+    };
+    auto scan = [] (const temporary_buffer<char>& buf) {
+        scan_result result;
+        auto in = seastar::util::as_input_stream(slice_buffer(buf, 0, buf.size()));
+        segment_scanner scanner(in, log_segment_id{8}, buf.size());
+        while (auto* chunk = scanner.next_chunk().get()) {
+            result.segment_seqs.push_back(chunk->info().segment_seq);
+            result.body_valid.push_back(chunk->body_valid());
+            for (const auto& record : chunk->records()) {
+                result.timestamps.push_back(record.header.timestamp);
+            }
+        }
+        in.close().get();
+        return result;
+    };
+
+    const auto torn_result = scan(torn);
+    BOOST_REQUIRE(torn_result.segment_seqs == std::vector<segment_sequence>{segment_sequence{11}});
+    BOOST_REQUIRE(torn_result.body_valid == std::vector<bool>{false});
+    BOOST_REQUIRE(torn_result.timestamps.empty());
+
+    // The same bytes with the CRCs matching them, which is what a scan that did not check the body
+    // would see: the old incarnation's records come back under the new sequence.
+    reseal_chunk_crcs(torn);
+    const auto resealed_result = scan(torn);
+    const auto expected = std::vector<api::timestamp_type>{
+        api::timestamp_type(11), api::timestamp_type(12), api::timestamp_type(3), api::timestamp_type(4),
+    };
+    BOOST_REQUIRE(resealed_result.timestamps == expected);
+}
+
+// A segment has one chunk write in flight at a time, so a crash tears only its last chunk. Checks
+// that the scan skips a chunk whose body fails its CRC and continues at the next chunk. A chunk of
+// an earlier generation after the failed chunk ends the scan.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_skips_chunk_with_failed_body) {
+    auto schema = make_kv_schema();
+
+    auto make_chunk = [&] (api::timestamp_type ts, segment_sequence seq) {
+        raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+        wb.append(log_record_writer(make_log_record(schema, sstring(fmt::format("pk{}", ts)), "value", ts)));
+        wb.seal(seq, std::nullopt, ondisk::block_alignment);
+        return copy_chunk(wb.chunk());
+    };
+    auto make_failed_chunk = [&] (api::timestamp_type ts, segment_sequence seq) {
+        auto chunk = make_chunk(ts, seq);
+        // The first byte of the body. The headers stay valid.
+        flip_byte(chunk, ondisk::chunk_header_size);
+        return chunk;
+    };
+
+    struct scan_result {
+        std::vector<segment_sequence> segment_seqs;
+        std::vector<bool> body_valid;
+        std::vector<api::timestamp_type> timestamps;
+    };
+    auto scan = [] (std::initializer_list<const temporary_buffer<char>*> chunks) {
+        scan_result result;
+        auto segment = concat_chunks(chunks);
+        const auto segment_size = segment.size();
+        auto in = seastar::util::as_input_stream(std::move(segment));
+        segment_scanner scanner(in, log_segment_id{9}, segment_size);
+        while (auto* chunk = scanner.next_chunk().get()) {
+            result.segment_seqs.push_back(chunk->info().segment_seq);
+            result.body_valid.push_back(chunk->body_valid());
+            for (const auto& record : chunk->records()) {
+                result.timestamps.push_back(record.header.timestamp);
+            }
+        }
+        in.close().get();
+        return result;
+    };
+
+    const auto seq = segment_sequence{141};
+    const auto chunk0 = make_chunk(api::timestamp_type(1), seq);
+    const auto failed_chunk1 = make_failed_chunk(api::timestamp_type(2), seq);
+    const auto chunk2 = make_chunk(api::timestamp_type(3), seq);
+
+    // A corrupt chunk in the middle of the segment. The records of the chunks around it are kept.
+    auto result = scan({&chunk0, &failed_chunk1, &chunk2});
+    BOOST_REQUIRE(result.segment_seqs == std::vector<segment_sequence>(3, seq));
+    BOOST_REQUIRE(result.body_valid == (std::vector<bool>{true, false, true}));
+    BOOST_REQUIRE(result.timestamps == (std::vector<api::timestamp_type>{api::timestamp_type(1), api::timestamp_type(3)}));
+
+    // A failed last chunk.
+    result = scan({&chunk0, &failed_chunk1});
+    BOOST_REQUIRE(result.segment_seqs == std::vector<segment_sequence>(2, seq));
+    BOOST_REQUIRE(result.timestamps == std::vector<api::timestamp_type>{api::timestamp_type(1)});
+
+    // A failed chunk with a chunk of an earlier generation after it ends the scan there.
+    const auto earlier_chunk2 = make_chunk(api::timestamp_type(3), segment_sequence{140});
+    result = scan({&chunk0, &failed_chunk1, &earlier_chunk2});
+    BOOST_REQUIRE(result.segment_seqs == std::vector<segment_sequence>(2, seq));
+    BOOST_REQUIRE(result.timestamps == std::vector<api::timestamp_type>{api::timestamp_type(1)});
+}
+
+// A chunk whose headers are on disk and whose body is cut short still gives its segment info, and
+// the scan ends after it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_gives_info_of_chunk_with_cut_short_body) {
+    auto schema = make_kv_schema();
+
+    auto make_chunk = [&] (api::timestamp_type ts) {
+        raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+        wb.append(log_record_writer(make_log_record(schema, "pk", "value", ts)));
+        wb.seal(segment_sequence{151}, std::nullopt, ondisk::block_alignment);
+        return copy_chunk(wb.chunk());
+    };
+    const auto chunk0 = make_chunk(api::timestamp_type(1));
+    const auto chunk1 = make_chunk(api::timestamp_type(2));
+    const auto cut_chunk1 = slice_buffer(chunk1, 0, ondisk::chunk_header_size + ondisk::record_frame_header_size);
+
+    // The segment is `extra_segment_size` bytes longer than the stream.
+    auto check = [&] (size_t extra_segment_size) {
+        auto segment = concat_chunks({&chunk0, &cut_chunk1});
+        const auto segment_size = segment.size() + extra_segment_size;
+        auto in = seastar::util::as_input_stream(std::move(segment));
+
+        std::vector<segment_sequence> segment_seqs;
+        std::vector<bool> body_valid;
+        std::vector<api::timestamp_type> timestamps;
+        segment_scanner scanner(in, log_segment_id{10}, segment_size);
+        while (auto* chunk = scanner.next_chunk().get()) {
+            segment_seqs.push_back(chunk->info().segment_seq);
+            body_valid.push_back(chunk->body_valid());
+            for (const auto& record : chunk->records()) {
+                timestamps.push_back(record.header.timestamp);
+            }
+        }
+        BOOST_REQUIRE(scanner.next_chunk().get() == nullptr);
+        in.close().get();
+
+        BOOST_REQUIRE(segment_seqs == std::vector<segment_sequence>(2, segment_sequence{151}));
+        BOOST_REQUIRE(body_valid == (std::vector<bool>{true, false}));
+        BOOST_REQUIRE(timestamps == std::vector<api::timestamp_type>{api::timestamp_type(1)});
+    };
+
+    // The header gives a body past the end of the segment.
+    check(0);
+    // The stream ends before the body does.
+    check(ondisk::block_alignment);
+}
+
+// Checks that the rewriter updates the initial full chunk header sequence number.
+SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rewrites_initial_full_chunk_header) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::full);
+    auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(201));
+    auto expected1 = make_kv_mutation(schema, "pk1-longer-key", "value1", api::timestamp_type(202));
+    auto expected2 = make_kv_mutation(schema, "pk2", "value2-with-a-longer-payload", api::timestamp_type(203));
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(201))));
+    wb.append(log_record_writer(make_log_record(schema, "pk1-longer-key", "value1", api::timestamp_type(202))));
+    wb.append(log_record_writer(make_log_record(schema, "pk2", "value2-with-a-longer-payload", api::timestamp_type(203))));
+    wb.seal(segment_sequence{211}, schema->id(), ondisk::block_alignment);
+
+    auto serialized = copy_chunk(wb.chunk());
+    auto rewritten = rewrite_streamed_segment(log_segment_id{33}, segment_sequence{221}, std::span(&serialized, 1));
+    auto ch = read_chunk_header(rewritten.data);
+
+    auto rewritten_size = rewritten.data.size();
+    auto in = seastar::util::as_input_stream(rewritten.data.share());
+    std::vector<segment_info> seen_segment_infos;
+    std::vector<log_record> seen_records;
+
+    segment_scanner scanner(in, log_segment_id{33}, rewritten_size);
+    while (auto* chunk = scanner.next_chunk().get()) {
+        seen_segment_infos.push_back(chunk->info());
+        for (const auto& record : chunk->records()) {
+            seen_records.push_back(record.to_log_record());
+        }
+    }
+    in.close().get();
+
+    BOOST_REQUIRE_EQUAL(rewritten.write_count, 1u);
+    BOOST_REQUIRE(ondisk::validate_chunk_headers(ch, read_segment_header(rewritten.data)));
+    BOOST_REQUIRE_EQUAL(ch.segment_seq.value, 221u);
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.size(), 1u);
+    BOOST_REQUIRE(seen_segment_infos.front().kind == segment_kind::full);
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.front().segment_seq.value, 221u);
+    BOOST_REQUIRE(std::holds_alternative<segment_info::full>(seen_segment_infos.front().v));
+    BOOST_REQUIRE_EQUAL(seen_records.size(), 3u);
+    BOOST_REQUIRE_EQUAL(seen_records[0].header.timestamp, api::timestamp_type(201));
+    BOOST_REQUIRE_EQUAL(seen_records[1].header.timestamp, api::timestamp_type(202));
+    BOOST_REQUIRE_EQUAL(seen_records[2].header.timestamp, api::timestamp_type(203));
+    BOOST_REQUIRE_EQUAL(seen_records[0].header.table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_records[1].header.table, schema->id());
+    BOOST_REQUIRE_EQUAL(seen_records[2].header.table, schema->id());
+    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
+    assert_that(to_mutation(seen_records[2], schema)).is_equal_to(expected2);
+}
+
+// Checks that the rewriter can wait for a fragmented initial header before rewriting it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_handles_fragmented_initial_header) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(231))));
+    wb.seal(segment_sequence{241}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized = copy_chunk(wb.chunk());
+    auto split = ondisk::chunk_header_size - 1;
+    std::vector<temporary_buffer<char>> pieces;
+    pieces.push_back(slice_buffer(serialized, 0, split));
+    pieces.push_back(slice_buffer(serialized, split, serialized.size() - split));
+
+    auto rewritten = rewrite_streamed_segment(log_segment_id{35}, segment_sequence{251}, pieces);
+    auto ch = read_chunk_header(rewritten.data);
+
+    BOOST_REQUIRE_EQUAL(rewritten.write_count, 1u);
+    BOOST_REQUIRE_EQUAL(ch.segment_seq.value, 251u);
+}
+
+// Checks that the rewriter rejects a stream whose initial chunk header is corrupted.
+SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rejects_invalid_initial_header) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(291))));
+    wb.seal(segment_sequence{301}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized = copy_chunk(wb.chunk());
+    flip_byte(serialized, 0);
+
+    BOOST_REQUIRE_THROW(rewrite_streamed_segment(log_segment_id{39}, segment_sequence{311}, std::span(&serialized, 1)), std::runtime_error);
+}
+
+// Checks that the rewriter rejects streams that end before the initial header is complete.
+SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rejects_truncated_initial_header) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(321))));
+    wb.seal(segment_sequence{331}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized = copy_chunk(wb.chunk());
+    auto truncated = slice_buffer(serialized, 0, ondisk::chunk_header_size - 1);
+
+    BOOST_REQUIRE_THROW(rewrite_streamed_segment(log_segment_id{41}, segment_sequence{341}, std::span(&truncated, 1)), std::runtime_error);
+}
+
+// Checks that buffered_writer forwards records to the flush callback and resolves returned locations.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_basic_flushes_records) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+
+    test_flush_controller flush_ctl;
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 3), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    std::vector<log_record> expected;
+    std::vector<future<record_location_with_holder>> persisted;
+    for (size_t i = 0; i < 3; ++i) {
+        auto record = make_buffered_writer_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(100 + i));
+        expected.push_back(record);
+        auto accepted = writer.write_to_buffer(log_record_writer(record), test_timeout()).get();
+        persisted.push_back(std::move(accepted.persisted));
+    }
+
+    std::vector<record_location> locations;
+    for (auto& fut : persisted) {
+        locations.push_back(wait_for_persisted(fut));
+    }
+
+    const auto actual = flush_ctl.all_records();
+    assert_records_in_order(schema, actual, expected);
+
+    BOOST_REQUIRE_EQUAL(locations.size(), expected.size());
+    for (size_t i = 0; i < locations.size(); ++i) {
+        auto read_back = read_record_at_location(flush_ctl.buffer_for_segment(locations[i].segment), locations[i]);
+        assert_log_record_matches(schema, read_back, expected[i]);
+    }
+}
+
+// Checks that flush() seals and writes a partially filled head buffer even when the sync timer has not expired.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_flushes_partial_buffer_with_large_sync_period) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    constexpr auto sync_period = std::chrono::hours(1);
+
+    test_flush_controller flush_ctl;
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 3, 0, sync_period), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    std::vector<log_record> expected;
+    std::vector<future<record_location_with_holder>> persisted;
+    for (size_t i = 0; i < 3; ++i) {
+        auto record = make_buffered_writer_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(150 + i));
+        expected.push_back(record);
+        auto accepted = writer.write_to_buffer(log_record_writer(record), test_timeout()).get();
+        persisted.push_back(std::move(accepted.persisted));
+    }
+
+    BOOST_REQUIRE(flush_ctl.flushed_buffers.empty());
+
+    auto flush = writer.flush();
+    flush_ctl.wait_for_flush_starts(1);
+
+    std::vector<record_location> locations;
+    for (auto& fut : persisted) {
+        locations.push_back(wait_for_persisted(fut));
+    }
+
+    flush.get();
+
+    BOOST_REQUIRE_EQUAL(flush_ctl.flushed_buffers.size(), 1u);
+    BOOST_REQUIRE_EQUAL(flush_ctl.flushed_buffers.front().record_count, expected.size());
+
+    const auto actual = flush_ctl.all_records();
+    assert_records_in_order(schema, actual, expected);
+
+    BOOST_REQUIRE_EQUAL(locations.size(), expected.size());
+    for (size_t i = 0; i < locations.size(); ++i) {
+        auto read_back = read_record_at_location(flush_ctl.buffer_for_segment(locations[i].segment), locations[i]);
+        assert_log_record_matches(schema, read_back, expected[i]);
+    }
+}
+
+// Checks that a paused tail flush can fill the ring, queue later writes, and then drain them without losing order.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_paused_flush_fills_ring_then_drains) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto large_value = make_single_buffer_value(schema, buffer_size);
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 2), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    std::vector<log_record> expected;
+    for (size_t i = 0; i < 4; ++i) {
+        expected.push_back(make_buffered_writer_record(schema, i, large_value, api::timestamp_type(200 + i)));
+    }
+
+    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto persisted0 = std::move(accepted0.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+    BOOST_REQUIRE(!persisted0.available());
+
+    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto persisted1 = std::move(accepted1.persisted);
+
+    auto queued2 = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout());
+    auto queued3 = writer.write_to_buffer(log_record_writer(expected[3]), test_timeout());
+    BOOST_REQUIRE(!queued2.available());
+    BOOST_REQUIRE(!queued3.available());
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 2u);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted0);
+    flush_ctl.wait_for_flush_starts(2);
+
+    auto accepted2 = queued2.get();
+    auto persisted2 = std::move(accepted2.persisted);
+    BOOST_REQUIRE(!queued3.available());
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 1u);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted1);
+    flush_ctl.wait_for_flush_starts(3);
+
+    auto accepted3 = queued3.get();
+    auto persisted3 = std::move(accepted3.persisted);
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 0u);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted2);
+    flush_ctl.wait_for_flush_starts(4);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted3);
+
+    assert_records_in_order(schema, flush_ctl.all_records(), expected);
+}
+
+// A record that finds no room in the ring is queued, and it has to keep the write target it came
+// with: the holders of that target are what keep its compaction group from being reported empty to
+// a tablet split and from finishing its stop() while the write is still to come.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queued_write_keeps_its_write_target) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto large_value = make_single_buffer_value(schema, buffer_size);
+
+    // Outlive the writer, so that the holders of the queued write are released before the gates
+    // they were taken from are destroyed.
+    seastar::gate non_empty_gate;
+    seastar::gate alive_gate;
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 2), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    std::vector<log_record> expected;
+    for (size_t i = 0; i < 3; ++i) {
+        expected.push_back(make_buffered_writer_record(schema, i, large_value, api::timestamp_type(300 + i)));
+    }
+
+    // Fill the ring: the first record is being flushed and the second holds the only other buffer.
+    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto persisted0 = std::move(accepted0.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto persisted1 = std::move(accepted1.persisted);
+
+    // The third record has nowhere to go, so it is queued rather than appended.
+    auto queued = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout(), write_target{
+            .cg = nullptr,
+            .non_empty_holder = non_empty_gate.hold(),
+            .alive_holder = alive_gate.hold(),
+    });
+    BOOST_REQUIRE(!queued.available());
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 1u);
+
+    // The write is in flight, so its group is still held by both of the target's holders. Checked
+    // rather than required, so that a failure here still drains the writer below: a queued write
+    // left behind would hang the stop() of this test rather than fail it.
+    BOOST_CHECK_EQUAL(non_empty_gate.get_count(), 1u);
+    BOOST_CHECK_EQUAL(alive_gate.get_count(), 1u);
+
+    // Let the queued record through and drain everything, which releases the holders.
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted0);
+    flush_ctl.wait_for_flush_starts(2);
+
+    auto accepted2 = queued.get();
+    auto persisted2 = std::move(accepted2.persisted);
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 0u);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted1);
+    flush_ctl.wait_for_flush_starts(3);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted2);
+
+    assert_records_in_order(schema, flush_ctl.all_records(), expected);
+}
+
+// Checks that queued writes are accepted and persisted in FIFO order once capacity becomes available.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queued_writes_preserve_fifo_order) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto large_value = make_single_buffer_value(schema, buffer_size);
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 2), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    std::vector<log_record> expected;
+    for (size_t i = 0; i < 5; ++i) {
+        expected.push_back(make_buffered_writer_record(schema, i, large_value, api::timestamp_type(300 + i)));
+    }
+
+    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto persisted0 = std::move(accepted0.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+
+    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto persisted1 = std::move(accepted1.persisted);
+
+    auto queued2 = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout());
+    auto queued3 = writer.write_to_buffer(log_record_writer(expected[3]), test_timeout());
+    auto queued4 = writer.write_to_buffer(log_record_writer(expected[4]), test_timeout());
+
+    BOOST_REQUIRE(!queued2.available());
+    BOOST_REQUIRE(!queued3.available());
+    BOOST_REQUIRE(!queued4.available());
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 3u);
+
+    // FIFO acceptance is proven by the !available() checks after each drain step below:
+    // each step frees exactly one buffer, and only the oldest queued write may be
+    // accepted into it while every later one stays pending.
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted0);
+    flush_ctl.wait_for_flush_starts(2);
+    auto accepted2 = queued2.get();
+    auto persisted2 = std::move(accepted2.persisted);
+    BOOST_REQUIRE(!queued3.available());
+    BOOST_REQUIRE(!queued4.available());
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted1);
+    flush_ctl.wait_for_flush_starts(3);
+    auto accepted3 = queued3.get();
+    auto persisted3 = std::move(accepted3.persisted);
+    BOOST_REQUIRE(!queued4.available());
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted2);
+    flush_ctl.wait_for_flush_starts(4);
+    auto accepted4 = queued4.get();
+    auto persisted4 = std::move(accepted4.persisted);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted3);
+    flush_ctl.wait_for_flush_starts(5);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted4);
+
+    assert_records_in_order(schema, flush_ctl.all_records(), expected);
+}
+
+// Checks that queued writes are rejected once max_queued_write_bytes would be exceeded.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_rejects_when_max_queued_write_bytes_exceeded) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto large_value = make_single_buffer_value(schema, buffer_size);
+
+    auto record0 = make_buffered_writer_record(schema, 0, large_value, api::timestamp_type(400));
+    const auto queued_write_budget = log_record_writer(record0).record_size() * 2;
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 2, queued_write_budget), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    std::vector<log_record> expected{record0};
+    for (size_t i = 1; i < 4; ++i) {
+        expected.push_back(make_buffered_writer_record(schema, i, large_value, api::timestamp_type(400 + i)));
+    }
+
+    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto persisted0 = std::move(accepted0.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+
+    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto persisted1 = std::move(accepted1.persisted);
+
+    auto queued2 = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout());
+    auto queued3 = writer.write_to_buffer(log_record_writer(expected[3]), test_timeout());
+    BOOST_REQUIRE(!queued2.available());
+    BOOST_REQUIRE(!queued3.available());
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 2u);
+
+    auto rejected = make_buffered_writer_record(schema, 4, large_value, api::timestamp_type(404));
+    BOOST_REQUIRE_THROW(writer.write_to_buffer(log_record_writer(rejected), test_timeout()).get(), replica::rate_limit_exception);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted0);
+    flush_ctl.wait_for_flush_starts(2);
+    auto accepted2 = queued2.get();
+    auto persisted2 = std::move(accepted2.persisted);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted1);
+    flush_ctl.wait_for_flush_starts(3);
+    auto accepted3 = queued3.get();
+    auto persisted3 = std::move(accepted3.persisted);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted2);
+    flush_ctl.wait_for_flush_starts(4);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted3);
+
+    assert_records_in_order(schema, flush_ctl.all_records(), expected);
+}
+
+// Checks that write_to_buffer() stays pending while a request is queued and only persistence remains pending once it is accepted.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_acceptance_stays_blocked_while_write_is_queued) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto large_value = make_single_buffer_value(schema, buffer_size);
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 2), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    auto record0 = make_buffered_writer_record(schema, 0, large_value, api::timestamp_type(500));
+    auto record1 = make_buffered_writer_record(schema, 1, large_value, api::timestamp_type(501));
+    auto record2 = make_buffered_writer_record(schema, 2, large_value, api::timestamp_type(502));
+
+    auto accepted0 = writer.write_to_buffer(log_record_writer(record0), test_timeout()).get();
+    auto persisted0 = std::move(accepted0.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+
+    auto accepted1 = writer.write_to_buffer(log_record_writer(record1), test_timeout()).get();
+    auto persisted1 = std::move(accepted1.persisted);
+
+    auto queued2 = writer.write_to_buffer(log_record_writer(record2), test_timeout());
+    BOOST_REQUIRE(!queued2.available());
+    BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 1u);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted0);
+    flush_ctl.wait_for_flush_starts(2);
+
+    auto accepted2 = queued2.get();
+    BOOST_REQUIRE(!accepted2.persisted.available());
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted1);
+    flush_ctl.wait_for_flush_starts(3);
+    BOOST_REQUIRE(!accepted2.persisted.available());
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(accepted2.persisted);
+
+    const auto actual = flush_ctl.all_records();
+    const std::vector<log_record> expected{record0, record1, record2};
+    assert_records_in_order(schema, actual, expected);
+}
+
+// Checks that stop() waits for a blocked in-flight flush instead of dropping it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_stop_drains_blocked_in_flight_write) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto record = make_buffered_writer_record(schema, 0, "value", api::timestamp_type(600));
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 2), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+
+    auto accepted = writer.write_to_buffer(log_record_writer(record), test_timeout()).get();
+    auto persisted = std::move(accepted.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+
+    auto stop_fut = writer.stop();
+    BOOST_REQUIRE(!stop_fut.available());
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted);
+    stop_fut.get();
+
+    const auto actual = flush_ctl.all_records();
+    BOOST_REQUIRE_EQUAL(actual.size(), 1u);
+    assert_log_record_matches(schema, actual.front().record, record);
+}
+
+// Checks that a flush failure is propagated to every write that was already accepted into that buffer.
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_flush_failure_fails_all_writes_in_buffer) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+
+    auto record0 = make_buffered_writer_record(schema, 0, "value0", api::timestamp_type(700));
+    auto record1 = make_buffered_writer_record(schema, 1, "value1", api::timestamp_type(701));
+    raw_write_buffer scratch(buffer_size, segment_kind::mixed);
+    BOOST_REQUIRE(scratch.can_fit(log_record_writer(record0)));
+    scratch.append(log_record_writer(record0));
+    BOOST_REQUIRE(scratch.can_fit(log_record_writer(record1)));
+
+    test_flush_controller flush_ctl{.fail_flush_index = 0};
+    // long sync period so both writes land in the same buffer.
+    buffered_writer writer(make_buffered_writer_config(buffer_size, 3, 0, std::chrono::hours(1)), [&flush_ctl] (write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    writer.start().get();
+    auto stop = defer([&writer] noexcept {
+        writer.stop().get();
+    });
+
+    auto accepted0 = writer.write_to_buffer(log_record_writer(record0), test_timeout()).get();
+    auto accepted1 = writer.write_to_buffer(log_record_writer(record1), test_timeout()).get();
+
+    auto flush = writer.flush();
+
+    BOOST_REQUIRE_THROW(accepted0.persisted.get(), std::runtime_error);
+    BOOST_REQUIRE_THROW(accepted1.persisted.get(), std::runtime_error);
+
+    flush.get();
+
+    BOOST_REQUIRE_EQUAL(flush_ctl.started_count, 1u);
+    BOOST_REQUIRE(flush_ctl.flushed_buffers.empty());
+}
+
+// A device error reported by the file layer on a segment write must fire the logstor disk error
+// signal, on top of failing the write. The signal is what makes the node isolate itself instead of
+// staying in the ring with a store it can no longer write to.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_write_io_error_signals_disk_error) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    unsigned signalled = 0;
+    boost::signals2::scoped_connection conn = logstor_error.connect([&signalled] { ++signalled; });
+
+    utils::get_local_injector().enable("logstor_segment_write_io_error", true /* one shot */);
+    auto m = make_kv_mutation(schema, "pk0", "io-error-value");
+    BOOST_REQUIRE_THROW(ls.write(m, write_target(&cg, {}), db::no_timeout).get(), storage_io_error);
+    BOOST_REQUIRE_EQUAL(signalled, 1u);
+
+    // The failed write only retired its segment, so a write to a new segment still succeeds and
+    // does not signal again.
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk1", "value-after-io-error"));
+    BOOST_REQUIRE_EQUAL(signalled, 1u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    auto expected = make_kv_mutation(schema, "pk0", "separator-value");
+    auto key = expected.decorated_key();
+
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+
+    BOOST_REQUIRE(cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+
+    auto entry_before_flush = cg.logstor_index().get(make_index_key(*schema, key));
+    BOOST_REQUIRE(entry_before_flush);
+
+    cg.flush_separator().get();
+
+    BOOST_REQUIRE(!cg.separator_has_data());
+    // The flush released everything the buffer was holding, which is also what gives it back to the
+    // pool: a group with nothing to separate holds no buffer.
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(snapshot.size(), 1u);
+
+    auto entry_after_flush = cg.logstor_index().get(make_index_key(*schema, key));
+    BOOST_REQUIRE(entry_after_flush);
+    BOOST_REQUIRE(entry_after_flush->location.segment != entry_before_flush->location.segment);
+    BOOST_REQUIRE_EQUAL(entry_after_flush->location.segment.value, snapshot.front().segment_id.value);
+
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+// Checks that a group discarded while the separator still holds unflushed records for it gives up
+// what it was holding: its records are left where they are, and the segments they are in are left
+// allocated. The index still points at them there, so freeing one would let it be reallocated over
+// live records - free_segment() aborts on the live data it finds rather than allow that, so the
+// reference has to be released as a failed flush rather than as a completed one.
+SEASTAR_THREAD_TEST_CASE(test_logstor_discarded_group_does_not_free_its_unflushed_source_segments) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    auto& sm = ls.get_segment_manager();
+    test_logstor_group cg(schema, ls);
+    // Writes for this group fill the shared active segment, so that the segment holding the record
+    // below is switched away from and drops the reference it holds itself. Its own records are
+    // separated out, which gives back the reference its separator buffer takes.
+    test_logstor_group filler(schema, ls);
+
+    auto expected = make_kv_mutation(schema, "pk0", "separator-value");
+    auto key = expected.decorated_key();
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 1u);
+
+    auto entry_before_discard = cg.logstor_index().get(make_index_key(*schema, key));
+    BOOST_REQUIRE(entry_before_discard);
+
+    // A value that takes most of a segment, so that the second record does not fit next to the first
+    // and the active segment has to be switched.
+    const auto filler_value = sstring(sm.get_segment_size() * 5 / 8, 'x');
+    write_and_flush_segment(ls, filler, make_kv_mutation(schema, "fill0", filler_value));
+    write_and_flush_segment(ls, filler, make_kv_mutation(schema, "fill1", filler_value));
+
+    // The separator buffer of the group under test now holds the last reference to the segment its
+    // record is in, and nothing has flushed it.
+    BOOST_REQUIRE(cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 1u);
+
+    // Discard the group the way a compaction group stopped while the separator still has records for
+    // it does. Removing it rather than destroying it keeps its index readable below.
+    ls.get_compaction_manager().remove(cg).get();
+
+    // Nothing of the buffer is left held, which is also what gives it back to the pool.
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+
+    // The records were never written out, so the index still points at them where they were, and the
+    // segment that holds them was not freed and reused underneath it.
+    auto entry_after_discard = cg.logstor_index().get(make_index_key(*schema, key));
+    BOOST_REQUIRE(entry_after_discard);
+    BOOST_REQUIRE(entry_after_discard->location == entry_before_discard->location);
+
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+// Checks that a group whose separator was closed takes no separator writes at all. Nothing can flush
+// what such a group buffers, so a record handed to it afterwards - which is what a write that was
+// already in flight when the group was closed amounts to - has to be refused rather than buffered.
+// The write itself still succeeds and the record stays readable where it is.
+SEASTAR_THREAD_TEST_CASE(test_logstor_closed_group_takes_no_separator_writes) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    // Close the group's separator the way stopping its compaction group does, and then write to it
+    // anyway.
+    ls.get_compaction_manager().remove(cg).get();
+
+    auto expected = make_kv_mutation(schema, "pk0", "separator-value");
+    auto key = expected.decorated_key();
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+
+    // The separator refused the record, so the group holds nothing: no buffer of its own, no reference
+    // to the segment the record is in, and no segment of its own that it was written into.
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+
+    // The write itself succeeded and the record is readable where it was written.
+    BOOST_REQUIRE(cg.logstor_index().get(make_index_key(*schema, key)));
+
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+// The live bytes of a segment set are maintained as segments are linked, freed from and unlinked,
+// rather than computed by walking it, so every one of those paths has to keep them in step with the
+// segments the set actually holds.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_live_bytes) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    constexpr size_t record_size = 1024;
+
+    // Descriptors are intrusively linked into the sets, so they must keep their addresses, and every
+    // set must be destroyed before them.
+    std::deque<segment_descriptor> descs;
+    segment_set segments{segment_size};
+
+    auto add_segment = [&] (segment_set& set, size_t live_records) -> segment_descriptor& {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        desc.on_write(live_records * record_size, live_records);
+        set.add_segment(desc);
+        return desc;
+    };
+
+    // An empty set holds nothing.
+    BOOST_REQUIRE_EQUAL(segments.live_record_bytes(), 0);
+
+    // A segment joins with the records it already holds.
+    auto& sparse = add_segment(segments, 1);
+    auto& dense = add_segment(segments, 16);
+    BOOST_REQUIRE_EQUAL(segments.live_record_bytes(), 17 * record_size);
+
+    // Freeing records takes off exactly the space they gave back.
+    dense.on_free(6 * record_size, 6);
+    segments.update_segment(dense, 6 * record_size);
+    BOOST_REQUIRE_EQUAL(segments.live_record_bytes(), 11 * record_size);
+
+    // Merging hands the segments over together with their live bytes.
+    segment_set other{segment_size};
+    other.merge(segments).get();
+    BOOST_REQUIRE_EQUAL(segments.live_record_bytes(), 0);
+    BOOST_REQUIRE_EQUAL(other.live_record_bytes(), 11 * record_size);
+
+    // Removing a segment takes its bytes out of the set.
+    other.remove_segment(sparse);
+    BOOST_REQUIRE_EQUAL(other.live_record_bytes(), 10 * record_size);
+
+    other.clear();
+    BOOST_REQUIRE_EQUAL(other.live_record_bytes(), 0);
+}
+
+// A segment set does not walk its segments to get its statistics. It updates them when it links or
+// unlinks a segment, and when a record is freed. Thus, each of these paths must keep the statistics
+// equal to the segments in the set, and to the shard-wide statistics.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    // Each record frame fills one utilization bucket. Thus, a segment with n records has a
+    // utilization of n/N, the upper limit of bucket n - 1. The limit is inclusive, so the segment
+    // goes into bucket n - 1.
+    constexpr size_t frame_size = segment_size / utilization_bucket_count;
+
+    // The sets link the descriptors intrusively. Thus, the descriptors must not move, and all the
+    // sets must be destroyed before the descriptors.
+    std::deque<segment_descriptor> descs;
+    segment_stats shard;
+    segment_set segments{segment_size, &shard};
+    segment_set other{segment_size, &shard};
+
+    auto add_segment = [&] (segment_set& set, size_t live_records) -> segment_descriptor& {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        desc.on_write(live_records * frame_size, live_records);
+        set.add_segment(desc);
+        return desc;
+    };
+
+    auto check_stats = [&] (const segment_set& set, uint64_t expected_segments, uint64_t expected_live_record_bytes) {
+        const auto& stats = set.stats();
+        BOOST_REQUIRE_EQUAL(stats.segment_count, expected_segments);
+        BOOST_REQUIRE_EQUAL(stats.live_record_bytes, expected_live_record_bytes);
+        BOOST_REQUIRE_EQUAL(set.live_record_bytes(), expected_live_record_bytes);
+        // The maintained statistics must agree with the segments, for all the paths that changed
+        // the set.
+        BOOST_REQUIRE(set.recompute_stats_for_test() == stats);
+        // Each segment of the set is in exactly one bucket.
+        uint64_t counted = 0;
+        for (auto count : stats.utilization) {
+            counted += count;
+        }
+        BOOST_REQUIRE_EQUAL(counted, expected_segments);
+    };
+
+    // The shard statistics are the sum of the statistics of the two sets, after all operations.
+    auto check_shard = [&] {
+        segment_stats expected;
+        for (const auto* set : {&segments, &other}) {
+            expected.segment_count += set->stats().segment_count;
+            expected.live_record_bytes += set->stats().live_record_bytes;
+            expected.dead_segments += set->stats().dead_segments;
+            for (size_t i = 0; i < utilization_bucket_count; ++i) {
+                expected.utilization[i] += set->stats().utilization[i];
+            }
+        }
+        BOOST_REQUIRE(shard == expected);
+    };
+
+    auto bucket_of = [&] (const segment_set& set, size_t bucket) {
+        return set.stats().utilization[bucket];
+    };
+
+    // An empty set has zero statistics.
+    check_stats(segments, 0, 0);
+    check_shard();
+
+    // A segment goes into the bucket of its utilization. A segment with a utilization of 1 goes
+    // into the last bucket, not into a bucket after the end of the histogram.
+    auto& sparse = add_segment(segments, 1);
+    auto& full = add_segment(segments, utilization_bucket_count);
+    check_stats(segments, 2, (utilization_bucket_count + 1) * frame_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, 0), 1);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, utilization_bucket_count - 1), 1);
+    check_shard();
+
+    // A free of records moves a segment down the histogram. The live record bytes decrease by
+    // exactly the freed record bytes.
+    constexpr size_t freed_records = utilization_bucket_count / 2;
+    full.on_free(freed_records * frame_size, freed_records);
+    segments.update_segment(full, freed_records * frame_size);
+    check_stats(segments, 2, (freed_records + 1) * frame_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, utilization_bucket_count - 1), 0);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, freed_records - 1), 1);
+    check_shard();
+
+    // A segment whose last record is freed stays in bucket 0, so only the dead count shows it.
+    sparse.on_free(frame_size, 1);
+    segments.update_segment(sparse, frame_size);
+    check_stats(segments, 2, freed_records * frame_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, 0), 1);
+    BOOST_REQUIRE_EQUAL(segments.stats().dead_segments, 1);
+    check_shard();
+
+    // A merge moves the segments and their statistics to the other set. The shard statistics do not
+    // change.
+    other.merge(segments).get();
+    check_stats(segments, 0, 0);
+    check_stats(other, 2, freed_records * frame_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(other, 0), 1);
+    BOOST_REQUIRE_EQUAL(bucket_of(other, freed_records - 1), 1);
+    BOOST_REQUIRE_EQUAL(other.stats().dead_segments, 1);
+    check_shard();
+    BOOST_REQUIRE_EQUAL(shard.segment_count, 2);
+
+    // A removal takes the segment and its bytes out of the set and out of the shard statistics.
+    other.remove_segment(sparse);
+    check_stats(other, 1, freed_records * frame_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(other, 0), 0);
+    BOOST_REQUIRE_EQUAL(other.stats().dead_segments, 0);
+    check_shard();
+
+    other.clear();
+    check_stats(other, 0, 0);
+    check_shard();
+    BOOST_REQUIRE(shard == segment_stats{});
+}
+
+// The metric exports the utilization histogram as a Prometheus histogram. The buckets of a
+// Prometheus histogram are cumulative, and the sum is the sum of the utilizations of the segments.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_utilization_histogram_export) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    constexpr size_t frame_size = segment_size / utilization_bucket_count;
+
+    auto add_segment = [&] (segment_stats& stats, uint64_t live_record_bytes) {
+        stats.add_segment(live_record_bytes, utilization_bucket_of(live_record_bytes, segment_size));
+    };
+
+    // An empty histogram has zero values.
+    const auto empty = to_metrics_histogram(segment_stats{}, segment_size);
+    BOOST_REQUIRE_EQUAL(empty.buckets.size(), utilization_bucket_count);
+    BOOST_REQUIRE_EQUAL(empty.sample_count, 0);
+    BOOST_REQUIRE_EQUAL(empty.sample_sum, 0);
+    for (const auto& bucket : empty.buckets) {
+        BOOST_REQUIRE_EQUAL(bucket.count, 0);
+    }
+
+    // Two segments without live records go into the first bucket. One segment has a utilization of
+    // 3/N, the upper limit of bucket 2. The limit is inclusive, so the segment goes into bucket 2. A
+    // full segment goes into the last bucket.
+    segment_stats stats;
+    add_segment(stats, 0);
+    add_segment(stats, 0);
+    add_segment(stats, 3 * frame_size);
+    add_segment(stats, segment_size);
+
+    const auto hist = to_metrics_histogram(stats, segment_size);
+    BOOST_REQUIRE_EQUAL(hist.buckets.size(), utilization_bucket_count);
+    for (size_t i = 0; i < utilization_bucket_count; ++i) {
+        // The limit of bucket i is the upper limit of its utilization range.
+        BOOST_REQUIRE_EQUAL(hist.buckets[i].upper_bound, double(i + 1) / utilization_bucket_count);
+        // Each bucket counts its segments and the segments of all the buckets before it.
+        const uint64_t expected_count = i < 2 ? 2 : i < utilization_bucket_count - 1 ? 3 : 4;
+        BOOST_REQUIRE_EQUAL(hist.buckets[i].count, expected_count);
+    }
+    BOOST_REQUIRE_EQUAL(hist.buckets.back().upper_bound, 1.0);
+    BOOST_REQUIRE_EQUAL(hist.sample_count, 4);
+    // The utilizations are 0, 0, 3 / utilization_bucket_count and 1. These values are exact in
+    // binary floating point.
+    BOOST_REQUIRE_EQUAL(hist.sample_sum, 3.0 / utilization_bucket_count + 1.0);
+}
+
+// The upper limit of a utilization bucket is inclusive, as in a Prometheus histogram. Thus, a
+// segment with a utilization equal to the upper limit of a bucket goes into that bucket. A segment
+// with one more live record byte goes into the next bucket.
+SEASTAR_THREAD_TEST_CASE(test_logstor_utilization_bucket_limits) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    constexpr uint64_t bucket_size = segment_size / utilization_bucket_count;
+
+    // A segment without live records goes into the first bucket.
+    BOOST_REQUIRE_EQUAL(utilization_bucket_of(0, segment_size), 0);
+    BOOST_REQUIRE_EQUAL(utilization_bucket_of(1, segment_size), 0);
+
+    for (size_t i = 0; i < utilization_bucket_count; ++i) {
+        const uint64_t limit = (i + 1) * bucket_size;
+        BOOST_REQUIRE_EQUAL(utilization_bucket_of(limit - 1, segment_size), i);
+        BOOST_REQUIRE_EQUAL(utilization_bucket_of(limit, segment_size), i);
+        if (i + 1 < utilization_bucket_count) {
+            BOOST_REQUIRE_EQUAL(utilization_bucket_of(limit + 1, segment_size), i + 1);
+        }
+    }
+
+    // A full segment goes into the last bucket.
+    BOOST_REQUIRE_EQUAL(utilization_bucket_of(segment_size, segment_size), utilization_bucket_count - 1);
+
+    // The limits also apply when the segment size is not a multiple of the bucket count.
+    constexpr uint64_t odd_segment_size = 1000;
+    for (uint64_t live_record_bytes = 0; live_record_bytes <= odd_segment_size; ++live_record_bytes) {
+        const auto bucket = utilization_bucket_of(live_record_bytes, odd_segment_size);
+        // The utilization is not more than the upper limit of the bucket.
+        BOOST_REQUIRE_LE(live_record_bytes * utilization_bucket_count, (bucket + 1) * odd_segment_size);
+        // The utilization is more than the lower limit of the bucket, except in the first bucket.
+        if (bucket > 0) {
+            BOOST_REQUIRE_GT(live_record_bytes * utilization_bucket_count, bucket * odd_segment_size);
+        }
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    auto pk1_v0 = make_kv_mutation(schema, "pk1", "v1", api::timestamp_type(2));
+    auto pk2_v0 = make_kv_mutation(schema, "pk2", "v2", api::timestamp_type(3));
+    auto pk0_v1 = make_kv_mutation(schema, "pk0", "v0-new", api::timestamp_type(4));
+    auto pk1_v1 = make_kv_mutation(schema, "pk1", "v1-new", api::timestamp_type(5));
+
+    write_and_flush_segment(ls, cg, pk0_v0);
+    write_and_flush_segment(ls, cg, pk1_v0);
+    write_and_flush_segment(ls, cg, pk2_v0);
+
+    const auto pk0 = make_index_key(*schema, pk0_v1.decorated_key());
+    const auto pk1 = make_index_key(*schema, pk1_v1.decorated_key());
+    const auto pk2 = make_index_key(*schema, pk2_v0.decorated_key());
+
+    auto stale_pk0_location = cg.logstor_index().get(pk0);
+    auto stale_pk1_location = cg.logstor_index().get(pk1);
+
+    BOOST_REQUIRE(stale_pk0_location);
+    BOOST_REQUIRE(stale_pk1_location);
+
+    write_and_flush_segment(ls, cg, pk0_v1);
+    write_and_flush_segment(ls, cg, pk1_v1);
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 5u);
+
+    auto live_pk0_before = cg.logstor_index().get(pk0);
+    auto live_pk1_before = cg.logstor_index().get(pk1);
+    auto live_pk2_before = cg.logstor_index().get(pk2);
+
+    BOOST_REQUIRE(live_pk0_before);
+    BOOST_REQUIRE(live_pk1_before);
+    BOOST_REQUIRE(live_pk2_before);
+
+    auto old_snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(old_snapshot.size(), 5u);
+    const auto old_segment_ids = snapshot_segment_ids(old_snapshot);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    auto new_snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(new_snapshot.size(), 1u);
+    const auto new_segment_ids = snapshot_segment_ids(new_snapshot);
+
+    auto live_pk0_after = cg.logstor_index().get(pk0);
+    auto live_pk1_after = cg.logstor_index().get(pk1);
+    auto live_pk2_after = cg.logstor_index().get(pk2);
+
+    BOOST_REQUIRE(live_pk0_after);
+    BOOST_REQUIRE(live_pk1_after);
+    BOOST_REQUIRE(live_pk2_after);
+
+    BOOST_REQUIRE(live_pk0_after->location != live_pk0_before->location);
+    BOOST_REQUIRE(live_pk1_after->location != live_pk1_before->location);
+    BOOST_REQUIRE(live_pk2_after->location != live_pk2_before->location);
+
+    BOOST_REQUIRE(new_segment_ids.contains(live_pk0_after->location.segment));
+    BOOST_REQUIRE(new_segment_ids.contains(live_pk1_after->location.segment));
+    BOOST_REQUIRE(new_segment_ids.contains(live_pk2_after->location.segment));
+
+    for (const auto old_segment_id : old_segment_ids) {
+        BOOST_REQUIRE(!new_segment_ids.contains(old_segment_id));
+    }
+
+    BOOST_REQUIRE(!new_segment_ids.contains(stale_pk0_location->location.segment));
+    BOOST_REQUIRE(!new_segment_ids.contains(stale_pk1_location->location.segment));
+
+    auto actual_pk0 = read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get();
+    auto actual_pk1 = read_mutation(ls, schema, cg.logstor_index(), pk1_v1.decorated_key(), schema->full_slice()).get();
+    auto actual_pk2 = read_mutation(ls, schema, cg.logstor_index(), pk2_v0.decorated_key(), schema->full_slice()).get();
+
+    BOOST_REQUIRE(actual_pk0);
+    BOOST_REQUIRE(actual_pk1);
+    BOOST_REQUIRE(actual_pk2);
+
+    assert_that(*actual_pk0).is_equal_to(pk0_v1);
+    assert_that(*actual_pk1).is_equal_to(pk1_v1);
+    assert_that(*actual_pk2).is_equal_to(pk2_v0);
+
+    // Scan all segments after compaction and verify they contain exactly the live records.
+    // Live records (pk0_v1 ts=4, pk1_v1 ts=5, pk2_v0 ts=3) must appear exactly once;
+    // overwritten records (pk0_v0 ts=1, pk1_v0 ts=2) must not appear at all.
+    auto record_counts = count_records_by_timestamp(ls, new_snapshot);
+
+    // Each live record appears exactly once.
+    BOOST_REQUIRE_EQUAL(record_counts[api::timestamp_type(3)], 1u); // pk2_v0 - untouched
+    BOOST_REQUIRE_EQUAL(record_counts[api::timestamp_type(4)], 1u); // pk0_v1 - latest version
+    BOOST_REQUIRE_EQUAL(record_counts[api::timestamp_type(5)], 1u); // pk1_v1 - latest version
+
+    // Overwritten records do not appear.
+    BOOST_REQUIRE_EQUAL(record_counts.count(api::timestamp_type(1)), 0u); // pk0_v0 - stale
+    BOOST_REQUIRE_EQUAL(record_counts.count(api::timestamp_type(2)), 0u); // pk1_v0 - stale
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    auto pk1_v0 = make_kv_mutation(schema, "pk1", "v1", api::timestamp_type(2));
+    auto pk2_v0 = make_kv_mutation(schema, "pk2", "v2", api::timestamp_type(3));
+    auto pk0_v1 = make_kv_mutation(schema, "pk0", "v0-new", api::timestamp_type(4));
+    auto pk1_v1 = make_kv_mutation(schema, "pk1", "v1-new", api::timestamp_type(5));
+
+    write_and_flush_segment(ls, cg, pk0_v0);
+    write_and_flush_segment(ls, cg, pk1_v0);
+    write_and_flush_segment(ls, cg, pk2_v0);
+    write_and_flush_segment(ls, cg, pk0_v1);
+    write_and_flush_segment(ls, cg, pk1_v1);
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 5u);
+
+    const auto pk0 = make_index_key(*schema, pk0_v1.decorated_key());
+    const auto pk1 = make_index_key(*schema, pk1_v1.decorated_key());
+    const auto pk2 = make_index_key(*schema, pk2_v0.decorated_key());
+
+    auto live_pk0_before = cg.logstor_index().get(pk0);
+    auto live_pk1_before = cg.logstor_index().get(pk1);
+    auto live_pk2_before = cg.logstor_index().get(pk2);
+
+    BOOST_REQUIRE(live_pk0_before);
+    BOOST_REQUIRE(live_pk1_before);
+    BOOST_REQUIRE(live_pk2_before);
+
+    auto snapshot_before = ls.get_segment_manager().make_snapshot(cg).get();
+    const auto segment_ids_before = snapshot_segment_ids(snapshot_before);
+
+    ls.get_compaction_manager().submit(cg);
+
+    auto snapshot_after = ls.get_segment_manager().make_snapshot(cg).get();
+    const auto segment_ids_after = snapshot_segment_ids(snapshot_after);
+
+    BOOST_REQUIRE_EQUAL(snapshot_after.size(), snapshot_before.size());
+    BOOST_REQUIRE(segment_ids_after == segment_ids_before);
+
+    auto live_pk0_after = cg.logstor_index().get(pk0);
+    auto live_pk1_after = cg.logstor_index().get(pk1);
+    auto live_pk2_after = cg.logstor_index().get(pk2);
+
+    BOOST_REQUIRE(live_pk0_after);
+    BOOST_REQUIRE(live_pk1_after);
+    BOOST_REQUIRE(live_pk2_after);
+
+    BOOST_REQUIRE(live_pk0_after->location == live_pk0_before->location);
+    BOOST_REQUIRE(live_pk1_after->location == live_pk1_before->location);
+    BOOST_REQUIRE(live_pk2_after->location == live_pk2_before->location);
+
+    auto actual_pk0 = read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get();
+    auto actual_pk1 = read_mutation(ls, schema, cg.logstor_index(), pk1_v1.decorated_key(), schema->full_slice()).get();
+    auto actual_pk2 = read_mutation(ls, schema, cg.logstor_index(), pk2_v0.decorated_key(), schema->full_slice()).get();
+
+    BOOST_REQUIRE(actual_pk0);
+    BOOST_REQUIRE(actual_pk1);
+    BOOST_REQUIRE(actual_pk2);
+
+    assert_that(*actual_pk0).is_equal_to(pk0_v1);
+    assert_that(*actual_pk1).is_equal_to(pk1_v1);
+    assert_that(*actual_pk2).is_equal_to(pk2_v0);
+}
+
+// Split compaction hands every segment of a group to the group its records belong to after the
+// split: a segment whose records are all on one side is moved as it is, and one that straddles the
+// split is rewritten into a segment per side, skipping the records that are no longer live.
+SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_splits_segments_between_target_groups) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    // The src and target groups in a split share the logstor index.
+    test_logstor_group src(schema, ls);
+    test_logstor_group left(schema, ls, src.logstor_index());
+    test_logstor_group right(schema, ls, src.logstor_index());
+    auto& index = src.logstor_index();
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(src).get());
+
+    // Keys in token order, split in the middle: keys[0..2] go to the left group, keys[3..5] to the
+    // right one.
+    const auto keys = make_token_ordered_keys(schema, 6);
+    const auto boundary = dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(keys[2]))).token();
+    auto classify = [boundary] (dht::token t) -> mutation_writer::token_group_id {
+        return t <= boundary ? 0 : 1;
+    };
+
+    auto k0 = make_kv_mutation(schema, keys[0], "v0", api::timestamp_type(1));
+    auto k1 = make_kv_mutation(schema, keys[1], "v1", api::timestamp_type(2));
+    auto k2_v0 = make_kv_mutation(schema, keys[2], "v2", api::timestamp_type(3));
+    auto k3 = make_kv_mutation(schema, keys[3], "v3", api::timestamp_type(4));
+    auto k4 = make_kv_mutation(schema, keys[4], "v4", api::timestamp_type(5));
+    auto k5 = make_kv_mutation(schema, keys[5], "v5", api::timestamp_type(6));
+    auto k2_v1 = make_kv_mutation(schema, keys[2], "v2-new", api::timestamp_type(7));
+
+    // One segment on each side of the split, one that straddles it, and one that overwrites a
+    // record of the straddling segment, so that the split also has a dead record to skip.
+    write_and_flush_segment(ls, src, k0);
+    const std::array right_only = {k4, k5};
+    write_and_flush_segment(ls, src, right_only);
+    const std::array straddling = {k1, k2_v0, k3};
+    write_and_flush_segment(ls, src, straddling);
+    write_and_flush_segment(ls, src, k2_v1);
+
+    BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 4u);
+
+    std::vector<primary_index_key> index_keys;
+    for (const auto& m : {k0, k1, k2_v1, k3, k4, k5}) {
+        index_keys.push_back(make_index_key(*schema, m.decorated_key()));
+    }
+
+    std::vector<record_location> locations_before;
+    for (const auto& key : index_keys) {
+        auto entry = index.get(key);
+        BOOST_REQUIRE(entry);
+        locations_before.push_back(entry->location);
+    }
+
+    const auto single_sided_segments = std::set<log_segment_id>{
+        locations_before[0].segment, // k0
+        locations_before[2].segment, // k2_v1
+        locations_before[4].segment, // k4, k5
+    };
+    const auto straddling_segment = locations_before[1].segment; // k1, k2_v0, k3
+    BOOST_REQUIRE(!single_sided_segments.contains(straddling_segment));
+    BOOST_REQUIRE(locations_before[4].segment == locations_before[5].segment);
+    BOOST_REQUIRE(locations_before[3].segment == straddling_segment);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit_split_compaction(src, classify,
+            [&] (log_segment_id, dht::token first_token, dht::token last_token) -> logstor_group& {
+                // Split compaction only asks about segments it has decided are on a single side.
+                BOOST_REQUIRE_EQUAL(classify(first_token), classify(last_token));
+                return classify(first_token) == 0 ? static_cast<logstor_group&>(left) : right;
+            }).get();
+
+    // Every segment of the group being split ends up in one of the target groups.
+    BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 0u);
+
+    auto left_snapshot = ls.get_segment_manager().make_snapshot(left).get();
+    auto right_snapshot = ls.get_segment_manager().make_snapshot(right).get();
+    const auto left_ids = snapshot_segment_ids(left_snapshot);
+    const auto right_ids = snapshot_segment_ids(right_snapshot);
+
+    std::vector<record_location> locations_after;
+    for (const auto& key : index_keys) {
+        auto entry = index.get(key);
+        BOOST_REQUIRE(entry);
+        locations_after.push_back(entry->location);
+    }
+
+    // The single-sided segments were moved as they are: the records they hold did not move, and
+    // their segments are now owned by the group of their side.
+    BOOST_REQUIRE(locations_after[0] == locations_before[0]);
+    BOOST_REQUIRE(locations_after[2] == locations_before[2]);
+    BOOST_REQUIRE(locations_after[4] == locations_before[4]);
+    BOOST_REQUIRE(locations_after[5] == locations_before[5]);
+    BOOST_REQUIRE(left_ids.contains(locations_after[0].segment));
+    BOOST_REQUIRE(left_ids.contains(locations_after[2].segment));
+    BOOST_REQUIRE(right_ids.contains(locations_after[4].segment));
+
+    // The straddling segment was rewritten into a new segment per side and freed.
+    BOOST_REQUIRE(locations_after[1] != locations_before[1]);
+    BOOST_REQUIRE(locations_after[3] != locations_before[3]);
+    BOOST_REQUIRE(left_ids.contains(locations_after[1].segment));
+    BOOST_REQUIRE(right_ids.contains(locations_after[3].segment));
+    BOOST_REQUIRE(!left_ids.contains(straddling_segment));
+    BOOST_REQUIRE(!right_ids.contains(straddling_segment));
+
+    // All the records are readable, from whichever group they ended up in.
+    for (const auto& expected : {k0, k1, k2_v1, k3, k4, k5}) {
+        auto actual = read_mutation(ls, schema, index, expected.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(expected);
+    }
+
+    // Each live record is held exactly once, by the group of its side, and the record the overwrite
+    // of k2 made dead was not rewritten.
+    auto left_records = count_records_by_timestamp(ls, left_snapshot);
+    auto right_records = count_records_by_timestamp(ls, right_snapshot);
+
+    const auto expected_left = std::map<api::timestamp_type, size_t>{
+        {api::timestamp_type(1), 1}, // k0
+        {api::timestamp_type(2), 1}, // k1
+        {api::timestamp_type(7), 1}, // k2_v1
+    };
+    const auto expected_right = std::map<api::timestamp_type, size_t>{
+        {api::timestamp_type(4), 1}, // k3
+        {api::timestamp_type(5), 1}, // k4
+        {api::timestamp_type(6), 1}, // k5
+    };
+    BOOST_REQUIRE(left_records == expected_left);
+    BOOST_REQUIRE(right_records == expected_right);
+}
+
+// Everything a reader test needs: a started logstor holding a single compaction group, and a
+// semaphore to take read permits from. Tests fill the group with populate() and read it back
+// through make_reader().
+struct reader_test_env {
+    schema_ptr schema;
+    tmpdir dir;
+    shared_logstor_cache cache;
+    logstor ls{make_test_logstor_config(dir.path()), cache.shared_tracker};
+    std::optional<test_logstor_group> cg;
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+
+    explicit reader_test_env(bool cache_enabled = false, schema_ptr s = make_kv_schema())
+            : schema(std::move(s)) {
+        test_recovery_catalog no_tables;
+        ls.do_recovery(no_tables).get();
+        ls.start().get();
+        cg.emplace(schema, ls, cache_enabled);
+    }
+
+    ~reader_test_env() {
+        cg->logstor_index().drain_cache().get();
+        cg.reset();
+        ls.stop().get();
+    }
+
+    void populate(std::span<const mutation> ms) {
+        write_and_flush_segment(ls, *cg, ms);
+    }
+
+    mutation_reader make_reader(const dht::partition_range& pr,
+            streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
+            mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no) {
+        return make_reader(pr, schema->full_slice(), fwd, fwd_mr);
+    }
+
+    mutation_reader make_reader(const dht::partition_range& pr, const query::partition_slice& slice,
+            streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
+            mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no) {
+        return make_reader(schema, pr, slice, fwd, fwd_mr);
+    }
+
+    // Under a query schema of the caller's: the reversed one, for a reversed read.
+    mutation_reader make_reader(schema_ptr query_schema, const dht::partition_range& pr, const query::partition_slice& slice,
+            streamed_mutation::forwarding fwd = streamed_mutation::forwarding::no,
+            mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no) {
+        return ls.make_reader(std::move(query_schema), cg->logstor_index(), semaphore.make_permit(), pr, slice, nullptr, fwd, fwd_mr);
+    }
+
+    const ::cache_tracker::stats& cache_stats() const {
+        return cache.shared_tracker.get_stats();
+    }
+};
+
+// Distinct key-value mutations in token order, which is also the order a reader produces them in.
+std::vector<mutation> make_token_ordered_mutations(schema_ptr schema, size_t count) {
+    std::vector<mutation> ms;
+    for (const auto& key : make_token_ordered_keys(schema, count)) {
+        ms.push_back(make_kv_mutation(schema, key, "value-" + key, api::timestamp_type(1)));
+    }
+    return ms;
+}
+
+dht::partition_range singular_range(const mutation& m) {
+    return dht::partition_range::make_singular(m.decorated_key());
+}
+
+// The range between two mutations, excluding both.
+dht::partition_range range_between(const mutation& lower, const mutation& upper) {
+    using bound = dht::partition_range::bound;
+    return dht::partition_range(bound(dht::ring_position(lower.decorated_key()), false),
+            bound(dht::ring_position(upper.decorated_key()), false));
+}
+
+// Runs a reader test twice: with the partitions read from the log, and with the cache enabled and
+// holding all of them, so that the same assertions check the readers' cache path.
+static void with_and_without_cache(size_t partitions, std::function<void(reader_test_env&, const std::vector<mutation>&)> body) {
+    for (const bool cache_enabled : {false, true}) {
+        reader_test_env env(cache_enabled);
+        auto ms = make_token_ordered_mutations(env.schema, partitions);
+        env.populate(ms);
+        if (cache_enabled) {
+            for (const auto& m : ms) {
+                assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+            }
+        }
+        body(env, ms);
+    }
+}
+
+// A reader stops at the buffer size the caller asked for, between any two fragments, those inside
+// a partition included. Without that, a caller that shrank its buffer is served a whole partition
+// in one fill.
+SEASTAR_THREAD_TEST_CASE(test_logstor_readers_honor_max_buffer_size) {
+    // Fills the reader with the smallest buffer bound there is and tells whether it stopped short
+    // of the end of the partition it was on. A reader that ignores the bound hands over the whole
+    // partition, its end included, in one go.
+    auto stops_inside_the_partition = [] (mutation_reader rd) {
+        rd.set_max_buffer_size(1);
+        rd.fill_buffer().get();
+        bool saw_partition_end = false;
+        while (!rd.is_buffer_empty()) {
+            saw_partition_end |= rd.pop_mutation_fragment().is_end_of_partition();
+        }
+        rd.close().get();
+        return !saw_partition_end;
+    };
+
+    with_and_without_cache(2, [&] (reader_test_env& env, const std::vector<mutation>& ms) {
+        BOOST_REQUIRE(stops_inside_the_partition(env.make_reader(singular_range(ms[0]))));
+        BOOST_REQUIRE(stops_inside_the_partition(env.make_reader(query::full_partition_range)));
+    });
+}
+
+// Checks that a reader over a singular partition range honors the mutation_reader
+// contract: next_partition() called before the partition was entered must not skip
+// it, a caller that may fast-forward the reader is served the following ranges, and
+// a forwarding reader produces a partition in clustering sub-streams.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_partition_navigation) {
+    reader_test_env env;
+    auto ms = make_token_ordered_mutations(env.schema, 2);
+    env.populate(ms);
+
+    const auto& first = ms[0];
+    const auto& second = ms[1];
+
+    assert_that(env.make_reader(singular_range(first)))
+            .produces(first)
+            .produces_end_of_stream();
+
+    // next_partition() before the partition was entered must not skip it.
+    assert_that(env.make_reader(singular_range(first)))
+            .next_partition()
+            .produces_partition_start(first.decorated_key())
+            .next_partition()
+            .produces_end_of_stream();
+
+    // A reader that may be fast-forwarded has to serve the ranges it is moved to, so a
+    // single-partition reader must not be used for it: make_reader() hands out the range
+    // reader instead, which serves a singular range too.
+    assert_that(env.make_reader(singular_range(first), streamed_mutation::forwarding::no, mutation_reader::forwarding::yes))
+            .produces(first)
+            .produces_end_of_stream()
+            .fast_forward_to(singular_range(second))
+            .produces(second)
+            .produces_end_of_stream();
+
+    // In forwarding mode the partition is produced in clustering sub-streams.
+    assert_that(env.make_reader(singular_range(first), streamed_mutation::forwarding::yes))
+            .produces_partition_start(first.decorated_key())
+            .produces_end_of_stream()
+            .fast_forward_to(position_range::all_clustered_rows())
+            .produces_row_with_key(clustering_key::make_empty())
+            .produces_end_of_stream();
+}
+
+// Checks that next_partition() does not skip a partition when the reader's buffer ran out right
+// at the end of the previous one, and that it does skip what is left of a partition the reader
+// is in the middle of.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_next_partition_at_buffer_boundary) {
+    with_and_without_cache(4, [] (reader_test_env& env, const std::vector<mutation>& ms) {
+
+        // A buffer this small holds a single fragment, so the reader runs out of buffer at every
+        // fragment boundary, the ones inside a partition included.
+        auto at_partition_end = env.make_reader(query::full_partition_range);
+        at_partition_end.set_max_buffer_size(1);
+        auto at_partition_end_assertions = assert_that(std::move(at_partition_end));
+        for (const auto& m : ms) {
+            at_partition_end_assertions.produces_partition_start(m.decorated_key())
+                    .produces_row_with_key(clustering_key::make_empty())
+                    .produces_partition_end()
+                    .next_partition();
+        }
+        at_partition_end_assertions.produces_end_of_stream();
+
+        // Called with the partition entered but not consumed, next_partition() drops the rest of it
+        // and moves on to the one that follows.
+        auto mid_partition = env.make_reader(query::full_partition_range);
+        mid_partition.set_max_buffer_size(1);
+        auto mid_partition_assertions = assert_that(std::move(mid_partition));
+        for (const auto& m : ms) {
+            mid_partition_assertions.produces_partition_start(m.decorated_key())
+                    .next_partition();
+        }
+        mid_partition_assertions.produces_end_of_stream();
+    });
+}
+
+// Checks that the range reader serves the bounds of the partition range it was given. It scans
+// the index by token, with both ends of the token range inclusive, so keys that fall outside the
+// range have to be filtered out by key once their records were read.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_honors_partition_range_bounds) {
+    using bound = dht::partition_range::bound;
+
+    with_and_without_cache(5, [] (reader_test_env& env, const std::vector<mutation>& ms) {
+
+        auto pos = [] (const mutation& m) { return dht::ring_position(m.decorated_key()); };
+
+        assert_that(env.make_reader(query::full_partition_range))
+                .produces(ms)
+                .produces_end_of_stream();
+
+        // [1, 3]
+        assert_that(env.make_reader(dht::partition_range(bound(pos(ms[1]), true), bound(pos(ms[3]), true))))
+                .produces(ms[1])
+                .produces(ms[2])
+                .produces(ms[3])
+                .produces_end_of_stream();
+
+        // (1, 3)
+        assert_that(env.make_reader(dht::partition_range(bound(pos(ms[1]), false), bound(pos(ms[3]), false))))
+                .produces(ms[2])
+                .produces_end_of_stream();
+
+        // (-inf, 1]
+        assert_that(env.make_reader(dht::partition_range(std::nullopt, bound(pos(ms[1]), true))))
+                .produces(ms[0])
+                .produces(ms[1])
+                .produces_end_of_stream();
+
+        // [3, +inf)
+        assert_that(env.make_reader(dht::partition_range(bound(pos(ms[3]), true), std::nullopt)))
+                .produces(ms[3])
+                .produces(ms[4])
+                .produces_end_of_stream();
+
+        // Bounds given by token only, without a key.
+        assert_that(env.make_reader(dht::partition_range(
+                        bound(dht::ring_position::starting_at(ms[2].token()), true),
+                        bound(dht::ring_position::ending_at(ms[3].token()), true))))
+                .produces(ms[2])
+                .produces(ms[3])
+                .produces_end_of_stream();
+    });
+}
+
+// Checks that a reader that may be fast-forwarded serves every range it is moved to, including
+// ranges that hold nothing and ranges it is moved to before the current partition was consumed.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_fast_forward_to) {
+    with_and_without_cache(5, [] (reader_test_env& env, const std::vector<mutation>& ms) {
+
+        auto make_forwardable_reader = [&] {
+            return env.make_reader(singular_range(ms[0]), streamed_mutation::forwarding::no,
+                    mutation_reader::forwarding::yes);
+        };
+
+        assert_that(make_forwardable_reader())
+                .produces(ms[0])
+                .produces_end_of_stream()
+                .fast_forward_to(singular_range(ms[2]))
+                .produces(ms[2])
+                .produces_end_of_stream()
+                .fast_forward_to(singular_range(ms[4]))
+                .produces(ms[4])
+                .produces_end_of_stream();
+
+        // A range with nothing in it is served as an empty stream, and does not end the reader:
+        // it still serves the range it is moved to next.
+        assert_that(make_forwardable_reader())
+                .produces(ms[0])
+                .produces_end_of_stream()
+                .fast_forward_to(range_between(ms[1], ms[2]))
+                .produces_end_of_stream()
+                .fast_forward_to(singular_range(ms[3]))
+                .produces(ms[3])
+                .produces_end_of_stream();
+
+        // Forwarding out of a partition that was entered but not consumed.
+        auto mid_partition = make_forwardable_reader();
+        mid_partition.set_max_buffer_size(1);
+        assert_that(std::move(mid_partition))
+                .produces_partition_start(ms[0].decorated_key())
+                .fast_forward_to(singular_range(ms[1]))
+                .produces(ms[1])
+                .produces_end_of_stream();
+    });
+}
+
+// The index scan hands the reader one batch of entries at a time, so a scan of more partitions
+// than a batch holds has to carry on across batches without dropping, repeating or reordering a
+// partition.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_scans_across_index_batches) {
+    // Comfortably more than the reader's read-ahead, so the scan takes several batches.
+    with_and_without_cache(25, [] (reader_test_env& env, const std::vector<mutation>& ms) {
+
+        assert_that(env.make_reader(query::full_partition_range))
+                .produces(ms)
+                .produces_end_of_stream();
+
+        assert_that(env.make_reader(query::full_partition_range)).has_monotonic_positions();
+    });
+}
+
+// Checks that a range reader in forwarding mode produces every partition in clustering
+// sub-streams, and that next_partition() is what moves it to the next partition.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_streamed_mutation_forwarding) {
+    with_and_without_cache(3, [] (reader_test_env& env, const std::vector<mutation>& ms) {
+
+        auto assertions = assert_that(env.make_reader(query::full_partition_range, streamed_mutation::forwarding::yes));
+        for (const auto& m : ms) {
+            assertions.produces_partition_start(m.decorated_key())
+                    .produces_end_of_stream()
+                    .fast_forward_to(position_range::all_clustered_rows())
+                    .produces_row_with_key(clustering_key::make_empty())
+                    .produces_end_of_stream()
+                    .next_partition();
+        }
+        assertions.produces_end_of_stream();
+    });
+}
+
+// Checks that a range holding no key ends the stream right away, whether the key it asks for was
+// never written or the range simply falls between two keys that were.
+SEASTAR_THREAD_TEST_CASE(test_logstor_reader_produces_nothing_for_empty_ranges) {
+    for (const bool cache_enabled : {false, true}) {
+        reader_test_env env(cache_enabled);
+        auto ms = make_token_ordered_mutations(env.schema, 3);
+        // Everything but the middle mutation, so that its key is the one missing from a populated index.
+        const std::array written = {ms[0], ms[2]};
+        env.populate(written);
+        if (cache_enabled) {
+            for (const auto& m : written) {
+                assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+            }
+        }
+
+        assert_that(env.make_reader(singular_range(ms[1])))
+                .produces_end_of_stream();
+
+        assert_that(env.make_reader(singular_range(ms[1]), streamed_mutation::forwarding::no, mutation_reader::forwarding::yes))
+                .produces_end_of_stream();
+
+        // The keys that were written bound this range without being in it, so the reader has to
+        // take their partitions - from the log or from the cache - and then filter both of them out.
+        assert_that(env.make_reader(range_between(ms[0], ms[2])))
+                .produces_end_of_stream();
+    }
+}
+
+// get_memory_usage() counts the B+tree, get_entries_memory_usage() does not, so it has to be the
+// larger of the two and it has to follow the index up and back down.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
+    auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
+
+    // The tree builds its root on the first insert, so an untouched index holds nothing.
+    BOOST_REQUIRE_EQUAL(index.get_entries_memory_usage(), 0u);
+    BOOST_REQUIRE_EQUAL(index.get_memory_usage(), 0u);
+
+    constexpr size_t key_count = 2000;
+    std::vector<primary_index_key> keys;
+    keys.reserve(key_count);
+    for (size_t i = 0; i < key_count; ++i) {
+        keys.push_back(make_index_key(*schema, make_kv_mutation(schema, format("pk{:06d}", i), "v").decorated_key()));
+    }
+
+    for (size_t i = 0; i < key_count; ++i) {
+        index.insert(keys[i], index_entry{
+                .location = record_location{.segment = log_segment_id{1}, .offset = uint32_t(i * 64), .size = 32},
+                .timestamp = api::timestamp_type(i + 1)});
+    }
+    BOOST_REQUIRE_EQUAL(index.get_key_count(), key_count);
+
+    const size_t entries = index.get_entries_memory_usage();
+    const size_t allocated = index.get_memory_usage();
+    BOOST_REQUIRE_GT(entries, 0u);
+    BOOST_REQUIRE_GT(allocated, entries);
+    testlog.info("primary index over {} keys: entries {} bytes, allocated {} bytes", key_count, entries, allocated);
+
+    // Erasing gives back both.
+    for (size_t i = 0; i < key_count / 2; ++i) {
+        BOOST_REQUIRE(index.erase(keys[i],
+                record_location{.segment = log_segment_id{1}, .offset = uint32_t(i * 64), .size = 32}));
+    }
+    BOOST_REQUIRE_LT(index.get_entries_memory_usage(), entries);
+    BOOST_REQUIRE_LT(index.get_memory_usage(), allocated);
+    BOOST_REQUIRE_GT(index.get_memory_usage(), index.get_entries_memory_usage());
+
+    // Clearing gives back everything but the root, which an element-wise erase leaves standing.
+    // More than that left behind would mean the accounting had drifted.
+    index.clear().get();
+    BOOST_REQUIRE_EQUAL(index.get_key_count(), 0u);
+    BOOST_REQUIRE_EQUAL(index.get_entries_memory_usage(), 0u);
+    const size_t after_clear = index.get_memory_usage();
+    testlog.info("primary index after clear: allocated {} bytes", after_clear);
+}
+
+// The shapes a logstor partition takes, on the key-value schema: a live row, a row with a row
+// tombstone older than its marker, a row whose marker and cell expire, a row whose marker is dead,
+// and a partition that is only a tombstone. One per key, in token order.
+static std::vector<mutation> make_partition_shapes(schema_ptr schema) {
+    const auto ts = api::timestamp_type(7);
+    const auto now = gc_clock::now();
+    auto keys = make_token_ordered_keys(schema, 5);
+    std::vector<mutation> ms;
+
+    ms.push_back(make_kv_mutation(schema, keys[0], "live", ts));
+
+    auto shadowed = make_kv_mutation(schema, keys[1], "shadowed", ts);
+    shadowed.partition().clustered_row(*schema, clustering_key::make_empty()).apply(row_tombstone(tombstone(ts - 1, now)));
+    ms.push_back(std::move(shadowed));
+
+    mutation expiring(schema, make_kv_mutation(schema, keys[2], "", ts).decorated_key());
+    {
+        auto& row = expiring.partition().clustered_row(*schema, clustering_key::make_empty());
+        row.apply(row_marker(ts, std::chrono::hours(1), now + std::chrono::hours(1)));
+        const auto& v_def = *schema->get_column_definition("v");
+        row.cells().apply(v_def, atomic_cell::make_live(*v_def.type, ts, serialized(sstring("expiring")),
+                now + std::chrono::hours(1), std::chrono::hours(1)));
+    }
+    ms.push_back(std::move(expiring));
+
+    mutation dead_marker(schema, make_kv_mutation(schema, keys[3], "", ts).decorated_key());
+    dead_marker.partition().clustered_row(*schema, clustering_key::make_empty()).apply(row_marker(tombstone(ts, now)));
+    ms.push_back(std::move(dead_marker));
+
+    mutation deleted(schema, make_kv_mutation(schema, keys[4], "", ts).decorated_key());
+    deleted.partition().apply(tombstone(ts, now));
+    ms.push_back(std::move(deleted));
+
+    return ms;
+}
+
+// Drains two readers side by side and requires them to produce the same fragments.
+static void require_same_fragments(const schema& s, mutation_reader actual, mutation_reader expected) {
+    auto close_actual = deferred_close(actual);
+    auto close_expected = deferred_close(expected);
+    while (auto expected_mf = expected().get()) {
+        auto actual_mf = actual().get();
+        BOOST_REQUIRE(actual_mf);
+        BOOST_REQUIRE(actual_mf->equal(s, *expected_mf));
+    }
+    BOOST_REQUIRE(!actual().get());
+}
+
+// A read of a key the cache holds is served from it, straight into the reader's buffer, and
+// produces what a read that bypasses the cache produces - for every shape a partition takes.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_serves_a_hit_from_the_cache) {
+    reader_test_env env(true);
+    auto ms = make_partition_shapes(env.schema);
+    env.populate(ms);
+
+    auto bypassing = partition_slice_builder(*env.schema).with_option<query::partition_slice::option::bypass_cache>().build();
+
+    const auto& stats = env.cache_stats();
+    for (const auto& m : ms) {
+        const auto hits = stats.partition_hits;
+        const auto misses = stats.partition_misses;
+
+        // The first read misses and admits the partition.
+        assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+        BOOST_REQUIRE_EQUAL(stats.partition_misses, misses + 1);
+        BOOST_REQUIRE_EQUAL(stats.partition_hits, hits);
+
+        // The second is a hit, and produces the same fragments as a read that goes to the log.
+        require_same_fragments(*env.schema, env.make_reader(singular_range(m)), env.make_reader(singular_range(m), bypassing));
+        BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + 1);
+        BOOST_REQUIRE_EQUAL(stats.partition_misses, misses + 1);
+    }
+}
+
+// A hit honors the buffer bound like any other read: with the smallest bound each fill_buffer()
+// delivers one fragment, and the fragments not delivered yet wait for the next call. The row is
+// charged to the permit while it waits, and the charge is released when the row is pushed.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_hit_honors_max_buffer_size) {
+    reader_test_env env(true);
+    auto ms = make_token_ordered_mutations(env.schema, 1);
+    env.populate(ms);
+    assert_that(env.make_reader(singular_range(ms[0]))).produces(ms[0]).produces_end_of_stream();
+
+    const auto hits = env.cache_stats().partition_hits;
+    auto rd = env.make_reader(singular_range(ms[0]));
+    auto close_rd = deferred_close(rd);
+    rd.set_max_buffer_size(1);
+
+    std::vector<mutation_fragment_v2::kind> kinds;
+    // The memory charged to the permit after each fill, when the fragments of the fill are gone.
+    std::vector<ssize_t> memory;
+    while (!rd.is_end_of_stream()) {
+        rd.fill_buffer().get();
+        while (!rd.is_buffer_empty()) {
+            kinds.push_back(rd.pop_mutation_fragment().mutation_fragment_kind());
+        }
+        memory.push_back(rd.permit().consumed_resources().memory);
+    }
+    BOOST_REQUIRE_EQUAL(env.cache_stats().partition_hits, hits + 1);
+    BOOST_REQUIRE_EQUAL(memory.size(), 3);
+    const std::vector<mutation_fragment_v2::kind> expected{
+        mutation_fragment_v2::kind::partition_start,
+        mutation_fragment_v2::kind::clustering_row,
+        mutation_fragment_v2::kind::partition_end,
+    };
+    BOOST_REQUIRE(kinds == expected);
+    BOOST_REQUIRE_GT(memory[0], memory[1]);
+    BOOST_REQUIRE_EQUAL(memory[1], memory[2]);
+}
+
+// A cached partition that does not carry the key it was looked up by - a hash collision, or a
+// corruption - is rejected by the reader with key_mismatch_error.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_rejects_a_cached_partition_of_another_key) {
+    reader_test_env env(true);
+    auto ms = make_token_ordered_mutations(env.schema, 2);
+    env.populate(ms);
+
+    auto& index = env.cg->logstor_index();
+    primary_index_key key(ms[0].decorated_key());
+    auto entry = index.get(key);
+    BOOST_REQUIRE(entry);
+    BOOST_REQUIRE(index.populate_cache(key, entry->location, ms[1].schema(), ms[1].key(), to_single_row_partition(mutation(ms[1]))));
+
+    auto rd = env.make_reader(singular_range(ms[0]));
+    auto close_rd = deferred_close(rd);
+    BOOST_REQUIRE_THROW(rd.fill_buffer().get(), key_mismatch_error);
+}
+
+// An eviction between two reads turns the second into a miss, which admits the partition again.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_misses_after_an_eviction) {
+    reader_test_env env(true);
+    auto ms = make_token_ordered_mutations(env.schema, 1);
+    env.populate(ms);
+    const auto& m = ms[0];
+    const auto& stats = env.cache_stats();
+
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 1);
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, 1);
+
+    // The one cached partition goes with the cache's contents.
+    env.cg->logstor_index().drain_cache().get();
+
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, 2);
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 2);
+}
+
+// The reader contract over a cached partition: next_partition() before the partition was entered
+// does not skip it, and a forwarding reader produces it in clustering sub-streams.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_partition_navigation_on_a_hit) {
+    reader_test_env env(true);
+    auto ms = make_token_ordered_mutations(env.schema, 1);
+    env.populate(ms);
+    const auto& first = ms[0];
+    assert_that(env.make_reader(singular_range(first))).produces(first).produces_end_of_stream();
+    const auto hits = env.cache_stats().partition_hits;
+
+    assert_that(env.make_reader(singular_range(first)))
+            .next_partition()
+            .produces_partition_start(first.decorated_key())
+            .next_partition()
+            .produces_end_of_stream();
+
+    assert_that(env.make_reader(singular_range(first), streamed_mutation::forwarding::yes))
+            .produces_partition_start(first.decorated_key())
+            .produces_end_of_stream()
+            .fast_forward_to(position_range::all_clustered_rows())
+            .produces_row_with_key(clustering_key::make_empty())
+            .produces_end_of_stream();
+
+    BOOST_REQUIRE_EQUAL(env.cache_stats().partition_hits, hits + 2);
+}
+
+// The partition of a hit is built inside the cache's allocating section and pushed outside it, so
+// an allocation failure that makes the section retry duplicates nothing: whatever allocation
+// fails, a read that completes produces exactly one partition.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_hit_survives_allocation_failures) {
+    reader_test_env env(true);
+    auto ms = make_token_ordered_mutations(env.schema, 1);
+    env.populate(ms);
+    assert_that(env.make_reader(singular_range(ms[0]))).produces(ms[0]).produces_end_of_stream();
+
+    memory::with_allocation_failures([&] {
+        auto rd = env.make_reader(singular_range(ms[0]));
+        auto close_rd = deferred_close(rd);
+        // The hit path does not yield, so this neither suspends the thread nor lets another task
+        // consume the injected failure.
+        rd.fill_buffer().get();
+        unsigned partition_starts = 0;
+        unsigned rows = 0;
+        while (!rd.is_buffer_empty()) {
+            auto mf = rd.pop_mutation_fragment();
+            partition_starts += mf.is_partition_start();
+            rows += mf.is_clustering_row();
+        }
+        BOOST_REQUIRE_EQUAL(partition_starts, 1);
+        BOOST_REQUIRE_EQUAL(rows, 1);
+        BOOST_REQUIRE(rd.is_end_of_stream());
+    });
+}
+
+// The schema registry of the shard, initialized the way a node's is: what a reversed read needs,
+// since the reversed schema of a table comes from it.
+struct schema_registry_init {
+    std::unique_ptr<db::config> config = std::make_unique<db::config>();
+    gms::feature_service fs{{get_disabled_features_from_db_config(*config)}};
+    schema_registry_init() {
+        local_schema_registry().init(db::schema_ctxt(config->extensions(), config->murmur3_partitioner_ignore_msb_bits(),
+                std::make_shared<data_dictionary::dummy_user_types_storage>(), fs),
+                std::chrono::seconds(config->schema_registry_grace_period()));
+    }
+};
+
+// A reversed read comes under the reversed schema, and a table without clustering columns has
+// nothing to reverse: it produces what the forward read does, from the log and from the cache, and
+// the cache serves it as it serves the forward read - a reversed read of a cached key is a hit,
+// and so is the forward read that follows it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_serves_a_reversed_read) {
+    // Registered, as a table's schema is, so that the reversed schema is the registry's and knows
+    // the table's as its own reverse.
+    schema_registry_init registry;
+    reader_test_env env(true, local_schema_registry().learn(make_kv_schema()));
+    auto ms = make_partition_shapes(env.schema);
+    env.populate(ms);
+
+    auto reversed_schema = env.schema->get_reversed();
+    BOOST_REQUIRE(reversed_schema->get_reversed() == env.schema);
+    auto reversed = partition_slice_builder(*reversed_schema).with_option<query::partition_slice::option::reversed>().build();
+    auto reversed_bypassing = partition_slice_builder(*reversed_schema, reversed).with_option<query::partition_slice::option::bypass_cache>().build();
+
+    const auto& stats = env.cache_stats();
+    for (const auto& m : ms) {
+        const auto hits = stats.partition_hits;
+        const auto misses = stats.partition_misses;
+
+        // The forward read, drained first, misses and admits the partition; the reversed read that
+        // follows is a hit, and produces the same fragments.
+        require_same_fragments(*env.schema, env.make_reader(reversed_schema, singular_range(m), reversed),
+                env.make_reader(singular_range(m)));
+        BOOST_REQUIRE_EQUAL(stats.partition_misses, misses + 1);
+        BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + 1);
+
+        // A reversed hit produces what a reversed read of the log does, and the forward read
+        // after it is a hit too.
+        require_same_fragments(*env.schema, env.make_reader(reversed_schema, singular_range(m), reversed),
+                env.make_reader(reversed_schema, singular_range(m), reversed_bypassing));
+        assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+        BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + 3);
+        BOOST_REQUIRE_EQUAL(stats.partition_misses, misses + 1);
+    }
+}
+
+// A slice whose row ranges exclude the one row a logstor partition has - an empty list of ranges,
+// since a logstor schema has no clustering columns for a range to be built on - gets the partition
+// without its row, from the log and from the cache alike.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_drops_the_row_the_slice_excludes) {
+    reader_test_env env(true);
+    auto ms = make_token_ordered_mutations(env.schema, 1);
+    env.populate(ms);
+    const auto& m = ms[0];
+
+    auto no_rows = partition_slice_builder(*env.schema).with_ranges({}).build();
+    const auto& stats = env.cache_stats();
+    const auto misses = stats.partition_misses;
+    const auto hits = stats.partition_hits;
+    for (unsigned read = 0; read < 2; ++read) {
+        assert_that(env.make_reader(singular_range(m), no_rows))
+                .produces_partition_start(m.decorated_key())
+                .produces_partition_end()
+                .produces_end_of_stream();
+    }
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, misses + 1);
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + 1);
+}
+
+// A range read of cached partitions serves them from the cache, counting a hit per partition, and
+// produces what a read that bypasses the cache produces - for every shape a partition takes.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_hits_from_the_cache) {
+    reader_test_env env(true);
+    auto ms = make_partition_shapes(env.schema);
+    env.populate(ms);
+    for (const auto& m : ms) {
+        assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    }
+
+    auto bypassing = partition_slice_builder(*env.schema).with_option<query::partition_slice::option::bypass_cache>().build();
+    const auto& stats = env.cache_stats();
+    const auto hits = stats.partition_hits;
+    const auto misses = stats.partition_misses;
+    require_same_fragments(*env.schema, env.make_reader(query::full_partition_range),
+            env.make_reader(query::full_partition_range, bypassing));
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}
+
+// A reversed range read comes under the reversed schema, and produces what the forward read does,
+// from the log and from the cache. Its reads of the cache are hits.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
+    // Registered, as a table's schema is, so that the reversed schema is the registry's and knows
+    // the table's as its own reverse.
+    schema_registry_init registry;
+    reader_test_env env(true, local_schema_registry().learn(make_kv_schema()));
+    auto ms = make_partition_shapes(env.schema);
+    env.populate(ms);
+
+    auto reversed_schema = env.schema->get_reversed();
+    auto reversed = partition_slice_builder(*reversed_schema).with_option<query::partition_slice::option::reversed>().build();
+    auto bypassing = partition_slice_builder(*env.schema).with_option<query::partition_slice::option::bypass_cache>().build();
+
+    // A range read does not populate the cache, so both reads go to the log.
+    require_same_fragments(*env.schema, env.make_reader(reversed_schema, query::full_partition_range, reversed),
+            env.make_reader(query::full_partition_range, bypassing));
+
+    for (const auto& m : ms) {
+        assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    }
+    const auto& stats = env.cache_stats();
+    const auto hits = stats.partition_hits;
+    const auto misses = stats.partition_misses;
+    require_same_fragments(*env.schema, env.make_reader(reversed_schema, query::full_partition_range, reversed),
+            env.make_reader(query::full_partition_range, bypassing));
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}

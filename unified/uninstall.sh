@@ -4,10 +4,12 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
 set -e
+
+trap 'echo "error $? in $0 line $LINENO"' ERR
 
 if [ -z "$BASH_VERSION" ]; then
     echo "Unsupported shell, please run this script on bash."
@@ -46,7 +48,6 @@ if ! $nonroot; then
     rsystemd="$rusr/lib/systemd/system"
     rdoc="$rprefix/share/doc"
     rdata="$root/var/lib/scylla"
-    rhkdata="$root/var/lib/scylla-housekeeping"
 else
     sysconfdir=/etc/sysconfig
     retc="$rprefix/etc"
@@ -62,8 +63,9 @@ if ! $nonroot; then
     rm -fv "$retc"/bash_completion.d/nodetool-completion
     rm -fv "$retc"/supervisord.d/scylla-*.ini
     rm -fv "$rusr"/lib/sysctl.d/99-scylla-*.conf
+    rm -fv "$retc"/sysctl.d/99-scylla-tcp.conf
     rm -fv "$rusr"/bin/{scylla,iotune,scyllatop}
-    rm -fv "$rusr"/sbin/{scylla_*setup,node_exporter_install,node_health_check,scylla_ec2_check,scylla_kernel_check}
+    rm -fv "$rusr"/sbin/{scylla_*setup,node_health_check,scylla_ec2_check,scylla_kernel_check}
     find "$rusr"/lib/scylla -type l -exec rm -fv {} \;
 else
     rm -rfv "$rsystemd"/scylla-*.service.d

@@ -3,51 +3,124 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include "counters.hh"
+#include "mutation/counters.hh"
 #include "commitlog_entry.hh"
-#include "idl/uuid.dist.hh"
-#include "idl/keys.dist.hh"
-#include "idl/frozen_mutation.dist.hh"
-#include "idl/mutation.dist.hh"
 #include "idl/commitlog.dist.hh"
-#include "serializer_impl.hh"
-#include "serialization_visitors.hh"
-#include "idl/uuid.dist.impl.hh"
-#include "idl/keys.dist.impl.hh"
-#include "idl/frozen_mutation.dist.impl.hh"
-#include "idl/mutation.dist.impl.hh"
 #include "idl/commitlog.dist.impl.hh"
-
+#include "idl/mutation.dist.hh"
+#include "idl/mutation.dist.impl.hh"
+#include "idl/raft_storage.dist.hh"
+#include "idl/raft_storage.dist.impl.hh"
 #include <seastar/core/simple-stream.hh>
 
 template<typename Output>
-void commitlog_entry_writer::serialize(Output& out) const {
-    [this, wr = ser::writer_of_commitlog_entry<Output>(out)] () mutable {
-        if (_with_schema) {
-            return std::move(wr).write_mapping(_schema->get_column_mapping());
-        } else {
-            return std::move(wr).skip_mapping();
-        }
-    }().write_mutation(_mutation).end_commitlog_entry();
+void commitlog_mutation_entry_writer::serialize(Output& out) const {
+    auto write_mut = [this](auto wr) {
+        auto after_mapping = _with_schema
+            ? std::move(wr).write_mapping(_schema->get_column_mapping())
+            : std::move(wr).skip_mapping();
+        return std::move(after_mapping).write_mutation(_mutation).end_mutation_entry();
+    };
+    if (use_variant_commitlog_entry_format()) {
+        write_mut(ser::writer_of_commitlog_entry<Output>(out).start_item_mutation_entry()).end_commitlog_entry();
+    } else {
+        write_mut(ser::writer_of_mutation_entry<Output>(out));
+    }
 }
 
-void commitlog_entry_writer::compute_size() {
+void commitlog_mutation_entry_writer::write(ostream& out) const {
+    serialize(out);
+}
+
+void commitlog_mutation_entry_writer::compute_size() {
     seastar::measuring_output_stream ms;
     serialize(ms);
     _size = ms.size();
 }
 
-void commitlog_entry_writer::write(typename seastar::memory_output_stream<std::vector<temporary_buffer<char>>::iterator>& out) const {
+
+template<typename Output>
+inline void commitlog_raft_batch_writer::serialize(Output& out) const {
+    auto entries = ser::writer_of_commitlog_entry<Output>(out)
+            .start_item_raft_commitlog_batch()
+            .write_group_id(_group_id)
+            .write_commit_idx(_commit_idx)
+            .start_entries();
+    for (const auto& entry : _entries) {
+        entries.add_entries(entry);
+    }
+    std::move(entries).end_entries().end_raft_commitlog_batch().end_commitlog_entry();
+}
+
+void commitlog_raft_batch_writer::write(ostream& out) const {
     serialize(out);
 }
 
-commitlog_entry_reader::commitlog_entry_reader(const fragmented_temporary_buffer& buffer)
-    : _ce([&] {
+namespace {
+auto read_variant_commitlog_entry(const fragmented_temporary_buffer& buffer) {
+    // XXX this is copying of the data, but since this is not critical path, only used during replay from commitlog,
+    // we can tolerate this for now. Should be fixed when we fix IDL generator to support deserialization directly from
+    // fragmented buffers.
+    bytes_ostream bo;
+    for (bytes_view frag : fragment_range(fragmented_temporary_buffer::view(buffer))) {
+        bo.write(reinterpret_cast<const char*>(frag.data()), frag.size());
+    }
+    auto in = ser::as_input_stream(bo);
+
+    // Note: we use the 'view' deserializer here because calling
+    // `ser::deserialize(in, std::type_identity<ser::commitlog_entry>())`
+    // would use the "manual" deserializer, which is not binary-compatible
+    // with the format produced by `ser::writer_of_commitlog_entry`.
+    // See issue: https://scylladb.atlassian.net/browse/SCYLLADB-1029
+    //
+    // For the same reason, we cannot rely on the implicit conversion from
+    // `ser::commitlog_entry_view` to `commitlog_entry` using
+    // `operator commitlog_entry()` since that conversion
+    // is also implemented using the "manual" deserializer.
+    auto view = ser::deserialize(in, std::type_identity<ser::commitlog_entry_view>());
+    return seastar::visit(
+            view.item(),
+            [](const ser::raft_commitlog_batch_view& batch_view) {
+                // Past this point the entry is a raft batch, whatever the payload
+                // turns out to be.
+                try {
+                    return commitlog_entry{.item = raft_commitlog_batch(batch_view)};
+                } catch (...) {
+                    std::throw_with_nested(
+                            raft_batch_decode_error("cannot decode the raft batch in a commitlog entry"));
+                }
+            },
+            [](const ser::mutation_entry_view& entry_view) {
+                return commitlog_entry{.item = mutation_entry(entry_view.mapping(), entry_view.mutation())};
+            },
+            [](ser::unknown_variant_type) -> commitlog_entry {
+                throw std::runtime_error("Unknown variant type in commitlog entry");
+            });
+}
+auto read_mutation_commitlog_entry(const fragmented_temporary_buffer& buffer) {
     auto in = seastar::fragmented_memory_input_stream(fragmented_temporary_buffer::view(buffer).begin(), buffer.size_bytes());
-    return ser::deserialize(in, boost::type<commitlog_entry>());
-}())
-{
+    auto e = ser::deserialize(in, std::type_identity<mutation_entry>());
+    return commitlog_entry{.item = mutation_entry(e.mapping(), frozen_mutation(e.mutation()))};
+}
+} // namespace
+
+commitlog_entry_reader::commitlog_entry_reader(const fragmented_temporary_buffer& buffer, detail::commitlog_entry_serialization_format format)
+    : _entry(format == detail::commitlog_entry_serialization_format::variant ? read_variant_commitlog_entry(buffer) : read_mutation_commitlog_entry(buffer)) {
+}
+
+
+commitlog_mutation_entry_reader::commitlog_mutation_entry_reader(const fragmented_temporary_buffer& buffer)
+    : _me([&] {
+        auto in = seastar::fragmented_memory_input_stream(fragmented_temporary_buffer::view(buffer).begin(), buffer.size_bytes());
+        return ser::deserialize(in, std::type_identity<mutation_entry>());
+    }()) {
+}
+
+void commitlog_raft_batch_writer::compute_size() {
+    seastar::measuring_output_stream ms;
+    serialize(ms);
+    _size = ms.size();
 }

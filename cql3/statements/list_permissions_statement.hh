@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright 2016-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -35,14 +32,16 @@ private:
 public:
     list_permissions_statement(auth::permission_set, std::optional<auth::resource>, std::optional<sstring>, bool);
 
-    std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
+    std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
+
+    virtual seastar::shared_ptr<const metadata> get_result_metadata() const override;
 
     void validate(query_processor&, const service::client_state&) const override;
 
     future<> check_access(query_processor& qp, const service::client_state&) const override;
 
     future<::shared_ptr<cql_transport::messages::result_message>>
-    execute(query_processor&, service::query_state& , const query_options&) const override;
+    execute(query_processor&, service::query_state& , const query_options&, std::optional<service::group0_guard> guard) const override;
 };
 
 }

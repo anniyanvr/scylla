@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,17 +11,20 @@
 #include <vector>
 
 #include <seastar/core/iostream.hh>
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/simple-stream.hh>
 
 #include "bytes.hh"
 #include "bytes_ostream.hh"
+#include "contiguous_shared_buffer.hh"
 #include "fragment_range.hh"
+#include "result.hh"
 
-/// Fragmented buffer consisting of multiple temporary_buffer<char>
-class fragmented_temporary_buffer {
-    using vector_type = std::vector<seastar::temporary_buffer<char>>;
+/// Fragmented buffer consisting of multiple Buffer objects.
+template <ContiguousSharedBuffer Buffer>
+class basic_fragmented_buffer {
+    using vector_type = std::vector<Buffer>;
     vector_type _fragments;
     size_t _size_bytes = 0;
 public:
@@ -30,13 +33,23 @@ public:
     class view;
     class istream;
     class reader;
-    using ostream = seastar::memory_output_stream<vector_type::iterator>;
+    using ostream = seastar::memory_output_stream<typename vector_type::iterator>;
 
-    fragmented_temporary_buffer() = default;
+    basic_fragmented_buffer() = default;
 
-    fragmented_temporary_buffer(std::vector<seastar::temporary_buffer<char>> fragments, size_t size_bytes) noexcept
+    basic_fragmented_buffer(std::vector<Buffer> fragments, size_t size_bytes) noexcept
         : _fragments(std::move(fragments)), _size_bytes(size_bytes)
     { }
+
+    basic_fragmented_buffer(const char* str, size_t size)
+    {
+        *this = allocate_to_fit(size);
+        size_t pos = 0;
+        for (auto& frag : _fragments) {
+            std::memcpy(frag.get_write(), str + pos, frag.size());
+            pos += frag.size();
+        }
+    }
 
     explicit operator view() const noexcept;
 
@@ -44,10 +57,19 @@ public:
 
     ostream get_ostream() noexcept {
         if (_fragments.size() != 1) {
-            return ostream::fragmented(_fragments.begin(), _size_bytes);
+            return typename ostream::fragmented(_fragments.begin(), _size_bytes);
         }
         auto& current = *_fragments.begin();
-        return ostream::simple(reinterpret_cast<char*>(current.get_write()), current.size());
+        return typename ostream::simple(reinterpret_cast<char*>(current.get_write()), current.size());
+    }
+
+    using const_fragment_iterator = typename vector_type::const_iterator;
+
+    const_fragment_iterator begin() const {
+        return _fragments.begin();
+    }
+    const_fragment_iterator end() const {
+        return _fragments.end();
     }
 
     size_t size_bytes() const { return _size_bytes; }
@@ -81,27 +103,32 @@ public:
         _fragments.erase(it.base(), _fragments.end());
     }
 
-    // Creates a fragmented temporary buffer of a specified size, supplied as a parameter.
+    // Creates a fragmented buffer of a specified size, supplied as a parameter.
     // Max chunk size is limited to 128kb (the same limit as `bytes_stream` has).
-    static fragmented_temporary_buffer allocate_to_fit(size_t data_size) {
+    static basic_fragmented_buffer allocate_to_fit(size_t data_size) {
         constexpr size_t max_fragment_size = default_fragment_size; // 128KB
 
         const size_t full_fragment_count = data_size / max_fragment_size; // number of max-sized fragments
         const size_t last_fragment_size = data_size % max_fragment_size;
 
-        std::vector<seastar::temporary_buffer<char>> fragments;
+        std::vector<Buffer> fragments;
         fragments.reserve(full_fragment_count + !!last_fragment_size);
         for (size_t i = 0; i < full_fragment_count; ++i) {
-            fragments.emplace_back(seastar::temporary_buffer<char>(max_fragment_size));
+            fragments.emplace_back(Buffer(max_fragment_size));
         }
         if (last_fragment_size) {
-            fragments.emplace_back(seastar::temporary_buffer<char>(last_fragment_size));
+            fragments.emplace_back(Buffer(last_fragment_size));
         }
-        return fragmented_temporary_buffer(std::move(fragments), data_size);
+        return basic_fragmented_buffer(std::move(fragments), data_size);
+    }
+
+    vector_type release() && noexcept {
+        return std::move(_fragments);
     }
 };
 
-class fragmented_temporary_buffer::view {
+template <ContiguousSharedBuffer Buffer>
+class basic_fragmented_buffer<Buffer>::view {
     vector_type::const_iterator _current;
     const char* _current_position = nullptr;
     size_t _current_size = 0;
@@ -162,9 +189,6 @@ public:
 
         bool operator==(const iterator& other) const noexcept {
             return _left == other._left;
-        }
-        bool operator!=(const iterator& other) const noexcept {
-            return !(*this == other);
         }
     };
 
@@ -232,7 +256,7 @@ public:
         _current_size = std::min(_current_size, _total_size);
     }
 
-    bool operator==(const fragmented_temporary_buffer::view& other) const noexcept {
+    bool operator==(const basic_fragmented_buffer::view& other) const noexcept {
         auto this_it = begin();
         auto other_it = other.begin();
 
@@ -264,15 +288,15 @@ public:
         }
         return this_it == end() && other_it == other.end();
     }
-
-    bool operator!=(const fragmented_temporary_buffer::view& other) const noexcept {
-        return !(*this == other);
-    }
 };
+
+using fragmented_temporary_buffer = basic_fragmented_buffer<temporary_buffer<char>>;
+
 static_assert(FragmentRange<fragmented_temporary_buffer::view>);
 static_assert(FragmentedView<fragmented_temporary_buffer::view>);
 
-inline fragmented_temporary_buffer::operator view() const noexcept
+template <ContiguousSharedBuffer Buffer>
+inline basic_fragmented_buffer<Buffer>::operator view() const noexcept
 {
     if (!_size_bytes) {
         return view();
@@ -283,13 +307,14 @@ inline fragmented_temporary_buffer::operator view() const noexcept
 namespace fragmented_temporary_buffer_concepts {
 
 template<typename T>
-concept ExceptionThrower = requires(T obj, size_t n) {
-    obj.throw_out_of_range(n, n);
+concept ExceptionCreator = requires(T obj, size_t n) {
+    { obj.out_of_range(n, n) } -> utils::ExceptionPtrResult;
 };
 
 }
 
-class fragmented_temporary_buffer::istream {
+template <ContiguousSharedBuffer Buffer>
+class basic_fragmented_buffer<Buffer>::istream {
     vector_type::const_iterator _current;
     const char* _current_position;
     const char* _current_end;
@@ -310,20 +335,25 @@ private:
         }
     }
 
-    template<typename ExceptionThrower>
-    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
-    void check_out_of_range(ExceptionThrower& exceptions, size_t n) {
-        if (__builtin_expect(bytes_left() < n, false)) {
-            exceptions.throw_out_of_range(n, bytes_left());
+    template<typename ExceptionCreator>
+    requires fragmented_temporary_buffer_concepts::ExceptionCreator<ExceptionCreator>
+    utils::result_with_exception_ptr<void>
+    check_out_of_range(ExceptionCreator& exceptions, size_t n) {
+        if (bytes_left() < n) [[unlikely]] {
+            return exceptions.out_of_range(n, bytes_left());
             // Let's allow skipping this check if the user trusts its input
             // data.
         }
+        return bo::success();
     }
 
-    template<typename T, typename ExceptionThrower>
+    template<typename T, typename ExceptionCreator>
     [[gnu::noinline]] [[gnu::cold]]
-    T read_slow(ExceptionThrower&& exceptions) {
-        check_out_of_range(exceptions, sizeof(T));
+    utils::result_with_exception_ptr<T> read_slow(ExceptionCreator&& exceptions) {
+        auto check = check_out_of_range(exceptions, sizeof(T));
+        if (!check) [[unlikely]] {
+            return bo::failure(std::move(check).assume_error());
+        }
 
         T obj;
         size_t left = sizeof(T);
@@ -354,13 +384,12 @@ private:
         }
     }
 public:
-    struct default_exception_thrower {
-        [[noreturn]] [[gnu::cold]]
-        static void throw_out_of_range(size_t attempted_read, size_t actual_left) {
-            throw std::out_of_range(format("attempted to read {:d} bytes from a {:d} byte buffer", attempted_read, actual_left));
+    struct default_exception_creator {
+        [[gnu::cold]]
+        static utils::result_with_exception_ptr<void> out_of_range(size_t attempted_read, size_t actual_left) {
+            return bo::failure(std::out_of_range(format("attempted to read {:d} bytes from a {:d} byte buffer", attempted_read, actual_left)));
         }
     };
-    static_assert(fragmented_temporary_buffer_concepts::ExceptionThrower<default_exception_thrower>);
 
     istream(const vector_type& fragments, size_t total_size) noexcept
         : _current(fragments.begin())
@@ -374,17 +403,17 @@ public:
     }
 
     void skip(size_t n) noexcept {
-        if (__builtin_expect(contig_remain() < n, false)) {
+        if (contig_remain() < n) [[unlikely]] {
             return skip_slow(n);
         }
         _current_position += n;
     }
 
-    template<typename T, typename ExceptionThrower = default_exception_thrower>
-    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
-    T read(ExceptionThrower&& exceptions = default_exception_thrower()) {
-        if (__builtin_expect(contig_remain() < sizeof(T), false)) {
-            return read_slow<T>(std::forward<ExceptionThrower>(exceptions));
+    template<typename T, typename ExceptionCreator = default_exception_creator>
+    requires fragmented_temporary_buffer_concepts::ExceptionCreator<ExceptionCreator>
+    utils::result_with_exception_ptr<T> read(ExceptionCreator&& exceptions = default_exception_creator()) {
+        if (contig_remain() < sizeof(T)) [[unlikely]] {
+            return read_slow<T>(std::forward<ExceptionCreator>(exceptions));
         }
         T obj;
         std::copy_n(_current_position, sizeof(T), reinterpret_cast<char*>(&obj));
@@ -392,15 +421,18 @@ public:
         return obj;
     }
 
-    template<typename Output, typename ExceptionThrower = default_exception_thrower>
-    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
-    Output read_to(size_t n, Output out, ExceptionThrower&& exceptions = default_exception_thrower()) {
-        if (__builtin_expect(contig_remain() >= n, true)) {
+    template<typename Output, typename ExceptionCreator = default_exception_creator>
+    requires fragmented_temporary_buffer_concepts::ExceptionCreator<ExceptionCreator>
+    utils::result_with_exception_ptr<Output> read_to(size_t n, Output out, ExceptionCreator&& exceptions = default_exception_creator()) {
+        if (contig_remain() >= n) [[likely]] {
             out = std::copy_n(_current_position, n, out);
             _current_position += n;
             return out;
         }
-        check_out_of_range(exceptions, n);
+        auto range = check_out_of_range(exceptions, n);
+        if (!range) [[unlikely]] {
+            return bo::failure(std::move(range).assume_error());
+        }
         out = std::copy(_current_position, _current_end, out);
         n -= _current_end - _current_position;
         next_fragment();
@@ -414,15 +446,18 @@ public:
         return out;
     }
 
-    template<typename ExceptionThrower = default_exception_thrower>
-    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
-    view read_view(size_t n, ExceptionThrower&& exceptions = default_exception_thrower()) {
-        if (__builtin_expect(contig_remain() >= n, true)) {
+    template<typename ExceptionCreator = default_exception_creator>
+    requires fragmented_temporary_buffer_concepts::ExceptionCreator<ExceptionCreator>
+    utils::result_with_exception_ptr<view> read_view(size_t n, ExceptionCreator&& exceptions = default_exception_creator()) {
+        if (contig_remain() >= n) [[likely]] {
             auto v = view(_current, _current_position - _current->get(), n);
             _current_position += n;
             return v;
         }
-        check_out_of_range(exceptions, n);
+        auto range = check_out_of_range(exceptions, n);
+        if (!range) [[unlikely]] {
+            return bo::failure(std::move(range).assume_error());
+        }
         auto v = view(_current, _current_position - _current->get(), n);
         n -= _current_end - _current_position;
         next_fragment();
@@ -434,44 +469,53 @@ public:
         return v;
     }
 
-    template<typename ExceptionThrower = default_exception_thrower>
-    requires fragmented_temporary_buffer_concepts::ExceptionThrower<ExceptionThrower>
-    bytes_view read_bytes_view(size_t n, bytes_ostream& linearization_buffer, ExceptionThrower&& exceptions = default_exception_thrower()) {
-        if (__builtin_expect(contig_remain() >= n, true)) {
+    template<typename ExceptionCreator = default_exception_creator>
+    requires fragmented_temporary_buffer_concepts::ExceptionCreator<ExceptionCreator>
+    utils::result_with_exception_ptr<bytes_view> read_bytes_view(size_t n, bytes_ostream& linearization_buffer, ExceptionCreator&& exceptions = default_exception_creator()) {
+        if (contig_remain() >= n) [[likely]] {
             auto v = bytes_view(reinterpret_cast<const bytes::value_type*>(_current_position), n);
             _current_position += n;
             return v;
         }
-        check_out_of_range(exceptions, n);
+        auto range = check_out_of_range(exceptions, n);
+        if (!range) [[unlikely]] {
+            return bo::failure(std::move(range).assume_error());
+        }
         auto ptr = linearization_buffer.write_place_holder(n);
-        read_to(n, ptr, std::forward<ExceptionThrower>(exceptions));
+        auto output = read_to(n, ptr, std::forward<ExceptionCreator>(exceptions));
+        if (!output) [[unlikely]] {
+            return bo::failure(std::move(output).assume_error());
+        }
         return bytes_view(reinterpret_cast<const bytes::value_type*>(ptr), n);
     }
 };
 
-inline fragmented_temporary_buffer::istream fragmented_temporary_buffer::get_istream() const noexcept // allow empty (ut for that)
+template <ContiguousSharedBuffer Buffer>
+inline basic_fragmented_buffer<Buffer>::istream basic_fragmented_buffer<Buffer>::get_istream() const noexcept // allow empty (ut for that)
 {
     return istream(_fragments, _size_bytes);
 }
 
-class fragmented_temporary_buffer::reader {
-    std::vector<temporary_buffer<char>> _fragments;
+template <ContiguousSharedBuffer Buffer>
+class basic_fragmented_buffer<Buffer>::reader {
+    using FragBuffer = basic_fragmented_buffer<Buffer>;
+    FragBuffer::vector_type _fragments;
     size_t _left = 0;
 public:
-    future<fragmented_temporary_buffer> read_exactly(input_stream<char>& in, size_t length) {
-        _fragments = std::vector<temporary_buffer<char>>();
+    future<FragBuffer> read_exactly(input_stream<char>& in, size_t length) {
+        _fragments = FragBuffer::vector_type();
         _left = length;
         return repeat_until_value([this, length, &in] {
             if (!_left) {
-                return make_ready_future<std::optional<fragmented_temporary_buffer>>(fragmented_temporary_buffer(std::move(_fragments), length));
+                return make_ready_future<std::optional<FragBuffer>>(FragBuffer(std::move(_fragments), length));
             }
             return in.read_up_to(_left).then([this] (temporary_buffer<char> buf) {
                 if (buf.empty()) {
-                    return std::make_optional(fragmented_temporary_buffer());
+                    return std::make_optional(FragBuffer());
                 }
                 _left -= buf.size();
-                _fragments.emplace_back(std::move(buf));
-                return std::optional<fragmented_temporary_buffer>();
+                _fragments.emplace_back(Buffer(std::move(buf)));
+                return std::optional<FragBuffer>();
             });
         });
     }
@@ -479,7 +523,8 @@ public:
 
 // The operator below is used only for logging
 
-inline std::ostream& operator<<(std::ostream& out, const fragmented_temporary_buffer::view& v) {
+template <ContiguousSharedBuffer Buffer>
+inline std::ostream& operator<<(std::ostream& out, const typename basic_fragmented_buffer<Buffer>::view& v) {
     for (bytes_view frag : fragment_range(v)) {
         out << to_hex(frag);
     }

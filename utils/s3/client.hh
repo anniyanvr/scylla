@@ -1,0 +1,404 @@
+/*
+ * Copyright (C) 2022-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#pragma once
+
+#include <seastar/core/file.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/metrics_registration.hh>
+#include <seastar/core/sstring.hh>
+#include <seastar/core/shared_ptr.hh>
+#include <seastar/core/queue.hh>
+#include <seastar/core/units.hh>
+#include <seastar/http/client.hh>
+#include <filesystem>
+#include <initializer_list>
+#include <stdexcept>
+#include <utility>
+#include <unordered_map>
+#include "utils/lister.hh"
+#include "utils/object_storage_metrics.hh"
+#include "utils/s3/creds.hh"
+#include "credentials_providers/aws_credentials_provider_chain.hh"
+#include "utils/s3/client_fwd.hh"
+#include "utils/s3/throttling_controller.hh"
+
+using namespace seastar;
+class memory_data_sink_buffers;
+
+namespace s3 {
+// "Each part must be at least 5 MB in size, except the last part."
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html
+static constexpr size_t minimum_part_size = 5_MiB;
+// https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+static constexpr size_t maximum_part_size = 5_GiB;
+// "Part numbers can be any number from 1 to 10,000, inclusive."
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_UploadPart.html
+static constexpr unsigned maximum_parts_in_piece = 10'000;
+// https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingObjects.html
+static constexpr size_t maximum_object_size = maximum_parts_in_piece * maximum_part_size;
+
+static constexpr size_t max_client_mpu_in_flight = 32;
+static constexpr size_t max_client_buffered_downloads_in_flight = 32;
+
+class range {
+    friend struct fmt::formatter<range>;
+
+public:
+    range() = delete;
+    constexpr range(uint64_t offset, uint64_t len) : _offset(offset), _length(len) {
+        uint64_t t;
+        if (__builtin_add_overflow(_offset, len, &t)) [[unlikely]] {
+            throw std::overflow_error(fmt::format("Range offset {} + length {} exceeds maximum uint64_t", _offset, len));
+        }
+        if (_offset + len > maximum_object_size) [[unlikely]] {
+            throw std::overflow_error(fmt::format("Range offset {} + length {} exceeds maximum object size {}", _offset, len, maximum_object_size));
+        }
+    }
+    explicit constexpr range(uint64_t offset) : _offset(offset) {}
+    constexpr range& operator+=(uint64_t offset) {
+        uint64_t t;
+        if (__builtin_add_overflow(_offset, offset, &t)) [[unlikely]] {
+            throw std::overflow_error(fmt::format("Range offset {} + length {} exceeds maximum uint64_t", _offset, offset));
+        }
+        if (_offset + offset > maximum_object_size) [[unlikely]] {
+            throw std::overflow_error(fmt::format("Range offset {} + length {} exceeds maximum object size {}", _offset, offset, maximum_object_size));
+        }
+
+        _offset += offset;
+        if (_length != maximum_object_size) [[unlikely]] {
+            if (__builtin_sub_overflow(_length, offset, &t)) {
+                throw std::underflow_error(fmt::format("Range length {} - offset {} exceeds minimum uint64_t", _length, offset));
+            }
+            _length -= offset;
+        }
+        return *this;
+    }
+    std::partial_ordering operator<=>(const range& other) const noexcept = default;
+    [[nodiscard]] sstring to_header_string() const noexcept {
+        return fmt::format("bytes={}-{}", _offset, _length != maximum_object_size ? fmt::format("{}", _offset + _length - 1) : "");
+    }
+    [[nodiscard]] uint64_t offset() const noexcept { return _offset; }
+    [[nodiscard]] uint64_t length() const noexcept { return _length; }
+
+private:
+    uint64_t _offset;
+    uint64_t _length{maximum_object_size};
+};
+
+using object_metadata = std::unordered_map<sstring, sstring>;
+
+// The user-defined attributes plus the entity tag: unlike the GCS object
+// resource, which carries the name, size, generation and modification time
+// alongside them, S3 reports those through get_object_stats().
+struct object_info {
+    object_metadata metadata;
+    // The object's ETag exactly as S3 reports it, i.e. wrapped in double quotes
+    // (RFC 9110 entity-tag). Treat it as an opaque change detector: whether it
+    // is the MD5 of the content depends on how the object was uploaded and
+    // encrypted -- it is not an MD5 for multipart uploads, nor for objects
+    // encrypted with SSE-KMS or SSE-C -- so it must not be used for data
+    // integrity verification.
+    sstring etag;
+};
+static constexpr range full_range{0};
+
+struct tag {
+    std::string key;
+    std::string value;
+    auto operator<=>(const tag&) const = default;
+};
+using tag_set = std::vector<tag>;
+
+struct stats {
+    uint64_t size;
+    std::time_t last_modified;
+};
+
+future<> ignore_reply(const http::reply& rep, input_stream<char>&& in_);
+[[noreturn]] void map_s3_client_exception(std::exception_ptr ex);
+
+// The reply statuses a request accepts; the rest go to the error-and-retry path. A
+// request that accepts an error status -- the 404 of object_exists(), say -- gets the
+// reply handed to its handler instead of an exception, which keeps the http connection
+// alive. Asking for a status with no bit here is a compile error rather than a request
+// that quietly accepts nothing.
+class expected_status {
+    enum class bits : uint8_t {
+        none            = 0,
+        ok              = 1 << 0, // 200
+        no_content      = 1 << 1, // 204
+        partial_content = 1 << 2, // 206
+        not_found       = 1 << 3, // 404
+    };
+    bits _accepted = bits::none;
+
+    // Tolerant on purpose: every reply ever received passes through here, so an unknown
+    // status is an ordinary answer that matches nothing. Only construction rejects one.
+    static constexpr bits as_bit(http::reply::status_type status) noexcept {
+        switch (status) {
+        case http::reply::status_type::ok:              return bits::ok;
+        case http::reply::status_type::no_content:      return bits::no_content;
+        case http::reply::status_type::partial_content: return bits::partial_content;
+        case http::reply::status_type::not_found:       return bits::not_found;
+        default:                                        return bits::none;
+        }
+    }
+
+    consteval void accept(http::reply::status_type status) {
+        auto bit = as_bit(status);
+        if (bit == bits::none) {
+            // Throwing from an immediate function is a compile error at the call site.
+            throw std::invalid_argument("no bit for this reply status, add one");
+        }
+        _accepted = bits(std::to_underlying(_accepted) | std::to_underlying(bit));
+    }
+
+public:
+    consteval expected_status(http::reply::status_type status) {
+        accept(status);
+    }
+    consteval expected_status(std::initializer_list<http::reply::status_type> statuses) {
+        for (auto status : statuses) {
+            accept(status);
+        }
+    }
+
+    constexpr bool accepts(http::reply::status_type status) const noexcept {
+        auto bit = as_bit(status);
+        return bit != bits::none && (std::to_underlying(_accepted) & std::to_underlying(bit));
+    }
+};
+
+class client : public enable_shared_from_this<client> {
+    class multipart_upload;
+    class copy_s3_object;
+    class upload_sink_base;
+    class upload_sink;
+    class upload_jumbo_sink;
+    class chunked_download_source;
+    class download_source;
+    class do_upload_file;
+    class readable_file;
+    std::string _host;
+    endpoint_config_ptr _cfg;
+    semaphore _creds_sem;
+    semaphore _mpus_sem{max_client_mpu_in_flight};
+    semaphore _buffered_dl_sem{max_client_buffered_downloads_in_flight};
+    timer<seastar::lowres_clock> _creds_invalidation_timer;
+    timer<seastar::lowres_clock> _creds_update_timer;
+    aws_credentials _credentials;
+    aws::aws_credentials_provider_chain _creds_provider_chain;
+    seastar::gate _config_update_gate;
+    seastar::gate _requests_gate;
+
+    struct group_client {
+        seastar::http::client http;
+        // http::client does not report the cap it was given, and the warning below
+        // names it when a pool outlives its configuration entry.
+        unsigned max_connections;
+        uint64_t read_bytes = 0;
+        uint64_t write_bytes = 0;
+        uint64_t prefetch_bytes = 0;
+        uint64_t downloads_starving_on_max_concurrency = 0;
+        seastar::metrics::metric_groups metrics;
+        std::optional<utils::http_client_metrics> object_storage_metrics;
+        group_client(std::unique_ptr<http::connection_factory> f, unsigned max_conn);
+        void register_metrics(std::string class_name, std::string host);
+    };
+    // Several scheduling groups can share one pool (see pool_name()), so _https maps each group to its pool.
+    std::unordered_map<sstring, group_client> _pools;
+    std::unordered_map<seastar::scheduling_group, group_client*> _https;
+    group_connections _group_connections;
+    // Groups that had no entry and fell back to the general pool, counted once each
+    // rather than per request: the fallback runs only on a group's first request.
+    uint64_t _unclassified_groups = 0;
+    // Set by the owner that knows this client is the only one for its endpoint
+    // on this shard. Unset means no object_storage metrics are reported.
+    std::optional<utils::object_storage_metrics_labels> _object_storage_metrics_labels;
+
+    // Send brake for this client, shared by every scheduling group on the shard.
+    std::unique_ptr<throttling_controller> _request_limiter;
+    seastar::metrics::metric_groups _client_metrics;
+    void register_client_metrics();
+    using global_factory = std::function<shared_ptr<client>(std::string)>;
+    global_factory _gf;
+    std::unique_ptr<seastar::http::retry_strategy> _retry_strategy;
+
+    struct private_tag {};
+
+    future<> update_credentials_and_rearm();
+    future<> authorize(http::request&);
+    group_client& find_or_create_client();
+    group_client& find_or_create_client_slow();
+    std::optional<unsigned> max_connections(std::string_view pool_name) const;
+
+    using error_handler = std::function<void(std::exception_ptr)>;
+    using reply_handler_ext = noncopyable_function<future<>(group_client&, const http::reply&, input_stream<char>&& body)>;
+
+    http::client::reply_handler wrap_handler(http::request& request,
+                                                           http::client::reply_handler handler,
+                                                           expected_status expected);
+
+    future<> make_request(http::request req,
+                          http::client::reply_handler handle,
+                          expected_status expected,
+                          seastar::abort_source* = nullptr);
+    future<> make_request(http::request req,
+                          http::client::reply_handler handle,
+                          const http::retry_strategy& rs,
+                          error_handler err_handler,
+                          expected_status expected,
+                          seastar::abort_source* as);
+
+    future<> make_request(http::request req,
+                          reply_handler_ext handle,
+                          expected_status expected,
+                          seastar::abort_source* = nullptr);
+    future<> make_request(http::request req,
+                          reply_handler_ext handle,
+                          const seastar::http::retry_strategy& rs,
+                          error_handler err_handler,
+                          expected_status expected,
+                          seastar::abort_source* = nullptr);
+    future<> get_object_header(sstring object_name, http::client::reply_handler handler, seastar::abort_source* = nullptr);
+public:
+
+    // No defaults, and no fallbacks in the body: make() is the only caller and decides
+    // both dependencies, so there is never a second opinion about what a null means.
+    client(std::string host, endpoint_config_ptr cfg, global_factory gf, private_tag, std::unique_ptr<seastar::http::retry_strategy> rs,
+           std::unique_ptr<throttling_controller> tc);
+    static shared_ptr<client> make(std::string endpoint, endpoint_config_ptr cfg, global_factory gf = {});
+    static shared_ptr<client> make(std::string endpoint, endpoint_config_ptr cfg, std::unique_ptr<seastar::http::retry_strategy> rs, global_factory gf = {});
+    static shared_ptr<client> make(std::string endpoint, endpoint_config_ptr cfg, std::unique_ptr<seastar::http::retry_strategy> rs,
+                                  std::unique_ptr<throttling_controller> tc, global_factory gf = {});
+    static shared_ptr<client> make(std::string url, std::string region, std::string iam_role_arn, global_factory gf, group_connections connections);
+
+    future<uint64_t> get_object_size(sstring object_name, seastar::abort_source* = nullptr);
+    future<stats> get_object_stats(sstring object_name, seastar::abort_source* = nullptr);
+    future<object_info> get_object_info(sstring object_name, seastar::abort_source* = nullptr);
+    future<bool> object_exists(sstring object_name, seastar::abort_source* = nullptr);
+    future<tag_set> get_object_tagging(sstring object_name, seastar::abort_source* = nullptr);
+    future<> put_object_tagging(sstring object_name, tag_set tagging, seastar::abort_source* = nullptr);
+    future<> delete_object_tagging(sstring object_name, seastar::abort_source* = nullptr);
+    future<temporary_buffer<char>> get_object_contiguous(sstring object_name, range download_range = s3::full_range, seastar::abort_source* = nullptr);
+    future<> put_object(sstring object_name, temporary_buffer<char> buf, object_metadata = {}, seastar::abort_source* = nullptr);
+    future<> put_object(sstring object_name, ::memory_data_sink_buffers bufs, object_metadata = {}, seastar::abort_source* = nullptr);
+    // Same as put_object() above, but resolves with the entity tag the server reported for
+    // the object the request created, exactly as it sent it (i.e. in double quotes), so that
+    // an upload sink can report the tag of the object it produced without a follow-up HEAD.
+    // Resolves with an empty string if the server created the object but reported no tag.
+    future<sstring> put_object_and_get_etag(sstring object_name, temporary_buffer<char> buf, object_metadata = {}, seastar::abort_source* = nullptr);
+    future<sstring> put_object_and_get_etag(sstring object_name, ::memory_data_sink_buffers bufs, object_metadata = {}, seastar::abort_source* = nullptr);
+    future<> copy_object(sstring source_object, sstring target_object, object_metadata = {}, std::optional<size_t> part_size = {}, std::optional<tag> tag = {}, seastar::abort_source* = nullptr);
+    future<> delete_object(sstring object_name, seastar::abort_source* = nullptr);
+    future<> create_bucket(sstring bucket_name, seastar::abort_source* = nullptr);
+    future<> delete_bucket(sstring bucket_name, seastar::abort_source* = nullptr);
+    future<> delete_bucket_with_objects(sstring bucket_name, seastar::abort_source* = nullptr);
+
+    file make_readable_file(sstring object_name, seastar::abort_source* = nullptr);
+    data_sink make_upload_sink(sstring object_name, object_metadata = {}, seastar::abort_source* = nullptr);
+    // Same as make_upload_sink() above, but also returns a future resolving into the entity
+    // tag of the object the sink produced, exactly as S3 reports it (i.e. in double quotes).
+    // It resolves when the first flush() of the sink does, and fails with the same exception
+    // if that flush() fails; if the sink is closed or destroyed without ever being flushed,
+    // it fails with broken_promise. Either way it is resolved by the time the sink is closed,
+    // so awaiting it never outlives the sink. It is the tag of the very object the sink
+    // wrote, which a HEAD issued after the upload would not be - somebody may overwrite the
+    // key in between. It is empty if the server created the object but reported no tag the
+    // sink could make sense of, so the caller is expected to check for that. The caller has
+    // to consume the future even if the upload fails, or seastar reports it as an ignored
+    // exceptional future.
+    std::pair<data_sink, future<sstring>> make_upload_sink_and_get_etag(sstring object_name, object_metadata = {}, seastar::abort_source* = nullptr);
+    data_sink make_upload_jumbo_sink(sstring object_name, object_metadata = {}, std::optional<unsigned> max_parts_per_piece = {}, seastar::abort_source* = nullptr);
+    // Same etag contract as make_upload_sink_and_get_etag() above.
+    std::pair<data_sink, future<sstring>> make_upload_jumbo_sink_and_get_etag(sstring object_name, object_metadata = {}, std::optional<unsigned> max_parts_per_piece = {},
+                                                                              seastar::abort_source* = nullptr);
+    data_source make_download_source(sstring object_name, range download_range = s3::full_range, seastar::abort_source* = nullptr);
+    data_source make_chunked_download_source(sstring object_name, range range = s3::full_range, seastar::abort_source* = nullptr);
+    /// upload a file with specified path to s3
+    ///
+    /// @param path the path to the file
+    /// @param object_name object name for the created object in S3
+    /// @param tag an optional tag
+    /// @param part_size the size of each part of the multipart upload
+    future<> upload_file(std::filesystem::path path,
+                         sstring object_name,
+                         std::optional<tag> tag = {},
+                         std::optional<size_t> max_part_size = {},
+                         seastar::abort_source* = nullptr);
+    future<> upload_file(std::filesystem::path path,
+                         sstring object_name,
+                         upload_progress& up,
+                         seastar::abort_source* = nullptr);
+
+    void update_config_sync(std::string reg, std::string ira);
+    void update_group_connections(group_connections connections);
+    // Bytes moved to and from objects by this client, for its owner to report.
+    utils::object_storage_bytes bytes() const;
+    // Reports the http client metrics under the labels the caller supplies. The
+    // client keeps one http client per scheduling group and names the class
+    // label after it, so the caller supplies only the type and the endpoint.
+    void report_object_storage_metrics(utils::object_storage_metrics_labels labels);
+
+    struct handle {
+        std::string _host;
+        global_factory _gf;
+    public:
+        handle(const client& cln)
+                : _host(cln._host)
+                , _gf(cln._gf)
+        {}
+
+        shared_ptr<client> to_client() && {
+            return _gf(std::move(_host));
+        }
+    };
+
+    class bucket_lister final : public abstract_lister::impl {
+        shared_ptr<client> _client;
+        sstring _bucket;
+        sstring _prefix;
+        sstring _max_keys;
+        std::optional<future<>> _opt_done_fut;
+        lister::filter_type _filter;
+        seastar::queue<std::optional<directory_entry>> _queue;
+
+        future<> start_listing();
+
+    public:
+
+        bucket_lister(shared_ptr<client> client, sstring bucket, sstring prefix = "", size_t objects_per_page = 64, size_t entries_batch = 512 / sizeof(std::optional<directory_entry>));
+        bucket_lister(shared_ptr<client> client, sstring bucket, sstring prefix, lister::filter_type filter, size_t objects_per_page = 64, size_t entries_batch = 512 / sizeof(std::optional<directory_entry>));
+
+        future<std::optional<directory_entry>> get() override;
+        future<> close() noexcept override;
+    };
+
+    future<> close() noexcept;
+};
+
+std::pair<unsigned, size_t> calc_part_size(size_t total_size, size_t part_size);
+
+// Parses the ETag out of an S3 UploadPartCopy <CopyPartResult> response body.
+// Returns an empty string if the body is not well-formed XML. Throws
+// std::runtime_error if the body is valid XML but lacks the expected
+// <CopyPartResult>/<ETag> nodes (e.g. an S3 <Error> document). Callers must
+// handle both the empty result and the exception as upload failures.
+// Exposed for unit testing.
+sstring parse_multipart_copy_upload_etag(sstring& body);
+
+} // namespace s3
+
+template <>
+struct fmt::formatter<s3::range> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const s3::range& range, fmt::format_context& ctx) const {
+        return fmt::format_to(ctx.out(), "{}-{}", range._offset, range._length != s3::maximum_object_size ? fmt::format("{}", range._length) : "∞");
+    }
+};

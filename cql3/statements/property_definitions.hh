@@ -1,14 +1,11 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
@@ -27,35 +24,76 @@ namespace cql3 {
 
 namespace statements {
 
+// A `<name> = <value>` property exactly as the grammar saw it. `propertyValue` renders the
+// NULL keyword and the string literal 'null' as the same text "null" (see the FIXME in
+// Cql.g), so `is_null_keyword` carries the distinction the text cannot: for cluster-config
+// properties `= NULL` removes the stored override, while `= 'null'` is an ordinary value
+// that a boolean or numeric option must reject.
+struct property_value {
+    sstring value;
+    bool is_null_keyword = false;
+};
+
 class property_definitions {
 public:
     using map_type = std::map<sstring, sstring>;
-    using value_type = std::variant<sstring, map_type>;
+    using list_type = std::vector<sstring>;
+    using extended_map_type = std::map<sstring, std::variant<sstring, list_type>>;
+    using value_type = std::variant<sstring, extended_map_type>;
+    using properties_map_type = std::unordered_map<sstring, value_type>;
 protected:
 #if 0
     protected static final Logger logger = LoggerFactory.getLogger(PropertyDefinitions.class);
 #endif
 
-    mutable std::unordered_map<sstring, value_type> _properties;
+    mutable properties_map_type _properties;
+    // The names whose value came from the NULL keyword. Only meaningful for a name that is
+    // still present in _properties; remove_property() does not prune it.
+    std::set<sstring> _null_keyword_properties;
 
     property_definitions();
 public:
     void add_property(const sstring& name, sstring value);
 
-    void add_property(const sstring& name, const std::map<sstring, sstring>& value);
+    void add_property(const sstring& name, const property_value& value);
+
+    void add_property(const sstring& name, const map_type& value) {
+        add_property(name, to_extended_map(value));
+    }
+
+    void add_property(const sstring& name, const extended_map_type& value);
 
     void validate(const std::set<sstring>& keywords, const std::set<sstring>& exts = {}, const std::set<sstring>& obsolete = {}) const;
 
 protected:
     std::optional<sstring> get_simple(const sstring& name) const;
 
-    std::optional<std::map<sstring, sstring>> get_map(const sstring& name) const;
+    void remove_property(const sstring& name) const;
 
     void remove_from_map_if_exists(const sstring& name, const sstring& key) const;
 public:
     bool has_property(const sstring& name) const;
 
+    // True iff `name` was written as the NULL keyword rather than as a value. Properties
+    // added programmatically (not through the grammar) are never null keywords.
+    bool is_null_keyword(const sstring& name) const;
+
+    const properties_map_type& properties() const { return _properties; }
+
+    value_type extract_property(const sstring& name);
+
     std::optional<value_type> get(const sstring& name) const;
+
+    std::optional<extended_map_type> get_extended_map(const sstring& name) const;
+    std::optional<map_type> get_map(const sstring& name) const;
+
+    static map_type to_simple_map(const extended_map_type&);
+    static extended_map_type to_extended_map(const map_type&);
+
+    // Extracts a plain-string property value, throwing a CQL syntax_exception rather than
+    // letting std::bad_variant_access escape when the property was given a map value
+    // (the grammar accepts `<ident> = <mapLiteral>` for any property name).
+    static sstring value_as_string(const sstring& name, const value_type& value);
 
     sstring get_string(sstring key, sstring default_value) const;
 
@@ -73,7 +111,14 @@ public:
     static int32_t to_int(sstring key, std::optional<sstring> value, int32_t default_value);
 
     static long to_long(sstring key, std::optional<sstring> value, long default_value);
+
+    size_t count() const {
+        return _properties.size();
+    }
 };
+
+property_definitions::map_type to_flattened_map(const property_definitions::extended_map_type&);
+property_definitions::extended_map_type from_flattened_map(const property_definitions::map_type&);
 
 }
 

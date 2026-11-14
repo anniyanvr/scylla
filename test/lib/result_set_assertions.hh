@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <map>
 
-#include "query-result-set.hh"
+#include "query/query-result-set.hh"
 
 //
 // Contains assertions for query::result_set objects

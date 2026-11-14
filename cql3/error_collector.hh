@@ -1,21 +1,19 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
+#include "bytes.hh"
 #include "cql3/error_listener.hh"
 #include "exceptions/exceptions.hh"
-#include "types.hh"
+#include "utils/chunked_string.hh"
 
 namespace cql3 {
 
@@ -37,7 +35,7 @@ class error_collector : public error_listener<RecognizerType, ExceptionBaseType>
     /**
      * The CQL query.
      */
-    const sstring_view _query;
+    const utils::chunked_string_view _query;
 
     /**
      * An empty bitset to be used as a workaround for AntLR null dereference
@@ -53,7 +51,7 @@ public:
      *
      * @param query the CQL query that will be parsed
      */
-    error_collector(const sstring_view& query) : _query(query) {}
+    error_collector(utils::chunked_string_view query) : _query(query) {}
 
     /**
      * Format and throw a new \c exceptions::syntax_exception.
@@ -89,55 +87,41 @@ private:
     {
         using namespace antlr3;
         std::stringstream msg;
+        // Antlr3 has a function ex->displayRecognitionError() which is
+        // supposed to nicely print the recognition exception. Unfortunately
+        // it is buggy - see https://github.com/antlr/antlr3/issues/191
+        // and not being fixed, so let's copy it here and fix it here.
         switch (ex->getType()) {
-        case ExceptionType::UNWANTED_TOKEN_EXCEPTION: {
-            msg << "extraneous input " << get_token_error_display(recognizer, ex->get_token());
-            if (token_names != nullptr) {
-                std::string token_name;
-                if (recognizer.is_eof_token(ex->get_expecting())) {
-                    token_name = "EOF";
-                } else {
-                    token_name = reinterpret_cast<const char*>(token_names[ex->get_expecting()]);
-                }
-                msg << " expecting " << token_name;
-            }
-            break;
-        }
-        case ExceptionType::MISSING_TOKEN_EXCEPTION: {
-            std::string token_name;
-            if (token_names == nullptr) {
-                token_name = "(" + std::to_string(ex->get_expecting()) + ")";
-            } else {
-                if (recognizer.is_eof_token(ex->get_expecting())) {
-                    token_name = "EOF";
-                } else {
-                    token_name = reinterpret_cast<const char*>(token_names[ex->get_expecting()]);
-                }
-            }
-            msg << "missing " << token_name << " at " << get_token_error_display(recognizer, ex->get_token());
-            break;
-        }
-        case ExceptionType::NO_VIABLE_ALT_EXCEPTION: {
-            msg << "no viable alternative at input " << get_token_error_display(recognizer, ex->get_token());
-            break;
-        }
+        case ExceptionType::RECOGNITION_EXCEPTION:
+        case ExceptionType::EARLY_EXIT_EXCEPTION:
         default:
-            // AntLR Exception class has a bug of dereferencing a null
-            // pointer in the displayRecognitionError. The following
-            // if statement makes sure it will not be null before the
-            // call to that function (displayRecognitionError).
-            // bug reference: https://github.com/antlr/antlr3/issues/191
-            if (!ex->get_expectingSet()) {
-                ex->set_expectingSet(&_empty_bit_list);
+            // Unknown syntax error - the parser can't figure out what
+            // specific token is missing or unwanted.
+            msg << ": Syntax error";
+            break;
+        case ExceptionType::MISSING_TOKEN_EXCEPTION:
+            msg << ": Missing ";
+            if (recognizer.is_eof_token(ex->get_expecting())) {
+                msg << "EOF";
+            } else if (token_names) {
+                msg << reinterpret_cast<const char*>(token_names[ex->get_expecting()]);
+            } else {
+                msg << ex->get_expecting();
             }
-            ex->displayRecognitionError(token_names, msg);
+            break;
+        case ExceptionType::UNWANTED_TOKEN_EXCEPTION:
+        case ExceptionType::MISMATCHED_SET_EXCEPTION:
+            msg << ": Unexpected '";
+            msg << recognizer.token_text(ex->get_token());
+            msg << "'";
+            break;
+        case ExceptionType::NO_VIABLE_ALT_EXCEPTION:
+            msg << "no viable alternative at input '";
+            msg << recognizer.token_text(ex->get_token());
+            msg << "'";
+            break;
         }
         return msg.str();
-    }
-
-    std::string get_token_error_display(RecognizerType& recognizer, const TokenType* token)
-    {
-        return "'" + recognizer.token_text(token) + "'";
     }
 
 #if 0

@@ -3,26 +3,17 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
-#include "mutation.hh"
-#include "sstables.hh"
-#include "types.hh"
+
+#pragma once
+
 #include <seastar/core/future-util.hh>
 #include <seastar/core/coroutine.hh>
-#include "key.hh"
-#include "keys.hh"
+#include "keys/keys.hh"
 #include <seastar/core/do_with.hh>
-#include "unimplemented.hh"
-#include "dht/i_partitioner.hh"
 #include <seastar/core/byteorder.hh>
 #include "index_reader.hh"
-#include "counters.hh"
-#include "utils/data_input.hh"
-#include "clustering_ranges_walker.hh"
-#include "binary_search.hh"
-#include "../dht/i_partitioner.hh"
-#include "flat_mutation_reader_v2.hh"
 #include "sstables/mx/partition_reversing_data_source.hh"
 
 namespace sstables {
@@ -36,8 +27,13 @@ namespace mx {
 }
 
 class mp_row_consumer_reader_base {
+public:
+    using tracker_link_type = bi::list_member_hook<bi::link_mode<bi::auto_unlink>>;
+    friend class reader_tracker;
 protected:
     shared_sstable _sst;
+
+    tracker_link_type _tracker_link;
 
     // Whether index lower bound is in current partition
     bool _index_in_current_partition = false;
@@ -53,27 +49,25 @@ protected:
     bool _before_partition = true;
 
     std::optional<dht::decorated_key> _current_partition_key;
+
+    // If inexact sstable indexes are used, the reader might only realize
+    // it has exceeded the queried range after it has already parsed
+    // the partition header following the range.
+    //
+    // In this case the parsed partition key and tombstone can't be emitted.
+    // However, the reader will need to emit them if its forwarded to that
+    // key later. It can't re-parse them, since the parser can't go backwards
+    // and recreating the context is awkward, so it saves the partition key
+    // and the tombstone and serves them to the consumer if that case happens.
+    std::optional<tombstone> _saved_partition_tombstone;
 public:
-    mp_row_consumer_reader_base(shared_sstable sst)
-        : _sst(std::move(sst))
-    { }
+    mp_row_consumer_reader_base(shared_sstable sst);
 
     // Called when all fragments relevant to the query range or fast forwarding window
     // within the current partition have been pushed.
     // If no skipping is required, this method may not be called before transitioning
     // to the next partition.
     virtual void on_out_of_clustering_range() = 0;
-};
-
-class mp_row_consumer_reader_k_l : public mp_row_consumer_reader_base, public flat_mutation_reader::impl {
-    friend class sstables::kl::mp_row_consumer_k_l;
-public:
-    mp_row_consumer_reader_k_l(schema_ptr s, reader_permit permit, shared_sstable sst)
-        : mp_row_consumer_reader_base(std::move(sst))
-        , impl(std::move(s), std::move(permit))
-    {}
-
-    void on_next_partition(dht::decorated_key, tombstone);
 };
 
 inline atomic_cell make_atomic_cell(const abstract_type& type,
@@ -92,6 +86,7 @@ inline atomic_cell make_atomic_cell(const abstract_type& type,
 atomic_cell make_counter_cell(api::timestamp_type timestamp, fragmented_temporary_buffer::view value);
 
 position_in_partition_view get_slice_upper_bound(const schema& s, const query::partition_slice& slice, dht::ring_position_view key);
+position_in_partition_view get_slice_lower_bound(const schema& s, const query::partition_slice& slice, dht::ring_position_view key);
 
 // data_consume_rows() iterates over rows in the data file from
 // a particular range, feeding them into the consumer. The iteration is
@@ -123,17 +118,18 @@ position_in_partition_view get_slice_upper_bound(const schema& s, const query::p
 // desired byte range from disk. However, when last_end > end, we may
 // read beyond end in anticipation of a small skip via fast_foward_to.
 // The amount of this excessive read is controlled by read ahead
-// hueristics which learn from the usefulness of previous read aheads.
+// heuristics which learn from the usefulness of previous read aheads.
 template <typename DataConsumeRowsContext>
-inline std::unique_ptr<DataConsumeRowsContext> data_consume_rows(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer, sstable::disk_read_range toread, uint64_t last_end) {
+inline future<std::unique_ptr<DataConsumeRowsContext>> data_consume_rows(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer,
+        sstable::disk_read_range toread, uint64_t last_end, integrity_check integrity) {
     // Although we were only asked to read until toread.end, we'll not limit
     // the underlying file input stream to this end, but rather to last_end.
     // This potentially enables read-ahead beyond end, until last_end, which
     // can be beneficial if the user wants to fast_forward_to() on the
     // returned context, and may make small skips.
-    auto input = sst->data_stream(toread.start, last_end - toread.start, consumer.io_priority(),
-            consumer.permit(), consumer.trace_state(), sst->_partition_range_history);
-    return std::make_unique<DataConsumeRowsContext>(s, std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start);
+    auto input = co_await sst->data_stream(toread.start, last_end - toread.start,
+            consumer.permit(), consumer.trace_state(), sst->_partition_range_history, sstable::raw_stream::no, integrity);
+    co_return std::make_unique<DataConsumeRowsContext>(s, std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start);
 }
 
 template <typename DataConsumeRowsContext>
@@ -150,11 +146,11 @@ struct reversed_context {
 // See `sstables::mx::make_partition_reversing_data_source` for documentation.
 template <typename DataConsumeRowsContext>
 inline reversed_context<DataConsumeRowsContext> data_consume_reversed_partition(
-        const schema& s, shared_sstable sst, index_reader& ir,
+        const schema& s, shared_sstable sst, abstract_index_reader& ir,
         typename DataConsumeRowsContext::consumer& consumer, sstable::disk_read_range toread) {
     auto reversing_data_source = sstables::mx::make_partition_reversing_data_source(
             s, sst, ir, toread.start, toread.end - toread.start,
-            consumer.permit(), consumer.io_priority(), consumer.trace_state());
+            consumer.permit(), consumer.trace_state());
     return reversed_context<DataConsumeRowsContext> {
         .the_context = std::make_unique<DataConsumeRowsContext>(
                 s, std::move(sst), consumer, input_stream<char>(std::move(reversing_data_source.the_source)),
@@ -164,17 +160,19 @@ inline reversed_context<DataConsumeRowsContext> data_consume_reversed_partition(
 }
 
 template <typename DataConsumeRowsContext>
-inline std::unique_ptr<DataConsumeRowsContext> data_consume_single_partition(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer, sstable::disk_read_range toread) {
-    auto input = sst->data_stream(toread.start, toread.end - toread.start, consumer.io_priority(),
-            consumer.permit(), consumer.trace_state(), sst->_single_partition_history);
-    return std::make_unique<DataConsumeRowsContext>(s, std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start);
+inline future<std::unique_ptr<DataConsumeRowsContext>> data_consume_single_partition(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer,
+        sstable::disk_read_range toread, integrity_check integrity) {
+    auto input = co_await sst->data_stream(toread.start, toread.end - toread.start,
+            consumer.permit(), consumer.trace_state(), sst->_single_partition_history, sstable::raw_stream::no, integrity);
+    co_return std::make_unique<DataConsumeRowsContext>(s, std::move(sst), consumer, std::move(input), toread.start, toread.end - toread.start);
 }
 
 // Like data_consume_rows() with bounds, but iterates over whole range
 template <typename DataConsumeRowsContext>
-inline std::unique_ptr<DataConsumeRowsContext> data_consume_rows(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer) {
-        auto data_size = sst->data_size();
-        return data_consume_rows<DataConsumeRowsContext>(s, std::move(sst), consumer, {0, data_size}, data_size);
+inline future<std::unique_ptr<DataConsumeRowsContext>> data_consume_rows(const schema& s, shared_sstable sst, typename DataConsumeRowsContext::consumer& consumer,
+        integrity_check integrity) {
+    auto data_size = sst->data_size();
+    return data_consume_rows<DataConsumeRowsContext>(s, std::move(sst), consumer, {0, data_size}, data_size, integrity);
 }
 
 template<typename T>
@@ -182,7 +180,6 @@ concept RowConsumer =
     requires(T t,
                     const partition_key& pk,
                     position_range cr) {
-        { t.io_priority() } -> std::convertible_to<const io_priority_class&>;
         { t.is_mutation_end() } -> std::same_as<bool>;
         { t.setup_for_partition(pk) } -> std::same_as<void>;
         { t.push_ready_fragments() } -> std::same_as<void>;

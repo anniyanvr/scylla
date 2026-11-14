@@ -3,48 +3,81 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <unordered_map>
 #include <vector>
-#include <iosfwd>
 #include <seastar/core/sstring.hh>
 
-#include "schema.hh"
-#include "locator/abstract_replication_strategy.hh"
+#include "cql3/description.hh"
+#include "schema/schema.hh"
+#include "locator/abstract_replication_strategy_fwd.hh"
 #include "data_dictionary/user_types_metadata.hh"
+#include "data_dictionary/storage_options.hh"
+#include "data_dictionary/consistency_config_options.hh"
+
+namespace gms {
+class feature_service;
+}
+
+namespace locator {
+class topology;
+}
+
+namespace replica {
+class database;
+}
 
 namespace data_dictionary {
 
 class keyspace_metadata final {
     sstring _name;
     sstring _strategy_name;
+    // If _next_strategy_options has value, there is ongoing rf change of this keyspace.
     locator::replication_strategy_config_options _strategy_options;
+    std::optional<locator::replication_strategy_config_options> _next_strategy_options;
+    std::optional<unsigned> _initial_tablets;
     std::unordered_map<sstring, schema_ptr> _cf_meta_data;
     bool _durable_writes;
     user_types_metadata _user_types;
+    lw_shared_ptr<const storage_options> _storage_options;
+    std::optional<consistency_config_option> _consistency_option;
+    // Registry-backed cluster-config options stored in the keyspace's scylla_keyspaces
+    // `configs` column. The cluster_config_manager only *caches* what the schema tables
+    // store; the schema tables remain the source of truth, and keyspace schema mutations
+    // are serialized from this metadata as a whole row (see make_create_keyspace_mutations).
+    // The current configs therefore have to be carried here: without them, any unrelated
+    // keyspace DDL would rewrite the row and wipe the stored options.
+    std::map<sstring, sstring> _config_options;
 public:
     keyspace_metadata(std::string_view name,
                  std::string_view strategy_name,
                  locator::replication_strategy_config_options strategy_options,
+                 std::optional<unsigned> initial_tablets,
+                 std::optional<consistency_config_option> consistency_option,
                  bool durable_writes,
-                 std::vector<schema_ptr> cf_defs = std::vector<schema_ptr>{});
-    keyspace_metadata(std::string_view name,
-                 std::string_view strategy_name,
-                 locator::replication_strategy_config_options strategy_options,
-                 bool durable_writes,
-                 std::vector<schema_ptr> cf_defs,
-                 user_types_metadata user_types);
+                 std::vector<schema_ptr> cf_defs = std::vector<schema_ptr>{},
+                 user_types_metadata user_types = user_types_metadata{},
+                 storage_options storage_opts = storage_options{},
+                 std::optional<locator::replication_strategy_config_options> next_options = std::nullopt,
+                 std::map<sstring, sstring> config_options = {});
     static lw_shared_ptr<keyspace_metadata>
     new_keyspace(std::string_view name,
                  std::string_view strategy_name,
                  locator::replication_strategy_config_options options,
-                 bool durables_writes,
-                 std::vector<schema_ptr> cf_defs = std::vector<schema_ptr>{});
-    void validate(const locator::topology&) const;
+                 std::optional<unsigned> initial_tablets,
+                 std::optional<consistency_config_option> consistency_option,
+                 bool durables_writes = true,
+                 storage_options storage_opts = {},
+                 std::vector<schema_ptr> cf_defs = {},
+                 std::optional<locator::replication_strategy_config_options> next_options = std::nullopt,
+                 std::map<sstring, sstring> config_options = {});
+    static lw_shared_ptr<keyspace_metadata>
+    new_keyspace(const keyspace_metadata& ksm);
+    void validate(const gms::feature_service&, const locator::topology&) const;
     const sstring& name() const {
         return _name;
     }
@@ -53,6 +86,28 @@ public:
     }
     const locator::replication_strategy_config_options& strategy_options() const {
         return _strategy_options;
+    }
+    void set_strategy_options(const locator::replication_strategy_config_options& options) {
+        _strategy_options = options;
+    }
+    const std::optional<locator::replication_strategy_config_options>& next_strategy_options_opt() const {
+        return _next_strategy_options;
+    }
+    void set_next_strategy_options(const locator::replication_strategy_config_options& options) {
+        _next_strategy_options = options;
+    }
+    void clear_next_strategy_options() {
+        _next_strategy_options = std::nullopt;
+    }
+    locator::replication_strategy_config_options strategy_options_v1() const;
+    std::optional<unsigned> initial_tablets() const {
+        return _initial_tablets;
+    }
+    std::optional<data_dictionary::consistency_config_option> consistency_option() const {
+        return _consistency_option;
+    }
+    bool uses_tablets() const noexcept {
+        return _initial_tablets.has_value();
     }
     const std::unordered_map<sstring, schema_ptr>& cf_meta_data() const {
         return _cf_meta_data;
@@ -66,6 +121,19 @@ public:
     const user_types_metadata& user_types() const {
         return _user_types;
     }
+    const storage_options& get_storage_options() const {
+        return *_storage_options;
+    }
+    const std::map<sstring, sstring>& config_options() const noexcept {
+        return _config_options;
+    }
+    void set_config_options(std::map<sstring, sstring> config_options) {
+        _config_options = std::move(config_options);
+    }
+    lw_shared_ptr<const storage_options> get_storage_options_ptr() {
+        return _storage_options;
+    }
+
     void add_or_update_column_family(const schema_ptr& s) {
         _cf_meta_data[s->cf_name()] = s;
     }
@@ -76,7 +144,14 @@ public:
     void remove_user_type(const user_type ut);
     std::vector<schema_ptr> tables() const;
     std::vector<view_ptr> views() const;
-    friend std::ostream& operator<<(std::ostream& os, const keyspace_metadata& m);
+
+    cql3::description describe(const replica::database& db, cql3::with_create_statement) const;
 };
 
 }
+
+template <>
+struct fmt::formatter<data_dictionary::keyspace_metadata> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    auto format(const data_dictionary::keyspace_metadata& ksm, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

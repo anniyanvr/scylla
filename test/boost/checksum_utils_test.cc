@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #define BOOST_TEST_MODULE core
@@ -11,14 +11,19 @@
 #include <boost/test/unit_test.hpp>
 #include "sstables/checksum_utils.hh"
 #include "test/lib/make_random_string.hh"
-#include <seastar/core/print.hh>
+#include <seastar/core/format.hh>
 
 template<typename ReferenceImpl, typename Impl>
 static
 void test_combine() {
-    auto check = [](size_t len) {
-        auto c1 = Impl::checksum_combine(0x12381237, 0x73747474, len);
-        auto c2 = ReferenceImpl::checksum_combine(0x12381237, 0x73747474, len);
+    auto check = [](size_t len2) {
+        constexpr auto crc1 = 0x12381237;
+        // len2==0 implies crc2==0. Newer zlib versions don't hold the
+        // caller's hands anymore in this case, so make sure we don't
+        // supply invalid input:
+        const auto crc2 = len2 == 0 ? 0 : 0x73747474;
+        auto c1 = Impl::checksum_combine(crc1, crc2, len2);
+        auto c2 = ReferenceImpl::checksum_combine(crc1, crc2, len2);
         BOOST_REQUIRE_EQUAL(c1, c2);
     };
 

@@ -3,20 +3,63 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <unordered_set>
 #include <memory>
-#include <seastar/core/shared_ptr.hh>
 #include "sstables/shared_sstable.hh"
-#include "sstables/progress_monitor.hh"
-#include "timestamp.hh"
+#include "mutation/timestamp.hh"
+#include "schema/schema_fwd.hh"
+
+class compaction_controller;
+
+namespace sstables {
+class sstable_set;
+}
+
+namespace compaction {
 
 class compaction_backlog_manager;
-class compaction_controller;
+
+// What a backlog tracker needs to know about the data it accounts for: the sstables
+// of a compaction group -- all of them, across every repair state -- and the schema
+// they belong to.
+//
+// Deliberately not a compaction_group_view: a view is scoped to one repair state and
+// is the target a compaction runs against, while a backlog is a property of the whole
+// group, which has a single tracker.
+class compaction_backlog_source {
+public:
+    virtual ~compaction_backlog_source() = default;
+    virtual const schema_ptr& schema() const noexcept = 0;
+    virtual lw_shared_ptr<const sstables::sstable_set> sstables_for_backlog() const = 0;
+};
+
+// Fixed cost, in bytes, that each sstable adds to the backlog on top of its own size.
+//
+// The backlog of an sstable is (Si - Ci) * log4(T / Si), so tiny sstables barely move
+// the needle, even though log4(T / Si) is large for them. That worked well until
+// tablets, where commitlog driven flush can produce a tiny sstable per replica in a
+// shard. Read amplification suffers badly, as each sstable being read has a fixed
+// memory overhead, but the controller sees almost no backlog and won't apply pressure
+// to compact them away.
+//
+// The tax reflects the cost we pay per sstable regardless of its size. It's applied to
+// Si where it weighs the work, but not inside log4(T / Si), which estimates write
+// amplification and should be left alone. Taxing the log too would shrink the estimate
+// for exactly the sstables we want to make visible.
+//
+// 1M is a conservative starting point, well below the size of a full memtable flush.
+static constexpr uint64_t sstable_backlog_fixed_cost = 1UL * 1024 * 1024;
+
+// Size used to weigh the backlog of an sstable, or of a run of sstables, whose data
+// size is data_size. Empty objects contribute nothing.
+static inline uint64_t effective_backlog_size(uint64_t data_size, size_t sstables = 1) {
+    return data_size == 0 ? 0 : data_size + sstables * sstable_backlog_fixed_cost;
+}
 
 // Read and write progress are provided by structures present in progress_manager.hh
 // However, we don't want to be tied to their lifetimes and for that reason we will not
@@ -60,34 +103,42 @@ public:
     using ongoing_compactions = std::unordered_map<sstables::shared_sstable, backlog_read_progress_manager*>;
 
     struct impl {
-        virtual void add_sstable(sstables::shared_sstable sst) = 0;
-        virtual void remove_sstable(sstables::shared_sstable sst) = 0;
-        virtual double backlog(const ongoing_writes& ow, const ongoing_compactions& oc) const = 0;
+        // FIXME: Should provide strong exception safety guarantees
+        virtual void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts) = 0;
+        virtual double backlog(const compaction_backlog_source& src, const ongoing_writes& ow, const ongoing_compactions& oc) const = 0;
         virtual ~impl() { }
     };
 
     compaction_backlog_tracker(std::unique_ptr<impl> impl) : _impl(std::move(impl)) {}
-    compaction_backlog_tracker(compaction_backlog_tracker&&) = default;
+    compaction_backlog_tracker(compaction_backlog_tracker&&);
+    compaction_backlog_tracker& operator=(compaction_backlog_tracker&&) = delete;
     compaction_backlog_tracker(const compaction_backlog_tracker&) = delete;
     ~compaction_backlog_tracker();
 
-    double backlog() const;
-    void add_sstable(sstables::shared_sstable sst);
-    void remove_sstable(sstables::shared_sstable sst);
+    double backlog(const compaction_backlog_source& src);
+    // FIXME: Should provide strong exception safety guarantees
+    void replace_sstables(const std::vector<sstables::shared_sstable>& old_ssts, const std::vector<sstables::shared_sstable>& new_ssts);
     void register_partially_written_sstable(sstables::shared_sstable sst, backlog_write_progress_manager& wp);
     void register_compacting_sstable(sstables::shared_sstable sst, backlog_read_progress_manager& rp);
-    void transfer_ongoing_charges(compaction_backlog_tracker& new_bt, bool move_read_charges = true);
+    void copy_ongoing_charges(compaction_backlog_tracker& new_bt, bool move_read_charges = true) const;
     void revert_charges(sstables::shared_sstable sst);
-private:
-    // Returns true if this SSTable can be added or removed from the tracker.
-    bool sstable_belongs_to_tracker(const sstables::shared_sstable& sst);
 
+    // Stops tracking. A disabled tracker reports the "backlog unknown" sentinel, which
+    // makes the controller fall back to maximum shares. Used when the tracker failed
+    // and its state can no longer be trusted.
     void disable() {
-        _disabled = true;
+        _impl = {};
         _ongoing_writes = {};
         _ongoing_compactions = {};
     }
-    bool _disabled = false;
+
+    // The tracked compaction group is gone. Stops tracking and stops contributing to
+    // the manager's backlog altogether, as there is no work left to account for.
+    void retire();
+private:
+    // Returns true if this SSTable can be added or removed from the tracker.
+    bool sstable_belongs_to_tracker(const sstables::shared_sstable& sst);
+    bool disabled() const noexcept { return !_impl; }
     std::unique_ptr<impl> _impl;
     // We keep track of this so that we can transfer to a new tracker if the compaction strategy is
     // changed in the middle of a compaction.
@@ -110,7 +161,7 @@ private:
 // Keeping a static part for the backlog complicates the code significantly, though, so this will
 // be left for a future optimization.
 class compaction_backlog_manager {
-    std::unordered_set<compaction_backlog_tracker*> _backlog_trackers;
+    std::unordered_map<compaction_backlog_tracker*, const compaction_backlog_source*> _backlog_trackers;
     void remove_backlog_tracker(compaction_backlog_tracker* tracker);
     compaction_controller* _compaction_controller;
     friend class compaction_backlog_tracker;
@@ -118,5 +169,9 @@ public:
     ~compaction_backlog_manager();
     compaction_backlog_manager(compaction_controller& controller) : _compaction_controller(&controller) {}
     double backlog() const;
-    void register_backlog_tracker(compaction_backlog_tracker& tracker);
+    // The tracker's backlog is calculated on the sstables the source it is registered
+    // with provides.
+    void register_backlog_tracker(compaction_backlog_tracker& tracker, const compaction_backlog_source& src);
 };
+
+}

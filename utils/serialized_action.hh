@@ -3,16 +3,18 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <functional>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_future.hh>
 #include <seastar/util/later.hh>
+#include <seastar/core/abort_source.hh>
 
 // An async action wrapper which ensures that at most one action
 // is running at any time.
@@ -24,6 +26,7 @@ private:
     std::function<future<>()> _func;
     seastar::shared_future<> _pending;
     seastar::semaphore _sem;
+    bool _join_called = false;
 private:
     future<> do_trigger() {
         _pending = {};
@@ -44,15 +47,24 @@ public:
     //
     // When action is not currently running, it is started immediately if !later or
     // at some point in time soon after current fiber defers when later is true.
-    future<> trigger(bool later = false) {
+    future<> trigger(bool later = false, seastar::abort_source* as = nullptr) {
+        if (_join_called) {
+            return seastar::make_exception_future<>(seastar::broken_semaphore());
+        }
         if (_pending.valid()) {
-            return _pending;
+            return as ? _pending.get_future(*as) : _pending.get_future();
         }
         seastar::shared_promise<> pr;
         _pending = pr.get_shared_future();
         future<> ret = _pending;
+        std::optional<future<>> abortable;
+
+        if (as) {
+            abortable = _pending.get_future(*as);
+        }
+
         // run in background, synchronize using `ret`
-        (void)_sem.wait().then([this, later] () mutable {
+        (void)with_semaphore(_sem, 1, [this, later] () mutable {
             if (later) {
                 return seastar::yield().then([this] () mutable {
                     return do_trigger();
@@ -66,9 +78,19 @@ public:
                 pr.set_value();
             }
         });
-        return ret.finally([this] {
-            _sem.signal();
-        });
+
+        if (abortable) {
+            // exception will be delivered to each individual future as well
+            (void)std::move(ret).handle_exception([] (std::exception_ptr ep) {});
+            return std::move(*abortable);
+        }
+
+        return ret;
+    }
+
+    // Like trigger() but can be aborted
+    future<> trigger(seastar::abort_source& as) {
+        return trigger(false, &as);
     }
 
     // Like trigger(), but defers invocation of the action to allow for batching
@@ -77,8 +99,36 @@ public:
         return trigger(true);
     }
 
-    // Waits for all invocations initiated in the past.
+    // Waits for all invocations initiated in the past, including
+    // those pending in the queue at the time of the call.
     future<> join() {
-        return get_units(_sem, 1).discard_result();
+        _join_called = true;
+        auto units = co_await get_units(_sem, 1);
+        _sem.broken();
+    }
+
+    // The adaptor is to be used as an argument to utils::observable.observe()
+    // When the notification happens the adaptor just triggers the action
+    // Note, that all arguments provided by the notification callback are lost,
+    // its up to the action to get the needed values
+    // Also, the future<> returned from .trigger() is ignored, the action code
+    // runs in the background. The user should .join() the action if it needs
+    // to wait for it to finish on stop/drain/shutdown
+    class observing_adaptor {
+        friend class serialized_action;
+        serialized_action& _action;
+        observing_adaptor(serialized_action& act) noexcept : _action(act) {}
+
+    public:
+        template <typename... Args>
+        void operator()(Args&&...) {
+            (void)_action.trigger().handle_exception_type([] (const seastar::broken_semaphore&) {
+                // Avoid an ignored exceptional future warning for notifications after join() starts.
+            });
+        };
+    };
+
+    observing_adaptor make_observer() noexcept {
+        return observing_adaptor(*this);
     }
 };

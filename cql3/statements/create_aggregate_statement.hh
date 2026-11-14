@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -11,6 +11,7 @@
 #include "cql3/statements/function_statement.hh"
 #include "cql3/cql3_type.hh"
 #include "cql3/expr/expression.hh"
+#include <optional>
 
 namespace cql3 {
 
@@ -23,19 +24,24 @@ namespace functions {
 namespace statements {
 
 class create_aggregate_statement final : public create_function_statement_base {
-    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats) override;
-    future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> prepare_schema_mutations(query_processor& qp, api::timestamp_type) const override;
+    virtual std::unique_ptr<prepared_statement> prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) override;
+    future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> prepare_schema_mutations(query_processor& qp, const query_options& options, api::timestamp_type) const override;
+    virtual future<> check_access(query_processor& qp, const service::client_state& state) const override;
 
-    virtual shared_ptr<functions::function> create(query_processor& qp, functions::function* old) const override;
+    virtual seastar::future<shared_ptr<db::functions::function>> create(query_processor& qp, db::functions::function* old) const override;
 
     sstring _sfunc;
     shared_ptr<cql3_type::raw> _stype;
-    sstring _ffunc;
-    expr::expression _ival;
+    std::optional<sstring> _rfunc;
+    std::optional<sstring> _ffunc;
+    std::optional<expr::expression> _ival;
 
+protected:
+    virtual audit::audit_info_ptr audit_info() const override;
+    virtual audit::statement_category category() const override;
 public:
     create_aggregate_statement(functions::function_name name, std::vector<shared_ptr<cql3_type::raw>> arg_types,
-            sstring sfunc, shared_ptr<cql3_type::raw> stype, sstring ffunc, expr::expression ival, bool or_replace, bool if_not_exists);
+            sstring sfunc, shared_ptr<cql3_type::raw> stype, std::optional<sstring> rfunc, std::optional<sstring> ffunc, std::optional<expr::expression> ival, bool or_replace, bool if_not_exists);
 };
 }
 }

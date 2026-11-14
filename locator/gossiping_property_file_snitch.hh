@@ -5,20 +5,15 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include <sstream>
-#include <string>
 #include <chrono>
 #include <optional>
 #include "production_snitch_base.hh"
-#include "exceptions/exceptions.hh"
-#include <seastar/core/file.hh>
-#include "log.hh"
-#include "locator/reconnectable_snitch_helper.hh"
 
 namespace locator {
 
@@ -36,7 +31,7 @@ public:
         return std::chrono::seconds(60);
     }
 
-    virtual future<> gossiper_starting() override;
+    virtual gms::application_state_map get_app_states() const override;
     virtual future<> stop() override;
     virtual future<> start() override;
     virtual future<> pause_io() override;
@@ -45,9 +40,7 @@ public:
         return "org.apache.cassandra.locator.GossipingPropertyFileSnitch";
     }
 
-    gossiping_property_file_snitch(
-        const sstring& fname = "",
-        unsigned io_cpuid = 0);
+    gossiping_property_file_snitch(const snitch_config&);
 
     virtual snitch_signal_connection_t when_reconfigured(snitch_signal_slot_t& slot) override {
         return _reconfigured.connect([slot = std::move(slot)] () mutable {
@@ -56,29 +49,8 @@ public:
         });
     }
 
-    /**
-     * This function register a Gossiper subscriber to reconnect according to
-     * the new "prefer_local" value, namely use either an internal or extenal IP
-     * address.
-     *
-     * @note Currently in order to be backward compatible we are mimicking the C*
-     *       behavior, which is a bit strange: while allowing the change of
-     *       prefer_local value during the same run it won't actually trigger
-     *       disconnect from all remote nodes as would be logical (in order to
-     *       connect using a new configuration). On the contrary, if the new
-     *       prefer_local value is TRUE, it will trigger the reconnect only when
-     *       there is a corresponding gossip event (e.g. on_change()) from the
-     *       corresponding node has been accepted. If the new value is FALSE
-     *       then it won't trigger disconnect at all! And in any case a remote
-     *       node will be reconnected using the PREFERED_IP value stored in the
-     *       system_table.peer.
-     *
-     * This is currently relevant to EC2/GCE(?) only.
-     */
-    virtual future<> reload_gossiper_state() override;
-
 private:
-    void periodic_reader_callback();
+    future<> periodic_reader_callback();
 
     /**
      * Parse the property file and indicate the StorageService and a Gossiper if
@@ -97,7 +69,7 @@ private:
     future<bool> property_file_was_modified();
 
     /**
-     * Read the propery file if it has changed since the last time we read it.
+     * Read the property file if it has changed since the last time we read it.
      */
     future<> read_property_file();
 
@@ -115,7 +87,14 @@ private:
     std::istringstream _istrm;
     bool _file_reader_runs = false;
     unsigned _file_reader_cpu_id;
-    shared_ptr<reconnectable_snitch_helper> _reconnectable_helper;
     snitch_signal_t _reconfigured;
+    promise<> _io_is_stopped;
+    std::optional<gms::inet_address> _listen_address;
+
+    void reset_io_state() {
+        // Reset the promise to allow repeating
+        // start()+stop()/pause_io()+resume_io() call sequences.
+        _io_is_stopped = promise<>();
+    }
 };
 } // namespace locator

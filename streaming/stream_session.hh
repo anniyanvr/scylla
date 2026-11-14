@@ -5,29 +5,24 @@
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include "gms/i_endpoint_state_change_subscriber.hh"
-#include <seastar/core/distributed.hh>
+#include <seastar/core/sharded.hh>
 #include "message/messaging_service_fwd.hh"
-#include "utils/UUID.hh"
 #include "streaming/stream_session_state.hh"
 #include "streaming/stream_transfer_task.hh"
 #include "streaming/stream_receive_task.hh"
 #include "streaming/stream_request.hh"
 #include "streaming/prepare_message.hh"
-#include "streaming/stream_detail.hh"
 #include "streaming/stream_manager.hh"
 #include "streaming/stream_reason.hh"
 #include "streaming/session_info.hh"
-#include "query-request.hh"
-#include "dht/i_partitioner.hh"
+#include "service/topology_guard.hh"
 #include <map>
 #include <vector>
-#include <memory>
 
 namespace db {
 
@@ -119,7 +114,6 @@ private:
     using messaging_service = netw::messaging_service;
     using msg_addr = netw::msg_addr;
     using inet_address = gms::inet_address;
-    using UUID = utils::UUID;
     using token = dht::token;
     using ring_position = dht::ring_position;
 
@@ -129,7 +123,7 @@ public:
      *
      * Each {@code StreamSession} is identified by this InetAddress which is broadcast address of the node streaming.
      */
-    inet_address peer;
+    locator::host_id peer;
     unsigned dst_cpu_id = 0;
 private:
     stream_manager& _mgr;
@@ -139,9 +133,9 @@ private:
     // stream requests to send to the peer
     std::vector<stream_request> _requests;
     // streaming tasks are created and managed per ColumnFamily ID
-    std::map<UUID, stream_transfer_task> _transfers;
+    std::map<table_id, stream_transfer_task> _transfers;
     // data receivers, filled after receiving prepare message
-    std::map<UUID, stream_receive_task> _receivers;
+    std::map<table_id, stream_receive_task> _receivers;
     //private final StreamingMetrics metrics;
     /* can be null when session is created in remote */
     //private final StreamConnectionFactory factory;
@@ -159,12 +153,21 @@ private:
     session_info _session_info;
 
     stream_reason _reason = stream_reason::unspecified;
+    service::frozen_topology_guard _topo_guard;
 public:
     stream_reason get_reason() const {
         return _reason;
     }
     void set_reason(stream_reason reason) {
         _reason = reason;
+    }
+
+    void set_topo_guard(service::frozen_topology_guard topo_guard) {
+        _topo_guard = topo_guard;
+    }
+
+    service::frozen_topology_guard topo_guard() const {
+        return _topo_guard;
     }
 
     void add_bytes_sent(int64_t bytes) {
@@ -190,10 +193,10 @@ public:
      * @param connecting Actual connecting address
      * @param factory is used for establishing connection
      */
-    stream_session(stream_manager& mgr, inet_address peer_);
+    stream_session(stream_manager& mgr, locator::host_id peer_);
     ~stream_session();
 
-    UUID plan_id() const;
+    streaming::plan_id plan_id() const;
 
     sstring description() const;
 
@@ -312,15 +315,15 @@ public:
 
     future<> update_progress();
 
-    void receive_task_completed(UUID cf_id);
-    void transfer_task_completed(UUID cf_id);
+    void receive_task_completed(table_id cf_id);
+    void transfer_task_completed(table_id cf_id);
     void transfer_task_completed_all();
 private:
     void send_failed_complete_message();
     bool maybe_completed();
     void prepare_receiving(stream_summary& summary);
     void start_streaming_files();
-    future<> receiving_failed(UUID cf_id);
+    future<> receiving_failed(table_id cf_id);
 };
 
 } // namespace streaming

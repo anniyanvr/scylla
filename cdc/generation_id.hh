@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -15,19 +15,22 @@
 
 namespace cdc {
 
-struct generation_id_v1 {
-    db_clock::time_point ts;
-};
 
-struct generation_id_v2 {
+struct generation_id {
     db_clock::time_point ts;
     utils::UUID id;
+    bool operator==(const generation_id&) const = default;
 };
 
-using generation_id = std::variant<generation_id_v1, generation_id_v2>;
-
-std::ostream& operator<<(std::ostream&, const generation_id&);
-bool operator==(const generation_id&, const generation_id&);
 db_clock::time_point get_ts(const generation_id&);
 
 } // namespace cdc
+
+template <>
+struct fmt::formatter<cdc::generation_id> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename FormatContext>
+    auto format(const cdc::generation_id& gen_id, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "({}, {})", gen_id.ts, gen_id.id);
+    }
+};

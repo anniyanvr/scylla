@@ -1,33 +1,27 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
-#include <unordered_map>
 #include <seastar/core/future.hh>
-#include <seastar/core/distributed.hh>
-#include <seastar/core/timer.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/semaphore.hh>
 
 #include "db_clock.hh"
-#include "mutation.hh"
-#include "utils/UUID.hh"
+#include "db/timeout_clock.hh"
 
 #include <chrono>
 #include <limits>
-#include <random>
 
 namespace cql3 {
 
@@ -35,57 +29,103 @@ class query_processor;
 
 } // namespace cql3
 
+namespace gms {
+
+class feature_service;
+
+} // namespace gms
+
 namespace db {
 
+class system_keyspace;
+
+using all_batches_replayed = bool_class<struct all_batches_replayed_tag>;
+
 struct batchlog_manager_config {
-    std::chrono::duration<double> write_request_timeout;
+    db_clock::duration replay_timeout;
     uint64_t replay_rate = std::numeric_limits<uint64_t>::max();
-    std::chrono::milliseconds delay;
+    std::chrono::milliseconds delay = std::chrono::milliseconds(0);
+    unsigned replay_cleanup_after_replays;
+};
+
+enum class batchlog_stage : int8_t {
+    initial,
+    failed_replay
 };
 
 class batchlog_manager : public peering_sharded_service<batchlog_manager> {
-private:
-    static constexpr uint32_t replay_interval = 60 * 1000; // milliseconds
-    static constexpr uint32_t page_size = 128; // same as HHOM, for now, w/out using any heuristics. TODO: set based on avg batch size.
-
-    using clock_type = lowres_clock;
+public:
+    using post_replay_cleanup = bool_class<class post_replay_cleanup_tag>;
 
     struct stats {
         uint64_t write_attempts = 0;
-    } _stats;
+    };
+
+
+private:
+    static constexpr std::chrono::seconds replay_interval = std::chrono::seconds(60);
+    static constexpr uint32_t page_size = 128; // same as HHOM, for now, w/out using any heuristics. TODO: set based on avg batch size.
+    static constexpr std::chrono::seconds write_timeout = std::chrono::seconds(300);
+
+    using clock_type = db::timeout_clock;
+
+    stats _stats;
 
     seastar::metrics::metric_groups _metrics;
 
-    size_t _total_batches_replayed = 0;
     cql3::query_processor& _qp;
-    db_clock::duration _write_request_timeout;
+    db::system_keyspace& _sys_ks;
+    gms::feature_service& _fs;
+    db_clock::duration _replay_timeout;
     uint64_t _replay_rate;
-    future<> _started;
     std::chrono::milliseconds _delay;
-    semaphore _sem{1};
-    seastar::gate _gate;
+    unsigned _replay_cleanup_after_replays = 100;
+    seastar::basic_semaphore<seastar::semaphore_default_exception_factory, clock_type> _sem{1};
+    seastar::named_gate _gate;
     unsigned _cpu = 0;
     seastar::abort_source _stop;
+    future<> _loop_done;
 
-    future<> replay_all_failed_batches();
+    gc_clock::time_point _last_replay;
+
+    // Was the v1 -> v2 migration already done since last restart?
+    // The migration is attempted once after each restart. This is redundant but
+    // keeps thing simple. Once no upgrade path exists from a ScyllaDB version
+    // which can still produce v1 entries, this migration code can be removed.
+    bool _migration_done = false;
+
+    // Stops at deadline, leaving the rest of the v1 entries for the next call.
+    future<> maybe_migrate_v1_to_v2(timeout_clock::time_point deadline);
+
+    future<all_batches_replayed> replay_all_failed_batches_v1(post_replay_cleanup cleanup, timeout_clock::time_point deadline);
+    future<all_batches_replayed> replay_all_failed_batches_v2(post_replay_cleanup cleanup, timeout_clock::time_point deadline);
+    future<all_batches_replayed> replay_all_failed_batches(post_replay_cleanup cleanup, timeout_clock::time_point deadline);
 public:
     // Takes a QP, not a distributes. Because this object is supposed
     // to be per shard and does no dispatching beyond delegating the the
     // shard qp (which is what you feed here).
-    batchlog_manager(cql3::query_processor&, batchlog_manager_config config);
+    batchlog_manager(cql3::query_processor&, db::system_keyspace& sys_ks, gms::feature_service& fs, batchlog_manager_config config);
 
-    future<> start();
     // abort the replay loop and return its future.
     future<> drain();
     future<> stop();
 
-    future<> do_batch_log_replay();
+    // deadline bounds the whole replay: the wait for the replay slot, the v1
+    // to v2 migration, the batchlog reads, the rate limiter wait, the writes
+    // of each batch and the loop over the batchlog shards all stop at it. A
+    // replay cut short returns all_batches_replayed::no and leaves the
+    // batches it did not get to for the next replay.
+    future<all_batches_replayed> do_batch_log_replay(post_replay_cleanup cleanup,
+            timeout_clock::time_point deadline = no_timeout);
 
     future<size_t> count_all_batches() const;
-    size_t get_total_batches_replayed() const {
-        return _total_batches_replayed;
+    gc_clock::time_point get_last_replay() const {
+        return _last_replay;
     }
-    db_clock::duration get_batch_log_timeout() const;
+
+    const stats& get_stats() const {
+        return _stats;
+    }
 private:
     future<> batchlog_replay_loop();
 };

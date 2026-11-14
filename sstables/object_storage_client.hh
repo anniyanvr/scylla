@@ -1,0 +1,118 @@
+/*
+ * Copyright (C) 2025-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#pragma once
+
+#include <string>
+#include <optional>
+#include <filesystem>
+#include <unordered_map>
+
+#include <seastar/core/future.hh>
+#include <seastar/core/semaphore.hh>
+#include <fmt/core.h>
+
+#include "utils/lister.hh"
+#include "utils/s3/creds.hh"
+#include "sstables/storage.hh"
+#include "sstables/types.hh"
+
+namespace seastar {
+class abort_source;
+class data_sink;
+class data_source;
+class file;
+
+}
+
+namespace db {
+class object_storage_endpoint_param;
+}
+
+namespace utils {
+class upload_progress;
+}
+
+using namespace seastar;
+
+class memory_data_sink_buffers;
+class abstract_lister;
+
+namespace sstables {
+
+using object_storage_attributes = std::unordered_map<sstring, sstring>;
+
+inline constexpr std::string_view object_storage_sstable_version_attribute = "version";
+inline constexpr std::string_view object_storage_sstable_format_attribute = "format";
+
+class object_name {
+    std::string _name;
+public:
+    object_name(const object_name&);
+    object_name(object_name&&);
+    // Designed for consumers that already hold a full "/bucket/object" location and
+    // therefore have nothing to format, e.g. sstables::storage::exists(const std::string&).
+    explicit object_name(std::string object_location);
+    // Used by native backup/restore with externally supplied prefixes
+    // following the foreign Scylla Manager bucket layout.
+    object_name(std::string_view bucket, std::string_view prefix, std::string_view type);
+    object_name(std::string_view bucket, std::string_view prefix, const sstable_id&, std::string_view type);
+    object_name(std::string_view bucket, std::string_view object);
+
+    std::string_view bucket() const;
+    std::string_view object() const;
+
+    const std::string& str() const {
+        return _name;
+    }
+    operator const std::string&() const {
+        return str();
+    }
+    operator std::string() && {
+        return std::move(_name);
+    }
+};
+
+class object_storage_client {
+public:
+    virtual ~object_storage_client() = default;
+
+    // The attributes are not defaulted: an object written without them cannot
+    // describe itself later, so every caller states whether it has any.  They
+    // come directly after the object being written, ahead of the remaining
+    // parameters, matching the order the backend clients use.
+    virtual future<> put_object(object_name, ::memory_data_sink_buffers bufs, object_storage_attributes, abort_source* = nullptr) = 0;
+    virtual future<> copy_object(object_name src, object_name dst, object_storage_attributes, abort_source* = nullptr) = 0;
+    virtual future<> delete_object(object_name, abort_source* = nullptr) = 0;
+    virtual file make_readable_file(object_name, abort_source* = nullptr) = 0;
+    virtual data_sink make_data_upload_sink(object_name, object_storage_attributes, std::optional<unsigned> max_parts_per_piece, abort_source* = nullptr) = 0;
+    virtual data_sink make_upload_sink(object_name, object_storage_attributes, abort_source* = nullptr) = 0;
+    virtual data_source make_download_source(object_name, abort_source* = nullptr) = 0;
+    virtual future<bool> object_exists(object_name name, abort_source* as = nullptr) = 0;
+    virtual future<object_storage_attributes> get_object_metadata(object_name name, abort_source* as = nullptr) = 0;
+
+    virtual abstract_lister make_object_lister(std::string bucket, std::string prefix, lister::filter_type) = 0;
+
+    virtual future<> upload_file(std::filesystem::path path, object_name, utils::upload_progress& up, seastar::abort_source* = nullptr) = 0;
+
+    virtual void update_config_sync(const db::object_storage_endpoint_param&) = 0;
+    virtual void update_group_connections(const s3::group_connections&) = 0;
+
+    virtual future<> close() = 0;
+};
+
+using shard_client_factory = std::function<shared_ptr<object_storage_client>(std::string)>;
+
+shared_ptr<object_storage_client> make_object_storage_client(const db::object_storage_endpoint_param&, semaphore&, shard_client_factory, s3::group_connections connections = {});
+
+}
+
+template <>
+struct fmt::formatter<sstables::object_name> : fmt::formatter<std::string_view> {
+    auto format(const sstables::object_name&, fmt::format_context& ctx) const -> decltype(ctx.out());
+};

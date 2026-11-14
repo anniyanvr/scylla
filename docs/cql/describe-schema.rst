@@ -1,0 +1,219 @@
+===============
+DESCRIBE SCHEMA
+===============
+
+When using ScyllaDB, you may want to back up your data. In case something unexpected happens, you will
+be able to restore it. However, you cannot insert data into the void; because of that, you need to
+first restore the schema.
+
+That is the main motivation for an introduced statement in ScyllaDB: ``DESCRIBE SCHEMA``, which is
+responsible for producing a sequence of CQL commands that can be executed in order to recreate the schema.
+
+Aside from elements of schema, like keyspaces and tables, it also allows for restoring entities such as
+roles and service levels.
+
+For more context, see the articles covering :doc:`backing up </operating-scylla/procedures/backup-restore/backup>`
+and :doc:`restoring </operating-scylla/procedures/backup-restore/restore>` the schema.
+
+Syntax and semantics
+--------------------
+
+``DESCRIBE SCHEMA`` comes in three forms that differ in semantics. We will refer to those forms as "tiers".
+
+* ``DESCRIBE [FULL] SCHEMA``: describe elements of the non-system schema: keyspaces, tables, views, UDTs, etc.
+  When `FULL` is used, it also includes the elements of the system schema, e.g. system tables.
+  If any cluster-scope configuration overrides are stored (see ``ALTER CLUSTER``), the corresponding
+  ``ALTER CLUSTER WITH ...`` statements lead the output, before any keyspace.
+
+* ``DESCRIBE [FULL] SCHEMA WITH INTERNALS``: in addition to the output of the previous tier, the statement
+  also describes authentication and authorization, as well as service levels. The statements corresponding to
+  restoring roles do *not* contain any information about their passwords. Aside from that, additional information
+  about tables, materialized views, and secondary indices may be provided, e.g. the ID of a table.
+  Cluster configuration overrides stored at any scope (cluster, keyspace, or table) are not part of the
+  ``CREATE`` statements; they are described by separate rows of type ``cluster_config``, ``keyspace_config``,
+  or ``table_config``, holding ``ALTER CLUSTER``, ``ALTER KEYSPACE``, or ``ALTER TABLE`` statements, which
+  follow all keyspaces.
+  See :doc:`Cluster configuration </cql/cluster-config>`.
+
+* ``DESCRIBE [FULL] SCHEMA WITH INTERNALS AND PASSWORDS``: aside from the information retrieved as part of the
+  previous tier, the statements corresponding to restoring roles *do* contain information about their
+  passwords; namely—their hashed passwords. For more information regarding hashed passwords, see the relevant section
+  below.
+
+Instead of ``DESCRIBE``, you can use its shortened form: ``DESC``.
+
+Output
+------
+
+As a result of the query, you will obtain a set of rows, each of which consists of four values:
+
+* ``keyspace_name``: the name of the keyspace the entity is part of,
+* ``type``: the type of the entity,
+* ``name``: the name of the entity,
+* ``create_statement``: the statement that can be used to restore the entity.
+
+All of those values are always present and represent strings using UTF-8 encoding.
+The value ``keyspace_name`` can be equal to ``null`` if the corresponding entity is not part of any keyspace,
+e.g. in the case of a role or a service level.
+
+Entity types
+^^^^^^^^^^^^
+
+The ``type`` column takes one of the following values. A tool processing the output, e.g. to restore only a
+part of it, should select rows by ``keyspace_name``, ``type`` and ``name`` rather than by parsing
+``create_statement``.
+
+.. list-table::
+   :widths: 22 14 22 42
+   :header-rows: 1
+
+   * - ``type``
+     - ``keyspace_name``
+     - ``name``
+     - ``create_statement``
+   * - ``keyspace``
+     - the keyspace
+     - the keyspace
+     - ``CREATE KEYSPACE``
+   * - ``type``
+     - the keyspace
+     - the user-defined type
+     - ``CREATE TYPE``
+   * - ``function``
+     - the keyspace
+     - the function
+     - ``CREATE FUNCTION``
+   * - ``aggregate``
+     - the keyspace
+     - the aggregate
+     - ``CREATE AGGREGATE``
+   * - ``table``
+     - the keyspace
+     - the table
+     - ``CREATE TABLE``; for the CDC log table of a table with CDC enabled, an ``ALTER TABLE`` statement
+       restoring the log table's properties
+   * - ``index``
+     - the keyspace
+     - the index
+     - ``CREATE INDEX``
+   * - ``view``
+     - the keyspace
+     - the materialized view
+     - ``CREATE MATERIALIZED VIEW``
+   * - ``cluster_config``
+     - ``null``
+     - ``cluster``
+     - The cluster configuration overrides stored at cluster scope, one ``ALTER CLUSTER`` statement per line.
+       See :doc:`Cluster configuration </cql/cluster-config>`.
+   * - ``keyspace_config``
+     - the keyspace
+     - the keyspace
+     - The cluster configuration overrides stored at keyspace scope, one ``ALTER KEYSPACE`` statement per line.
+   * - ``table_config``
+     - the keyspace
+     - the table
+     - The cluster configuration overrides stored at table scope, one ``ALTER TABLE`` statement per line.
+   * - ``role``
+     - ``null``
+     - the role
+     - ``CREATE ROLE``
+   * - ``grant_role``
+     - ``null``
+     - the granted role
+     - ``GRANT <role> TO <role>``
+   * - ``grant_permission``
+     - ``null``
+     - the role the permission is granted to
+     - ``GRANT <permission> ON <resource> TO <role>``
+   * - ``service_level``
+     - ``null``
+     - the service level
+     - ``CREATE SERVICE LEVEL``; for the built-in ``driver`` service level, an ``ALTER`` or ``DROP`` statement may
+       follow or replace it, so there can be more than one row with the same name
+   * - ``service_level_attachment``
+     - ``null``
+     - the service level
+     - ``ATTACH SERVICE LEVEL <service level> TO <role>``
+
+The rows of type ``keyspace_config``, ``table_config``, ``role``, ``grant_role``, ``grant_permission``,
+``service_level`` and ``service_level_attachment`` are emitted only with ``WITH INTERNALS``. The rows of the three
+``*_config`` types are the cluster configuration; they can be selected or skipped as a group, e.g. to apply the
+configuration only after the data is restored.
+
+Every ``create_statement`` in the output can be executed. Objects that ScyllaDB creates automatically are not
+listed: the materialized view backing a secondary index (restored by restoring the index), the CDC log table
+(created with its base table, and followed by an ``ALTER TABLE`` statement restoring its properties) and the paxos
+tables. A direct ``DESCRIBE`` of such an object returns its statement as an informational CQL comment, which must
+not be executed.
+
+The rows are emitted in an order in which the statements can be executed one after the other:
+
+1. without ``WITH INTERNALS`` only: the cluster-scope ``cluster_config`` row,
+2. for each keyspace, in alphabetical order: the keyspace, its user-defined types (each after the types it depends
+   on), functions, aggregates and tables; each table is followed by its indexes, its materialized views and the
+   ``ALTER TABLE`` statement of its CDC log table,
+3. with ``WITH INTERNALS`` only: the ``cluster_config`` row, then the ``keyspace_config`` and ``table_config`` rows,
+   in keyspace order, each keyspace's row before its tables' rows,
+4. with ``WITH INTERNALS`` only: roles, role grants, permission grants, service levels and service level
+   attachments.
+
+Required permissions
+--------------------
+
+No permissions are necessary to execute the first two tiers. However, executing the last tier requires that the user
+performing the query be a superuser.
+
+Restoring the schema by executing the consecutive statements returned by ``DESCRIBE SCHEMA`` should be conducted by
+a superuser—some of the statements may require that status. It's advised to use the default superuser and not modify
+the schema, roles, permissions, or service levels beforehand.
+
+Relation to authentication and authorization
+--------------------------------------------
+
+It's important to note that the information returned by ``DESCRIBE [FULL] SCHEMA WITH INTERNALS [AND PASSWORDS]``
+depends on the currently used authenticator and authorizer. If the used authenticator doesn't use passwords to
+authenticate a role, the hashed passwords won't be returned even if they're present in the database. That scenario
+may happen if, for example, you start using `AllowAllAuthenticator`.
+
+Similarly, permission grants may not be returned if they're not used, e.g. when ScyllaDB is configured to use
+`AllowAllAuthorizer`.
+
+Since ScyllaDB may also use third party software service for authentication and authorization, the result of the query
+will depend on what information that service will provide the database with.
+
+That's why it's *crucial* for you to take into consideration the current configuration of your cluster.
+
+Restoring process and its side effects
+--------------------------------------
+
+When a resource is created, the current role is always granted full permissions to that resource. As a consequence, the role
+used to restore the backup will gain permissions to all of the resources that will be recreated. That's one of the reasons
+why using a superuser to restore the schema is advised—a superuser has full access to all resources anyway.
+
+cqlsh support
+-------------
+
+    +---------------------------------------------------------+---------------------------+
+    | Statement                                               | Required version of cqlsh |
+    +=========================================================+===========================+
+    | ``DESCRIBE [FULL] SCHEMA``                              | 6.0.19                    |
+    +---------------------------------------------------------+---------------------------+
+    | ``DESCRIBE [FULL] SCHEMA WITH INTERNALS``               | 6.0.19                    |
+    +---------------------------------------------------------+---------------------------+
+    | ``DESCRIBE [FULL] SCHEMA WITH INTERNALS AND PASSWORDS`` | 6.0.23                    |
+    +---------------------------------------------------------+---------------------------+
+
+Appendix I, hashed passwords
+----------------------------
+
+A hashed password is an encrypted form of a password stored by ScyllaDB to authenticate roles. The statements returned
+by ``DESCRIBE [FULL] SCHEMA WITH INTERNALS AND PASSWORDS`` corresponding to recreating the roles will be of the
+following form:
+
+.. code-block:: cql
+
+    CREATE ROLE [IF NOT EXISTS] <role_name> WITH HASHED PASSWORD = '<hashed_password>' AND LOGIN = <boolean> AND SUPERUSER = <boolean>
+
+The semantics of this statement is analogous to the regular ``CREATE ROLE`` statement except that it circumvents
+the encryption phase of the execution and inserts the hashed password directly into the database.
+See :doc:`the article on authorization in ScyllaDB </operating-scylla/security/authorization>` to learn more about it.

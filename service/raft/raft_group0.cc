@@ -3,107 +3,335 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+#include <iterator>
+#include <source_location>
+#include <fmt/ranges.h>
+
+#include "mutation/async_utils.hh"
+#include "raft/raft.hh"
+#include "service/raft/group0_fwd.hh"
 #include "service/raft/raft_group0.hh"
+#include "service/raft/raft_metrics.hh"
 #include "service/raft/raft_rpc.hh"
-#include "service/raft/raft_gossip_failure_detector.hh"
 #include "service/raft/raft_sys_table_storage.hh"
 #include "service/raft/group0_state_machine.hh"
+#include "service/raft/raft_group0_client.hh"
 
 #include "message/messaging_service.hh"
 #include "cql3/query_processor.hh"
+#include "cql3/untyped_result_set.hh"
+#include "service/storage_proxy.hh"
+#include "service/storage_service.hh"
+#include "service/migration_manager.hh"
+#include "service/direct_failure_detector/failure_detector.hh"
 #include "gms/gossiper.hh"
+#include "gms/feature_service.hh"
+#include "db/config.hh"
 #include "db/system_keyspace.hh"
+#include "replica/database.hh"
+#include "service/topology_mutation.hh"
+#include "utils/assert.hh"
+#include "utils/error_injection.hh"
 
 #include <seastar/core/smp.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/with_scheduling_group.hh>
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/rpc/rpc_types.hh>
+#include <stdexcept>
+#include <csignal>
+#include <unordered_set>
+
+#include "idl/group0.dist.hh"
+#include "idl/migration_manager.dist.hh"
+
+// Used to implement 'wait for any task to finish'.
+//
+// Pass a copy of this object to each task in a set of tasks.
+// Once a task finishes, it should call `set_value` or `set_exception`.
+//
+// Call `get()` to wait for the result of the first task that finishes.
+// Note that the results of all other tasks will be lost.
+//
+// There can be at most one `get()` call.
+//
+// Make sure that there is at least one task that reaches `set_value` or `set_exception`;
+// otherwise `get()` would hang indefinitely.
+template <typename T>
+requires std::is_nothrow_move_constructible_v<T>
+class tracker {
+    struct shared {
+        bool is_set{false};
+        promise<T> p{};
+    };
+
+    lw_shared_ptr<shared> _shared{make_lw_shared<shared>()};
+
+public:
+    bool finished() {
+        return _shared->is_set;
+    }
+
+    void set_value(T&& v) {
+        if (!_shared->is_set) {
+            _shared->p.set_value(std::move(v));
+            _shared->is_set = true;
+        }
+    }
+
+    void set_exception(std::exception_ptr ep) {
+        if (!_shared->is_set) {
+            _shared->p.set_exception(std::move(ep));
+            _shared->is_set = true;
+        }
+    }
+
+    future<T> get() {
+        return _shared->p.get_future();
+    }
+};
 
 namespace service {
 
+static logging::logger group0_log("raft_group0");
+static logging::logger upgrade_log("raft_group0_upgrade");
+
+namespace {
+
+constexpr std::chrono::milliseconds default_retry_period{10};   // 10 milliseconds
+constexpr std::chrono::seconds default_max_retry_period{1};     // 1 second
+constexpr std::chrono::seconds default_max_total_timeout{300};  // 5 minutes
+
+enum class operation_result : uint8_t { success, failure };
+
+future<> run_op_with_retry(abort_source& as, auto&& op, const sstring op_name,
+        const std::optional<std::chrono::seconds> max_total_timeout = default_max_total_timeout, std::chrono::milliseconds retry_period = default_retry_period,
+        const std::chrono::seconds max_retry_period = default_max_retry_period) {
+    const auto start = lowres_clock::now();
+    while (true) {
+        as.check();
+        const operation_result result = co_await op();
+        if (result == operation_result::success) {
+            co_return;
+        }
+
+        if (max_total_timeout) {
+            const auto elapsed = lowres_clock::now() - start;
+            if (elapsed > *max_total_timeout) {
+                on_internal_error(group0_log,
+                        format("{} timed out after retrying for {} seconds", op_name, std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()));
+            }
+        }
+
+        retry_period *= 2;
+        if (retry_period > max_retry_period) {
+            retry_period = max_retry_period;
+        }
+        co_await sleep_abortable(retry_period, as);
+    }
+    std::unreachable();
+}
+
+} // namespace
+
+// TODO: change the links from master to stable/5.2 after 5.2 is released
+const char* const raft_upgrade_doc = "https://docs.scylladb.com/master/architecture/raft.html#verifying-that-the-internal-raft-upgrade-procedure-finished-successfully";
+static const auto raft_manual_recovery_doc = "https://docs.scylladb.com/master/architecture/raft.html#raft-manual-recovery-procedure";
+
+// {{{ group0_rpc Maintain failure detector subscription whenever
+// group 0 configuration changes.
+
+class group0_rpc: public service::raft_rpc {
+    direct_failure_detector::failure_detector& _direct_fd;
+public:
+    explicit group0_rpc(direct_failure_detector::failure_detector& direct_fd,
+            raft_state_machine& sm, netw::messaging_service& ms,
+            shared_ptr<raft::failure_detector> raft_fd, raft::group_id gid, raft::server_id srv_id,
+            lw_shared_ptr<raft_rpc::stats> shared_stats)
+        : raft_rpc(sm, ms, std::move(raft_fd), gid, srv_id, std::move(shared_stats))
+        , _direct_fd(direct_fd)
+    {}
+
+    virtual void on_configuration_change(raft::server_address_set add, raft::server_address_set del) override {
+        for (const auto& addr: add) {
+            // Notify the direct failure detector that it should track
+            // (or liveness of a specific raft server id.
+            if (addr != _my_id) {
+                // No need to ping self to know it's alive
+                _direct_fd.add_endpoint(addr.id.id);
+            }
+        }
+        for (const auto& addr: del) {
+            _direct_fd.remove_endpoint(addr.id.id);
+        }
+    }
+};
+
+// }}} group0_rpc
+
 raft_group0::raft_group0(seastar::abort_source& abort_source,
         raft_group_registry& raft_gr,
-        netw::messaging_service& ms,
+        sharded<netw::messaging_service>& ms,
         gms::gossiper& gs,
-        cql3::query_processor& qp,
-        service::migration_manager& mm)
-    : _abort_source(abort_source), _raft_gr(raft_gr), _ms(ms), _gossiper(gs), _qp(qp), _mm(mm)
+        gms::feature_service& feat,
+        raft_group0_client& client,
+        seastar::scheduling_group sg)
+    : _shutdown_gate("raft_group0::shutdown")
+    , _abort_source(abort_source), _raft_gr(raft_gr), _ms(ms), _gossiper(gs),  _feat(feat), _client(client), _sg(sg)
+    , _status_for_monitoring(status_for_monitoring::normal)
 {
+    register_metrics();
 }
 
-seastar::future<raft::server_address> raft_group0::load_or_create_my_addr() {
-    assert(this_shard_id() == 0);
-    raft::server_address my_addr;
-    my_addr.id = raft::server_id{co_await db::system_keyspace::get_raft_server_id()};
-    if (my_addr.id == raft::server_id{}) {
-        my_addr.id = raft::server_id::create_random_id();
-        co_await db::system_keyspace::set_raft_server_id(my_addr.id.id);
-    }
-    my_addr.info = inet_addr_to_raft_addr(_gossiper.get_broadcast_address());
-    co_return my_addr;
+future<> raft_group0::start() {
+    return smp::invoke_on_all([shard0_this=this]() {
+        init_rpc_verbs(*shard0_this);
+    });
 }
 
-raft_server_for_group raft_group0::create_server_for_group(raft::group_id gid,
-        raft::server_address my_addr) {
+void raft_group0::init_rpc_verbs(raft_group0& shard0_this) {
+    ser::group0_rpc_verbs::register_group0_peer_exchange(&shard0_this._ms.local(),
+        [&shard0_this] (const rpc::client_info&, rpc::opt_time_point, discovery::peer_list peers) {
+            return smp::submit_to(0, [&shard0_this, peers = std::move(peers)]() mutable {
+                return shard0_this.peer_exchange(std::move(peers));
+            });
+        });
 
-    _raft_gr.address_map().set(my_addr);
-    auto state_machine = std::make_unique<group0_state_machine>(_mm, _qp.proxy());
-    auto rpc = std::make_unique<raft_rpc>(*state_machine, _ms, _raft_gr.address_map(), gid, my_addr.id);
+    ser::group0_rpc_verbs::register_group0_modify_config(&shard0_this._ms.local(),
+        [&shard0_this] (const rpc::client_info&, rpc::opt_time_point, raft::group_id gid, std::vector<raft::config_member> add, std::vector<raft::server_id> del) {
+            return smp::submit_to(0, [&shard0_this, gid, add = std::move(add), del = std::move(del)]() mutable {
+                return shard0_this._raft_gr.get_server(gid).modify_config(std::move(add), std::move(del), nullptr);
+            });
+        });
+}
+
+future<> raft_group0::uninit_rpc_verbs(netw::messaging_service& ms) {
+    return when_all_succeed(
+        ser::group0_rpc_verbs::unregister_group0_peer_exchange(&ms),
+        ser::group0_rpc_verbs::unregister_group0_modify_config(&ms)
+    ).discard_result();
+}
+
+const raft::server_id& raft_group0::load_my_id() {
+    return _raft_gr.get_my_raft_id();
+}
+
+raft_server_for_group raft_group0::create_server_for_group0(raft::group_id gid, raft::server_id my_id, service::storage_service& ss, cql3::query_processor& qp,
+                                                            service::migration_manager& mm, bool enable_sm_immediately,
+                                                            lw_shared_ptr<raft::server_stats> server_stats) {
+    auto state_machine = std::make_unique<group0_state_machine>(
+            _client, mm, qp.proxy(), ss, _gossiper, _feat, enable_sm_immediately,
+            [gid, this] (std::exception_ptr e) {
+                abort_server_on_error(gid, fmt::format("state machine error, {:t}", e));
+            });
+    auto& state_machine_ref = *state_machine;
+    auto rpc = std::make_unique<group0_rpc>(_raft_gr.direct_fd(), *state_machine, _ms.local(), _raft_gr.failure_detector(), gid, my_id, _rpc_stats);
     // Keep a reference to a specific RPC class.
     auto& rpc_ref = *rpc;
-    auto storage = std::make_unique<raft_sys_table_storage>(_qp, gid, my_addr.id);
+    auto storage = std::make_unique<raft_sys_table_storage>(qp, gid, my_id);
     auto& persistence_ref = *storage;
-    auto server = raft::create_server(my_addr.id, std::move(rpc), std::move(state_machine),
-            std::move(storage), _raft_gr.failure_detector(), raft::server::configuration());
+    auto* cl = qp.proxy().get_db().local().schema_commitlog();
+    auto config = raft::server::configuration {
+        .on_background_error = [gid, this](std::exception_ptr e) {
+            abort_server_on_error(gid, fmt::format("background error, {:t}", e));
+        }
+    };
+    if (cl) {
+        // Dividing by two is to protect against paddings that the
+        // commit log can add for each mutation, as well as
+        // against different commit log limits on different nodes.
+        config.max_command_size = cl->max_record_size() / 2;
+        config.max_log_size = 3 * config.max_command_size;
+        config.snapshot_threshold_log_size = config.max_log_size / 2;
+        config.snapshot_trailing_size = config.snapshot_threshold_log_size / 2;
+    };
+    auto server = raft::create_server(my_id, std::move(rpc), std::move(state_machine),
+            std::move(storage), _raft_gr.failure_detector(), config, std::move(server_stats));
 
     // initialize the corresponding timer to tick the raft server instance
     auto ticker = std::make_unique<raft_ticker_type>([srv = server.get()] { srv->tick(); });
-
     return raft_server_for_group{
         .gid = std::move(gid),
         .server = std::move(server),
         .ticker = std::move(ticker),
         .rpc = rpc_ref,
         .persistence = persistence_ref,
+        .state_machine = state_machine_ref,
+        .default_op_timeout_in_ms = qp.proxy().get_db().local().get_config().group0_raft_op_timeout_in_ms,
+        .is_group0 = true,
     };
 }
 
 future<group0_info>
-raft_group0::discover_group0(raft::server_address my_addr) {
-    std::vector<raft::server_address> seeds;
-    seeds.reserve(_gossiper.get_seeds().size());
-    for (auto& seed : _gossiper.get_seeds()) {
-        if (seed == _gossiper.get_broadcast_address()) {
-            continue;
+raft_group0::discover_group0(const std::vector<gms::inet_address>& seeds, cql3::query_processor& qp) {
+    auto my_id = load_my_id();
+    discovery::peer_list peers;
+    for (auto& ip: seeds) {
+        if (ip != _gossiper.get_broadcast_address()) {
+            peers.emplace_back(discovery_peer{raft::server_id{}, ip});
         }
-        seeds.push_back({.info = inet_addr_to_raft_addr(seed)});
     }
-    _group0 = discovery{my_addr, std::move(seeds)};
-    auto clear_discovery = defer([this] {
-        _group0 = std::monostate{};
-    });
+    discovery_peer my_addr = {my_id, _gossiper.get_broadcast_address()};
 
-    struct tracker {
-        explicit tracker(discovery::output output_arg) : output(std::move(output_arg)) {}
-        discovery::output output;
-        promise<std::optional<group0_info>> g0_info;
-        bool is_set = false;
-        void set_value(std::optional<group0_info> opt_g0_info) {
-            if (!is_set) {
-                is_set = true;
-                g0_info.set_value(std::move(opt_g0_info));
-            }
-        }
-        void set_exception() {
-            if (!is_set) {
-                is_set = true;
-                g0_info.set_exception(std::current_exception());
-            }
-        }
-    };
+    auto& p_discovery = _group0.emplace<persistent_discovery>(co_await persistent_discovery::make(my_addr, std::move(peers), qp));
+    co_return co_await futurize_invoke([this, &p_discovery, my_addr = std::move(my_addr)] () mutable {
+        return p_discovery.run(_ms.local(), _shutdown_gate.hold(), _abort_source, std::move(my_addr));
+    }).finally(std::bind_front([] (raft_group0& self, persistent_discovery& p_discovery) -> future<> {
+        co_await p_discovery.stop();
+        self._group0 = std::monostate{};
+    }, std::ref(*this), std::ref(p_discovery)));
+}
+
+static constexpr auto DISCOVERY_KEY = "peers";
+
+static future<discovery::peer_list> load_discovered_peers(cql3::query_processor& qp) {
+    static const auto load_cql = format(
+            "SELECT ip_addr, raft_server_id FROM system.{} WHERE key = '{}'",
+            db::system_keyspace::DISCOVERY, DISCOVERY_KEY);
+    auto rs = co_await qp.execute_internal(load_cql, cql3::query_processor::cache_internal::yes);
+    SCYLLA_ASSERT(rs);
+
+    discovery::peer_list peers;
+    for (auto& r: *rs) {
+        peers.push_back({
+            raft::server_id{r.get_as<utils::UUID>("raft_server_id")},
+            gms::inet_address{r.get_as<net::inet_address>("ip_addr")}
+        });
+    }
+
+    co_return peers;
+}
+
+static mutation make_discovery_mutation(discovery::peer_list peers) {
+    auto s = db::system_keyspace::discovery();
+    auto ts = api::new_timestamp();
+    auto raft_id_cdef = s->get_column_definition("raft_server_id");
+    SCYLLA_ASSERT(raft_id_cdef);
+
+    mutation m(s, partition_key::from_singular(*s, DISCOVERY_KEY));
+    for (auto& p: peers) {
+        auto& row = m.partition().clustered_row(*s, clustering_key::from_singular(*s, data_value(p.ip_addr)));
+        row.apply(row_marker(ts));
+        row.cells().apply(*raft_id_cdef, atomic_cell::make_live(*raft_id_cdef->type, ts, raft_id_cdef->type->decompose(p.id.id)));
+    }
+
+    return m;
+}
+
+static future<> store_discovered_peers(cql3::query_processor& qp, discovery::peer_list peers) {
+    return qp.proxy().mutate_locally({make_discovery_mutation(std::move(peers))}, tracing::trace_state_ptr{});
+}
+
+future<group0_info> persistent_discovery::run(
+        netw::messaging_service& ms,
+        gate::holder pause_shutdown,
+        abort_source& as,
+        discovery_peer my_addr) {
     // Send peer information to all known peers. If replies
     // discover new peers, send peer information to them as well.
     // As soon as we get a Raft Group 0 member information from
@@ -114,180 +342,700 @@ raft_group0::discover_group0(raft::server_address my_addr) {
     // creates a group and shares its group 0 id and peer address
     // with us.
     while (true) {
-        auto tracker = make_lw_shared<struct tracker>(std::get<discovery>(_group0).get_output());
-        if (std::holds_alternative<discovery::i_am_leader>(tracker->output)) {
+        auto output = co_await tick();
+
+        if (std::holds_alternative<discovery::i_am_leader>(output)) {
             co_return group0_info{
                 // Time-based ordering for groups identifiers may be
                 // useful to provide linearisability between group
                 // operations. Currently it's unused.
                 .group0_id = raft::group_id{utils::UUID_gen::get_time_UUID()},
-                .addr = my_addr
+                .id = my_addr.id,
+                .ip_addr = my_addr.ip_addr
             };
         }
-        if (std::holds_alternative<discovery::pause>(tracker->output)) {
-            rslog.trace("server {} pausing discovery...", my_addr.id);
-            co_await seastar::sleep_abortable(std::chrono::milliseconds{1000}, _abort_source);
+
+        if (std::holds_alternative<discovery::pause>(output)) {
+            group0_log.trace("server {} pausing discovery...", my_addr.id);
+            co_await seastar::sleep_abortable(std::chrono::milliseconds{100}, as);
             continue;
         }
-        auto& request_list = std::get<discovery::request_list>(tracker->output);
-        auto timeout = db::timeout_clock::now() + std::chrono::milliseconds{1000};
-        (void) parallel_for_each(request_list, [this, tracker_ = tracker, timeout]
-                (std::pair<raft::server_address, discovery::peer_list>& req) -> future<> {
 
-            netw::msg_addr peer(raft_addr_to_inet_addr(req.first));
-            auto pause_shutdown = _shutdown_gate.hold();
-            rslog.trace("sending discovery message to {}", peer);
-            auto tracker = tracker_; // https://bugs.llvm.org/show_bug.cgi?id=51515
-            try {
-                auto reply = co_await _ms.send_group0_peer_exchange(peer, timeout, std::move(req.second));
-                if (std::holds_alternative<discovery::peer_list>(reply.info)) {
-                    if (auto p_discovery = std::get_if<service::discovery>(&_group0)) {
-                        p_discovery->response(req.first, std::move(std::get<discovery::peer_list>(reply.info)));
+        ::tracker<std::optional<group0_info>> tracker;
+        (void)[] (persistent_discovery& self, netw::messaging_service& ms, gate::holder pause_shutdown,
+                  discovery::request_list request_list, ::tracker<std::optional<group0_info>> tracker) -> future<> {
+            auto timeout = db::timeout_clock::now() + std::chrono::milliseconds{1000};
+            co_await parallel_for_each(request_list, [&] (std::pair<discovery_peer, discovery::peer_list>& req) -> future<> {
+                netw::msg_addr peer(req.first.ip_addr);
+                group0_log.trace("sending discovery message to {}", peer);
+                try {
+                    auto reply = co_await ser::group0_rpc_verbs::send_group0_peer_exchange(&ms, peer, timeout, std::move(req.second));
+
+                    if (tracker.finished()) {
+                        // Another peer was used to discover group 0 before us.
+                        co_return;
                     }
-                } else if (std::holds_alternative<group0_info>(reply.info)) {
-                    tracker->set_value(std::move(std::get<group0_info>(reply.info)));
+
+                    if (auto peer_list = std::get_if<discovery::peer_list>(&reply.info)) {
+                        // `tracker.finished()` is false so `run_discovery` hasn't exited yet, still safe to access `self`.
+                        self.response(req.first, std::move(*peer_list));
+                    } else if (auto g0_info = std::get_if<group0_info>(&reply.info)) {
+                        tracker.set_value(std::move(*g0_info));
+                    }
+                } catch (std::exception& e) {
+                    if (dynamic_cast<std::runtime_error*>(&e)) {
+                        group0_log.trace("failed to send message: {}", e);
+                    } else {
+                        tracker.set_exception(std::current_exception());
+                    }
                 }
-            } catch (std::exception& e) {
-                if (dynamic_cast<std::runtime_error*>(&e)) {
-                    rslog.trace("failed to send message: {}", e);
-                } else {
-                    tracker->set_exception();
-                }
-            }
-        }).then([tracker] { tracker->set_value({}); });
-        if (auto g0_info = co_await tracker->g0_info.get_future()) {
+            });
+
+            // In case we haven't discovered group 0 yet - need to run another iteration.
+            tracker.set_value(std::nullopt);
+        }(std::ref(*this), ms, pause_shutdown, std::move(std::get<discovery::request_list>(output)), tracker);
+
+        if (auto g0_info = co_await tracker.get()) {
             co_return *g0_info;
         }
     }
 }
 
-future<> raft_group0::join_group0() {
-    assert(this_shard_id() == 0);
-    if (!_raft_gr.is_enabled()) {
+future<> raft_group0::abort_and_drain() {
+    if (!_aborted) {
+        // Async lambdas are destroyed at the first co_await,
+        // so accessing lambda-local state (like 'this') afterward would result
+        // in use-after-free. To avoid that, we delegate to a helper function,
+        // do_abort_and_drain().
+
+        _aborted = futurize_invoke([this]() { return do_abort_and_drain(); });
+    }
+    return _aborted->get_future();
+}
+
+future<> raft_group0::do_abort_and_drain() {
+    group0_log.debug("Aborting raft group0 service...");
+
+    // abort_server() may already be running in the background if triggered by the
+    // on_background_error callback. We wait for that to complete. This code
+    // shouldn't normally throw, but we wrap it in try/catch just in case, to ensure
+    // we still wait for the background abort.
+
+    try {
+        co_await smp::invoke_on_all([this]() {
+            return uninit_rpc_verbs(_ms.local());
+        });
+
+        _leadership_monitor_as.request_abort();
+
+        co_await _shutdown_gate.close();
+
+        co_await std::move(_leadership_monitor);
+    } catch (...) {
+        rslog.warn("Failed to abort raft group0: {:t}", std::current_exception());
+    }
+
+    if (auto* group0_id = std::get_if<raft::group_id>(&_group0)) {
+        co_await _raft_gr.abort_server(*group0_id, "raft group0 is aborted");
+    }
+
+    group0_log.debug("Raft group0 service aborted");
+}
+
+void raft_group0::destroy() {
+    if (auto* group0_id = std::get_if<raft::group_id>(&_group0)) {
+        _server_metrics.clear();
+        _raft_gr.destroy_server(*group0_id);
+    }
+}
+
+future<> raft_group0::start_server_for_group0(raft::group_id group0_id, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm, bool enable_sm_immediately) {
+    SCYLLA_ASSERT(group0_id != raft::group_id{});
+    // The address map may miss our own id in case we connect
+    // to an existing Raft Group 0 leader.
+    auto my_id = load_my_id();
+    group0_log.info("Server {} is starting group 0 with id {}", my_id, group0_id);
+    auto server_stats = make_lw_shared<raft::server_stats>();
+    auto srv_for_group0 = create_server_for_group0(group0_id, my_id, ss, qp, mm, enable_sm_immediately, server_stats);
+    auto& persistence = srv_for_group0.persistence;
+    auto& server = *srv_for_group0.server;
+    co_await with_scheduling_group(_sg, [this, &srv_for_group0, group0_id, enable_sm_immediately] (this auto self) -> future<> {
+        _group0_sm = &dynamic_cast<group0_state_machine&>(srv_for_group0.state_machine);
+        co_await _raft_gr.start_server_for_group(std::move(srv_for_group0));
+        // Set _group0 immediately after the server is registered in _raft_gr._servers.
+        // This ensures abort_and_drain()/destroy() can find and clean up the server
+        // even if enable_in_memory_state_machine() or later steps throw.
+        _group0.emplace<raft::group_id>(group0_id);
+        if (!enable_sm_immediately) {
+            co_await _group0_sm->enable_in_memory_state_machine();
+        }
+    });
+    register_server_metrics(my_id, server, *server_stats);
+
+    // Fix for scylladb/scylladb#16683:
+    // If the snapshot index is 0, trigger creation of a new snapshot
+    // so bootstrapping nodes will receive a snapshot transfer.
+    auto snap = co_await persistence.load_snapshot_descriptor();
+    if (snap.idx == raft::index_t{0}) {
+        group0_log.info("Detected snapshot with index=0, id={}, triggering new snapshot", snap.id);
+        bool created = co_await server.trigger_snapshot(&_abort_source);
+        if (created) {
+            snap = co_await persistence.load_snapshot_descriptor();
+            group0_log.info("New snapshot created, index={} id={}", snap.idx, snap.id);
+        } else {
+            group0_log.warn("Could not create new snapshot, there are no entries applied");
+        }
+    }
+}
+
+future<> raft_group0::reload_schema_dependent_state() {
+    SCYLLA_ASSERT(_group0_sm);
+    co_await _group0_sm->reload_schema_dependent_state();
+}
+
+future<> raft_group0::leadership_monitor_fiber() {
+    try {
+        auto sub = _abort_source.subscribe([&] () noexcept {
+            if (!_leadership_monitor_as.abort_requested()) {
+                _leadership_monitor_as.request_abort();
+            }
+        });
+
+        auto holder = hold_group0_gate();
+        while (true) {
+            while (!group0_server().is_leader()) {
+                co_await group0_server().wait_for_state_change(&_leadership_monitor_as);
+            }
+            group0_log.info("gaining leadership");
+            _leadership_observable.set(true);
+            co_await group0_server().wait_for_state_change(&_leadership_monitor_as);
+            group0_log.info("losing leadership");
+            _leadership_observable.set(false);
+        }
+    } catch (...) {
+        group0_log.debug("leadership_monitor_fiber aborted with {:t}", std::current_exception());
+    }
+}
+
+utils::observer<bool> raft_group0::observe_leadership(std::function<void(bool)> cb) {
+    if (_leadership_observable.get()) {
+        cb(true);
+    }
+    return _leadership_observable.observe(cb);
+}
+
+future<> raft_group0::join_group0(std::vector<gms::inet_address> seeds, shared_ptr<service::group0_handshaker> handshaker, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm,
+                                  db::system_keyspace& sys_ks, const join_node_request_params& params) {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    SCYLLA_ASSERT(!joined_group0());
+
+    auto group0_id = raft::group_id{co_await sys_ks.get_raft_group0_id()};
+    if (group0_id) {
+        // Group 0 ID present means we've already joined group 0 before.
+        // enable_immediately=true: the state machine is enabled from construction,
+        // so apply() and transfer_snapshot() process entries correctly from the start.
+        co_await start_server_for_group0(group0_id, ss, qp, mm, true);
         co_return;
     }
-    auto my_addr = co_await load_or_create_my_addr();
-    raft::group_id group0_id = raft::group_id{co_await db::system_keyspace::get_raft_group0_id()};
-    if (group0_id != raft::group_id{}) {
-        rslog.trace("{} is starting group 0 with id {}", my_addr.id, group0_id);
-        co_await _raft_gr.start_server_for_group(create_server_for_group(group0_id, my_addr));
-        _group0 = group0_id;
-        co_return;
-    }
+
     raft::server* server = nullptr;
-    rslog.trace("{} found no local group 0. Discovering...", my_addr.id);
+    auto my_id = load_my_id();
+    group0_log.info("server {} found no local group 0. Discovering...", my_id);
     while (true) {
-        auto g0_info = co_await discover_group0(my_addr);
-        rslog.trace("server {} found group 0 with id {}, leader {}", my_addr.id,
-            g0_info.group0_id, g0_info.addr.id);
+        auto g0_info = co_await discover_group0(seeds, qp);
+        group0_log.info("server {} found group 0 with group id {}, leader {}", my_id, g0_info.group0_id, g0_info.id);
+
         if (server && group0_id != g0_info.group0_id) {
-            // Subsequent discovery returned a different group 0 id?!
-            throw std::runtime_error(format("Can't add server to two clusters ({} and {}). Please check your seeds don't overlap",
-                group0_id, g0_info.group0_id));
+            // `server` is not `nullptr` so we finished discovery in an earlier iteration and found a group 0 ID.
+            // But in this iteration it's different. That shouldn't be possible.
+            on_internal_error(group0_log, format(
+                "The Raft discovery algorithm returned two different group IDs on subsequent runs: {} and {}."
+                " Cannot proceed due to possible inconsistency problems."
+                " If you're bootstrapping a fresh cluster, make sure that every node uses the same seeds configuration, then retry."
+                " If this is happening after upgrade, please report a bug, then try following the manual recovery procedure: {}",
+                group0_id, g0_info.group0_id, raft_manual_recovery_doc));
         }
         group0_id = g0_info.group0_id;
+        raft::server_address my_addr{my_id, {}};
+
+        bool starting_server_as_follower = false;
         if (server == nullptr) {
-            // This is the first time the discovery is run.
+            // This is the first time discovery is run. Create and start a Raft server for group 0 on this node.
             raft::configuration initial_configuration;
-            if (g0_info.addr.id == my_addr.id) {
-                // We should start a new group.
-                initial_configuration.current.emplace(my_addr);
+            bool nontrivial_snapshot = false;
+            if (g0_info.id == my_id) {
+                // We were chosen as the discovery leader.
+                // We should start a new group with this node as voter.
+                group0_log.info("Server {} chosen as discovery leader; bootstrapping group 0 from scratch", my_id);
+                initial_configuration.current.emplace(my_addr, raft::is_voter::yes);
+
+                // Initializes system tables for the first group 0 member. Nodes joining group 0 henceforth would apply them via snapshots.
+                // We should not change system tables on the recovery leader (the discovery leader of the new group 0
+                // created in the Raft-based recovery procedure). The persistent topology state is present on that node
+                // when it creates the new group 0. Also, it joins the new group 0 using legacy_handshaker, so there is
+                // no need to create a join request.
+                if (!qp.db().get_config().recovery_leader.is_set()) {
+                    co_await ss.raft_initialize_discovery_leader(params);
+                }
+
+                // Force snapshot transfer from us to subsequently joining servers.
+                // This is important for upgrade and recovery, where the group 0 state machine
+                // (schema tables in particular) is nonempty.
+                // In case of fresh cluster with raft topology enabled, this will trigger a snapshot transfer which propagates initial
+                // topology state (created in raft_initialize_discovery_leader above). Otherwise, with raft topology disabled, this will
+                // trigger an empty snapshot transfer.
+                nontrivial_snapshot = true;
+            } else {
+                starting_server_as_follower = true;
+                co_await handshaker->pre_server_start(g0_info);
             }
-            auto grp = create_server_for_group(group0_id, my_addr);
-            server = grp.server.get();
-            co_await grp.persistence.bootstrap(std::move(initial_configuration));
-            co_await _raft_gr.start_server_for_group(std::move(grp));
+
+            utils::get_local_injector().inject("stop_after_sending_join_node_request",
+                [] { std::raise(SIGSTOP); });
+
+            // Populates correct upgrade state value before starting raft server, so that reads always get correct values.
+            co_await ss.initialize_done_topology_upgrade_state();
+
+            // Bootstrap the initial configuration
+            co_await raft_sys_table_storage(qp, group0_id, my_id)
+                    .bootstrap(std::move(initial_configuration), nontrivial_snapshot);
+
+            utils::get_local_injector().inject("stop_after_bootstrapping_initial_raft_configuration",
+                [] { std::raise(SIGSTOP); });
+
+            // enable_immediately=true: the state machine is enabled from construction,
+            // so apply() and transfer_snapshot() process entries correctly from the start.
+            co_await start_server_for_group0(group0_id, ss, qp, mm, true);
+            server = &_raft_gr.group0();
+            // FIXME if we crash now or after getting added to the config but before storing group 0 ID,
+            // we'll end with a bootstrapped server that possibly added some entries, but we won't remember that we have such a server
+            // after we restart. Then we'll call `persistence.bootstrap` again after restart which will overwrite our snapshot, leading to
+            // possibly incorrect state. One way of handling this may be changing `persistence.bootstrap` so it checks if any persistent
+            // state is present, and if it is, do nothing.
         }
-        if (server->get_configuration().can_vote(my_addr.id)) {
-            // True if we started a new group or completed a configuration change
-            // initiated earlier.
+
+        SCYLLA_ASSERT(server);
+        co_await utils::get_local_injector().inject("join_group0_pause_before_config_check",
+                utils::wait_for_message(std::chrono::minutes{5}));
+        if (!starting_server_as_follower && server->get_configuration().contains(my_id)) {
+            // True if we started a new group or completed a configuration change initiated earlier.
+            group0_log.info("server {} already in group 0 (id {}) as {}", my_id, group0_id,
+                    server->get_configuration().can_vote(my_id)? "voter" : "non-voter");
             break;
         }
-        std::vector<raft::server_address> add_set;
-        add_set.push_back(my_addr);
-        auto pause_shutdown = _shutdown_gate.hold();
-        auto timeout = db::timeout_clock::now() + std::chrono::milliseconds{1000};
-        netw::msg_addr peer(raft_addr_to_inet_addr(g0_info.addr));
-        try {
-            co_await _ms.send_group0_modify_config(peer, timeout, group0_id, add_set, {});
+
+        if (co_await handshaker->post_server_start(g0_info, _abort_source)) {
             break;
-        } catch (std::runtime_error& e) {
-            // Retry
-            rslog.error("failed to modify config at peer {}: {}", g0_info.addr.id, e);
         }
+
         // Try again after a pause
         co_await seastar::sleep_abortable(std::chrono::milliseconds{1000}, _abort_source);
     }
-    co_await db::system_keyspace::set_raft_group0_id(group0_id.id);
+    co_await sys_ks.set_raft_group0_id(group0_id.id);
     // Allow peer_exchange() RPC to access group 0 only after group0_id is persisted.
 
     _group0 = group0_id;
-    rslog.info("{} joined group 0 with id {}", my_addr.id, group0_id);
+
+    co_await _gossiper.container().invoke_on_all([group0_id = group0_id.uuid()] (auto& gossiper) {
+        gossiper.set_group0_id(group0_id);
+        return make_ready_future<>();
+    });
+
+    group0_log.info("server {} joined group 0 with group id {}", my_id, group0_id);
 }
 
-future<> raft_group0::leave_group0(std::optional<gms::inet_address> node) {
-    if (!_raft_gr.is_enabled()) {
-        co_return;
-    }
-    assert(this_shard_id() == 0);
-    raft::server_address my_addr;
-    raft::server_id remove_addr;
-    my_addr.id = raft::server_id{co_await db::system_keyspace::get_raft_server_id()};
-    if (node) {
-        if (my_addr.id == raft::server_id{}) {
-            throw std::runtime_error("Can't invoke removenode on a node which is not part of the cluster");
+shared_ptr<service::group0_handshaker> raft_group0::make_legacy_handshaker(raft::is_voter can_vote) {
+    struct legacy_handshaker : public group0_handshaker {
+        service::raft_group0& _group0;
+        netw::messaging_service& _ms;
+        raft::is_voter _can_vote;
+
+        legacy_handshaker(service::raft_group0& group0, netw::messaging_service& ms, raft::is_voter can_vote)
+            : _group0(group0)
+            , _ms(ms)
+            , _can_vote(can_vote) {
         }
-        auto opt_id= _raft_gr.address_map().find_replace_id(*node, my_addr.id);
-        if (!opt_id) {
-            // The node being removed is not part of the
-            // configuration.
+
+        future<> pre_server_start(const group0_info& info) override {
+            // Nothing to do in this step
             co_return;
         }
-        remove_addr = *opt_id;
-    } else if (my_addr.id) {
-        remove_addr = my_addr.id;
+
+        future<bool> post_server_start(const group0_info& g0_info, abort_source& as) override {
+            auto timeout = db::timeout_clock::now() + std::chrono::milliseconds{1000};
+            auto my_id = _group0.load_my_id();
+            raft::server_address my_addr{my_id, {}};
+            try {
+                co_await ser::group0_rpc_verbs::send_group0_modify_config(
+                        &_ms, locator::host_id{g0_info.id.uuid()}, timeout, g0_info.group0_id, {{my_addr, _can_vote}}, {});
+                co_return true;
+            } catch (std::runtime_error& e) {
+                group0_log.warn("failed to modify config at peer {}: {}. Retrying.", g0_info.id, e.what());
+                co_return false;
+            }
+        };
+    };
+
+    return make_shared<legacy_handshaker>(*this, _ms.local(), can_vote);
+}
+
+struct group0_members {
+    const raft::server& _group0_server;
+
+    raft::config_member_set get_members() const {
+        return _group0_server.get_configuration().current;
+    }
+
+    std::vector<locator::host_id> get_host_ids() const {
+        return _group0_server.get_configuration().current |
+                std::views::transform([] (const auto& m) { return locator::host_id(m.addr.id.uuid()); }) |
+                std::ranges::to<std::vector<locator::host_id>>();
+    }
+
+    bool is_joint() const {
+        return _group0_server.get_configuration().is_joint();
+    }
+};
+
+bool raft_group0::maintenance_mode() {
+    SCYLLA_ASSERT(this_shard_id() == 0);
+    return _client.maintenance_mode();
+}
+
+future<> raft_group0::setup_group0_if_exist(db::system_keyspace& sys_ks, service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm) {
+    auto group0_id = raft::group_id{co_await sys_ks.get_raft_group0_id()};
+    if (group0_id) {
+        // Group 0 ID is present => we've already joined group 0 earlier.
+        group0_log.info("setup_group0: group 0 ID present. Starting existing Raft server.");
+        co_await start_server_for_group0(group0_id, ss, qp, mm, false);
+
+        // Start group 0 leadership monitor fiber.
+        _leadership_monitor = leadership_monitor_fiber();
+    } else if (qp.db().get_config().recovery_leader.is_set()) {
+        // Recovery mode, no group0 to start
     } else {
-        // Nothing to do
+        throw std::runtime_error("The node is bootstrapped already but Raft group0 is not present. This means that you try to upgrade"
+            " a node of a cluster that is not using Raft yet. This is no longer supported. Please first complete the upgrade of the cluster to use Raft");
+    }
+}
+
+future<> raft_group0::setup_group0(
+        db::system_keyspace& sys_ks, const std::unordered_set<gms::inet_address>& initial_contact_nodes, shared_ptr<group0_handshaker> handshaker,
+        service::storage_service& ss, cql3::query_processor& qp, service::migration_manager& mm,
+        const join_node_request_params& params) {
+    // Reaching this point is possible only in two cases:
+    // - the node is bootstrapping,
+    // - the node is restarting in the Raft-based recovery procedure and has not joined the new group 0 yet.
+
+    std::vector<gms::inet_address> seeds(initial_contact_nodes.begin(), initial_contact_nodes.end());
+
+    group0_log.info("setup_group0: joining group 0...");
+    co_await join_group0(std::move(seeds), std::move(handshaker), ss, qp, mm, sys_ks, params);
+    group0_log.info("setup_group0: successfully joined group 0.");
+
+    // Start group 0 leadership monitor fiber.
+    _leadership_monitor = leadership_monitor_fiber();
+
+    utils::get_local_injector().inject("stop_after_joining_group0", [&] {
+        throw std::runtime_error{"injection: stop_after_joining_group0"};
+    });
+
+    group0_log.info("setup_group0: the cluster is ready to use Raft. Finishing.");
+    co_await sys_ks.save_group0_upgrade_state("use_post_raft_procedures");
+}
+
+bool raft_group0::is_member(raft::server_id id, bool include_voters_only) {
+    if (!joined_group0()) {
+        on_internal_error(group0_log, "called is_member before we joined group 0");
+    }
+
+    auto cfg = _raft_gr.group0().get_configuration();
+    return cfg.contains(id) && (!include_voters_only || cfg.can_vote(id));
+}
+
+future<> raft_group0::modify_voters(const std::unordered_set<raft::server_id>& voters_add, const std::unordered_set<raft::server_id>& voters_del,
+        abort_source& as, std::optional<raft_timeout> timeout) {
+    if (voters_add.empty() && voters_del.empty()) {
         co_return;
     }
-    std::vector<raft::server_id> del_set;
-    del_set.push_back(remove_addr);
-    auto pause_shutdown = _shutdown_gate.hold();
-    if (std::holds_alternative<raft::group_id>(_group0)) {
-        co_return co_await _raft_gr.group0().modify_config({}, del_set);
+
+    // Ensure that we're not trying to add and remove the same node.
+    auto calculate_intersection = [](const auto& nodes_add, const auto& nodes_del) {
+        return nodes_add | std::views::filter([&nodes_del](auto id) {
+            return nodes_del.contains(id);
+        });
+    };
+    if (!calculate_intersection(voters_add, voters_del).empty()) {
+        on_internal_error(group0_log, "called modify_voters with the same node in both voters and non-voters sets");
     }
-    auto g0_info = co_await discover_group0(my_addr);
-    if (g0_info.addr.id == my_addr.id) {
-        co_return;
+
+    if (!voters_add.empty()) {
+        group0_log.info("making servers {} voters ...", voters_add);
     }
-    netw::msg_addr peer(raft_addr_to_inet_addr(g0_info.addr));
-    // During removenode, the client itself will retry or abort
-    // the operation if necessary, it's move important it's not
-    // "flaky" on slow network or CPU.
-    auto timeout = db::timeout_clock::now() + std::chrono::minutes{20};
-    co_return co_await _ms.send_group0_modify_config(peer, timeout, g0_info.group0_id, {}, del_set);
+    if (!voters_del.empty()) {
+        group0_log.info("making servers {} non-voters ...", voters_del);
+    }
+
+    co_await modify_raft_voter_status(voters_add, voters_del, as, timeout);
+
+    if (!voters_add.empty()) {
+        group0_log.info("servers {} are now voters.", voters_add);
+    }
+    if (!voters_del.empty()) {
+        group0_log.info("servers {} are now non-voters.", voters_del);
+    }
+}
+
+future<> raft_group0::modify_raft_voter_status(const std::unordered_set<raft::server_id>& voters_add, const std::unordered_set<raft::server_id>& voters_del,
+        abort_source& as, std::optional<raft_timeout> timeout) {
+    return run_op_with_retry(as, [this, &voters_add, &voters_del, timeout, &as] -> future<operation_result> {
+        std::vector<raft::config_member> add;
+        add.reserve(voters_add.size() + voters_del.size());
+
+        for (const auto& id: voters_add) {
+            if (is_member(id, false)) {
+                add.push_back(raft::config_member{{id, {}}, raft::is_voter::yes});
+            } else {
+                group0_log.warn("modify_raft_voter_config({}, {}): tried to mark non-member {} as a voter, ignoring",
+                        voters_add, voters_del, id);
+            }
+        }
+
+        for (const auto& id: voters_del) {
+            if (is_member(id, false)) {
+                add.push_back(raft::config_member{{id, {}}, raft::is_voter::no});
+            } else {
+                group0_log.warn("modify_raft_voter_config({}, {}): tried to mark non-member {} as a non-voter, ignoring",
+                        voters_add, voters_del, id);
+            }
+        }
+
+        try {
+            co_await _raft_gr.group0_with_timeouts().modify_config(std::move(add), {}, &as, timeout);
+        } catch (const raft::commit_status_unknown& e) {
+            group0_log.info("modify_raft_voter_status({}, {}): modify_config returned \"{}\", retrying", voters_add, voters_del, e);
+            co_return operation_result::failure;
+        }
+        co_return operation_result::success;
+    }, "modify_raft_voter_status->modify_config");
+}
+
+future<> raft_group0::remove_from_raft_config(raft::server_id id) {
+    return run_op_with_retry(_abort_source, [this, id] -> future<operation_result> {
+        try {
+            co_await _raft_gr.group0_with_timeouts().modify_config({}, {id}, &_abort_source, raft_timeout{});
+        } catch (const raft::commit_status_unknown& e) {
+            group0_log.info("remove_from_raft_config({}): modify_config returned \"{}\", retrying", id, e);
+            co_return operation_result::failure;
+        }
+        co_return operation_result::success;
+    }, "remove_from_raft_config->modify_config");
+}
+
+bool raft_group0::joined_group0() const {
+    return std::holds_alternative<raft::group_id>(_group0);
 }
 
 future<group0_peer_exchange> raft_group0::peer_exchange(discovery::peer_list peers) {
-    return std::visit([this, peers = std::move(peers)] (auto&& d) -> future<group0_peer_exchange> {
+    return std::visit([this, peers = std::move(peers)] (auto&& d) mutable -> future<group0_peer_exchange> {
         using T = std::decay_t<decltype(d)>;
         if constexpr (std::is_same_v<T, std::monostate>) {
             // Discovery not started or we're persisting the
             // leader information locally.
             co_return group0_peer_exchange{std::monostate{}};
-        } else if constexpr (std::is_same_v<T, discovery>) {
+        } else if constexpr (std::is_same_v<T, persistent_discovery>) {
             // Use discovery to produce a response
-            co_return group0_peer_exchange{d.request(std::move(peers))};
+            if (auto response = co_await d.request(std::move(peers))) {
+                co_return group0_peer_exchange{std::move(*response)};
+            }
+            // We just became a leader.
+            // Eventually we'll answer with group0_info.
+            co_return group0_peer_exchange{std::monostate{}};
         } else if constexpr (std::is_same_v<T, raft::group_id>) {
             // Even if in follower state, return own address: the
             // incoming RPC will then be bounced to the leader.
             co_return group0_peer_exchange{group0_info{
                 .group0_id = std::get<raft::group_id>(_group0),
-                .addr = _raft_gr.address_map().get_server_address(_raft_gr.group0().id())
+                // Use self as leader - modify_config() is
+                // a forwarding API so we'll be able to forward
+                // the request when it arrives.
+                .id = _raft_gr.group0().id(),
+                .ip_addr = _gossiper.get_broadcast_address(),
             }};
         }
     }, _group0);
 }
 
+future<persistent_discovery> persistent_discovery::make(discovery_peer my_addr, peer_list seeds, cql3::query_processor& qp) {
+    auto peers = co_await load_discovered_peers(qp);
+    // If we're restarting discovery, the peer list is loaded from
+    // the discovery table and includes the seeds from
+    // scylla.yaml, so ignore the 'seeds' param.
+    //
+    // Should we perhaps use 'seeds' instead, or use both, the
+    // loaded seeds and scylla.yaml seeds?
+    //
+    // If a node crashes or stops during discovery, either of the
+    // following two option is safe:
+    // - restart the node; the discovery will resume from where it
+    // stopped with the persisted seeds
+    // - erase the data directory, possibly update scylla.yaml,
+    // and start a new boot.
+    // Updating scylla.yaml with a new set of seeds while keeping
+    // the old data directory is something DBAs can potentially
+    // do but their intent would be unclear at best: it is not
+    // safe to ignore the old seeds, they may have learned about
+    // this node already, so it's not safe to progress if they are
+    // not unreachable. As long as the old seeds have to be reached,
+    // adding more seeds is not very useful.
+    //
+    // We could check for this and throw, but since the
+    // whole case is a bit made up, let's simply ignore scylla.yaml
+    // seeds once we know they are persisted in the discovery table.
+    if (peers.empty()) {
+        peers = std::move(seeds);
+    }
+    // discovery::step() will automatically exclude my_addr and skip
+    // duplicates in the list.
+    co_return persistent_discovery{std::move(my_addr), peers, qp};
+}
+
+future<std::optional<discovery::peer_list>> persistent_discovery::request(peer_list peers) {
+    for (auto& p: peers) {
+        group0_log.debug("discovery: request peer: id={}, ip={}", p.id, p.ip_addr);
+    }
+
+    if (_gate.is_closed()) {
+        // We stopped discovery, about to destroy it.
+        co_return std::nullopt;
+    }
+    auto holder = _gate.hold();
+
+    auto response = _discovery.request(peers);
+    co_await store_discovered_peers(_qp, _discovery.get_peer_list());
+
+    co_return response;
+}
+
+void persistent_discovery::response(discovery_peer from, const peer_list& peers) {
+    // The peers discovered here will be persisted on the next `request` or `tick`.
+    for (auto& p: peers) {
+        group0_log.debug("discovery: response peer: id={}, ip={}", p.id, p.ip_addr);
+    }
+    _discovery.response(std::move(from), peers);
+}
+
+future<discovery::tick_output> persistent_discovery::tick() {
+    // No need to enter `_gate`, since `stop` must be called after all calls to `tick` (and before the object is destroyed).
+
+    auto result = _discovery.tick();
+    co_await store_discovered_peers(_qp, _discovery.get_peer_list());
+
+    co_return result;
+}
+
+future<> persistent_discovery::stop() {
+    return _gate.close();
+}
+
+persistent_discovery::persistent_discovery(discovery_peer my_addr, const peer_list& seeds, cql3::query_processor& qp)
+    : _discovery{std::move(my_addr), seeds}
+    , _qp{qp}
+    , _gate("raft_group0::persistent_discovery")
+{
+    for (auto& addr: seeds) {
+        group0_log.debug("discovery: seed peer: id={}, info={}", addr.id, addr.ip_addr);
+    }
+}
+
+// A helper class to sleep in a loop with an exponentially
+// increasing retry period.
+struct sleep_with_exponential_backoff {
+    std::chrono::seconds _retry_period{1};
+    static constexpr std::chrono::seconds _max_retry_period{16};
+    future<> operator()(abort_source& as,
+                        std::source_location loc = std::source_location::current()) {
+        upgrade_log.info("{}: sleeping for {} seconds before retrying...", loc.function_name(), _retry_period);
+        co_await sleep_abortable(_retry_period, as);
+        _retry_period = std::min(_retry_period * 2, _max_retry_period);
+    }
+};
+
+void raft_group0::abort_server_on_error(raft::group_id gid, sstring reason) {
+    _status_for_monitoring = status_for_monitoring::aborted;
+    if (utils::get_local_injector().is_enabled("delay_group0_abort_on_error") && !_shutdown_gate.is_closed()) {
+        // Lets a test act before the group 0 server is aborted. The gate makes
+        // abort_and_drain() wait for the delayed abort.
+        (void)with_gate(_shutdown_gate, [this, gid, reason = std::move(reason)] () mutable {
+            return delay_abort_server(gid, std::move(reason));
+        });
+        return;
+    }
+    // The future will be waited indirectly in raft_group0::abort_and_drain.
+    (void)_raft_gr.abort_server(gid, std::move(reason));
+}
+
+future<> raft_group0::delay_abort_server(raft::group_id gid, sstring reason) {
+    try {
+        co_await utils::get_local_injector().inject("delay_group0_abort_on_error", utils::wait_for_message(std::chrono::minutes(5)));
+    } catch (...) {
+        group0_log.warn("delay_group0_abort_on_error: {}", std::current_exception());
+    }
+    co_await _raft_gr.abort_server(gid, std::move(reason));
+}
+
+void raft_group0::register_metrics() {
+    namespace sm = seastar::metrics;
+    _metrics.add_group("raft_group0", {
+        sm::make_gauge("status", [this] { return static_cast<uint8_t>(_status_for_monitoring); },
+            sm::description("status of the raft group, 1 - normal, 2 - aborted"))
+    });
+    register_raft_rpc_stats_metrics(_metrics, *_rpc_stats, raft_metrics_options{.group_name = "raft_group0"});
+}
+
+static const seastar::metrics::label server_id_label("id");
+
+void raft_group0::register_server_metrics(raft::server_id my_id, const raft::server& server, const raft::server_stats& stats) {
+    namespace sm = seastar::metrics;
+    const auto id = server_id_label(my_id);
+    // The group name predates the "raft_group0" one used elsewhere and is kept
+    // so that the existing dashboards keep working.
+    register_raft_server_stats_metrics(_server_metrics, stats, raft_metrics_options{.group_name = "raft", .labels = {id}});
+    auto status = sm::make_collector([&server] { return server.get_status(); });
+    _server_metrics.add_group("raft", {
+        sm::make_gauge("in_memory_log_size", status, &raft::server_status::in_memory_log_size,
+             sm::description("size of in-memory part of the log"), {id}),
+        sm::make_gauge("log_memory_usage", status, &raft::server_status::log_memory_usage,
+             sm::description("memory usage of in-memory part of the log in bytes"), {id}),
+        sm::make_gauge("log_full", status, &raft::server_status::log_full,
+             sm::description("1 if the in-memory log has no room under max_follower_log_size for the next entry from the leader, so entries from it are being refused"), {id}),
+        sm::make_gauge("log_last_index", status, [] (const raft::server_status& s) { return s.last_idx.value(); },
+             sm::description("index of the last log entry"), {id}),
+        sm::make_gauge("log_last_term", status, [] (const raft::server_status& s) { return s.last_term.value(); },
+             sm::description("term of the last log entry"), {id}),
+        sm::make_gauge("snapshot_last_index", status, [] (const raft::server_status& s) { return s.last_snapshot_idx.value(); },
+             sm::description("index of the snapshot"), {id}),
+        sm::make_gauge("snapshot_last_term", status, [] (const raft::server_status& s) { return s.last_snapshot_term.value(); },
+             sm::description("term of the snapshot"), {id}),
+        sm::make_gauge("state", status, &raft::server_status::state,
+             sm::description("current state: 0 - follower, 1 - candidate, 2 - leader"), {id}),
+        sm::make_gauge("commit_index", status, [] (const raft::server_status& s) { return s.commit_idx.value(); },
+             sm::description("commit index"), {id}),
+        sm::make_gauge("apply_index", status, [] (const raft::server_status& s) { return s.applied_idx.value(); },
+             sm::description("applied index"), {id}),
+        sm::make_gauge("log_limiter_waiters", status, &raft::server_status::log_limiter_waiters,
+             sm::description("Number of entries currently waiting for the in-memory log to shrink below max_log_size"), {id}),
+        sm::make_gauge("blocked_followers", status, [] (const raft::server_status& s) { return s.blocked.probe; },
+             sm::description("Number of followers the leader cannot send entries to, the reason label can be probe (waiting for the reply to a probe of the follower's log), pipeline_full (the maximal number of append requests is in flight), snapshot (waiting for a snapshot transfer) or log_full (the follower reported that its log is full); followers the failure detector reports down are not counted"), {id, raft_blocked_reason_label("probe")}),
+        sm::make_gauge("blocked_followers", status, [] (const raft::server_status& s) { return s.blocked.pipeline_full; },
+             sm::description("Number of followers the leader cannot send entries to, the reason label can be probe (waiting for the reply to a probe of the follower's log), pipeline_full (the maximal number of append requests is in flight), snapshot (waiting for a snapshot transfer) or log_full (the follower reported that its log is full); followers the failure detector reports down are not counted"), {id, raft_blocked_reason_label("pipeline_full")}),
+        sm::make_gauge("blocked_followers", status, [] (const raft::server_status& s) { return s.blocked.snapshot; },
+             sm::description("Number of followers the leader cannot send entries to, the reason label can be probe (waiting for the reply to a probe of the follower's log), pipeline_full (the maximal number of append requests is in flight), snapshot (waiting for a snapshot transfer) or log_full (the follower reported that its log is full); followers the failure detector reports down are not counted"), {id, raft_blocked_reason_label("snapshot")}),
+        sm::make_gauge("blocked_followers", status, [] (const raft::server_status& s) { return s.blocked.log_full; },
+             sm::description("Number of followers the leader cannot send entries to, the reason label can be probe (waiting for the reply to a probe of the follower's log), pipeline_full (the maximal number of append requests is in flight), snapshot (waiting for a snapshot transfer) or log_full (the follower reported that its log is full); followers the failure detector reports down are not counted"), {id, raft_blocked_reason_label("log_full")}),
+    });
+}
+
 } // end of namespace service
+
 

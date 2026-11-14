@@ -3,14 +3,14 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <seastar/core/timer.hh>
 #include <seastar/core/semaphore.hh>
-#include <seastar/core/seastar.hh>
+#include <seastar/core/lowres_clock.hh>
 #include "seastarx.hh"
 
 namespace utils {
@@ -18,18 +18,20 @@ namespace utils {
 /**
  * 100% naive rate limiter. Consider it a placeholder
  * Will let you process X "units" per second, then reset this every s.
- * Obviously, accuracy is virtually non-existant and steady rate will fluctuate.
+ * Obviously, accuracy is virtually non-existent and steady rate will fluctuate.
  */
 class rate_limiter {
 private:
     timer<lowres_clock> _timer;
     size_t _units_per_s;
-    semaphore _sem {0};
+    basic_semaphore<semaphore_default_exception_factory, lowres_clock> _sem {0};
 
     void on_timer();
 public:
     rate_limiter(size_t rate);
-    future<> reserve(size_t u);
+    // Waits until u units fit in the budget. Fails with semaphore_timed_out
+    // if that has not happened by timeout.
+    future<> reserve(size_t u, lowres_clock::time_point timeout = lowres_clock::time_point::max());
 };
 
 }

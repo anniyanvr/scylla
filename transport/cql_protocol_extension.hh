@@ -3,14 +3,12 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #pragma once
 
 #include <seastar/core/sstring.hh>
 #include "enum_set.hh"
-
-#include <map>
 
 namespace cql_transport {
 
@@ -25,18 +23,26 @@ namespace cql_transport {
  * to be used in a connection.
  * 
  * The negotiation procedure and extensions themselves are documented in the
- * `docs/protocol-extensions.md`. 
+ * `docs/dev/protocol-extensions.md`. 
  */
 enum class cql_protocol_extension {
-    LWT_ADD_METADATA_MARK
+    LWT_ADD_METADATA_MARK,
+    RATE_LIMIT_ERROR,
+    TABLETS_ROUTING_V1,
+    USE_METADATA_ID,
+    TABLETS_ROUTING_V2_EXPERIMENTAL,
+    FAILURE_REASON_MAP
 };
 
 using cql_protocol_extension_enum = super_enum<cql_protocol_extension,
-    cql_protocol_extension::LWT_ADD_METADATA_MARK>;
+    cql_protocol_extension::LWT_ADD_METADATA_MARK,
+    cql_protocol_extension::RATE_LIMIT_ERROR,
+    cql_protocol_extension::TABLETS_ROUTING_V1,
+    cql_protocol_extension::USE_METADATA_ID,
+    cql_protocol_extension::TABLETS_ROUTING_V2_EXPERIMENTAL,
+    cql_protocol_extension::FAILURE_REASON_MAP>;
 
 using cql_protocol_extension_enum_set = enum_set<cql_protocol_extension_enum>;
-
-cql_protocol_extension_enum_set supported_cql_protocol_extensions();
 
 /**
  * Returns the name of extension to be used in SUPPORTED/STARTUP feature negotiation.

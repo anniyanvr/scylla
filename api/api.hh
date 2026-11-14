@@ -3,71 +3,31 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
 
 #include <seastar/json/json_elements.hh>
 #include <type_traits>
-#include <boost/lexical_cast.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
-#include <boost/units/detail/utility.hpp>
+#include "api/api_init.hh"
+#include "api/utils.hh"
 #include "api/api-doc/utils.json.hh"
 #include "utils/histogram.hh"
 #include "utils/estimated_histogram.hh"
 #include <seastar/http/exception.hh>
-#include "api_init.hh"
 #include "seastarx.hh"
 
 namespace api {
 
-template<class T>
-std::vector<sstring> container_to_vec(const T& container) {
-    std::vector<sstring> res;
-    for (auto i : container) {
-        res.push_back(boost::lexical_cast<std::string>(i));
-    }
-    return res;
-}
-
-template<class T>
-std::vector<T> map_to_key_value(const std::map<sstring, sstring>& map) {
-    std::vector<T> res;
-    for (auto i : map) {
-        res.push_back(T());
-        res.back().key = i.first;
-        res.back().value = i.second;
-    }
-    return res;
-}
-
-template<class T, class MAP>
-std::vector<T>& map_to_key_value(const MAP& map, std::vector<T>& res) {
-    for (auto i : map) {
-        T val;
-        val.key = boost::lexical_cast<std::string>(i.first);
-        val.value = boost::lexical_cast<std::string>(i.second);
-        res.push_back(val);
-    }
-    return res;
-}
 template <typename T, typename S = T>
 T map_sum(T&& dest, const S& src) {
-    for (auto i : src) {
+    for (const auto& i : src) {
         dest[i.first] += i.second;
     }
     return std::move(dest);
-}
-
-template <typename MAP>
-std::vector<sstring> map_keys(const MAP& map) {
-    std::vector<sstring> res;
-    for (const auto& i : map) {
-        res.push_back(boost::lexical_cast<std::string>(i.first));
-    }
-    return res;
 }
 
 /**
@@ -87,7 +47,7 @@ inline std::vector<sstring> split(const sstring& text, const char* separator) {
  *
  */
 template<class T, class F, class V>
-future<json::json_return_type>  sum_stats(distributed<T>& d, V F::*f) {
+future<json::json_return_type>  sum_stats(sharded<T>& d, V F::*f) {
     return d.map_reduce0([f](const T& p) {return p.get_stats().*f;}, 0,
             std::plus<V>()).then([](V val) {
         return make_ready_future<json::json_return_type>(val);
@@ -120,7 +80,7 @@ httpd::utils_json::rate_moving_average_and_histogram timer_to_json(const utils::
 }
 
 template<class T, class F>
-future<json::json_return_type>  sum_histogram_stats(distributed<T>& d, utils::timed_rate_moving_average_and_histogram F::*f) {
+future<json::json_return_type>  sum_histogram_stats(sharded<T>& d, utils::timed_rate_moving_average_and_histogram F::*f) {
 
     return d.map_reduce0([f](const T& p) {return (p.get_stats().*f).hist;}, utils::ihistogram(),
             std::plus<utils::ihistogram>()).then([](const utils::ihistogram& val) {
@@ -129,8 +89,16 @@ future<json::json_return_type>  sum_histogram_stats(distributed<T>& d, utils::ti
 }
 
 template<class T, class F>
-future<json::json_return_type>  sum_timer_stats(distributed<T>& d, utils::timed_rate_moving_average_and_histogram F::*f) {
+future<json::json_return_type>  sum_timer_stats(sharded<T>& d, utils::timed_rate_moving_average_and_histogram F::*f) {
 
+    return d.map_reduce0([f](const T& p) {return (p.get_stats().*f).rate();}, utils::rate_moving_average_and_histogram(),
+            std::plus<utils::rate_moving_average_and_histogram>()).then([](const utils::rate_moving_average_and_histogram& val) {
+        return make_ready_future<json::json_return_type>(timer_to_json(val));
+    });
+}
+
+template<class T, class F>
+future<json::json_return_type>  sum_timer_stats(sharded<T>& d, utils::timed_rate_moving_average_summary_and_histogram F::*f) {
     return d.map_reduce0([f](const T& p) {return (p.get_stats().*f).rate();}, utils::rate_moving_average_and_histogram(),
             std::plus<utils::rate_moving_average_and_histogram>()).then([](const utils::rate_moving_average_and_histogram& val) {
         return make_ready_future<json::json_return_type>(timer_to_json(val));
@@ -181,7 +149,7 @@ struct basic_ratio_holder : public json::jsonable {
 typedef basic_ratio_holder<double>  ratio_holder;
 typedef basic_ratio_holder<int64_t> integral_ratio_holder;
 
-class unimplemented_exception : public base_exception {
+class unimplemented_exception : public httpd::base_exception {
 public:
     unimplemented_exception()
             : base_exception("API call is not supported yet", reply::status_type::internal_server_error) {
@@ -199,44 +167,6 @@ std::vector<T> concat(std::vector<T> a, std::vector<T>&& b) {
     return a;
 }
 
-template <class T, class Base = T>
-class req_param {
-public:
-    sstring name;
-    sstring param;
-    T value;
-
-    req_param(const request& req, sstring name, T default_val) : name(name) {
-        param = req.get_query_param(name);
-        if (param.empty()) {
-            value = default_val;
-            return;
-        }
-        try {
-            // boost::lexical_cast does not use boolalpha. Converting a
-            // true/false throws exceptions. We don't want that.
-            if constexpr (std::is_same_v<Base, bool>) {
-                // Cannot use boolalpha because we (probably) want to
-                // accept 1 and 0 as well as true and false. And True. And fAlse.
-                std::transform(param.begin(), param.end(), param.begin(), ::tolower);
-                if (param == "true" || param == "1") {
-                    value = T(true);
-                } else if (param == "false" || param == "0") {
-                    value = T(false);
-                } else {
-                    throw boost::bad_lexical_cast{};
-                }
-            } else {
-                value = T{boost::lexical_cast<Base>(param)};
-            }
-        } catch (boost::bad_lexical_cast&) {
-            throw bad_param_exception(format("{} ({}): type error - should be {}", name, param, boost::units::detail::demangle(typeid(Base).name())));
-        }
-    }
-
-    operator T() const { return value; }
-};
-
-utils_json::estimated_histogram time_to_json_histogram(const utils::time_estimated_histogram& val);
+httpd::utils_json::estimated_histogram time_to_json_histogram(const utils::time_estimated_histogram& val);
 
 }

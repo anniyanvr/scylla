@@ -1,30 +1,33 @@
 /*
- */
-
-/*
  * Copyright 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #include <seastar/core/coroutine.hh>
 #include "cql3/statements/create_keyspace_statement.hh"
 #include "cql3/statements/ks_prop_defs.hh"
+#include "exceptions/exceptions.hh"
+#include "locator/tablets.hh"
 #include "prepared_statement.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "data_dictionary/keyspace_metadata.hh"
-#include "mutation.hh"
+#include "mutation/mutation.hh"
 #include "service/migration_manager.hh"
 #include "service/storage_proxy.hh"
-#include "transport/messages/result_message.hh"
 #include "cql3/query_processor.hh"
+#include "cql3/cql_config.hh"
 #include "db/config.hh"
+#include "locator/abstract_replication_strategy.hh"
+#include "gms/feature_service.hh"
+#include "replica/database.hh"
 
-#include <regex>
+#include <boost/regex.hpp>
+#include <stdexcept>
 
 bool is_system_keyspace(std::string_view keyspace);
 
@@ -51,7 +54,7 @@ future<> create_keyspace_statement::check_access(query_processor& qp, const serv
     return state.has_all_keyspaces_access(auth::permission::CREATE);
 }
 
-void create_keyspace_statement::validate(query_processor&, const service::client_state& state) const
+void create_keyspace_statement::validate(query_processor& qp, const service::client_state& state) const
 {
     std::string name;
     name.resize(_name.length());
@@ -60,18 +63,23 @@ void create_keyspace_statement::validate(query_processor&, const service::client
         throw exceptions::invalid_request_exception("system keyspace is not user-modifiable");
     }
     // keyspace name
-    std::regex name_regex("\\w+");
-    if (!std::regex_match(name, name_regex)) {
+    boost::regex name_regex("\\w+");
+    if (!boost::regex_match(name, name_regex)) {
         throw exceptions::invalid_request_exception(format("\"{}\" is not a valid keyspace name", _name.c_str()));
     }
     if (name.length() > schema::NAME_LENGTH) {
         throw exceptions::invalid_request_exception(format("Keyspace names shouldn't be more than {:d} characters long (got \"{}\")", schema::NAME_LENGTH, _name.c_str()));
     }
 
-    _attrs->validate();
+    _attrs->validate(qp.proxy().features());
 
     if (!bool(_attrs->get_replication_strategy_class())) {
         throw exceptions::configuration_exception("Missing mandatory replication strategy class");
+    }
+    try {
+        _attrs->get_storage_options();
+    } catch (const std::runtime_error& e) {
+        throw exceptions::invalid_request_exception(e.what());
     }
 #if 0
     // The strategy is validated through KSMetaData.validate() in announceNewKeyspace below.
@@ -85,107 +93,286 @@ void create_keyspace_statement::validate(query_processor&, const service::client
 #endif
 }
 
-future<std::pair<::shared_ptr<cql_transport::event::schema_change>, std::vector<mutation>>> create_keyspace_statement::prepare_schema_mutations(query_processor& qp, api::timestamp_type ts) const {
+future<std::tuple<::shared_ptr<cql_transport::event::schema_change>, utils::chunked_vector<mutation>, cql3::cql_warnings_vec>> create_keyspace_statement::prepare_schema_mutations(query_processor& qp, const query_options&, api::timestamp_type ts) const {
     using namespace cql_transport;
-    const auto& tm = *qp.proxy().get_token_metadata_ptr();
-    ::shared_ptr<event::schema_change> ret;
-    std::vector<mutation> m;
+    const auto tmptr = qp.proxy().get_token_metadata_ptr();
+    const auto& feat = qp.proxy().features();
+    const auto& cfg = qp.db().get_config();
+    utils::chunked_vector<mutation> m;
+    std::vector<sstring> warnings;
 
     try {
-        m = qp.get_migration_manager().prepare_new_keyspace_announcement(_attrs->as_ks_metadata(_name, tm), ts);
+        auto ksm = _attrs->as_ks_metadata(_name, *tmptr, feat, cfg);
+        m = service::prepare_new_keyspace_announcement(qp.db().real_database(), ksm, ts);
+        // If the new keyspace uses tablets, as long as there are features
+        // which aren't supported by tablets we want to warn the user that
+        // they will not be usable on the new keyspace - and suggest how a
+        // keyspace can be created without tablets (see rationale in #16807).
+        // Once all feature will become supported with tablets, we should
+        // remove this check.
+        auto rs = locator::abstract_replication_strategy::create_replication_strategy(
+            ksm->strategy_name(),
+            locator::replication_strategy_params(ksm->strategy_options(), ksm->initial_tablets(), ksm->consistency_option()),
+            tmptr->get_topology());
+        if (rs->uses_tablets() && ksm->initial_tablets().value()) {
+            warnings.push_back("Keyspace `initial` tablets option is deprecated.  Use per-table tablet options instead.");
+        }
 
-        ret = ::make_shared<event::schema_change>(
-                event::schema_change::change_type::CREATED,
-                event::schema_change::target_type::KEYSPACE,
-                keyspace());
+        // If RF-rack-validity must be enforced for the keyspace according to `enforce_rf_rack_validity_for_keyspace`,
+        // it's forbidden to create an RF-rack-invalid keyspace. Verify that it's RF-rack-valid.
+        // For more context, see: scylladb/scylladb#23071.
+        try {
+            // We hold a group0_guard, so it's correct to check this here.
+            // The topology or schema cannot change while we're performing this query.
+            locator::assert_rf_rack_valid_keyspace(_name, tmptr, *rs);
+        } catch (const std::invalid_argument& e) {
+            if (replica::database::enforce_rf_rack_validity_for_keyspace(cfg, *ksm)) {
+                // wrap the exception in a type that can be passed to the user.
+                throw exceptions::invalid_request_exception(e.what());
+            } else {
+                // Even when RF-rack-validity is not enforced for the keyspace, we'd
+                // like to inform the user that the keyspace they're creating does not
+                // satisfy the restriction--but just as a warning.
+                // For more context, see issue: scylladb/scylladb#23330.
+                warnings.push_back(seastar::format(
+                    "Keyspace '{}' is not RF-rack-valid: the replication factor doesn't match "
+                    "the rack count in at least one datacenter. A rack failure may reduce availability. "
+                    "For more context, see: "
+                    "https://docs.scylladb.com/manual/stable/reference/glossary.html#term-RF-rack-valid-keyspace.",
+                    _name));
+            }
+        }
     } catch (const exceptions::already_exists_exception& e) {
         if (!_if_not_exists) {
           co_return coroutine::exception(std::current_exception());
         }
     }
 
-    co_return std::make_pair(std::move(ret), std::move(m));
+    // If an IF NOT EXISTS clause was used and resource was already created
+    // we shouldn't emit created event. However it interacts badly with
+    // concurrent clients creating resources. The client seeing no create event
+    // assumes resource already previously existed and proceeds with its logic
+    // which may depend on that resource. But it may send requests to nodes which
+    // are not yet aware of new schema or client's metadata may be outdated.
+    // To force synchronization always emit the event (see
+    // github.com/scylladb/scylladb/issues/16909).
+    co_return std::make_tuple(created_event(), std::move(m), std::move(warnings));
 }
 
 std::unique_ptr<cql3::statements::prepared_statement>
-cql3::statements::create_keyspace_statement::prepare(data_dictionary::database db, cql_stats& stats) {
-    return std::make_unique<prepared_statement>(make_shared<create_keyspace_statement>(*this));
+cql3::statements::create_keyspace_statement::prepare(data_dictionary::database db, cql_stats& stats, const cql_config& cfg) {
+    _attrs->set_default_replication_strategy_class_option();
+    return std::make_unique<prepared_statement>(audit_info(), make_shared<create_keyspace_statement>(*this));
 }
 
-future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creator(const service::client_state& cs) const {
-    return do_with(auth::make_data_resource(keyspace()), [&cs](const auth::resource& r) {
-        return auth::grant_applicable_permissions(
+future<> cql3::statements::create_keyspace_statement::grant_permissions_to_creator(const service::client_state& cs, service::group0_batch& mc) const {
+    auto resource = auth::make_data_resource(keyspace());
+    try {
+        co_await auth::grant_applicable_permissions(
                 *cs.get_auth_service(),
                 *cs.user(),
-                r).handle_exception_type([](const auth::unsupported_authorization_operation&) {
-            // Nothing.
-        });
-    });
+                resource,
+                mc);
+    } catch (const auth::unsupported_authorization_operation&) {
+        // Nothing.
+    }
 }
 
 // Check for replication strategy choices which are restricted by the
 // configuration. This check can throw a configuration_exception immediately
 // if the strategy is forbidden by the configuration, or return a warning
-// string if the restriction was set to "warn".
+// string if the restriction was set to warning level.
 // This function is only supposed to check for replication strategies
 // restricted by the configuration. Checks for other types of strategy
 // errors (such as unknown replication strategy name or unknown options
 // to a known replication strategy) are done elsewhere.
-std::optional<sstring> check_restricted_replication_strategy(
+std::vector<sstring> check_against_restricted_replication_strategies(
     query_processor& qp,
     const sstring& keyspace,
-    const ks_prop_defs& attrs)
+    const ks_prop_defs& attrs,
+    cql_stats& stats,
+    const cql3::replication_restrictions& rr)
 {
     if (!attrs.get_replication_strategy_class()) {
-        return std::nullopt;
+        return {};
     }
-    sstring replication_strategy = locator::abstract_replication_strategy::to_qualified_class_name(
-        *attrs.get_replication_strategy_class());
-    // SimpleStrategy is not recommended in any setup which already has - or
-    // may have in the future - multiple racks or DCs. So depending on how
-    // protective we are configured, let's prevent it or allow with a warning:
-    if (replication_strategy == "org.apache.cassandra.locator.SimpleStrategy") {
-        switch(qp.db().get_config().restrict_replication_simplestrategy()) {
-        case db::tri_mode_restriction_t::mode::TRUE:
-            throw exceptions::configuration_exception(
-                "SimpleStrategy replication class is not recommended, and "
-                "forbidden by the current configuration. Please use "
-                "NetworkToplogyStrategy instead. You may also override this "
-                "restriction with the restrict_replication_simplestrategy=false "
-                "configuration option.");
-        case db::tri_mode_restriction_t::mode::WARN:
-            return format("SimpleStrategy replication class is not "
-                "recommended, but was used for keyspace {}. The "
-                "restrict_replication_simplestrategy configuration option "
-                "can be changed to silence this warning or make it into an error.",
-                keyspace);
-        case db::tri_mode_restriction_t::mode::FALSE:
+
+    std::vector<sstring> warnings;
+    locator::replication_strategy_config_options opts;
+    locator::replication_strategy_params params(opts, std::nullopt, std::nullopt);
+    auto replication_strategy = locator::abstract_replication_strategy::create_replication_strategy(
+            locator::abstract_replication_strategy::to_qualified_class_name(
+                    *attrs.get_replication_strategy_class()), params,
+                    qp.db().real_database().get_token_metadata().get_topology())->get_type();
+    auto rs_warn_list = rr.replication_strategy_warn_list();
+    auto rs_fail_list = rr.replication_strategy_fail_list();
+
+    if (replication_strategy == locator::replication_strategy_type::simple) {
+        if (auto simple_strategy_restriction = rr.restrict_replication_simplestrategy();
+                simple_strategy_restriction == db::tri_mode_restriction_t::mode::TRUE) {
+            rs_fail_list.emplace_back(locator::replication_strategy_type::simple);
+        } else if (simple_strategy_restriction == db::tri_mode_restriction_t::mode::WARN) {
+            rs_warn_list.emplace_back(locator::replication_strategy_type::simple);
+        } else if (auto &topology = qp.proxy().get_token_metadata_ptr()->get_topology();
+                topology.get_datacenter_endpoints().size() > 1) {
             // Scylla was configured to allow SimpleStrategy, but let's warn
             // if it's used on a cluster which *already* has multiple DCs:
-            if (qp.proxy().get_token_metadata_ptr()->get_topology().get_datacenter_endpoints().size() > 1) {
-                return "Using SimpleStrategy in a multi-datacenter environment is not recommended.";
-            }
-            break;
+            warnings.emplace_back("Using SimpleStrategy in a multi-datacenter environment is not recommended.");
         }
     }
-    return std::nullopt;
+
+    if (auto present_on_fail_list = std::find(rs_fail_list.begin(), rs_fail_list.end(), replication_strategy); present_on_fail_list != rs_fail_list.end()) {
+        ++stats.replication_strategy_fail_list_violations;
+        throw exceptions::configuration_exception(format(
+                "{} replication class is not recommended, and forbidden by the current configuration, "
+                "but was used for keyspace {}. You may override this restriction by modifying "
+                "replication_strategy_fail_list configuration option to not list {}.",
+                *attrs.get_replication_strategy_class(), keyspace, *attrs.get_replication_strategy_class()));
+    }
+    if (auto present_on_warn_list = std::find(rs_warn_list.begin(), rs_warn_list.end(), replication_strategy); present_on_warn_list != rs_warn_list.end()) {
+        ++stats.replication_strategy_warn_list_violations;
+        warnings.push_back(format("{} replication class is not recommended, but was used for keyspace {}. "
+                           "You may suppress this warning by delisting {} from replication_strategy_warn_list configuration option, "
+                           "or make it into an error by listing this replication strategy on replication_strategy_fail_list.",
+                           *attrs.get_replication_strategy_class(), keyspace, *attrs.get_replication_strategy_class()));
+    }
+
+    // The {minimum,maximum}_replication_factor_{warn,fail}_threshold configuration option can be used to forbid
+    // a smaller/greater replication factor. We assume that all numeric replication
+    // options except for initial_tablets are replication factors - this is true for both
+    // SimpleStrategy and NetworkTopologyStrategy
+    // A zero replication factor is not forbidden - it is the traditional
+    // way to avoid replication on some DC.
+    // We ignore errors (non-number, negative number, etc.) here,
+    // these are checked and reported elsewhere.
+    for (auto opt : attrs.get_replication_options()) {
+        try {
+            long rf = 0;
+            try {
+                rf = locator::get_replication_factor(opt.second);
+            } catch (const exceptions::configuration_exception&) {
+            }
+
+            if (rf > 0) {
+                if (auto min_fail = rr.minimum_replication_factor_fail_threshold();
+                    min_fail >= 0 && rf < min_fail) {
+                    ++stats.minimum_replication_factor_fail_violations;
+                    throw exceptions::configuration_exception(format(
+                            "Replication Factor {}={} is forbidden by the current "
+                            "configuration setting of minimum_replication_factor_fail_threshold={}. Please "
+                            "increase replication factor, or lower minimum_replication_factor_fail_threshold "
+                            "set in the configuration.", opt.first, rf,
+                            rr.minimum_replication_factor_fail_threshold()));
+                }
+                else if (auto max_fail = rr.maximum_replication_factor_fail_threshold();
+                         max_fail >= 0 && rf > max_fail) {
+                    ++stats.maximum_replication_factor_fail_violations;
+                    throw exceptions::configuration_exception(format(
+                            "Replication Factor {}={} is forbidden by the current "
+                            "configuration setting of maximum_replication_factor_fail_threshold={}. Please "
+                            "decrease replication factor, or increase maximum_replication_factor_fail_threshold "
+                            "set in the configuration.", opt.first, rf,
+                            rr.maximum_replication_factor_fail_threshold()));
+                }
+                else if (auto min_warn = rr.minimum_replication_factor_warn_threshold();
+                         min_warn >= 0 && rf < min_warn)
+                {
+                    ++stats.minimum_replication_factor_warn_violations;
+                    warnings.push_back(format("Using Replication Factor {}={} lower than the "
+                                              "minimum_replication_factor_warn_threshold={} is not recommended.", opt.first, rf,
+                                              rr.minimum_replication_factor_warn_threshold()));
+                }
+                else if (auto max_warn = rr.maximum_replication_factor_warn_threshold();
+                        max_warn >= 0 && rf > max_warn)
+                {
+                    ++stats.maximum_replication_factor_warn_violations;
+                    warnings.push_back(format("Using Replication Factor {}={} greater than the "
+                                              "maximum_replication_factor_warn_threshold={} is not recommended.", opt.first, rf,
+                                              rr.maximum_replication_factor_warn_threshold()));
+                }
+            }
+        } catch (std::invalid_argument&) {
+        } catch (std::out_of_range& ) {
+        }
+    }
+    return warnings;
+}
+
+// A cluster keeps all of its user data either locally or in object storage.
+// Refuse a keyspace of the other kind, unless restrict_mixed_storage_clusters
+// says otherwise. A cluster which is already mixed only gets a warning whatever
+// the setting says: refusing more keyspaces would not bring it back to either
+// kind, and would leave it unable to create any user keyspace at all.
+std::vector<sstring> check_against_mixed_storage(query_processor& qp, const sstring& keyspace, const ks_prop_defs& attrs) {
+    // An existing keyspace is not created again, whether the statement carries
+    // IF NOT EXISTS or is about to fail on the name, so it has nothing to check.
+    if (qp.db().has_keyspace(keyspace)) {
+        return {};
+    }
+
+    std::vector<sstring> warnings;
+    const auto restriction = qp.db().get_config().restrict_mixed_storage_clusters();
+    if (restriction == db::tri_mode_restriction_t::mode::FALSE) {
+        return warnings;
+    }
+
+    const bool wants_object_storage = attrs.get_storage_options().is_object_storage_type();
+    const auto refuse = [&] (std::string_view asked_for, std::string_view cluster_keeps) {
+        auto message = seastar::format("Cannot create keyspace '{}' in {} storage: this cluster keeps its user data in {} "
+                                       "storage. A cluster keeps all of its user data either locally or in object storage.",
+                                       keyspace, asked_for, cluster_keeps);
+        if (restriction == db::tri_mode_restriction_t::mode::TRUE) {
+            throw exceptions::invalid_request_exception(std::move(message));
+        }
+        warnings.push_back(std::move(message));
+    };
+
+    switch (qp.db().real_database().get_user_storage_kind()) {
+        using enum replica::database::user_storage_kind;
+    case none:
+        break;
+    case local:
+        if (wants_object_storage) {
+            refuse("object", "local");
+        }
+        break;
+    case object_storage:
+        if (!wants_object_storage) {
+            refuse("local", "object");
+        }
+        break;
+    case mixed:
+        warnings.push_back("This cluster keeps some of its user data locally and some in object storage. Such a cluster is not supported.");
+        break;
+    }
+    return warnings;
 }
 
 future<::shared_ptr<messages::result_message>>
-create_keyspace_statement::execute(query_processor& qp, service::query_state& state, const query_options& options) const {
-    std::optional<sstring> warning = check_restricted_replication_strategy(qp, keyspace(), *_attrs);
-    return schema_altering_statement::execute(qp, state, options).then([this, warning = std::move(warning)] (::shared_ptr<messages::result_message> msg) {
-        if (warning) {
-            msg->add_warning(*warning);
-            mylogger.warn("{}", *warning);
+create_keyspace_statement::execute(query_processor& qp, service::query_state& state, const query_options& options, std::optional<service::group0_guard> guard) const {
+    std::vector<sstring> warnings = check_against_restricted_replication_strategies(qp, keyspace(), *_attrs, qp.get_cql_stats(), qp.get_cql_config().replication_restrictions);
+    for (auto& warning : check_against_mixed_storage(qp, keyspace(), *_attrs)) {
+        warnings.push_back(std::move(warning));
+    }
+        return schema_altering_statement::execute(qp, state, options, std::move(guard)).then([warnings = std::move(warnings)] (::shared_ptr<messages::result_message> msg) {
+        for (const auto& warning : warnings) {
+            msg->add_warning(warning);
+            mylogger.warn("{}", warning);
         }
         return msg;
     });
 }
 
-lw_shared_ptr<data_dictionary::keyspace_metadata> create_keyspace_statement::get_keyspace_metadata(const locator::token_metadata& tm) {
-    _attrs->validate();
-    return _attrs->as_ks_metadata(_name, tm);
+lw_shared_ptr<data_dictionary::keyspace_metadata> create_keyspace_statement::get_keyspace_metadata(const locator::token_metadata& tm, const gms::feature_service& feat, const db::config& cfg) {
+    _attrs->validate(feat);
+    return _attrs->as_ks_metadata(_name, tm, feat, cfg);
+}
+
+::shared_ptr<schema_altering_statement::event_t> create_keyspace_statement::created_event() const {
+    return make_shared<event_t>(
+            event_t::change_type::CREATED,
+            event_t::target_type::KEYSPACE,
+            keyspace());
 }
 
 }

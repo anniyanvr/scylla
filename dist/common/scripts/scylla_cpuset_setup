@@ -5,15 +5,15 @@
 #
 
 #
-# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 
 import os
 import sys
 import argparse
-from scylla_util import *
+from scylla_util import is_container, sysconfig_parser
 
 if __name__ == '__main__':
-    if os.getuid() > 0:
+    if not is_container() and os.getuid() > 0:
         print('Requires root permission.')
         sys.exit(1)
     parser = argparse.ArgumentParser(description='Configure cpuset configuration for Scylla.')
@@ -26,12 +26,21 @@ if __name__ == '__main__':
         parser.print_help()
         sys.exit(1)
 
-    cfg = sysconfig_parser('/etc/scylla.d/cpuset.conf')
-    cfg.set('CPUSET', '{cpuset}{smp}'.format( \
-            cpuset='--cpuset {} '.format(args.cpuset) if args.cpuset else '', \
-            smp='--smp {} '.format(args.smp) if args.smp else '' \
-            ))
-    cfg.commit()
+    cpuset = smp = None
+    try:
+        cfg = sysconfig_parser('/etc/scylla.d/cpuset.conf')
+        line = cfg.get('CPUSET')
+        cpuset_args = parser.parse_args(line.split())
+        cpuset = cpuset_args.cpuset
+        smp = cpuset_args.smp
+    except:
+        pass
+    if cpuset != args.cpuset or smp != args.smp:
+        if os.path.exists('/etc/scylla.d/perftune.yaml'):
+            os.remove('/etc/scylla.d/perftune.yaml')
 
-    if os.path.exists('/etc/scylla.d/perftune.yaml'):
-        os.remove('/etc/scylla.d/perftune.yaml')
+        cfg.set('CPUSET', '{cpuset}{smp}'.format( \
+                cpuset='--cpuset {} '.format(args.cpuset) if args.cpuset else '', \
+                smp='--smp {} '.format(args.smp) if args.smp else '' \
+                ))
+        cfg.commit()

@@ -1,34 +1,27 @@
 /*
- */
-
-/*
  * Copyright (C) 2015-present ScyllaDB
  *
  * Modified by ScyllaDB
  */
 
 /*
- * SPDX-License-Identifier: (AGPL-3.0-or-later and Apache-2.0)
+ * SPDX-License-Identifier: (LicenseRef-ScyllaDB-Source-Available-1.1 and Apache-2.0)
  */
 
 #pragma once
 
 #include "auth/service.hh"
 #include "exceptions/exceptions.hh"
-#include "unimplemented.hh"
 #include "timeout_config.hh"
-#include "timestamp.hh"
-#include "db_clock.hh"
+#include "mutation/timestamp.hh"
 #include "replica/database_fwd.hh"
 #include "auth/authenticated_user.hh"
 #include "auth/authenticator.hh"
 #include "auth/permission.hh"
-#include "tracing/tracing.hh"
-#include "tracing/trace_state.hh"
+#include "client_data.hh"
 
-#include "enum_set.hh"
 #include "transport/cql_protocol_extension.hh"
-#include "service/qos/service_level_controller.hh"
+#include "service/qos/qos_common.hh"
 
 namespace auth {
 class resource;
@@ -38,7 +31,29 @@ namespace data_dictionary {
 class database;
 }
 
+namespace qos {
+class service_level_controller;
+}
+
 namespace service {
+
+class client_state;
+struct forwarded_client_state {
+    sstring keyspace;
+    std::optional<sstring> username;
+    timeout_config timeout_config;
+    uint64_t protocol_extensions_mask;
+    gms::inet_address remote_address;
+    uint16_t remote_port;
+
+    forwarded_client_state(sstring keyspace,
+                           std::optional<sstring> username,
+                           ::timeout_config timeout_config,
+                           uint64_t protocol_extensions_mask,
+                           gms::inet_address remote_address,
+                           uint16_t remote_port);
+    forwarded_client_state(const client_state& cs);
+};
 
 /**
  * State related to a client connection.
@@ -50,33 +65,28 @@ public:
     };
     using workload_type = qos::service_level_options::workload_type;
 
-    // This class is used to move client_state between shards
-    // It is created on a shard that owns client_state than passed
-    // to a target shard where client_state_for_another_shard::get()
-    // can be called to obtain a shard local copy.
-    class client_state_for_another_shard {
-    private:
-        const client_state* _cs;
-        seastar::sharded<auth::service>* _auth_service;
-        client_state_for_another_shard(const client_state* cs, seastar::sharded<auth::service>* auth_service) : _cs(cs), _auth_service(auth_service) {}
-        friend client_state;
-    public:
-        client_state get() const {
-            return client_state(_cs, _auth_service);
-        }
-    };
+    class client_state_for_another_shard;
 private:
-    client_state(const client_state* cs, seastar::sharded<auth::service>* auth_service)
+    // Copies the client_state fields from `cs`. Must be called on the shard
+    // owning `cs`, unless `cs` is a private snapshot which is not modified.
+    client_state(const client_state* cs,
+        seastar::sharded<auth::service>* auth_service,
+        seastar::sharded<qos::service_level_controller>* sl_controller,
+        abort_source* as)
             : _keyspace(cs->_keyspace)
             , _user(cs->_user)
             , _auth_state(cs->_auth_state)
+            , _user_connection(cs->_user_connection)
             , _is_internal(cs->_is_internal)
-            , _is_thrift(cs->_is_thrift)
+            , _bypass_auth_checks(cs->_bypass_auth_checks)
             , _remote_address(cs->_remote_address)
             , _auth_service(auth_service ? &auth_service->local() : nullptr)
+            , _sl_controller(sl_controller ? &sl_controller->local() : nullptr)
             , _default_timeout_config(cs->_default_timeout_config)
             , _timeout_config(cs->_timeout_config)
+            , _as(as)
             , _enabled_protocol_extensions(cs->_enabled_protocol_extensions)
+            , _original_shard(cs->_original_shard)
     {}
     friend client_state_for_another_shard;
 private:
@@ -104,14 +114,31 @@ private:
     private volatile String keyspace;
 #endif
     std::optional<auth::authenticated_user> _user;
-    std::optional<sstring> _driver_name, _driver_version;
+    std::optional<client_options_cache_entry_type> _driver_name, _driver_version;
+	std::list<client_option_key_value_cached_entry> _client_options;
 
     auth_state _auth_state = auth_state::UNINITIALIZED;
+    // A connection is treated as a driver control connection by default: it is
+    // meant to issue only the system queries a driver needs to manage itself.
+    // Once it is observed running user (non-system) load it is multiplexed with
+    // user load by the driver and is reclassified as a regular user connection.
+    // The reclassification is sticky so the connection is never turned back into
+    // a control connection. Whether a non-reclassified connection actually runs
+    // in the driver scheduling group additionally depends on sl:driver existing.
+    bool _user_connection = false;
+    // Set together with _user_connection and cleared once the CQL server has
+    // switched the connection to the user scheduling group, so the switch happens
+    // exactly once.
+    bool _reclassification_pending = false;
 
     // isInternal is used to mark ClientState as used by some internal component
     // that should have an ability to modify system keyspace.
     bool _is_internal;
-    bool _is_thrift;
+
+    // bypass_auth_checks is used to skip authorization checks.
+    // This is used by the maintenance socket to allow privileged access without
+    // going through normal auth, while still treating queries as external.
+    bool _bypass_auth_checks;
 
     // The biggest timestamp that was returned by getTimestamp/assigned to a query
     static thread_local api::timestamp_type _last_timestamp_micros;
@@ -129,6 +156,11 @@ private:
 
     workload_type _workload_type = workload_type::unspecified;
 
+    // Used to communicate with the code executing user requests.
+    // It's a way to indicate that we might abort processing the
+    // request, e.g. if the corresponding connection has been severed.
+    abort_source* _as{nullptr};
+
 public:
     struct internal_tag {};
     struct external_tag {};
@@ -145,28 +177,67 @@ public:
         _auth_state = new_state;
     }
 
-    std::optional<sstring> get_driver_name() const {
+    bool is_user_connection() const noexcept {
+        return _user_connection;
+    }
+
+    void reclassify_as_user_connection() noexcept {
+        _user_connection = true;
+        _reclassification_pending = true;
+    }
+
+    bool needs_scheduling_group_reclassification() const noexcept {
+        return _reclassification_pending;
+    }
+
+    void mark_reclassification_applied() noexcept {
+        _reclassification_pending = false;
+    }
+
+    std::optional<client_options_cache_entry_type> get_driver_name() const {
         return _driver_name;
     }
-    void set_driver_name(sstring driver_name) {
-        _driver_name = std::move(driver_name);
+    future<> set_driver_name(client_options_cache_type& keys_and_values_cache, const sstring& driver_name) {
+        _driver_name = co_await keys_and_values_cache.get_or_load(driver_name, [] (const client_options_cache_key_type&) {
+            return make_ready_future<options_cache_value_type>(options_cache_value_type{});
+        });
     }
 
-    std::optional<sstring> get_driver_version() const {
+    const auto& get_client_options() const {
+        return _client_options;
+    }
+
+    future<> set_client_options(
+        client_options_cache_type& keys_and_values_cache,
+        const std::unordered_map<sstring, sstring>& client_options);
+
+    std::optional<client_options_cache_entry_type> get_driver_version() const {
         return _driver_version;
     }
-    void set_driver_version(sstring driver_version) {
-        _driver_version = std::move(driver_version);
+    future<> set_driver_version(
+        client_options_cache_type& keys_and_values_cache,
+        const sstring& driver_version)
+    {
+        _driver_version = co_await keys_and_values_cache.get_or_load(driver_version, [] (const client_options_cache_key_type&) {
+            return make_ready_future<options_cache_value_type>(options_cache_value_type{});
+        });
     }
 
-    client_state(external_tag, auth::service& auth_service, qos::service_level_controller* sl_controller, timeout_config timeout_config, const socket_address& remote_address = socket_address(), bool thrift = false)
+    client_state(external_tag,
+                 auth::service& auth_service,
+                 qos::service_level_controller* sl_controller,
+                 timeout_config timeout_config,
+                 const socket_address& remote_address = socket_address(),
+                 bool bypass_auth_checks = false,
+                 abort_source* as = nullptr)
             : _is_internal(false)
-            , _is_thrift(thrift)
+            , _bypass_auth_checks(bypass_auth_checks)
             , _remote_address(remote_address)
             , _auth_service(&auth_service)
             , _sl_controller(sl_controller)
             , _default_timeout_config(timeout_config)
-            , _timeout_config(timeout_config) {
+            , _timeout_config(timeout_config)
+            , _as(as) {
         if (!auth_service.underlying_authenticator().require_authentication()) {
             _user = auth::authenticated_user();
         }
@@ -175,9 +246,13 @@ public:
     gms::inet_address get_client_address() const {
         return gms::inet_address(_remote_address);
     }
-    
+
     ::in_port_t get_client_port() const {
         return _remote_address.port();
+    }
+
+    const socket_address& get_remote_address() const {
+        return _remote_address;
     }
 
     const timeout_config& get_timeout_config() const {
@@ -188,15 +263,45 @@ public:
         return *_sl_controller;
     }
 
-    client_state(internal_tag) : client_state(internal_tag{}, infinite_timeout_config)
+    client_state(internal_tag, abort_source* as = nullptr) : client_state(internal_tag{}, infinite_timeout_config, as)
     {}
 
-    client_state(internal_tag, const timeout_config& config)
+    client_state(internal_tag, const timeout_config& config, abort_source* as = nullptr)
             : _keyspace("system")
             , _is_internal(true)
-            , _is_thrift(false)
+            , _bypass_auth_checks(true)
             , _default_timeout_config(config)
             , _timeout_config(config)
+            , _as(as)
+    {}
+
+    client_state(internal_tag, auth::service& auth_service, qos::service_level_controller& sl_controller, sstring username, abort_source* as = nullptr)
+        : _user(auth::authenticated_user(username))
+        , _auth_state(auth_state::READY)
+        , _is_internal(true)
+        , _bypass_auth_checks(true)
+        , _auth_service(&auth_service)
+        , _sl_controller(&sl_controller)
+        , _as(as)
+    {}
+
+    client_state(auth::service& auth_service,
+                 qos::service_level_controller* sl_controller,
+                 forwarded_client_state&& forwarded_state,
+                 abort_source* as = nullptr)
+            : _keyspace(std::move(forwarded_state.keyspace))
+            , _user(forwarded_state.username ? auth::authenticated_user(*forwarded_state.username) : auth::authenticated_user{})
+            , _auth_state(auth_state::READY)
+            , _is_internal(false)
+            , _bypass_auth_checks(false)
+            , _remote_address(socket_address(forwarded_state.remote_address, forwarded_state.remote_port))
+            , _auth_service(&auth_service)
+            , _sl_controller(sl_controller)
+            , _default_timeout_config(forwarded_state.timeout_config)
+            , _timeout_config(std::move(forwarded_state.timeout_config))
+            , _as(as)
+            , _enabled_protocol_extensions(cql_transport::cql_protocol_extension_enum_set::from_mask(
+                    forwarded_state.protocol_extensions_mask))
     {}
 
     client_state(const client_state&) = delete;
@@ -205,12 +310,8 @@ public:
     ///
     /// `nullptr` for internal instances.
     ///
-    const auth::service* get_auth_service() const {
+    auth::service* get_auth_service() const {
         return _auth_service;
-    }
-
-    bool is_thrift() const {
-        return _is_thrift;
     }
 
     bool is_internal() const {
@@ -249,7 +350,7 @@ public:
      * As during the prepared phase replica send us the last propose they accepted, a first option would be to take
      * the maximum of those last accepted proposal timestamp plus 1 (and use a default value, say 0, if it's the
      * first known proposal for the partition). This would mostly work (giving commits the timestamp 0, 1, 2, ...
-     * in the order they are commited) but with 2 important caveats:
+     * in the order they are committed) but with 2 important caveats:
      *   1) it would give a very poor experience when Paxos and non-Paxos updates are mixed in the same partition,
      *      since paxos operations wouldn't be using microseconds timestamps. And while you shouldn't theoretically
      *      mix the 2 kind of operations, this would still be pretty nonintuitive. And what if you started writing
@@ -285,6 +386,14 @@ public:
         return _last_timestamp_micros;
     }
 
+    // Forget this shard's last generated timestamp, so the next ones follow
+    // the clock even if it moved backward. Only for the test-only clocks
+    // offset (see set_clocks_offset()), whose changes would otherwise leave
+    // the timestamps in the future after a test undoes a forward jump.
+    static void reset_last_timestamp() {
+        _last_timestamp_micros = 0;
+    }
+
 #if 0
     public SocketAddress getRemoteAddress()
     {
@@ -314,6 +423,16 @@ public:
         return _keyspace;
     }
 
+    abort_source& get_abort_source() {
+        if (_as == nullptr) {
+            utils::on_internal_error("client_state::get_abort_source(): Tried to dereference nullptr");
+        }
+        return *_as;
+    }
+    abort_source* get_abort_source_ptr() noexcept {
+        return _as;
+    }
+
     /**
      * Sets active user. Does _not_ validate anything
      */
@@ -323,19 +442,27 @@ public:
     future<> check_user_can_login();
 
     future<> has_all_keyspaces_access(auth::permission) const;
-    future<> has_keyspace_access(data_dictionary::database db, const sstring&, auth::permission) const;
-    future<> has_column_family_access(data_dictionary::database db, const sstring&, const sstring&, auth::permission,
-                                      auth::command_desc::type = auth::command_desc::type::OTHER) const;
-    future<> has_schema_access(data_dictionary::database db, const schema& s, auth::permission p) const;
-    future<> has_schema_access(data_dictionary::database db, const sstring&, const sstring&, auth::permission p) const;
+    future<> has_keyspace_access(const sstring&, auth::permission) const;
+    future<> has_column_family_access(const sstring&, const sstring&, auth::permission,
+                                      auth::command_desc::type = auth::command_desc::type::OTHER, auth::permission_set additional_permissions = {}) const;
 
+    future<> has_functions_access(auth::permission p) const;
+    future<> has_functions_access(const sstring& ks, auth::permission p) const;
+    future<> has_function_access(const sstring& ks, const sstring& function_signature, auth::permission p) const;
 private:
-    future<> has_access(data_dictionary::database db, const sstring& keyspace, auth::command_desc) const;
+    future<> check_internal_table_permissions(std::string_view ks, std::string_view table_name, auth::permission permission, const auth::resource& resource) const;
+    future<> check_access_rules(const sstring& ks, auth::permission permission, const auth::resource& resource,
+                                auth::command_desc::type type, auth::permission_set additional_permissions) const;
+    future<> has_access(const sstring& keyspace, auth::permission permission, const auth::resource& resource,
+                        auth::command_desc::type type = auth::command_desc::type::OTHER, auth::permission_set additional_permissions = {}) const;
+    sstring generate_authorization_error_msg(const auth::command_desc&) const;
+    sstring generate_authorization_error_msg(const auth::command_desc_with_permission_set&) const;
 
 public:
-    future<bool> check_has_permission(auth::command_desc) const;
-    future<> ensure_has_permission(auth::command_desc) const;
-    future<> maybe_update_per_service_level_params();
+    template<typename Cmd = auth::command_desc> future<bool> check_has_permission(Cmd) const;
+    template<typename Cmd = auth::command_desc> future<> ensure_has_permission(Cmd) const;
+    void maybe_update_per_service_level_params();
+    void update_per_service_level_params(qos::service_level_options& slo);
 
     /**
      * Returns an exceptional future with \ref exceptions::invalid_request_exception if the resource does not exist.
@@ -344,6 +471,10 @@ public:
 
     void validate_login() const;
     void ensure_not_anonymous() const; // unauthorized_exception on error
+
+    /// Returns true if the user has superuser privileges.
+    /// Internal clients are always considered superusers.
+    future<bool> has_superuser() const;
 
 #if 0
     public void ensureIsSuper(String message) throws UnauthorizedException
@@ -363,9 +494,9 @@ public:
         return _user;
     }
 
-    client_state_for_another_shard move_to_other_shard() {
-        return client_state_for_another_shard(this, _auth_service ? &_auth_service->container() : nullptr);
-    }
+    // Takes a snapshot of this client_state which can be safely passed to
+    // other shards.
+    client_state_for_another_shard move_to_other_shard() const;
 
 #if 0
     public static SemanticVersion[] getCQLSupportedVersion()
@@ -394,14 +525,55 @@ private:
 
     cql_transport::cql_protocol_extension_enum_set _enabled_protocol_extensions;
 
+    // The shard where the current CQL request originally entered the node.
+    // After an internal CAS shard bounce this differs from this_shard_id().
+    unsigned _original_shard = this_shard_id();
+
 public:
 
     bool is_protocol_extension_set(cql_transport::cql_protocol_extension ext) const {
         return _enabled_protocol_extensions.contains(ext);
     }
 
+    cql_transport::cql_protocol_extension_enum_set get_protocol_extensions() const {
+        return _enabled_protocol_extensions;
+    }
+
     void set_protocol_extensions(cql_transport::cql_protocol_extension_enum_set exts) {
         _enabled_protocol_extensions = std::move(exts);
+    }
+
+    unsigned get_original_shard() const noexcept {
+        return _original_shard;
+    }
+};
+
+// This class is used to move client_state between shards
+// It is created on a shard that owns client_state than passed
+// to a target shard where client_state_for_another_shard::get()
+// can be called to obtain a shard local copy.
+//
+// The relevant fields are copied eagerly, on the owning shard, when
+// this object is constructed. The original client_state must not be
+// referenced from another shard because it can be concurrently
+// modified by the owning shard (e.g. by a USE statement changing
+// _keyspace) while the other shard reads it, which is a data race.
+class client_state::client_state_for_another_shard {
+private:
+    client_state _snapshot;
+    seastar::sharded<auth::service>* _auth_service;
+    seastar::sharded<qos::service_level_controller>* _sl_controller;
+    client_state_for_another_shard(const client_state* cs,
+        seastar::sharded<auth::service>* auth_service,
+        seastar::sharded<qos::service_level_controller>* sl_controller)
+        : _snapshot(cs, nullptr, nullptr, nullptr), _auth_service(auth_service), _sl_controller(sl_controller) {}
+    friend client_state;
+public:
+    client_state_for_another_shard(const client_state_for_another_shard& o)
+        : _snapshot(&o._snapshot, nullptr, nullptr, nullptr), _auth_service(o._auth_service), _sl_controller(o._sl_controller) {}
+    client_state_for_another_shard(client_state_for_another_shard&&) = default;
+    client_state get(abort_source* as = nullptr) const {
+        return client_state(&_snapshot, _auth_service, _sl_controller, as);
     }
 };
 

@@ -1,0 +1,321 @@
+# Logstor
+
+## Introduction
+
+Logstor is a log-structured storage engine for ScyllaDB optimized for key-value workloads. It provides an alternative storage backend for key-value tables - tables with a partition key only, with no clustering columns, and where rows are written whole, as a single value (individual
+columns are usually not updated separately).
+
+Unlike the traditional LSM-tree based storage, logstor uses a log-structured approach with in-memory indexing, making it particularly suitable for workloads with frequent overwrites and point lookups.
+
+## Architecture
+
+Logstor consists of several key components:
+
+### Components
+
+#### Primary Index
+
+The primary index is entirely in memory and it maps a partition key to its location in the log segments. It consists of a B-tree per each table that is ordered by token.
+
+An index entry does not hold the partition key itself but a `primary_index_key`: the token and a 128-bit XXH3 hash of the key's internal representation, seeded with a value drawn at random when the process starts. This keeps every entry the same small size regardless of the key length. Keys that share a token are ordered by their hash rather than by ring order; the range reader restores ring order after reading the records, which carry the full key. The hash exists only in memory: records store the partition key, and recovery recomputes the hash from it, so the seed is never persisted. A read verifies the key found in the record against the requested key, so a hash collision surfaces as an error rather than as another partition's data.
+
+#### Segment Manager
+
+The `segment_manager` handles the allocation and management of fixed-size segments (default 128KB). Segments are grouped into large files (default 32MB). Key responsibilities include:
+
+- **Segment allocation**: Provides segments for writing new data
+- **Space reclamation**: Tracks free space in each segment
+- **Compaction**: Copies live data from sparse segments to reclaim space
+- **Recovery**: Scans segments on startup to rebuild the index
+- **Separator**: Writes to all _compaction groups_ (tablets and even tables) go to a single active segment. The separator splits these mixed segments, which have records from different compaction groups, into segments that each has a single compaction group. This separation is useful when migrating tablets.
+
+The data in the segments consists of records of type `log_record`. Each record contains the value for some key as an encoded partition (`record_value`) and additional metadata. On disk a record is stored as a **record frame**, described under [Record Frames](#record-frames) below, which is also the unit the index points at.
+
+The `segment_manager` receives new writes via a `write_buffer`, and appends each buffer to the active segment as a 4k-block-aligned chunk (see [Segments](#segments)).
+
+#### Write Buffer
+
+The `write_buffer` manages a buffer of log records and handles the serialization of the records including headers and alignment. It can be used to write multiple records to the buffer, then seal it into a chunk and write the chunk to a segment through the segment manager.
+
+The `buffered_writer` manages multiple write buffers for user writes, an active buffer and multiple flushing ones, to batch writes and manage backpressure.
+
+### Data Flow
+
+**Write Path:**
+1. Application writes mutation to logstor
+2. Mutation is converted to a log record
+3. Record is written to write buffer
+4. The buffer is switched, sealed into a chunk, and the chunk is appended to the active segment.
+5. Index is updated with new record locations
+6. Old record locations (for overwrites) are marked as free
+
+Only step 4 writes to the disk - all other steps only update in-memory metadata.
+
+**Read Path:**
+1. Application requests data for a partition key
+2. Index lookup returns the cached partition, if the cache has it, or the record location
+3. Segment manager reads record from disk
+4. Record is decoded into a partition, which is added to the cache and returned
+
+**Separator:**
+1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.
+2. The separator buffer is flushed when it's full, or requested to flush for other reason. It is written into a new segment in the compaction group, and it updates the location of the records from the original mixed segments to the new segments in the compaction group.
+3. After the separator buffer is flushed and all records from the original segment are moved, it releases the reference of the segment. When there are no more reference to the segment it is freed.
+
+**Compaction:**
+1. The amount of live data is tracked for each segment in its (in-memory) segment_descriptor. The segment descriptors are stored in a histogram by live data. This histogram is called a `segment_set` and each compaction group owns one.
+2. A segment set from a single compaction group is submitted for compaction.
+3. Compaction picks segments for compaction from the segment set. It chooses segments with the lowest utilization such that compacting them results in net gain of free segments.
+4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
+5. After all live records are rewritten the old segments are freed.
+
+**Automatic compaction:**
+1. A segment is a candidate when its utilization (live record bytes / segment size) is at most the utilization threshold, `logstor_compaction_utilization_threshold` (default 0.5).
+2. The threshold is a function of the free level, the number of available segments on the shard, and it is linear between three points:
+   - At the space floor (`logstor_compaction_space_floor`, default 3% of the disk, at least two batches and at most a quarter of the disk) and below, the threshold is 1.
+   - At the anchor (twice the space floor, at most half of the disk), the threshold is the configured value.
+   - At the ceiling (one segment above the anchor) and above, the threshold is a minimum, `logstor_compaction_min_utilization_threshold` (default 0.1).
+
+   So the free level stays near the anchor as long as the threshold that holds it there is above the minimum. Below the anchor, a full disk compacts fuller segments. Above the anchor, a disk with free space compacts only emptier segments, which costs less write amplification. The minimum makes sure that a segment with a few long-lived records is compacted at any free level, which bounds the space that such segments hold.
+3. One driver per shard runs while a compaction group has a batch of candidates with a net gain. Nothing throttles it: the threshold decides what it compacts, and the CPU shares decide how fast.
+4. The CPU shares of the compaction scheduling group are 50, the floor of the sstable compaction controller, while the free level is at or above the anchor, and increase linearly to `logstor_compaction_max_shares` at the space floor. So when compaction does not keep up with the writes, the free level decreases below the anchor and compaction gets more CPU.
+5. A job that runs next to another job starts only if its batch reclaims at least 75% of what the best batch of the shard reclaims per byte copied.
+6. Automatic compaction skips the compaction groups of a table whose automatic compaction is off, for example after `nodetool disableautocompaction`. A compaction that is asked for through the logstor compaction API still runs.
+
+## Usage
+
+### Enabling Logstor
+
+To use logstor, enable the experimental feature in the configuration:
+
+```yaml
+experimental_features:
+  - logstor
+```
+
+### Creating Tables
+
+Tables using logstor must have no clustering columns, and created with the `storage_engine` property equals to 'logstor':
+
+```cql
+CREATE TABLE keyspace.user_profiles (
+    user_id uuid PRIMARY KEY,
+    name text,
+    email text,
+    metadata frozen<map<text, text>>
+) WITH storage_engine = 'logstor';
+```
+
+### Basic Operations
+
+**Insert/Update:**
+
+```cql
+INSERT INTO keyspace.table_name (pk, v) VALUES (1, 'value1');
+INSERT INTO keyspace.table_name (pk, v) VALUES (2, 'value2');
+
+-- Overwrite with new value
+INSERT INTO keyspace.table_name (pk, v) VALUES (1, 'updated_value');
+```
+
+Currently, updates must write the full row. Updating individual columns is not yet supported. Each write replaces the entire partition.
+
+**Select:**
+
+```cql
+SELECT * FROM keyspace.table_name WHERE pk = 1;
+-- Returns: (1, 'updated_value')
+
+SELECT pk, v FROM keyspace.table_name WHERE pk = 2;
+-- Returns: (2, 'value2')
+
+SELECT * FROM keyspace.table_name;
+-- Returns: (1, 'updated_value'), (2, 'value2')
+```
+
+**Delete:**
+
+```cql
+DELETE FROM keyspace.table_name WHERE pk = 1;
+```
+
+### Inspecting a Table
+
+`SELECT ... FROM MUTATION_FRAGMENTS()` dumps the raw mutations of a logstor table as the
+node they are read on stores them, bypassing the storage proxy. A logstor table has two
+mutation sources:
+
+| Source | Content |
+|--------|---------|
+| `logstor-cache` | The partition as held in the logstor cache, if it is cached |
+| `logstor-log:${file path}:${segment}` | The log record, named after the segment holding it |
+
+```cql
+SELECT * FROM MUTATION_FRAGMENTS(keyspace.table_name) WHERE pk = 1;
+```
+
+## Space Accounting
+
+Logstor counts the space it takes in several ways, because its consumers ask different questions. The
+segments a compaction group owns hold live records and dead ones, and the dead ones stay until
+compaction reclaims them.
+
+| Number | Where | Consumers |
+|--------|-------|-----------|
+| Space of the segments a group owns | `compaction_group::live_disk_space_used()`, the `live_disk_space` and `logstor_segments` table metrics | the disk space of a table (nodetool, the `column_family` API) |
+| Live record bytes of the segments a group owns | `compaction_group::data_size()`, the `owned_segments_live_record_bytes` metric | tablet sizes, the table size for split and merge |
+| Live record bytes the index refers to, the records in mixed segments included | the `logstor_live_record_bytes` table metric, the `live_record_bytes` metric | metrics only |
+| Segments that hold records | `segment_bytes_in_use`, the `segments_in_use` metric | the load of the node (`database::disk_space_used()`) |
+| Files allocated for segments | `disk_usage`, the `disk_usage` metric; `segment_bytes_in_use` with sparse files (`space_on_disk`) | the capacity of the node for the tablet balancer |
+
+A write counts in the live record bytes of a group only after the separator moves it into a segment
+of the group.
+
+## Measuring Performance
+
+Two tests measure the cost of a logstor operation on one node, at two levels.
+
+**`scylla perf-simple-query --logstor`** measures the whole read and write path - CQL, the
+coordinator, the replica and logstor - against a logstor table. It is the same test that measures an
+sstable backed table, so the baseline is the same command without the flag. Use it for the cost of
+an operation as a workload sees it, and for the two storage engines side by side.
+
+**`test/perf/perf_logstor`** drives a logstor directly - no CQL, no coordinator, no replica - and
+measures the steps of a read and of a write both together and one at a time, so that a change to the
+hot path can be attributed to the step it moved. Its tests, its options, how its steps add up and
+what a run has to get right are in the comment at the top of
+[test/perf/perf_logstor.cc](../../test/perf/perf_logstor.cc).
+
+## On-Disk Format
+
+### Files
+
+Segments are stored in large pre-allocated files on disk. Each file holds a fixed number of segments determined by the `file_size / segment_size` ratio. File names follow the pattern:
+
+```
+ls_{shard_id}-{file_id}-Data.db
+```
+
+Files are pre-formatted (zero-filled) before use.
+
+### Segments
+
+Each segment is a contiguous fixed-size region within a file (default 128KB). A segment is identified by a `log_segment_id` (a 32-bit integer index), which maps to a file and offset within that file.
+
+A segment contains one or more **chunks** written sequentially. A chunk is the unit written to a segment: it starts at a 4KB block boundary and is padded to a multiple of 4KB. A chunk is built in memory by a write buffer (see [Write Buffer](#write-buffer)); "buffer" always refers to that memory, and "chunk" to what it writes to disk. A segment has one of two kinds:
+
+- **mixed**: written by normal user writes; may contain records from multiple tables and compaction groups. Contains one or more chunks, appended one at a time.
+- **full**: written by compaction or the separator; contains records from a single table and token range. Contains exactly one chunk.
+
+### Chunk Layout
+
+A chunk within a segment has the following layout:
+
+```
+chunk_header
+(segment_header)?       -- present only when kind == full
+record_frame_1
+record_frame_2
+...
+record_frame_n
+zero_padding            -- to align the entire chunk to block_alignment (4096 bytes)
+```
+
+chunk_header, segment_header, and record frames are aligned by `record_alignment` (8 bytes).
+
+All integer fields in the structures below are serialized little-endian, including the two
+64-bit halves of a UUID.
+
+#### Chunk Header
+
+A serialized form of `ondisk::chunk_header`.
+
+| Offset | Size | Field       | Description |
+|--------|------|-------------|-------------|
+| 0      | 4    | `magic`     | `0x4C475342`. Used to detect valid chunks during recovery. |
+| 4      | 1    | `kind`      | Segment kind: `0` = mixed, `1` = full. |
+| 5      | 1    | `version`   | Version of the chunk format. |
+| 6      | 2    | `reserved`  | Reserved for future use. Currently written as zero and included in the CRC. |
+| 8      | 8    | `segment_seq` | Monotonic segment sequence number used during recovery and segment ordering checks. |
+| 16     | 4    | `records_size` | Size in bytes of the record frames following the header(s), their padding included. |
+| 20     | 4    | `body_crc`  | CRC32 of the chunk's body: the record frames that follow the headers, `records_size` bytes. |
+| 24     | 4    | `reserved2` | Reserved for future use. Currently written as zero and included in the CRC. |
+| 28     | 4    | `crc`       | CRC32 of all preceding chunk header fields and, in a full segment, of the segment header that follows. Used for validating the headers. |
+
+The chunk header is 32 bytes long, which keeps it aligned to `record_alignment` (8 bytes).
+
+#### Segment Header (full segments only)
+
+Immediately follows the chunk header when `kind == full`. The chunk header's `crc` covers it.
+
+A serialized form of `ondisk::segment_header`.
+
+| Offset | Size | Field         | Description |
+|--------|------|---------------|-------------|
+| 32     | 16   | `table`       | UUID of the table this segment belongs to. |
+| 48     | 8    | `first_token` | Minimum token of all records in the segment (raw token number). |
+| 56     | 8    | `last_token`  | Maximum token of all records in the segment (raw token number). |
+
+#### Record Frames
+
+Each record within the chunk is stored as a record frame:
+
+```
+record_frame_header  (8 bytes)
+record_header        (32 + key_size bytes)
+record_value         (value_size bytes)
+zero_padding         -- to align to record_alignment (8 bytes)
+```
+
+The sizes of the parts of a frame are named consistently throughout the code, since several of
+them are otherwise easy to confuse:
+
+| Name | Bytes |
+|------|-------|
+| `header_size`  | The serialized `record_header`: its fixed part plus `key_size`. |
+| `value_size`   | The serialized `record_value`. Stored in the frame header. |
+| `record_size`  | `header_size + value_size`, the record without its frame header. This is what `max_record_size()` bounds. |
+| `frame_size`   | `record_frame_header_size + record_size`, the frame without its padding. This is what `record_location::size` holds. |
+| `records_size` | All the frames of one chunk, their padding included. Stored in the chunk header. |
+| `record_bytes` | The frame sizes of a set of records summed, their padding excluded. What a `segment_descriptor` and the `live_record_bytes` metric count. |
+
+**Record Frame Header** (`ondisk::record_frame_header`):
+
+| Offset | Size | Field       | Description |
+|--------|------|-------------|-------------|
+| 0      | 4    | `key_size`  | Size in bytes of the partition key at the end of the `record_header` that follows. |
+| 4      | 4    | `value_size` | Size in bytes of the `record_value` that follows the `record_header`. |
+
+**Record Header** (`record_header`):
+
+Written by `ondisk::write_record_header()`. The fixed fields come first, at constant offsets, and the partition key is the only variable part.
+
+| Offset | Size       | Field       | Description |
+|--------|------------|-------------|-------------|
+| 0      | 8          | `token`     | Raw token number of the partition key. |
+| 8      | 8          | `timestamp` | `api::timestamp_type` — timestamp used for conflict resolution. |
+| 16     | 16         | `table`     | `table_id` (UUID) — the table this record belongs to, written as its most significant and then its least significant 64-bit half. |
+| 32     | `key_size` | `key`       | The partition key in its internal representation (`partition_key::representation()`). |
+
+**Record Value** (`record_value`):
+
+The `value_size` bytes immediately following the record header are the encoded partition. They are opaque to everything but `encode_record_value()` and `decode_record_value()` in `replica/logstor/record_value.hh`: compaction, the separator and segment streaming copy a value as it is.
+
+The encoding is written and read in `replica/logstor/record_value.cc`, behind `encode_record_value()` and `decode_record_value()`. It is a `canonical_mutation` stripped of what the record header already carries, the table id and the partition key, with the remaining parts each written by the serializer `canonical_mutation` uses for it:
+
+| Offset | Size       | Field                | Description |
+|--------|------------|----------------------|-------------|
+| 0      | 16         | `schema_version`     | The version of the schema the record was written under, as its most significant and then its least significant 64-bit half. |
+| 16     | variable   | `column_mapping`     | The columns of that schema version, IDL-serialized. A read under the same schema version steps over it; a read under another version uses it to map the record's columns onto the schema's, so a record stays readable after an `ALTER TABLE`. It is stored in the record because the schema history in the system tables keeps superseded versions only for a while. |
+|        | variable   | `mutation_partition` | The partition, IDL-serialized as `mutation_partition_serializer` writes it. |
+
+The value has no frame or size of its own: `value_size` gives its size.
+
+**Record Location** (`record_location`):
+
+The `record_location` stored in the index for each record points to the start of the `record_frame_header`:
+- `segment`: the `log_segment_id` holding the frame.
+- `offset`: byte offset from the start of the segment to the `record_frame_header`.
+- `size`: the `frame_size`, that is `record_frame_header` + `record_header` + `record_value`, without the padding that follows the frame. Reading exactly these bytes at this offset yields the whole record, which is what `segment_manager::read()` does.
+
+Where a chunk itself landed is a `segment_position` instead: the segment and the offset, with no size. Each record location is derived from it by adding the record's frame offset within the chunk. The two are separate types so that a chunk position cannot be read as a record location.

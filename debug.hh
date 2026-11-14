@@ -3,7 +3,7 @@
  */
 
 /*
- * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
 #pragma once
@@ -16,8 +16,9 @@ class database;
 
 namespace debug {
 
-extern seastar::sharded<replica::database>* the_database;
-
+extern seastar::sharded<replica::database>* volatile the_database;
+extern seastar::scheduling_group streaming_scheduling_group;
+extern seastar::scheduling_group gossip_scheduling_group;
 
 }
 
